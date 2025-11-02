@@ -107,7 +107,9 @@ impl<CP: ControlPlane> RelayServer<CP> {
     pub async fn run(self) -> anyhow::Result<()> {
         if let Some(web) = self.web {
             tokio::spawn(async move {
-                web.run().await.expect("failed to run web server");
+                if let Err(e) = web.run().await {
+                    log::error!("web server failed: {}", e);
+                }
             });
         }
 

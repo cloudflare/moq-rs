@@ -10,7 +10,7 @@ pub struct Origin {
 
 /// Trait for control plane operations that enable cross-relay routing and state sharing
 #[async_trait]
-pub trait ControlPlane: Send + Sync + Clone + Default + 'static {
+pub trait ControlPlane: Send + Sync + Clone + 'static {
     /// Get the origin URL for a given namespace
     async fn get_origin(&self, namespace: &str) -> Result<Option<Origin>>;
 

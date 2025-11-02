@@ -25,16 +25,6 @@ impl HttpControlPlane {
     }
 }
 
-impl Default for HttpControlPlane {
-    fn default() -> Self {
-        // This is a stub implementation - in practice you'd need valid URLs
-        // The actual instance should be created via `new()` with proper config
-        panic!(
-            "HttpControlPlane requires API URL and node URL - use HttpControlPlane::new() instead"
-        )
-    }
-}
-
 #[async_trait]
 impl ControlPlane for HttpControlPlane {
     async fn get_origin(&self, namespace: &str) -> Result<Option<Origin>> {
