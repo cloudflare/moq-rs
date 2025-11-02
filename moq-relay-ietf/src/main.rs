@@ -1,23 +1,5 @@
 use clap::Parser;
-
-mod api;
-mod consumer;
-mod local;
-mod producer;
-mod relay;
-mod remote;
-mod session;
-mod web;
-
-pub use api::*;
-pub use consumer::*;
-pub use local::*;
-pub use producer::*;
-pub use relay::*;
-pub use remote::*;
-pub use session::*;
-pub use web::*;
-
+use moq_relay_ietf::{HttpControlPlane, RelayServer, RelayServerConfig};
 use std::{net, path::PathBuf};
 use url::Url;
 
@@ -87,47 +69,25 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("missing TLS certificates");
     }
 
-    // Determine qlog directory for both relay and web server
-    let qlog_dir_for_relay = cli.qlog_dir.clone();
-    let qlog_dir_for_web = if cli.qlog_serve {
-        cli.qlog_dir.clone()
+    // Create control plane if both API and node URLs are provided
+    let control_plane = if let (Some(api_url), Some(node_url)) = (cli.api, cli.node.clone()) {
+        Some(HttpControlPlane::new(api_url, node_url))
     } else {
         None
     };
 
-    // Determine mlog directory for both relay and web server
-    let mlog_dir_for_relay = cli.mlog_dir.clone();
-    let mlog_dir_for_web = if cli.mlog_serve {
-        cli.mlog_dir.clone()
-    } else {
-        None
-    };
-
-    // Create a QUIC server for media.
-    let relay = Relay::new(RelayConfig {
-        tls: tls.clone(),
+    // Build relay server config
+    let config = RelayServerConfig {
         bind: cli.bind,
-        qlog_dir: qlog_dir_for_relay,
-        mlog_dir: mlog_dir_for_relay,
-        node: cli.node,
-        api: cli.api,
+        tls,
+        qlog_dir: cli.qlog_dir,
+        mlog_dir: cli.mlog_dir,
         announce: cli.announce,
-    })?;
+        enable_dev_web: cli.dev,
+        qlog_serve: cli.qlog_serve,
+        mlog_serve: cli.mlog_serve,
+    };
 
-    if cli.dev {
-        // Create a web server too.
-        // Currently this only contains the certificate fingerprint (for development only).
-        let web = Web::new(WebConfig {
-            bind: cli.bind,
-            tls,
-            qlog_dir: qlog_dir_for_web,
-            mlog_dir: mlog_dir_for_web,
-        });
-
-        tokio::spawn(async move {
-            web.run().await.expect("failed to run web server");
-        });
-    }
-
-    relay.run().await
+    let server = RelayServer::new(config, control_plane, cli.node)?;
+    server.run().await
 }

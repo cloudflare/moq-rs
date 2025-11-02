@@ -5,28 +5,33 @@ use moq_transport::{
     session::{Announced, SessionError, Subscriber},
 };
 
-use crate::{Api, Locals, Producer};
+use crate::{Locals, Producer};
+use crate::control_plane::{ControlPlane, Origin};
+use url::Url;
 
 /// Consumer of tracks from a remote Publisher
 #[derive(Clone)]
-pub struct Consumer {
+pub struct Consumer<CP: ControlPlane> {
     remote: Subscriber,
     locals: Locals,
-    api: Option<Api>,
-    forward: Option<Producer>, // Forward all announcements to this subscriber
+    control_plane: Option<CP>,
+    node_url: Option<Url>,
+    forward: Option<Producer<CP>>, // Forward all announcements to this subscriber
 }
 
-impl Consumer {
+impl<CP: ControlPlane> Consumer<CP> {
     pub fn new(
         remote: Subscriber,
         locals: Locals,
-        api: Option<Api>,
-        forward: Option<Producer>,
+        control_plane: Option<CP>,
+        node_url: Option<Url>,
+        forward: Option<Producer<CP>>,
     ) -> Self {
         Self {
             remote,
             locals,
-            api,
+            control_plane,
+            node_url,
             forward,
         }
     }
@@ -64,12 +69,23 @@ impl Consumer {
         // Produce the tracks for this announce and return the reader
         let (_, mut request, reader) = Tracks::new(announce.namespace.clone()).produce();
 
-        // Start refreshing the API origin, if any
-        if let Some(api) = self.api.as_ref() {
-            let mut refresh = api.set_origin(reader.namespace.to_utf8_path()).await?;
-            tasks.push(
-                async move { refresh.run().await.context("failed refreshing origin") }.boxed(),
-            );
+        // Start refreshing the control plane origin, if any
+        if let Some(control_plane) = self.control_plane.as_ref() {
+            if let Some(node_url) = &self.node_url {
+                let origin = Origin {
+                    url: node_url.clone(),
+                };
+                let namespace = reader.namespace.to_utf8_path();
+                
+                // Set the origin initially
+                control_plane.set_origin(&namespace, origin.clone()).await?;
+                
+                // Create and spawn refresher task
+                let mut refresh = control_plane.create_refresher(namespace, origin);
+                tasks.push(
+                    async move { refresh.run().await.context("failed refreshing origin") }.boxed(),
+                );
+            }
         }
 
         // Register the local tracks, unregister on drop

@@ -6,10 +6,11 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic;
 use url::Url;
 
-use crate::{Api, Consumer, Locals, Producer, Remotes, RemotesConsumer, RemotesProducer, Session};
+use crate::{Consumer, Locals, Producer, Remotes, RemotesConsumer, RemotesProducer, Session};
+use crate::control_plane::ControlPlane;
 
 /// Configuration for the relay.
-pub struct RelayConfig {
+pub struct RelayConfig<CP: ControlPlane> {
     /// Listen on this address
     pub bind: net::SocketAddr,
 
@@ -25,8 +26,8 @@ pub struct RelayConfig {
     /// Forward all announcements to the (optional) URL.
     pub announce: Option<Url>,
 
-    /// Connect to the HTTP moq-api at this URL.
-    pub api: Option<Url>,
+    /// Control plane implementation for routing and state sharing
+    pub control_plane: Option<CP>,
 
     /// Our hostname which we advertise to other origins.
     /// We use QUIC, so the certificate must be valid for this address.
@@ -34,17 +35,18 @@ pub struct RelayConfig {
 }
 
 /// MoQ Relay server.
-pub struct Relay {
+pub struct Relay<CP: ControlPlane> {
     quic: quic::Endpoint,
     announce_url: Option<Url>,
     mlog_dir: Option<PathBuf>,
     locals: Locals,
-    api: Option<Api>,
-    remotes: Option<(RemotesProducer, RemotesConsumer)>,
+    control_plane: Option<CP>,
+    node_url: Option<Url>,
+    remotes: Option<(RemotesProducer<CP>, RemotesConsumer<CP>)>,
 }
 
-impl Relay {
-    pub fn new(config: RelayConfig) -> anyhow::Result<Self> {
+impl<CP: ControlPlane> Relay<CP> {
+    pub fn new(config: RelayConfig<CP>) -> anyhow::Result<Self> {
         // Create a QUIC endpoint that can be used for both clients and servers.
         let quic = quic::Endpoint::new(quic::Config {
             bind: config.bind,
@@ -63,20 +65,17 @@ impl Relay {
             log::info!("mlog output enabled: {}", mlog_dir.display());
         }
 
-        // Create an API client if we have the necessary configuration
-        let api = if let (Some(url), Some(node)) = (config.api, config.node) {
-            log::info!("using moq-api: url={} node={}", url, node);
-            Some(Api::new(url, node))
-        } else {
-            None
-        };
+        // Log control plane usage
+        if let Some(_) = &config.control_plane {
+            log::info!("using control plane for routing, node={:?}", config.node);
+        }
 
         let locals = Locals::new();
 
-        // Create remotes if we have an API client
-        let remotes = api.clone().map(|api| {
+        // Create remotes if we have a control plane
+        let remotes = config.control_plane.clone().map(|control_plane| {
             Remotes {
-                api,
+                control_plane,
                 quic: quic.client.clone(),
             }
             .produce()
@@ -86,7 +85,8 @@ impl Relay {
             quic,
             announce_url: config.announce,
             mlog_dir: config.mlog_dir,
-            api,
+            control_plane: config.control_plane,
+            node_url: config.node,
             locals,
             remotes,
         })
@@ -128,7 +128,7 @@ impl Relay {
                     self.locals.clone(),
                     remotes.clone(),
                 )),
-                consumer: Some(Consumer::new(subscriber, self.locals.clone(), None, None)),
+                consumer: Some(Consumer::new(subscriber, self.locals.clone(), None, None, None)),
             };
 
             let forward_producer = session.producer.clone();
@@ -157,7 +157,8 @@ impl Relay {
                     let locals = self.locals.clone();
                     let remotes = remotes.clone();
                     let forward = forward_producer.clone();
-                    let api = self.api.clone();
+                    let control_plane = self.control_plane.clone();
+                    let node_url = self.node_url.clone();
 
                     // Spawn a new task to handle the connection
                     tasks.push(async move {
@@ -175,7 +176,7 @@ impl Relay {
                         let session = Session {
                             session,
                             producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes)),
-                            consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, api, forward)),
+                            consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, control_plane, node_url, forward)),
                         };
 
                         if let Err(err) = session.run().await {

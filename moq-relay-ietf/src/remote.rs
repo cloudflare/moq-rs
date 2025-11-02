@@ -15,19 +15,19 @@ use moq_transport::serve::{Track, TrackReader, TrackWriter};
 use moq_transport::watch::State;
 use url::Url;
 
-use crate::Api;
+use crate::control_plane::ControlPlane;
 
 /// Information about remote origins.
-pub struct Remotes {
-    /// The client we use to fetch/store origin information.
-    pub api: Api,
+pub struct Remotes<CP: ControlPlane> {
+    /// The control plane we use to fetch/store origin information.
+    pub control_plane: CP,
 
     // A QUIC endpoint we'll use to fetch from other origins.
     pub quic: quic::Client,
 }
 
-impl Remotes {
-    pub fn produce(self) -> (RemotesProducer, RemotesConsumer) {
+impl<CP: ControlPlane> Remotes<CP> {
+    pub fn produce(self) -> (RemotesProducer<CP>, RemotesConsumer<CP>) {
         let (send, recv) = State::default().split();
         let info = Arc::new(self);
 
@@ -38,26 +38,34 @@ impl Remotes {
     }
 }
 
-#[derive(Default)]
-struct RemotesState {
-    lookup: HashMap<Url, RemoteConsumer>,
-    requested: VecDeque<RemoteProducer>,
+struct RemotesState<CP: ControlPlane> {
+    lookup: HashMap<Url, RemoteConsumer<CP>>,
+    requested: VecDeque<RemoteProducer<CP>>,
+}
+
+impl<CP: ControlPlane> Default for RemotesState<CP> {
+    fn default() -> Self {
+        Self {
+            lookup: HashMap::default(),
+            requested: VecDeque::default(),
+        }
+    }
 }
 
 // Clone for convenience, but there should only be one instance of this
 #[derive(Clone)]
-pub struct RemotesProducer {
-    info: Arc<Remotes>,
-    state: State<RemotesState>,
+pub struct RemotesProducer<CP: ControlPlane> {
+    info: Arc<Remotes<CP>>,
+    state: State<RemotesState<CP>>,
 }
 
-impl RemotesProducer {
-    fn new(info: Arc<Remotes>, state: State<RemotesState>) -> Self {
+impl<CP: ControlPlane> RemotesProducer<CP> {
+    fn new(info: Arc<Remotes<CP>>, state: State<RemotesState<CP>>) -> Self {
         Self { info, state }
     }
 
     /// Block until the next remote requested by a consumer.
-    async fn next(&mut self) -> Option<RemoteProducer> {
+    async fn next(&mut self) -> Option<RemoteProducer<CP>> {
         loop {
             {
                 let state = self.state.lock();
@@ -109,8 +117,8 @@ impl RemotesProducer {
     }
 }
 
-impl ops::Deref for RemotesProducer {
-    type Target = Remotes;
+impl<CP: ControlPlane> ops::Deref for RemotesProducer<CP> {
+    type Target = Remotes<CP>;
 
     fn deref(&self) -> &Self::Target {
         &self.info
@@ -118,13 +126,13 @@ impl ops::Deref for RemotesProducer {
 }
 
 #[derive(Clone)]
-pub struct RemotesConsumer {
-    pub info: Arc<Remotes>,
-    state: State<RemotesState>,
+pub struct RemotesConsumer<CP: ControlPlane> {
+    pub info: Arc<Remotes<CP>>,
+    state: State<RemotesState<CP>>,
 }
 
-impl RemotesConsumer {
-    fn new(info: Arc<Remotes>, state: State<RemotesState>) -> Self {
+impl<CP: ControlPlane> RemotesConsumer<CP> {
+    fn new(info: Arc<Remotes<CP>>, state: State<RemotesState<CP>>) -> Self {
         Self { info, state }
     }
 
@@ -132,9 +140,9 @@ impl RemotesConsumer {
     pub async fn route(
         &self,
         namespace: &TrackNamespace,
-    ) -> anyhow::Result<Option<RemoteConsumer>> {
+    ) -> anyhow::Result<Option<RemoteConsumer<CP>>> {
         // Always fetch the origin instead of using the (potentially invalid) cache.
-        let origin = match self.api.get_origin(&namespace.to_utf8_path()).await? {
+        let origin = match self.control_plane.get_origin(&namespace.to_utf8_path()).await? {
             None => return Ok(None),
             Some(origin) => origin,
         };
@@ -167,20 +175,20 @@ impl RemotesConsumer {
     }
 }
 
-impl ops::Deref for RemotesConsumer {
-    type Target = Remotes;
+impl<CP: ControlPlane> ops::Deref for RemotesConsumer<CP> {
+    type Target = Remotes<CP>;
 
     fn deref(&self) -> &Self::Target {
         &self.info
     }
 }
 
-pub struct Remote {
-    pub remotes: Arc<Remotes>,
+pub struct Remote<CP: ControlPlane> {
+    pub remotes: Arc<Remotes<CP>>,
     pub url: Url,
 }
 
-impl fmt::Debug for Remote {
+impl<CP: ControlPlane> fmt::Debug for Remote<CP> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Remote")
             .field("url", &self.url.to_string())
@@ -188,17 +196,17 @@ impl fmt::Debug for Remote {
     }
 }
 
-impl ops::Deref for Remote {
-    type Target = Remotes;
+impl<CP: ControlPlane> ops::Deref for Remote<CP> {
+    type Target = Remotes<CP>;
 
     fn deref(&self) -> &Self::Target {
         &self.remotes
     }
 }
 
-impl Remote {
+impl<CP: ControlPlane> Remote<CP> {
     /// Create a new broadcast.
-    pub fn produce(self) -> (RemoteProducer, RemoteConsumer) {
+    pub fn produce(self) -> (RemoteProducer<CP>, RemoteConsumer<CP>) {
         let (send, recv) = State::default().split();
         let info = Arc::new(self);
 
@@ -215,13 +223,13 @@ struct RemoteState {
     requested: VecDeque<TrackWriter>,
 }
 
-pub struct RemoteProducer {
-    pub info: Arc<Remote>,
+pub struct RemoteProducer<CP: ControlPlane> {
+    pub info: Arc<Remote<CP>>,
     state: State<RemoteState>,
 }
 
-impl RemoteProducer {
-    fn new(info: Arc<Remote>, state: State<RemoteState>) -> Self {
+impl<CP: ControlPlane> RemoteProducer<CP> {
+    fn new(info: Arc<Remote<CP>>, state: State<RemoteState>) -> Self {
         Self { info, state }
     }
 
@@ -289,8 +297,8 @@ impl RemoteProducer {
     }
 }
 
-impl ops::Deref for RemoteProducer {
-    type Target = Remote;
+impl<CP: ControlPlane> ops::Deref for RemoteProducer<CP> {
+    type Target = Remote<CP>;
 
     fn deref(&self) -> &Self::Target {
         &self.info
@@ -298,13 +306,13 @@ impl ops::Deref for RemoteProducer {
 }
 
 #[derive(Clone)]
-pub struct RemoteConsumer {
-    pub info: Arc<Remote>,
+pub struct RemoteConsumer<CP: ControlPlane> {
+    pub info: Arc<Remote<CP>>,
     state: State<RemoteState>,
 }
 
-impl RemoteConsumer {
-    fn new(info: Arc<Remote>, state: State<RemoteState>) -> Self {
+impl<CP: ControlPlane> RemoteConsumer<CP> {
+    fn new(info: Arc<Remote<CP>>, state: State<RemoteState>) -> Self {
         Self { info, state }
     }
 
@@ -338,8 +346,8 @@ impl RemoteConsumer {
     }
 }
 
-impl ops::Deref for RemoteConsumer {
-    type Target = Remote;
+impl<CP: ControlPlane> ops::Deref for RemoteConsumer<CP> {
+    type Target = Remote<CP>;
 
     fn deref(&self) -> &Self::Target {
         &self.info
