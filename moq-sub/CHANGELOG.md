@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5](https://github.com/cloudflare/moq-rs/compare/moq-sub-v0.3.4...moq-sub-v0.3.5) - 2025-11-07
+
+### Other
+
+- Add support for nested namespaces
+- Log CID
+- Print CID for clock sessions
+- Add --qlog-dir CLI argument to QUIC configuration
+- Merge branch 'main' into sub-catalog
+
 ## [0.3.4](https://github.com/englishm/moq-rs/compare/moq-sub-v0.3.3...moq-sub-v0.3.4) - 2025-09-15
 
 ### Other
