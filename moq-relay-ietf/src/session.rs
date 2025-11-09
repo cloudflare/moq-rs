@@ -1,15 +1,16 @@
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::session::SessionError;
 
+use crate::control_plane::ControlPlane;
 use crate::{Consumer, Producer};
 
-pub struct Session {
+pub struct Session<CP: ControlPlane> {
     pub session: moq_transport::session::Session,
-    pub producer: Option<Producer>,
-    pub consumer: Option<Consumer>,
+    pub producer: Option<Producer<CP>>,
+    pub consumer: Option<Consumer<CP>>,
 }
 
-impl Session {
+impl<CP: ControlPlane> Session<CP> {
     /// Run the session, producer, and consumer as necessary.
     pub async fn run(self) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();

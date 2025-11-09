@@ -4,18 +4,19 @@ use moq_transport::{
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
 };
 
+use crate::control_plane::ControlPlane;
 use crate::{Locals, RemotesConsumer};
 
 /// Producer of tracks to a remote Subscriber
 #[derive(Clone)]
-pub struct Producer {
+pub struct Producer<CP: ControlPlane> {
     remote_publisher: Publisher,
     locals: Locals,
-    remotes: Option<RemotesConsumer>,
+    remotes: Option<RemotesConsumer<CP>>,
 }
 
-impl Producer {
-    pub fn new(remote: Publisher, locals: Locals, remotes: Option<RemotesConsumer>) -> Self {
+impl<CP: ControlPlane> Producer<CP> {
+    pub fn new(remote: Publisher, locals: Locals, remotes: Option<RemotesConsumer<CP>>) -> Self {
         Self {
             remote_publisher: remote,
             locals,
