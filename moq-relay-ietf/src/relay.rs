@@ -4,6 +4,8 @@ use anyhow::Context;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic;
+use moq_transport::session::SessionMigration;
+use tokio::sync::broadcast;
 use url::Url;
 
 use crate::{Api, Consumer, Locals, Producer, Remotes, RemotesConsumer, RemotesProducer, Session};
@@ -96,9 +98,58 @@ impl Relay {
     pub async fn run(self) -> anyhow::Result<()> {
         let mut tasks = FuturesUnordered::new();
 
+        // Setup SIGTERM handler and broadcast channel
+        #[cfg(unix)]
+        let mut signal_term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut signal_int =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
+        let (signal_tx, signal_rx) = broadcast::channel::<SessionMigration>(16);
+
+        // Get server address early for the shutdown signal
+        let server_addr = self
+            .quic
+            .server
+            .as_ref()
+            .context("missing TLS certificate")?
+            .local_addr()?;
+        let shutdown_uri = format!("https://{}", server_addr);
+
+        // Spawn task to listen for SIGTERM and broadcast shutdown
+        let signal_tx_clone = signal_tx.clone();
+        tasks.push(
+            async move {
+                log::info!("Listening for SIGTERM");
+                #[cfg(unix)]
+                {
+                    tokio::select! {
+                        _ = signal_term.recv() => {
+                            log::info!("Received SIGTERM");
+                        }
+                        _ = signal_int.recv() => {
+                            log::info!("Received SIGINT");
+                        }
+                    }
+                    log::info!("broadcasting shutdown to all sessions");
+
+                    if let Err(e) = signal_tx.send(SessionMigration { uri: shutdown_uri }) {
+                        log::error!("failed to broadcast shutdown: {}", e);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+            .boxed(),
+        );
+
         // Start the remotes producer task, if any
         let remotes = self.remotes.map(|(producer, consumer)| {
-            tasks.push(producer.run().boxed());
+            let signal_rx = signal_rx.resubscribe();
+            tasks.push(producer.run(signal_rx).boxed());
             consumer
         });
 
@@ -133,7 +184,15 @@ impl Relay {
 
             let forward_producer = session.producer.clone();
 
-            tasks.push(async move { session.run().await.context("forwarding failed") }.boxed());
+            tasks.push(
+                async move {
+                    session
+                        .run(signal_tx_clone.subscribe())
+                        .await
+                        .context("forwarding failed")
+                }
+                .boxed(),
+            );
 
             forward_producer
         } else {
@@ -143,6 +202,7 @@ impl Relay {
         // Start the QUIC server loop
         let mut server = self.quic.server.context("missing TLS certificate")?;
         log::info!("listening on {}", server.local_addr()?);
+        let mut cloned_signal_rx = signal_rx.resubscribe();
 
         loop {
             tokio::select! {
@@ -158,10 +218,10 @@ impl Relay {
                     let remotes = remotes.clone();
                     let forward = forward_producer.clone();
                     let api = self.api.clone();
+                    let session_signal_rx = signal_rx.resubscribe();
 
                     // Spawn a new task to handle the connection
                     tasks.push(async move {
-
                         // Create the MoQ session over the connection (setup handshake etc)
                         let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path).await {
                             Ok(session) => session,
@@ -178,7 +238,7 @@ impl Relay {
                             consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, api, forward)),
                         };
 
-                        if let Err(err) = session.run().await {
+                        if let Err(err) = session.run(session_signal_rx).await {
                             log::warn!("failed to run MoQ session: {}", err);
                         }
 
@@ -186,6 +246,21 @@ impl Relay {
                     }.boxed());
                 },
                 res = tasks.next(), if !tasks.is_empty() => res.unwrap()?,
+                _ = cloned_signal_rx.recv() => {
+                    log::info!("received shutdown signal, shutting down. Active tasks: {}", tasks.len());
+                    // set a timeout for waiting for tasks to be empty
+                    // FIXME(itzmanish): make this configurable and revisit
+                    let timeout = tokio::time::timeout(tokio::time::Duration::from_secs(20), async move {
+                        while !tasks.is_empty() {
+                            // sleep 500ms before checking again
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        }
+                    });
+                    if let Err(e) = timeout.await {
+                        log::warn!("timed out waiting for tasks to be empty: {}", e);
+                    }
+                    break Ok(());
+                }
             }
         }
     }

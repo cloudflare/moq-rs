@@ -12,10 +12,12 @@ mod writer;
 pub use announce::*;
 pub use announced::*;
 pub use error::*;
+use log::info;
 pub use publisher::*;
 pub use subscribe::*;
 pub use subscribed::*;
 pub use subscriber::*;
+use tokio::sync::broadcast;
 pub use track_status_requested::*;
 
 use reader::*;
@@ -24,8 +26,8 @@ use writer::*;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::sync::{atomic, Arc, Mutex};
 
-use crate::coding::KeyValuePairs;
-use crate::message::Message;
+use crate::coding::{KeyValuePairs, SessionUri};
+use crate::message::{GoAway, Message};
 use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
@@ -49,6 +51,11 @@ pub struct Session {
     /// Optional mlog writer for MoQ Transport events
     /// Wrapped in Arc<Mutex<>> to share across send/recv tasks when enabled
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionMigration {
+    pub uri: String,
 }
 
 impl Session {
@@ -197,7 +204,33 @@ impl Session {
     /// Run Tasks for the session, including sending of control messages, receiving and processing
     /// inbound control messages, receiving and processing new inbound uni-directional QUIC streams,
     /// and receiving and processing QUIC datagrams received
-    pub async fn run(self) -> Result<(), SessionError> {
+    pub async fn run(
+        self,
+        signal_rx: Option<broadcast::Receiver<SessionMigration>>,
+    ) -> Result<(), SessionError> {
+        let mut cloned_outgoing = self.outgoing.clone();
+
+        // Spawn a task that waits for shutdown signal and pushes GOAWAY
+        // This runs independently and doesn't affect the main session tasks
+        if let Some(mut signal_rx) = signal_rx {
+            tokio::spawn(async move {
+                if let Ok(info) = signal_rx.recv().await {
+                    log::info!(
+                        "received terminate/interrupt signal, sending GOAWAY: {:#?}",
+                        info
+                    );
+                    let msg = GoAway {
+                        uri: SessionUri(info.uri),
+                    };
+                    if let Err(e) = cloned_outgoing.push(Message::GoAway(msg)) {
+                        log::error!("failed to push GOAWAY: {:#?}", e);
+                    } else {
+                        log::info!("GOAWAY message queued successfully");
+                    }
+                }
+            });
+        }
+
         tokio::select! {
             res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
@@ -338,6 +371,18 @@ impl Session {
                     continue;
                 }
                 Err(msg) => msg,
+            };
+
+            let msg = match msg {
+                Message::GoAway(goaway) => {
+                    info!("Received GOAWAY: {:?}", goaway);
+                    subscriber
+                        .as_mut()
+                        .ok_or(SessionError::RoleViolation)?
+                        .handle_go_away(goaway)?;
+                    continue;
+                }
+                _ => msg,
             };
 
             // TODO GOAWAY, MAX_REQUEST_ID, REQUESTS_BLOCKED

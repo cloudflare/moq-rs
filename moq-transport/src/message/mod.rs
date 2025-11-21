@@ -222,3 +222,9 @@ message_types! {
     PublishOk = 0x1e,
     PublishError = 0x1f,
 }
+
+pub enum MiscMessage {
+    GoAway,
+    MaxRequestId,
+    RequestsBlocked,
+}

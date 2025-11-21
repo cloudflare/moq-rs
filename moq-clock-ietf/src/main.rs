@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
             let clock_publisher = clock::Publisher::new_datagram(track_writer.datagrams()?);
 
             tokio::select! {
-                res = session.run() => res.context("session error")?,
+                res = session.run(None) => res.context("session error")?,
                 res = clock_publisher.run() => res.context("clock error")?,
                 res = publisher.announce(tracks_reader) => res.context("failed to serve tracks")?,
             }
@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
             let clock_publisher = clock::Publisher::new(track_writer.subgroups()?);
 
             tokio::select! {
-                res = session.run() => res.context("session error")?,
+                res = session.run(None) => res.context("session error")?,
                 res = clock_publisher.run() => res.context("clock error")?,
                 res = publisher.announce(tracks_reader) => res.context("failed to serve tracks")?,
             }
@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         let clock_subscriber = clock::Subscriber::new(track_reader);
 
         tokio::select! {
-            res = session.run() => res.context("session error")?,
+            res = session.run(None) => res.context("session error")?,
             res = clock_subscriber.run() => res.context("clock error")?,
             res = subscriber.subscribe(track_writer) => res.context("failed to subscribe to track")?,
         }

@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to create MoQ Transport publisher")?;
 
     tokio::select! {
-        res = session.run() => res.context("session error")?,
+        res = session.run(None) => res.context("session error")?,
         res = run_media(media) => {
             res.context("media error")?
         },

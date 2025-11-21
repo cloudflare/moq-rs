@@ -1,7 +1,7 @@
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use moq_transport::session::SessionError;
-
 use crate::{Consumer, Producer};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use moq_transport::session::{SessionError, SessionMigration};
+use tokio::sync::broadcast;
 
 pub struct Session {
     pub session: moq_transport::session::Session,
@@ -11,9 +11,12 @@ pub struct Session {
 
 impl Session {
     /// Run the session, producer, and consumer as necessary.
-    pub async fn run(self) -> Result<(), SessionError> {
+    pub async fn run(
+        self,
+        signal_rx: broadcast::Receiver<SessionMigration>,
+    ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
-        tasks.push(self.session.run().boxed());
+        tasks.push(self.session.run(Some(signal_rx)).boxed());
 
         if let Some(producer) = self.producer {
             tasks.push(producer.run().boxed());

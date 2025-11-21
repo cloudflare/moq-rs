@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let mut media = Media::new(subscriber, tracks, out, config.catalog).await?;
 
     tokio::select! {
-        res = session.run() => res.context("session error")?,
+        res = session.run(None) => res.context("session error")?,
         res = media.run() => res.context("media error")?,
     }
 

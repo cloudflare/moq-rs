@@ -4,6 +4,8 @@ use std::{
     sync::{atomic, Arc, Mutex},
 };
 
+use log::info;
+
 use crate::{
     coding::{Decode, TrackNamespace},
     data,
@@ -157,6 +159,26 @@ impl Subscriber {
         }
 
         res
+    }
+
+    pub(super) fn handle_go_away(&mut self, goaway: message::GoAway) -> Result<(), SessionError> {
+        info!(
+            "Received GOAWAY: {:?}, sending unsubscribe for all active subscriptions",
+            goaway
+        );
+
+        // Collect all subscription IDs first to avoid holding the lock while calling remove_subscribe
+        let ids: Vec<u64> = {
+            let subscribes = self.subscribes.lock().unwrap();
+            subscribes.keys().copied().collect()
+        };
+
+        // Remove each subscription (this will acquire the lock internally)
+        for id in ids {
+            self.remove_subscribe(id);
+        }
+
+        Ok(())
     }
 
     /// Handle the reception of a PublishNamespace message from the publisher.
