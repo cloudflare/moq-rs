@@ -273,6 +273,9 @@ impl Subscribed {
 
         let mut object_count = 0;
         while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
+            // Check if subscription was cancelled before processing next object
+            state.lock().closed.clone()?;
+
             let subgroup_object = data::SubgroupObjectExt {
                 object_id_delta: 0, // before delta logic, used to be subgroup_object_reader.object_id,
                 extension_headers: subgroup_object_reader.extension_headers.clone(), // Pass through extension headers
@@ -325,6 +328,9 @@ impl Subscribed {
             let mut chunks_sent = 0;
             let mut bytes_sent = 0;
             while let Some(chunk) = subgroup_object_reader.read().await? {
+                // Check if subscription was cancelled before writing each chunk
+                state.lock().closed.clone()?;
+
                 log::trace!(
                     "[PUBLISHER] serve_subgroup: sending payload chunk #{} for object #{} ({} bytes)",
                     chunks_sent + 1,
@@ -363,6 +369,9 @@ impl Subscribed {
 
         let mut datagram_count = 0;
         while let Some(datagram) = datagrams.read().await? {
+            // Check if subscription was cancelled before sending next datagram
+            self.state.lock().closed.clone()?;
+
             // Determine datagram type based on extension headers presence
             let has_extension_headers = !datagram.extension_headers.is_empty();
             let datagram_type = if has_extension_headers {

@@ -12,10 +12,12 @@ mod writer;
 pub use announce::*;
 pub use announced::*;
 pub use error::*;
+use log::info;
 pub use publisher::*;
 pub use subscribe::*;
 pub use subscribed::*;
 pub use subscriber::*;
+use tokio::sync::broadcast;
 pub use track_status_requested::*;
 
 use reader::*;
@@ -24,8 +26,8 @@ use writer::*;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::sync::{atomic, Arc, Mutex};
 
-use crate::coding::KeyValuePairs;
-use crate::message::Message;
+use crate::coding::{KeyValuePairs, SessionUri};
+use crate::message::{GoAway, Message};
 use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
@@ -49,6 +51,14 @@ pub struct Session {
     /// Optional mlog writer for MoQ Transport events
     /// Wrapped in Arc<Mutex<>> to share across send/recv tasks when enabled
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Optional signal receiver for migration events
+    signal_rx: Option<broadcast::Receiver<SessionMigration>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionMigration {
+    pub uri: String,
 }
 
 impl Session {
@@ -66,6 +76,7 @@ impl Session {
         recver: Reader,
         first_requestid: u64,
         mlog: Option<mlog::MlogWriter>,
+        signal_rx: Option<broadcast::Receiver<SessionMigration>>,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let next_requestid = Arc::new(atomic::AtomicU64::new(first_requestid));
         let outgoing = Queue::default().split();
@@ -93,6 +104,7 @@ impl Session {
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
             mlog: mlog_shared,
+            signal_rx,
         };
 
         (session, publisher, subscriber)
@@ -103,6 +115,7 @@ impl Session {
     pub async fn connect(
         mut session: web_transport::Session,
         mlog_path: Option<PathBuf>,
+        signal_rx: Option<broadcast::Receiver<SessionMigration>>,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
@@ -135,7 +148,7 @@ impl Session {
         // TODO: emit server_setup_parsed event
 
         // We are the client, so the first request id is 0
-        let session = Session::new(session, sender, recver, 0, mlog);
+        let session = Session::new(session, sender, recver, 0, mlog, signal_rx);
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
@@ -144,6 +157,7 @@ impl Session {
     pub async fn accept(
         mut session: web_transport::Session,
         mlog_path: Option<PathBuf>,
+        signal_rx: Option<broadcast::Receiver<SessionMigration>>,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
@@ -188,7 +202,7 @@ impl Session {
             sender.encode(&server).await?;
 
             // We are the server, so the first request id is 1
-            Ok(Session::new(session, sender, recver, 1, mlog))
+            Ok(Session::new(session, sender, recver, 1, mlog, signal_rx))
         } else {
             Err(SessionError::Version(client.versions, server_versions))
         }
@@ -198,9 +212,32 @@ impl Session {
     /// inbound control messages, receiving and processing new inbound uni-directional QUIC streams,
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
+        let mut cloned_outgoing = self.outgoing.clone();
+
+        // Spawn a task that waits for shutdown signal and pushes GOAWAY
+        // This runs independently and doesn't affect the main session tasks
+        if let Some(mut signal_rx) = self.signal_rx {
+            tokio::spawn(async move {
+                if let Ok(info) = signal_rx.recv().await {
+                    log::info!(
+                        "received terminate/interrupt signal, sending GOAWAY: {:#?}",
+                        info
+                    );
+                    let msg = GoAway {
+                        uri: SessionUri(info.uri),
+                    };
+                    if let Err(e) = cloned_outgoing.push(Message::GoAway(msg)) {
+                        log::error!("failed to push GOAWAY: {:#?}", e);
+                    } else {
+                        log::info!("GOAWAY message queued successfully");
+                    }
+                }
+            });
+        }
+
         tokio::select! {
             res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone()) => res,
-            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
+            res = Self::run_send(self.sender, self.outgoing, self.subscriber.clone(), self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
         }
@@ -210,6 +247,7 @@ impl Session {
     async fn run_send(
         mut sender: Writer,
         mut outgoing: Queue<message::Message>,
+        mut subscriber: Option<Subscriber>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         while let Some(msg) = outgoing.pop().await {
@@ -254,6 +292,12 @@ impl Session {
                         let _ = mlog_guard.add_event(event);
                     }
                 }
+            }
+
+            if let Message::GoAway(_m) = &msg {
+                subscriber
+                    .iter_mut()
+                    .for_each(|s| s.handle_go_away().unwrap_or(()));
             }
 
             sender.encode(&msg).await?;
@@ -338,6 +382,18 @@ impl Session {
                     continue;
                 }
                 Err(msg) => msg,
+            };
+
+            let msg = match msg {
+                Message::GoAway(goaway) => {
+                    info!("Received GOAWAY: {:?}", goaway);
+                    subscriber
+                        .as_mut()
+                        .ok_or(SessionError::RoleViolation)?
+                        .handle_go_away()?;
+                    continue;
+                }
+                _ => msg,
             };
 
             // TODO GOAWAY, MAX_REQUEST_ID, REQUESTS_BLOCKED

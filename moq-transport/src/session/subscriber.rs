@@ -4,6 +4,8 @@ use std::{
     sync::{atomic, Arc, Mutex},
 };
 
+use log::info;
+
 use crate::{
     coding::{Decode, TrackNamespace},
     data,
@@ -65,13 +67,13 @@ impl Subscriber {
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
     pub async fn accept(session: web_transport::Session) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::accept(session, None).await?;
+        let (session, _, subscriber) = Session::accept(session, None, None).await?;
         Ok((session, subscriber.unwrap()))
     }
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
     pub async fn connect(session: web_transport::Session) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::connect(session, None).await?;
+        let (session, _, subscriber) = Session::connect(session, None, None).await?;
         Ok((session, subscriber))
     }
 
@@ -157,6 +159,23 @@ impl Subscriber {
         }
 
         res
+    }
+
+    pub(super) fn handle_go_away(&mut self) -> Result<(), SessionError> {
+        info!("sending unsubscribe for all active subscriptions");
+
+        // Collect all subscription IDs first to avoid holding the lock while calling remove_subscribe
+        let ids: Vec<u64> = {
+            let subscribes = self.subscribes.lock().unwrap();
+            subscribes.keys().copied().collect()
+        };
+
+        // Remove each subscription (this will acquire the lock internally)
+        for id in ids {
+            self.remove_subscribe(id);
+        }
+
+        Ok(())
     }
 
     /// Handle the reception of a PublishNamespace message from the publisher.
