@@ -67,13 +67,13 @@ impl Subscriber {
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
     pub async fn accept(session: web_transport::Session) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::accept(session, None).await?;
+        let (session, _, subscriber) = Session::accept(session, None, None).await?;
         Ok((session, subscriber.unwrap()))
     }
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
     pub async fn connect(session: web_transport::Session) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::connect(session, None).await?;
+        let (session, _, subscriber) = Session::connect(session, None, None).await?;
         Ok((session, subscriber))
     }
 
@@ -161,11 +161,8 @@ impl Subscriber {
         res
     }
 
-    pub(super) fn handle_go_away(&mut self, goaway: message::GoAway) -> Result<(), SessionError> {
-        info!(
-            "Received GOAWAY: {:?}, sending unsubscribe for all active subscriptions",
-            goaway
-        );
+    pub(super) fn handle_go_away(&mut self) -> Result<(), SessionError> {
+        info!("sending unsubscribe for all active subscriptions");
 
         // Collect all subscription IDs first to avoid holding the lock while calling remove_subscribe
         let ids: Vec<u64> = {

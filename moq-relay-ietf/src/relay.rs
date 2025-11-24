@@ -33,10 +33,14 @@ pub struct RelayConfig {
     /// Our hostname which we advertise to other origins.
     /// We use QUIC, so the certificate must be valid for this address.
     pub node: Option<Url>,
+
+    /// The public URL we advertise to other origins.
+    pub public_url: Option<Url>,
 }
 
 /// MoQ Relay server.
 pub struct Relay {
+    public_url: Option<Url>,
     quic: quic::Endpoint,
     announce_url: Option<Url>,
     mlog_dir: Option<PathBuf>,
@@ -85,6 +89,7 @@ impl Relay {
         });
 
         Ok(Self {
+            public_url: config.public_url,
             quic,
             announce_url: config.announce,
             mlog_dir: config.mlog_dir,
@@ -105,7 +110,7 @@ impl Relay {
         let mut signal_int =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
-        let (signal_tx, signal_rx) = broadcast::channel::<SessionMigration>(16);
+        let (signal_tx, mut signal_rx) = broadcast::channel::<SessionMigration>(16);
 
         // Get server address early for the shutdown signal
         let server_addr = self
@@ -114,7 +119,12 @@ impl Relay {
             .as_ref()
             .context("missing TLS certificate")?
             .local_addr()?;
-        let shutdown_uri = format!("https://{}", server_addr);
+        // FIXME(itzmanish): this gives [::]:4433, which is not a valid URL
+        let shutdown_uri = if let Some(public_url) = &self.public_url {
+            public_url.clone().into()
+        } else {
+            format!("https://{}", server_addr)
+        };
 
         // Spawn task to listen for SIGTERM and broadcast shutdown
         let signal_tx_clone = signal_tx.clone();
@@ -148,8 +158,7 @@ impl Relay {
 
         // Start the remotes producer task, if any
         let remotes = self.remotes.map(|(producer, consumer)| {
-            let signal_rx = signal_rx.resubscribe();
-            tasks.push(producer.run(signal_rx).boxed());
+            tasks.push(producer.run().boxed());
             consumer
         });
 
@@ -166,10 +175,13 @@ impl Relay {
                 .context("failed to establish forward connection")?;
 
             // Create the MoQ session over the connection
-            let (session, publisher, subscriber) =
-                moq_transport::session::Session::connect(session, None)
-                    .await
-                    .context("failed to establish forward session")?;
+            let (session, publisher, subscriber) = moq_transport::session::Session::connect(
+                session,
+                None,
+                Some(signal_tx_clone.subscribe()),
+            )
+            .await
+            .context("failed to establish forward session")?;
 
             // Create a normal looking session, except we never forward or register announces.
             let session = Session {
@@ -184,15 +196,7 @@ impl Relay {
 
             let forward_producer = session.producer.clone();
 
-            tasks.push(
-                async move {
-                    session
-                        .run(signal_tx_clone.subscribe())
-                        .await
-                        .context("forwarding failed")
-                }
-                .boxed(),
-            );
+            tasks.push(async move { session.run().await.context("forwarding failed") }.boxed());
 
             forward_producer
         } else {
@@ -202,7 +206,6 @@ impl Relay {
         // Start the QUIC server loop
         let mut server = self.quic.server.context("missing TLS certificate")?;
         log::info!("listening on {}", server.local_addr()?);
-        let mut cloned_signal_rx = signal_rx.resubscribe();
 
         loop {
             tokio::select! {
@@ -218,12 +221,12 @@ impl Relay {
                     let remotes = remotes.clone();
                     let forward = forward_producer.clone();
                     let api = self.api.clone();
-                    let session_signal_rx = signal_rx.resubscribe();
+                    let session_signal_rx = signal_tx_clone.subscribe();
 
                     // Spawn a new task to handle the connection
                     tasks.push(async move {
                         // Create the MoQ session over the connection (setup handshake etc)
-                        let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path).await {
+                        let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path, Some(session_signal_rx)).await {
                             Ok(session) => session,
                             Err(err) => {
                                 log::warn!("failed to accept MoQ session: {}", err);
@@ -238,7 +241,7 @@ impl Relay {
                             consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, api, forward)),
                         };
 
-                        if let Err(err) = session.run(session_signal_rx).await {
+                        if let Err(err) = session.run().await {
                             log::warn!("failed to run MoQ session: {}", err);
                         }
 
@@ -246,18 +249,27 @@ impl Relay {
                     }.boxed());
                 },
                 res = tasks.next(), if !tasks.is_empty() => res.unwrap()?,
-                _ = cloned_signal_rx.recv() => {
-                    log::info!("received shutdown signal, shutting down. Active tasks: {}", tasks.len());
-                    // set a timeout for waiting for tasks to be empty
-                    // FIXME(itzmanish): make this configurable and revisit
-                    let timeout = tokio::time::timeout(tokio::time::Duration::from_secs(20), async move {
-                        while !tasks.is_empty() {
-                            // sleep 500ms before checking again
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                _ = signal_rx.recv() => {
+                    log::info!("received shutdown signal, waiting for {} active tasks to complete", tasks.len());
+
+                    // Give sessions a moment to send GOAWAY messages
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+                    // Stop accepting new connections and wait for existing tasks to complete
+                    log::info!("draining {} remaining tasks...", tasks.len());
+                    let shutdown_timeout = tokio::time::Duration::from_secs(20);
+                    let result = tokio::time::timeout(shutdown_timeout, async {
+                        // Actually poll tasks to completion
+                        while let Some(res) = tasks.next().await {
+                            if let Err(e) = res {
+                                log::warn!("task failed during shutdown: {:?}", e);
+                            }
                         }
-                    });
-                    if let Err(e) = timeout.await {
-                        log::warn!("timed out waiting for tasks to be empty: {}", e);
+                    }).await;
+
+                    match result {
+                        Ok(_) => log::info!("all tasks completed successfully"),
+                        Err(_) => log::warn!("timed out waiting for tasks after {}s", shutdown_timeout.as_secs()),
                     }
                     break Ok(());
                 }

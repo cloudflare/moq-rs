@@ -68,6 +68,12 @@ pub struct Cli {
     /// Requires --dev to enable the web server. Only serves files by exact CID - no index.
     #[arg(long)]
     pub mlog_serve: bool,
+
+    /// The public URL we advertise to other origins.
+    /// The provided certificate must be valid for this address.
+    #[arg(long)]
+    #[arg(default_value = "https://localhost:4443")]
+    pub public_url: Option<Url>,
 }
 
 #[tokio::main]
@@ -105,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create a QUIC server for media.
     let relay = Relay::new(RelayConfig {
+        public_url: cli.public_url,
         tls: tls.clone(),
         bind: cli.bind,
         qlog_dir: qlog_dir_for_relay,

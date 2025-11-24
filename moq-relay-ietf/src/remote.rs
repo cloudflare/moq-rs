@@ -74,18 +74,13 @@ impl RemotesProducer {
     }
 
     /// Run the remotes producer to serve remote requests.
-    pub async fn run(
-        mut self,
-        signal_rx: broadcast::Receiver<SessionMigration>,
-    ) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         let mut tasks = FuturesUnordered::new();
 
         loop {
             tokio::select! {
                 Some(mut remote) = self.next() => {
                     let url = remote.url.clone();
-                    // Each remote task needs its own receiver
-                    let remote_signal_rx = signal_rx.resubscribe();
 
                     // Spawn a task to serve the remote
                     tasks.push(async move {
@@ -94,7 +89,7 @@ impl RemotesProducer {
                         log::warn!("serving remote: {:?}", info);
 
                         // Run the remote producer
-                        if let Err(err) = remote.run(remote_signal_rx).await {
+                        if let Err(err) = remote.run().await {
                             log::warn!("failed serving remote: {:?}, error: {}", info, err);
                         }
 
@@ -232,16 +227,13 @@ impl RemoteProducer {
         Self { info, state }
     }
 
-    pub async fn run(
-        &mut self,
-        signal_rx: broadcast::Receiver<SessionMigration>,
-    ) -> anyhow::Result<()> {
+    pub async fn run(&mut self) -> anyhow::Result<()> {
         // TODO reuse QUIC and MoQ sessions
         let (session, _quic_client_initial_cid) = self.quic.connect(&self.url).await?;
         let (session, subscriber) = moq_transport::session::Subscriber::connect(session).await?;
 
         // Run the session
-        let mut session = session.run(Some(signal_rx)).boxed();
+        let mut session = session.run().boxed();
         let mut tasks = FuturesUnordered::new();
 
         let mut done = None;
