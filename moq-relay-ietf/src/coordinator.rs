@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use moq_transport::coding::TrackNamespace;
 use url::Url;
 
 /// Handle returned when a namespace is registered with the coordinator.
@@ -9,6 +10,7 @@ use url::Url;
 /// or the namespace is no longer served, cleanup happens automatically.
 pub struct NamespaceRegistration {
     _inner: Box<dyn Send + Sync>,
+    _metadata: Option<Vec<(String, String)>>,
 }
 
 impl NamespaceRegistration {
@@ -19,7 +21,14 @@ impl NamespaceRegistration {
     pub fn new<T: Send + Sync + 'static>(inner: T) -> Self {
         Self {
             _inner: Box::new(inner),
+            _metadata: None,
         }
+    }
+
+    /// Add metadata as list of key value pair of string: string
+    pub fn with_metadata(mut self, metadata: Vec<(String, String)>) -> Self {
+        self._metadata = Some(metadata);
+        self
     }
 }
 
@@ -42,19 +51,30 @@ impl TrackRegistration {
 
 /// Result of a namespace lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NamespaceOrigin {
-    /// Namespace is served locally by this relay.
-    Local,
+pub struct NamespaceOrigin(TrackNamespace, Url);
 
-    /// Namespace is served by a remote relay at the given URL.
-    Remote(Url),
+impl NamespaceOrigin {
+    /// Create a new NamespaceOrigin.
+    pub fn new(namespace: TrackNamespace, url: Url) -> Self {
+        Self(namespace, url)
+    }
+
+    /// Get the namespace.
+    pub fn namespace(&self) -> &TrackNamespace {
+        &self.0
+    }
+
+    /// Get the URL of the relay serving this namespace.
+    pub fn url(&self) -> Url {
+        self.1.clone()
+    }
 }
 
 /// Information about a track within a namespace.
 #[derive(Debug, Clone)]
 pub struct TrackInfo {
     /// The track namespace
-    pub namespace: String,
+    pub namespace: TrackNamespace,
 
     /// The track name within the namespace
     pub track_name: String,
@@ -96,7 +116,8 @@ pub trait Coordinator: Send + Sync {
     ///
     /// A `NamespaceRegistration` handle. The namespace remains registered
     /// as long as this handle is held. Dropping it unregisters the namespace.
-    async fn register_namespace(&self, namespace: &str) -> Result<NamespaceRegistration>;
+    async fn register_namespace(&self, namespace: &TrackNamespace)
+        -> Result<NamespaceRegistration>;
 
     /// Unregister a namespace.
     ///
@@ -107,7 +128,7 @@ pub trait Coordinator: Send + Sync {
     /// # Arguments
     ///
     /// * `namespace` - The namespace to unregister
-    async fn unregister_namespace(&self, namespace: &str) -> Result<()>;
+    async fn unregister_namespace(&self, namespace: &TrackNamespace) -> Result<()>;
 
     /// Register a track as available under a namespace.
     ///
@@ -133,7 +154,7 @@ pub trait Coordinator: Send + Sync {
     ///
     /// * `namespace` - The namespace containing the track
     /// * `track_name` - The track name to unregister
-    async fn unregister_track(&self, namespace: &str, track_name: &str) -> Result<()>;
+    async fn unregister_track(&self, namespace: &TrackNamespace, track_name: &str) -> Result<()>;
 
     /// Lookup where a namespace is served from.
     ///
@@ -149,10 +170,10 @@ pub trait Coordinator: Send + Sync {
     ///
     /// # Returns
     ///
-    /// - `Ok(Some(NamespaceOrigin::Local))` - Served by this relay
-    /// - `Ok(Some(NamespaceOrigin::Remote(url)))` - Served by remote relay
-    /// - `Ok(None)` - Namespace not found anywhere
-    async fn lookup(&self, namespace: &str) -> Result<Option<NamespaceOrigin>>;
+    /// - `Ok(NamespaceOrigin::Local)` - Served by this relay
+    /// - `Ok(NamespaceOrigin::Remote(url))` - Served by remote relay
+    /// - `Err` - Namespace not found anywhere
+    async fn lookup(&self, namespace: &TrackNamespace) -> Result<NamespaceOrigin>;
 
     /// Graceful shutdown of the coordinator.
     ///

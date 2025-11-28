@@ -1,9 +1,13 @@
+mod file_coordinator;
+
+use std::sync::Arc;
 use std::{net, path::PathBuf};
 
 use clap::Parser;
 use url::Url;
 
-use moq_relay_ietf::{LocalCoordinator, Relay, RelayConfig, Web, WebConfig};
+use file_coordinator::FileCoordinator;
+use moq_relay_ietf::{Relay, RelayConfig, Web, WebConfig};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -52,6 +56,11 @@ pub struct Cli {
     /// Requires --dev to enable the web server. Only serves files by exact CID - no index.
     #[arg(long)]
     pub mlog_serve: bool,
+
+    /// Path to the shared coordinator file for multi-relay coordination.
+    /// Multiple relay instances can share namespace/track registration via this file.
+    #[arg(long, default_value = "/tmp/moq-coordinator.json")]
+    pub coordinator_file: PathBuf,
 }
 
 #[tokio::main]
@@ -87,10 +96,16 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Create the coordinator
-    // For now we always use LocalCoordinator. Later we can add HttpCoordinator
-    // based on --api and --node CLI args.
-    let coordinator = LocalCoordinator::new();
+    // Build the relay URL from the node or bind address
+    let relay_url = cli
+        .node
+        .clone()
+        .unwrap_or_else(|| Url::parse(&format!("https://{}", cli.bind)).unwrap());
+
+    // Create the file-based coordinator for multi-relay coordination
+    let coordinator = Arc::new(FileCoordinator::new(&cli.coordinator_file, relay_url));
+
+    log::info!("using file coordinator: {}", cli.coordinator_file.display());
 
     // Create a QUIC server for media.
     let relay = Relay::new(RelayConfig {
@@ -99,7 +114,6 @@ async fn main() -> anyhow::Result<()> {
         qlog_dir: qlog_dir_for_relay,
         mlog_dir: mlog_dir_for_relay,
         node: cli.node,
-        api: cli.api,
         announce: cli.announce,
         coordinator,
     })?;

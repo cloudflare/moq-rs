@@ -6,10 +6,7 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic;
 use url::Url;
 
-use crate::{
-    Api, Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer, RemotesProducer,
-    Session,
-};
+use crate::{Api, Consumer, Coordinator, Locals, Producer, RemoteManager, Session};
 
 /// Configuration for the relay.
 pub struct RelayConfig {
@@ -28,9 +25,6 @@ pub struct RelayConfig {
     /// Forward all announcements to the (optional) URL.
     pub announce: Option<Url>,
 
-    /// Connect to the HTTP moq-api at this URL.
-    pub api: Option<Url>,
-
     /// Our hostname which we advertise to other origins.
     /// We use QUIC, so the certificate must be valid for this address.
     pub node: Option<Url>,
@@ -45,19 +39,18 @@ pub struct Relay {
     announce_url: Option<Url>,
     mlog_dir: Option<PathBuf>,
     locals: Locals,
-    api: Option<Api>,
-    remotes: Option<(RemotesProducer, RemotesConsumer)>,
+    remotes: RemoteManager,
     coordinator: Arc<dyn Coordinator>,
 }
 
 impl Relay {
     pub fn new(config: RelayConfig) -> anyhow::Result<Self> {
         // Create a QUIC endpoint that can be used for both clients and servers.
-        let quic = quic::Endpoint::new(quic::Config {
-            bind: config.bind,
-            qlog_dir: config.qlog_dir,
-            tls: config.tls,
-        })?;
+        let quic = quic::Endpoint::new(quic::Config::new(
+            config.bind,
+            config.qlog_dir,
+            config.tls.clone(),
+        ))?;
 
         // Validate mlog directory if provided
         if let Some(mlog_dir) = &config.mlog_dir {
@@ -70,30 +63,15 @@ impl Relay {
             log::info!("mlog output enabled: {}", mlog_dir.display());
         }
 
-        // Create an API client if we have the necessary configuration
-        let api = if let (Some(url), Some(node)) = (config.api, config.node) {
-            log::info!("using moq-api: url={} node={}", url, node);
-            Some(Api::new(url, node))
-        } else {
-            None
-        };
-
         let locals = Locals::new();
 
-        // Create remotes if we have an API client
-        let remotes = api.clone().map(|api| {
-            Remotes {
-                api,
-                quic: quic.client.clone(),
-            }
-            .produce()
-        });
+        // Create remote manager - uses coordinator for namespace lookups
+        let remotes = RemoteManager::new(config.coordinator.clone(), config.tls.clone());
 
         Ok(Self {
             quic,
             announce_url: config.announce,
             mlog_dir: config.mlog_dir,
-            api,
             locals,
             remotes,
             coordinator: config.coordinator,
@@ -104,11 +82,7 @@ impl Relay {
     pub async fn run(self) -> anyhow::Result<()> {
         let mut tasks = FuturesUnordered::new();
 
-        // Start the remotes producer task, if any
-        let remotes = self.remotes.map(|(producer, consumer)| {
-            tasks.push(producer.run().boxed());
-            consumer
-        });
+        let remotes = self.remotes.clone();
 
         // Start the forwarder, if any
         let forward_producer = if let Some(url) = &self.announce_url {
@@ -118,7 +92,7 @@ impl Relay {
             let (session, _quic_client_initial_cid) = self
                 .quic
                 .client
-                .connect(url)
+                .connect(url, None)
                 .await
                 .context("failed to establish forward connection")?;
 
@@ -129,6 +103,7 @@ impl Relay {
                     .context("failed to establish forward session")?;
 
             // Create a normal looking session, except we never forward or register announces.
+            let coordinator = self.coordinator.clone();
             let session = Session {
                 session,
                 producer: Some(Producer::new(
@@ -139,7 +114,7 @@ impl Relay {
                 consumer: Some(Consumer::new(
                     subscriber,
                     self.locals.clone(),
-                    self.coordinator.clone(),
+                    coordinator,
                     None,
                 )),
             };
@@ -174,7 +149,6 @@ impl Relay {
 
                     // Spawn a new task to handle the connection
                     tasks.push(async move {
-
                         // Create the MoQ session over the connection (setup handshake etc)
                         let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path).await {
                             Ok(session) => session,
@@ -185,8 +159,9 @@ impl Relay {
                         };
 
                         // Create our MoQ relay session
+                        let moq_session = session;
                         let session = Session {
-                            session,
+                            session: moq_session,
                             producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes)),
                             consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward)),
                         };

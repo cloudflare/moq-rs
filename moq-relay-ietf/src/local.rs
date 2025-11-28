@@ -46,9 +46,9 @@ impl Locals {
         Ok(registration)
     }
 
-    /// Lookup local tracks by namespace using hierarchical prefix matching.
+    /// Retrieve local tracks by namespace using hierarchical prefix matching.
     /// Returns the TracksReader for the longest matching namespace prefix.
-    pub fn route(&self, namespace: &TrackNamespace) -> Option<TracksReader> {
+    pub fn retrieve(&self, namespace: &TrackNamespace) -> Option<TracksReader> {
         let lookup = self.lookup.lock().unwrap();
 
         // Find the longest matching prefix

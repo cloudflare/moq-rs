@@ -12,7 +12,7 @@ use crate::{Coordinator, Locals, Producer};
 /// Consumer of tracks from a remote Publisher
 #[derive(Clone)]
 pub struct Consumer {
-    remote: Subscriber,
+    subscriber: Subscriber,
     locals: Locals,
     coordinator: Arc<dyn Coordinator>,
     forward: Option<Producer>, // Forward all announcements to this subscriber
@@ -20,13 +20,13 @@ pub struct Consumer {
 
 impl Consumer {
     pub fn new(
-        remote: Subscriber,
+        subscriber: Subscriber,
         locals: Locals,
         coordinator: Arc<dyn Coordinator>,
         forward: Option<Producer>,
     ) -> Self {
         Self {
-            remote,
+            subscriber,
             locals,
             coordinator,
             forward,
@@ -40,7 +40,7 @@ impl Consumer {
         loop {
             tokio::select! {
                 // Handle a new announce request
-                Some(announce) = self.remote.announced() => {
+                Some(announce) = self.subscriber.announced() => {
                     let this = self.clone();
 
                     tasks.push(async move {
@@ -67,10 +67,9 @@ impl Consumer {
         let (_, mut request, reader) = Tracks::new(announce.namespace.clone()).produce();
 
         // Register namespace with the coordinator
-        let namespace_path = reader.namespace.to_utf8_path();
         let _namespace_registration = self
             .coordinator
-            .register_namespace(&namespace_path)
+            .register_namespace(&reader.namespace)
             .await
             .context("failed to register namespace with coordinator")?;
 
@@ -102,7 +101,7 @@ impl Consumer {
 
                 // Wait for the next subscriber and serve the track.
                 Some(track) = request.next() => {
-                    let mut remote = self.remote.clone();
+                    let mut subscriber = self.subscriber.clone();
 
                     // Spawn a new task to handle the subscribe
                     tasks.push(async move {
@@ -110,7 +109,7 @@ impl Consumer {
                         log::info!("forwarding subscribe: {:?}", info);
 
                         // Forward the subscribe request
-                        if let Err(err) = remote.subscribe(track).await {
+                        if let Err(err) = subscriber.subscribe(track).await {
                             log::warn!("failed forwarding subscribe: {:?}, error: {}", info, err)
                         }
 

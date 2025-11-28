@@ -31,7 +31,6 @@
 mod api;
 mod consumer;
 mod coordinator;
-mod coordinator_local;
 mod local;
 mod producer;
 mod relay;
@@ -42,7 +41,6 @@ mod web;
 pub use api::*;
 pub use consumer::*;
 pub use coordinator::*;
-pub use coordinator_local::*;
 pub use local::*;
 pub use producer::*;
 pub use relay::*;

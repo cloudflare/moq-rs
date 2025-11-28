@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     fs::File,
     io::BufWriter,
     net,
@@ -16,6 +17,25 @@ use crate::tls;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
+
+/// Represents the address family of the local QUIC socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    Ipv4,
+    Ipv6,
+    /// IPv6 with dual-stack support (Linux)
+    Ipv6DualStack,
+}
+
+impl fmt::Display for AddressFamily {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AddressFamily::Ipv4 => write!(f, "IPv4"),
+            AddressFamily::Ipv6 => write!(f, "IPv6"),
+            AddressFamily::Ipv6DualStack => write!(f, "IPv6 (dual stack)"),
+        }
+    }
+}
 
 /// Build a TransportConfig with our standard settings
 ///
@@ -57,18 +77,41 @@ impl Default for Args {
 impl Args {
     pub fn load(&self) -> anyhow::Result<Config> {
         let tls = self.tls.load()?;
-        Ok(Config {
-            bind: self.bind,
-            qlog_dir: self.qlog_dir.clone(),
-            tls,
-        })
+        Ok(Config::new(self.bind, self.qlog_dir.clone(), tls))
     }
 }
 
 pub struct Config {
-    pub bind: net::SocketAddr,
+    pub bind: Option<net::SocketAddr>,
+    pub socket: net::UdpSocket,
     pub qlog_dir: Option<PathBuf>,
     pub tls: tls::Config,
+}
+
+impl Config {
+    pub fn new(bind: net::SocketAddr, qlog_dir: Option<PathBuf>, tls: tls::Config) -> Self {
+        Self {
+            bind: Some(bind),
+            socket: net::UdpSocket::bind(bind)
+                .context("failed to bind socket")
+                .unwrap(),
+            qlog_dir,
+            tls,
+        }
+    }
+
+    pub fn with_socket(
+        socket: net::UdpSocket,
+        qlog_dir: Option<PathBuf>,
+        tls: tls::Config,
+    ) -> Self {
+        Self {
+            bind: None,
+            socket,
+            qlog_dir,
+            tls,
+        }
+    }
 }
 
 pub struct Endpoint {
@@ -111,13 +154,13 @@ impl Endpoint {
         // There's a bit more boilerplate to make a generic endpoint.
         let runtime = quinn::default_runtime().context("no async runtime")?;
         let endpoint_config = quinn::EndpointConfig::default();
-        let socket = std::net::UdpSocket::bind(config.bind).context("failed to bind UDP socket")?;
+        let socket = config.socket;
 
         // Create the generic QUIC endpoint.
         let quic = quinn::Endpoint::new(endpoint_config, server_config.clone(), socket, runtime)
             .context("failed to create QUIC endpoint")?;
 
-        let server = server_config.clone().map(|base_server_config| Server {
+        let server = server_config.map(|base_server_config| Server {
             quic: quic.clone(),
             accept: Default::default(),
             qlog_dir: config.qlog_dir.map(Arc::new),
@@ -270,7 +313,34 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn connect(&self, url: &Url) -> anyhow::Result<(web_transport::Session, String)> {
+    /// Returns the local address of the QUIC socket.
+    pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {
+        self.quic
+            .local_addr()
+            .context("failed to get local address")
+    }
+
+    /// Returns the address family of the local QUIC socket.
+    pub fn address_family(&self) -> anyhow::Result<AddressFamily> {
+        let local_addr = self
+            .quic
+            .local_addr()
+            .context("failed to get local socket address")?;
+
+        if local_addr.is_ipv4() {
+            Ok(AddressFamily::Ipv4)
+        } else if cfg!(target_os = "linux") {
+            Ok(AddressFamily::Ipv6DualStack)
+        } else {
+            Ok(AddressFamily::Ipv6)
+        }
+    }
+
+    pub async fn connect(
+        &self,
+        url: &Url,
+        socket_addr: Option<net::SocketAddr>,
+    ) -> anyhow::Result<(web_transport::Session, String)> {
         let mut config = self.config.clone();
 
         // TODO support connecting to both ALPNs at the same time
@@ -303,12 +373,15 @@ impl Client {
         let host = url.host().context("invalid DNS name")?.to_string();
         let port = url.port().unwrap_or(443);
 
-        // Look up the DNS entry.
-        let addr = tokio::net::lookup_host((host.clone(), port))
-            .await
-            .context("failed DNS lookup")?
-            .next()
-            .context("no DNS entries")?;
+        // Look up the DNS entry and filter by socket address family.
+        let addr = match socket_addr {
+            Some(addr) => addr,
+            None => {
+                // Default DNS resolution logic
+                self.resolve_dns(&host, port, self.address_family()?)
+                    .await?
+            }
+        };
 
         let connection = self.quic.connect_with(config, addr, &host)?.await?;
 
@@ -327,5 +400,84 @@ impl Client {
         };
 
         Ok((session.into(), connection_id_hex))
+    }
+
+    /// Default DNS resolution logic that filters results by address family.
+    async fn resolve_dns(
+        &self,
+        host: &str,
+        port: u16,
+        address_family: AddressFamily,
+    ) -> anyhow::Result<net::SocketAddr> {
+        let local_addr = self.local_addr()?;
+
+        // Collect all DNS results
+        let addrs: Vec<net::SocketAddr> = tokio::net::lookup_host((host, port))
+            .await
+            .context("failed DNS lookup")?
+            .collect();
+
+        if addrs.is_empty() {
+            anyhow::bail!("DNS lookup for host '{}' returned no addresses", host);
+        }
+
+        // Log all DNS results for debugging
+        log::debug!(
+            "DNS lookup for {}, family {:?}: found {} results",
+            host,
+            address_family,
+            addrs.len()
+        );
+        for (i, addr) in addrs.iter().enumerate() {
+            log::debug!(
+                "  DNS[{}]: {} ({})",
+                i,
+                addr,
+                if addr.is_ipv4() { "IPv4" } else { "IPv6" }
+            );
+        }
+
+        // Filter DNS results to match our local socket's address family
+        let compatible_addr = match address_family {
+            AddressFamily::Ipv4 => {
+                // IPv4 socket: filter to IPv4 addresses
+                addrs
+                    .iter()
+                    .find(|a| a.is_ipv4())
+                    .cloned()
+                    .context(format!(
+                        "No IPv4 address found for host '{}' (local socket is IPv4: {})",
+                        host, local_addr
+                    ))?
+            }
+            AddressFamily::Ipv6DualStack => {
+                // IPv6 socket on Linux: dual-stack, use first result
+                log::debug!(
+                    "Using first DNS result (Linux IPv6 dual-stack): {}",
+                    addrs[0]
+                );
+                addrs[0]
+            }
+            AddressFamily::Ipv6 => {
+                // IPv6 socket non-Linux: filter to IPv6 addresses
+                addrs
+                    .iter()
+                    .find(|a| a.is_ipv6())
+                    .cloned()
+                    .context(format!(
+                        "No IPv6 address found for host '{}' (local socket is IPv6: {})",
+                        host, local_addr
+                    ))?
+            }
+        };
+
+        log::debug!(
+            "Connecting from {} to {} (selected from {} DNS results)",
+            local_addr,
+            compatible_addr,
+            addrs.len()
+        );
+
+        Ok(compatible_addr)
     }
 }
