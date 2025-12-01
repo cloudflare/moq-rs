@@ -57,14 +57,14 @@ async fn main() -> anyhow::Result<()> {
 
     let tls = cli.tls.load()?;
 
-    let quic = quic::Endpoint::new(moq_native_ietf::quic::Config {
-        bind: cli.bind,
-        qlog_dir: None,
-        tls: tls.clone(),
-    })?;
+    let quic = quic::Endpoint::new(moq_native_ietf::quic::Config::new(
+        cli.bind,
+        None,
+        tls.clone(),
+    ))?;
 
     log::info!("connecting to relay: url={}", cli.url);
-    let (session, connection_id) = quic.client.connect(&cli.url).await?;
+    let (session, connection_id) = quic.client.connect(&cli.url, None).await?;
 
     log::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",

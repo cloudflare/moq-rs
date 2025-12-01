@@ -29,16 +29,12 @@ async fn main() -> anyhow::Result<()> {
     let tls = config.tls.load()?;
 
     // Create the QUIC endpoint
-    let quic = quic::Endpoint::new(quic::Config {
-        bind: config.bind,
-        qlog_dir: None,
-        tls,
-    })?;
+    let quic = quic::Endpoint::new(quic::Config::new(config.bind, None, tls))?;
 
     log::info!("connecting to server: url={}", config.url);
 
     // Connect to the server
-    let (session, connection_id) = quic.client.connect(&config.url).await?;
+    let (session, connection_id) = quic.client.connect(&config.url, None).await?;
 
     log::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
