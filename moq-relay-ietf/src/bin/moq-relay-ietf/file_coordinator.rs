@@ -218,6 +218,8 @@ impl Coordinator for FileCoordinator {
         Ok(NamespaceRegistration::new(handle))
     }
 
+    // FIXME(itzmanish): Not being called currently but we need to call this on publish_namespace_done
+    // currently unregister happens on drop of namespace
     async fn unregister_namespace(&self, namespace: &TrackNamespace) -> CoordinatorResult<()> {
         let namespace = namespace.clone();
         let file_path = self.file_path.clone();

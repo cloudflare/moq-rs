@@ -59,6 +59,10 @@ pub struct Cli {
 
     /// Path to the shared coordinator file for multi-relay coordination.
     /// Multiple relay instances can share namespace/track registration via this file.
+    /// User doesn't have to explicitly create and populate anything. This path will be
+    /// used by file coordinator to store namespace/track registration information.
+    /// User need to make sure if multiple relay's are being used all of them have same path
+    /// to this file.
     #[arg(long, default_value = "/tmp/moq-coordinator.json")]
     pub coordinator_file: PathBuf,
 }
