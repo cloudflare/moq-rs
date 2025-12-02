@@ -77,6 +77,7 @@ fn unregister_namespace_sync(file_path: &Path, namespace: &TrackNamespace) -> Re
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(file_path)?;
 
     file.lock_exclusive()?;
@@ -107,6 +108,7 @@ fn unregister_track_sync(
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(file_path)?;
 
     file.lock_exclusive()?;
@@ -193,6 +195,7 @@ impl Coordinator for FileCoordinator {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&file_path)?;
 
             file.lock_exclusive()?;
@@ -300,6 +303,7 @@ impl Coordinator for FileCoordinator {
                     .read(true)
                     .write(true)
                     .create(true)
+                    .truncate(false)
                     .open(&file_path)?;
 
                 file.lock_shared()?;
@@ -323,7 +327,6 @@ impl Coordinator for FileCoordinator {
                     // instead of working on strings
                     let is_prefix = registered_key
                         .split('/')
-                        .into_iter()
                         .zip(key.split('/'))
                         .all(|(a, b)| a == b);
                     match best_match {
