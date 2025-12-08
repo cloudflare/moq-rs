@@ -3,7 +3,7 @@ use std::{
     fmt,
     fs::File,
     io::BufWriter,
-    net,
+    net::{self, IpAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
     time,
@@ -26,6 +26,11 @@ pub enum AddressFamily {
     Ipv6,
     /// IPv6 with dual-stack support (Linux)
     Ipv6DualStack,
+}
+
+pub enum Host {
+    Ip(IpAddr),
+    Name(String),
 }
 
 impl fmt::Display for AddressFamily {
@@ -137,6 +142,7 @@ pub struct Endpoint {
 impl Endpoint {
     pub fn new(config: Config) -> anyhow::Result<Self> {
         // Validate qlog directory if provided
+
         if let Some(qlog_dir) = &config.qlog_dir {
             if !qlog_dir.exists() {
                 anyhow::bail!("qlog directory does not exist: {}", qlog_dir.display());
@@ -216,7 +222,10 @@ impl Server {
                 res = self.accept.next(), if !self.accept.is_empty() => {
                     match res? {
                         Ok(result) => return Some(result),
-                        Err(err) => log::warn!("failed to accept QUIC connection: {}", err),
+                        Err(err) => {
+                            log::warn!("failed to accept QUIC connection: {}", err.root_cause());
+                            continue;
+                        }
                     }
                 }
             }
@@ -389,7 +398,11 @@ impl Client {
             cid
         }));
 
-        let host = url.host().context("invalid DNS name")?.to_string();
+        let host = match url.host().context("missing host")? {
+            url::Host::Domain(d) => d.to_string(),
+            url::Host::Ipv4(ip) => ip.to_string(),
+            url::Host::Ipv6(ip) => ip.to_string(), // No brackets
+        };
         let port = url.port().unwrap_or(443);
 
         // Look up the DNS entry and filter by socket address family.
@@ -431,10 +444,15 @@ impl Client {
         let local_addr = self.local_addr()?;
 
         // Collect all DNS results
-        let addrs: Vec<net::SocketAddr> = tokio::net::lookup_host((host, port))
-            .await
-            .context("failed DNS lookup")?
-            .collect();
+        let addrs: Vec<net::SocketAddr> = match Self::parse_socket_addr(host, port) {
+            Ok(addr) => {
+                vec![addr]
+            }
+            Err(_) => tokio::net::lookup_host((host, port))
+                .await
+                .context("failed DNS lookup")?
+                .collect(),
+        };
 
         if addrs.is_empty() {
             anyhow::bail!("DNS lookup for host '{}' returned no addresses", host);
@@ -498,5 +516,10 @@ impl Client {
         );
 
         Ok(compatible_addr)
+    }
+
+    fn parse_socket_addr(host: &str, port: u16) -> Result<net::SocketAddr, net::AddrParseError> {
+        let host = format!("{}:{}", host, port);
+        host.parse::<net::SocketAddr>()
     }
 }

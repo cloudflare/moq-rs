@@ -130,7 +130,11 @@ impl TryFrom<&str> for TrackNamespace {
     type Error = TrackNamespaceError;
 
     fn try_from(path: &str) -> Result<Self, Self::Error> {
-        let fields: Vec<TupleField> = path.split('/').map(TupleField::from_utf8).collect();
+        let fields: Vec<TupleField> = path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(TupleField::from_utf8)
+            .collect();
         Self::try_from(fields)
     }
 }

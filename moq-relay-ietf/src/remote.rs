@@ -50,7 +50,10 @@ impl RemoteManager {
         // Ask coordinator where this namespace lives
         let (origin, client) = match self.coordinator.lookup(&namespace).await {
             Ok((origin, client)) => (origin, client),
-            Err(_) => return Ok(None), // Namespace not found anywhere
+            Err(e) => {
+                log::error!("failed to lookup namespace: {}", e);
+                return Ok(None); // Namespace not found anywhere
+            }
         };
 
         let url = origin.url();

@@ -1,3 +1,4 @@
+mod api_coordinator;
 mod file_coordinator;
 
 use std::sync::Arc;
@@ -6,8 +7,9 @@ use std::{net, path::PathBuf};
 use clap::Parser;
 use url::Url;
 
+use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Relay, RelayConfig, Web, WebConfig};
+use moq_relay_ietf::{Coordinator, Relay, RelayConfig, Web, WebConfig};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -65,6 +67,17 @@ pub struct Cli {
     /// to this file.
     #[arg(long, default_value = "/tmp/moq-coordinator.json")]
     pub coordinator_file: PathBuf,
+
+    /// URL of the moq-api server for coordination (e.g., "http://localhost:8080").
+    /// When specified, uses moq-api HTTP server instead of file-based coordination.
+    /// This is useful when running a cluster of relays with a centralized API server.
+    #[arg(long)]
+    pub api_url: Option<Url>,
+
+    /// TTL in seconds for namespace registrations in the API.
+    /// Only used when --api-url is specified.
+    #[arg(long, default_value = "600")]
+    pub api_ttl: u64,
 }
 
 #[tokio::main]
@@ -106,10 +119,17 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| Url::parse(&format!("https://{}", cli.bind)).unwrap());
 
-    // Create the file-based coordinator for multi-relay coordination
-    let coordinator = Arc::new(FileCoordinator::new(&cli.coordinator_file, relay_url));
-
-    log::info!("using file coordinator: {}", cli.coordinator_file.display());
+    // Create the coordinator based on CLI arguments
+    // Priority: api-url > file coordinator
+    let coordinator: Arc<dyn Coordinator> = if let Some(api_url) = &cli.api_url {
+        let config = ApiCoordinatorConfig::new(api_url.clone(), relay_url).with_ttl(cli.api_ttl);
+        let api_coordinator = ApiCoordinator::new(config);
+        log::info!("using API coordinator: {}", api_url);
+        Arc::new(api_coordinator)
+    } else {
+        log::info!("using file coordinator: {}", cli.coordinator_file.display());
+        Arc::new(FileCoordinator::new(&cli.coordinator_file, relay_url))
+    };
 
     // Create a QUIC server for media.
     let relay = Relay::new(RelayConfig {

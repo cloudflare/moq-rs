@@ -66,6 +66,11 @@ impl Consumer {
         // Produce the tracks for this announce and return the reader
         let (_, mut request, reader) = Tracks::new(announce.namespace.clone()).produce();
 
+        // NOTE(mpandit): once the track is pulled from origin, internally it will be relayed
+        // from this metal only, because now coordinator will have entry for the namespace.
+
+        // should we allow the same namespace being served from multiple relays??
+
         // Register namespace with the coordinator
         let _namespace_registration = self
             .coordinator
