@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::fmt::write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
 use moq_transport::serve::{Track, TrackReader};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::Coordinator;
@@ -59,10 +62,28 @@ impl RemoteManager {
         let url = origin.url();
 
         // Get or create a connection to the remote relay
-        let remote = self.get_or_connect(&url, client.as_ref()).await?;
+        let remote = match self.get_or_connect(&url, client.as_ref()).await {
+            Ok(remote) => remote,
+            Err(e) => {
+                log::error!("failed to connect to remote relay {}: {}", url, e);
+                // Remove failed connection from cache
+                self.remove(&url).await;
+                return Err(e);
+            }
+        };
 
         // Subscribe to the track on the remote
-        remote.subscribe(namespace, track_name).await
+        match remote.subscribe(namespace, track_name).await {
+            Ok(reader) => Ok(reader),
+            Err(e) => {
+                // If subscription fails, check if connection is dead and remove it
+                if !remote.is_connected() {
+                    log::warn!("remote connection {} is dead, removing from cache", url);
+                    self.remove(&url).await;
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Get an existing remote connection or create a new one.
@@ -79,10 +100,17 @@ impl RemoteManager {
                 return Ok(remote.clone());
             }
             // Connection is dead, remove it
+            log::info!("removing dead connection to remote relay: {}", url);
             remotes.remove(url);
         }
 
-        let client = client.unwrap_or(&self.clients[0]);
+        // Get client, with proper error handling for empty clients vec
+        let client = match client {
+            Some(c) => c,
+            None => self.clients.first().ok_or_else(|| {
+                anyhow::anyhow!("no QUIC clients configured for remote connections")
+            })?,
+        };
 
         // Create a new connection with its own QUIC client
         log::info!("connecting to remote relay: {}", url);
@@ -96,7 +124,19 @@ impl RemoteManager {
     /// Remove a remote connection (called when connection fails).
     pub async fn remove(&self, url: &Url) {
         let mut remotes = self.remotes.lock().await;
-        remotes.remove(url);
+        if let Some(remote) = remotes.remove(url) {
+            // Cancel the session task when removing
+            remote.shutdown();
+        }
+    }
+
+    /// Shutdown all remote connections.
+    pub async fn shutdown(&self) {
+        let mut remotes = self.remotes.lock().await;
+        for (url, remote) in remotes.drain() {
+            log::info!("shutting down remote connection: {}", url);
+            remote.shutdown();
+        }
     }
 }
 
@@ -107,6 +147,10 @@ pub struct Remote {
     subscriber: moq_transport::session::Subscriber,
     /// Track subscriptions - maps (namespace, track_name) to track reader
     tracks: Arc<Mutex<HashMap<(TrackNamespace, String), TrackReader>>>,
+    /// Flag indicating if the connection is still alive
+    connected: Arc<AtomicBool>,
+    /// Cancellation token for the session task
+    cancel: CancellationToken,
 }
 
 impl Remote {
@@ -116,28 +160,49 @@ impl Remote {
         let (session, _cid) = client.connect(&url, None).await?;
         let (session, subscriber) = moq_transport::session::Subscriber::connect(session).await?;
 
+        let connected = Arc::new(AtomicBool::new(true));
+        let cancel = CancellationToken::new();
+
         // Spawn a task to run the session
         let session_url = url.clone();
+        let session_connected = connected.clone();
+        let session_cancel = cancel.clone();
+
         tokio::spawn(async move {
-            if let Err(err) = session.run().await {
-                log::warn!("remote session closed: {} - {}", session_url, err);
+            tokio::select! {
+                result = session.run() => {
+                    if let Err(err) = result {
+                        log::warn!("remote session closed: {} - {}", session_url, err);
+                    } else {
+                        log::info!("remote session closed normally: {}", session_url);
+                    }
+                }
+                _ = session_cancel.cancelled() => {
+                    log::info!("remote session cancelled: {}", session_url);
+                }
             }
+            // Mark connection as dead
+            session_connected.store(false, Ordering::Release);
         });
 
         Ok(Self {
             url,
             subscriber,
             tracks: Arc::new(Mutex::new(HashMap::new())),
+            connected,
+            cancel,
         })
     }
 
     /// Check if the connection is still alive.
-    /// Note: This is a simple heuristic - we assume connected until proven otherwise.
-    fn is_connected(&self) -> bool {
-        // We don't have a direct way to check if the subscriber is closed,
-        // so we assume it's connected. Dead connections will be cleaned up
-        // when subscribe operations fail.
-        true
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Shutdown the remote connection.
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
+        self.connected.store(false, Ordering::Release);
     }
 
     /// Subscribe to a track on this remote relay.
@@ -146,23 +211,37 @@ impl Remote {
         namespace: TrackNamespace,
         track_name: String,
     ) -> anyhow::Result<Option<TrackReader>> {
+        // Check connection state first
+        if !self.is_connected() {
+            return Err(anyhow::anyhow!(
+                "remote connection to {} is closed",
+                self.url
+            ));
+        }
+
         let key = (namespace.clone(), track_name.clone());
 
+        // Hold lock for entire check-and-insert to prevent race conditions
+        let mut tracks = self.tracks.lock().await;
+
         // Check if we already have this track
-        {
-            let tracks = self.tracks.lock().await;
-            if let Some(reader) = tracks.get(&key) {
-                return Ok(Some(reader.clone()));
-            }
+        if let Some(reader) = tracks.get(&key) {
+            return Ok(Some(reader.clone()));
         }
 
         // Create a new track and subscribe
         let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
 
+        // Insert BEFORE spawning to prevent race with removal in the spawned task
+        tracks.insert(key.clone(), reader.clone());
+
+        // Drop lock before spawning async task
+        drop(tracks);
+
         // Subscribe to the track on the remote
         let mut subscriber = self.subscriber.clone();
-        let track_key = key.clone();
-        let tracks = self.tracks.clone();
+        let track_key = key;
+        let tracks_clone = self.tracks.clone();
         let url = self.url.clone();
 
         tokio::spawn(async move {
@@ -181,17 +260,19 @@ impl Remote {
                     track_key.1,
                     err
                 );
+                // NOTE(itzmanish): should we assume the connection is bad?
+                // connected.store(false, Ordering::Release);
             }
 
             // Remove track from map when subscription ends
-            tracks.lock().await.remove(&track_key);
+            tracks_clone.lock().await.remove(&track_key);
+            log::debug!(
+                "remote track subscription ended: {} - {}/{}",
+                url,
+                track_key.0,
+                track_key.1
+            );
         });
-
-        // Store the reader for deduplication
-        {
-            let mut tracks = self.tracks.lock().await;
-            tracks.insert(key, reader.clone());
-        }
 
         Ok(Some(reader))
     }
@@ -201,6 +282,7 @@ impl std::fmt::Debug for Remote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Remote")
             .field("url", &self.url.to_string())
+            .field("connected", &self.is_connected())
             .finish()
     }
 }
