@@ -4,18 +4,18 @@ use moq_transport::{
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
 };
 
-use crate::{Locals, RemoteManager};
+use crate::{Locals, RemotesConsumer};
 
 /// Producer of tracks to a remote Subscriber
 #[derive(Clone)]
 pub struct Producer {
     publisher: Publisher,
     locals: Locals,
-    remotes: RemoteManager,
+    remotes: Option<RemotesConsumer>,
 }
 
 impl Producer {
-    pub fn new(publisher: Publisher, locals: Locals, remotes: RemoteManager) -> Self {
+    pub fn new(publisher: Publisher, locals: Locals, remotes: Option<RemotesConsumer>) -> Self {
         Self {
             publisher,
             locals,
@@ -89,16 +89,22 @@ impl Producer {
             }
         }
 
-        // Check remote tracks second, and serve from remote if possible
-        if let Some(track) = self
-            .remotes
-            .subscribe(namespace.clone(), track_name.clone())
-            .await?
-        {
-            log::info!("serving subscribe from remote: {:?}", track.info);
-            return Ok(subscribed.serve(track).await?);
+        if let Some(remotes) = self.remotes {
+            // Check remote tracks second, and serve from remote if possible
+            match remotes.route(&namespace).await {
+                Ok(remote) => {
+                    if let Some(remote) = remote {
+                        if let Some(track) = remote.subscribe(&namespace, &track_name)? {
+                            log::info!("serving subscribe from remote: {:?}", track.info);
+                            return Ok(subscribed.serve(track.reader).await?);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("failed to route to remote: {}", e);
+                }
+            }
         }
-
         // Track not found - close the subscription with not found error
         let err = ServeError::not_found_ctx(format!(
             "track '{}/{}' not found in local or remote tracks",

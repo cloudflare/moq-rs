@@ -6,7 +6,9 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
 use url::Url;
 
-use crate::{Consumer, Coordinator, Locals, Producer, RemoteManager, Session};
+use crate::{
+    Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer, RemotesProducer, Session,
+};
 
 // A type alias for boxed future
 type ServerFuture = Pin<
@@ -54,7 +56,7 @@ pub struct Relay {
     announce_url: Option<Url>,
     mlog_dir: Option<PathBuf>,
     locals: Locals,
-    remotes: RemoteManager,
+    remotes: Option<(RemotesProducer, RemotesConsumer)>,
     coordinator: Arc<dyn Coordinator>,
 }
 
@@ -99,14 +101,18 @@ impl Relay {
             .collect::<Vec<_>>();
 
         // Create remote manager - uses coordinator for namespace lookups
-        let remotes = RemoteManager::new(config.coordinator.clone(), remote_clients)?;
+        let remotes = Remotes {
+            coordinator: config.coordinator.clone(),
+            quic: remote_clients[0].clone(),
+        }
+        .produce();
 
         Ok(Self {
             quic_endpoints: endpoints,
             announce_url: config.announce,
             mlog_dir: config.mlog_dir,
             locals,
-            remotes,
+            remotes: Some(remotes),
             coordinator: config.coordinator,
         })
     }
@@ -115,7 +121,11 @@ impl Relay {
     pub async fn run(self) -> anyhow::Result<()> {
         let mut tasks = FuturesUnordered::new();
 
-        let remotes = self.remotes.clone();
+        // Split remotes producer/consumer and spawn producer task
+        let remotes = self.remotes.map(|(producer, consumer)| {
+            tasks.push(producer.run().boxed());
+            consumer
+        });
 
         // Start the forwarder, if any
         let forward_producer = if let Some(url) = &self.announce_url {
