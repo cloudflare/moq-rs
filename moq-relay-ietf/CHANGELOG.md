@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.8](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.7...moq-relay-ietf-v0.7.8) - 2025-12-18
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.7.7](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.6...moq-relay-ietf-v0.7.7) - 2025-12-18
 
 ### Added
