@@ -73,6 +73,8 @@ pub struct NamespaceOrigin {
     namespace: TrackNamespace,
     /// The URL of the relay serving this namespace
     /// If the relay is not discoverable via this URL, use `socket_addr`
+    /// But you still have to pass a valid URL because the TLS verification
+    /// happens for hostname
     url: Url,
     /// The socket address of the relay if the relay is not approachable
     /// via DNS lookup, This is to bypass DNS lookups.
