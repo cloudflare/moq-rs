@@ -240,7 +240,10 @@ impl Coordinator for ApiCoordinator {
         match result {
             Some(origin) => {
                 log::debug!("found namespace {} at {}", namespace_str, origin.url);
-                Ok((NamespaceOrigin::new(namespace.clone(), origin.url), None))
+                Ok((
+                    NamespaceOrigin::new(namespace.clone(), origin.url, None),
+                    None,
+                ))
             }
             None => {
                 log::debug!("namespace not found: {}", namespace_str);

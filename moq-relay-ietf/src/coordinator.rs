@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use async_trait::async_trait;
 use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
@@ -67,21 +69,30 @@ impl NamespaceRegistration {
 /// Result of a namespace lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceOrigin {
+    /// The namespace of the track belongs to
     namespace: TrackNamespace,
+    /// The URL of the relay serving this namespace
+    /// If the relay is not discoverable via this URL, use `socket_addr`
+    /// But you still have to pass a valid URL because the TLS verification
+    /// happens for hostname
     url: Url,
+    /// The socket address of the relay if the relay is not approachable
+    /// via DNS lookup, This is to bypass DNS lookups.
+    socket_addr: Option<SocketAddr>,
+    /// Additional metadata associated with this namespace
     metadata: Option<Vec<(String, String)>>,
 }
 
 impl NamespaceOrigin {
     /// Create a new NamespaceOrigin.
-    pub fn new(namespace: TrackNamespace, url: Url) -> Self {
+    pub fn new(namespace: TrackNamespace, url: Url, addr: Option<SocketAddr>) -> Self {
         Self {
             namespace,
             url,
+            socket_addr: addr,
             metadata: None,
         }
     }
-
     pub fn with_metadata(mut self, values: (String, String)) -> Self {
         if let Some(metadata) = &mut self.metadata {
             metadata.push(values);
@@ -99,6 +110,10 @@ impl NamespaceOrigin {
     /// Get the URL of the relay serving this namespace.
     pub fn url(&self) -> Url {
         self.url.clone()
+    }
+
+    pub fn addr(&self) -> Option<SocketAddr> {
+        self.socket_addr
     }
 
     /// Get the metadata associated with this namespace.

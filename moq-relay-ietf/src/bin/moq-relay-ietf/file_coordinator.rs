@@ -206,7 +206,7 @@ impl Coordinator for FileCoordinator {
                 if let Some(relay_url) = data.namespaces.get(&key) {
                     file.unlock()?;
                     let url = Url::parse(relay_url)?;
-                    return Ok(Some((NamespaceOrigin::new(namespace, url), None)));
+                    return Ok(Some((NamespaceOrigin::new(namespace, url, None), None)));
                 }
 
                 // Try prefix matching (find longest matching prefix)
@@ -234,7 +234,7 @@ impl Coordinator for FileCoordinator {
                 if let Some((matched_key, relay_url)) = best_match {
                     let matched_ns = TrackNamespace::from_utf8_path(&matched_key);
                     let url = Url::parse(&relay_url)?;
-                    return Ok(Some((NamespaceOrigin::new(matched_ns, url), None)));
+                    return Ok(Some((NamespaceOrigin::new(matched_ns, url, None), None)));
                 }
 
                 Ok(None)
