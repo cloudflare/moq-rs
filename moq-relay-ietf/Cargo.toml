@@ -1,7 +1,7 @@
 [package]
 name = "moq-relay-ietf"
 description = "Media over QUIC"
-authors = ["Luke Curley", "Manish Kumar Pandit"]
+authors = ["Luke Curley", "Manish Kumar Pandit", "Mike English"]
 repository = "https://github.com/cloudflare/moq-rs"
 license = "MIT OR Apache-2.0"
 
@@ -30,7 +30,7 @@ url = "2"
 
 # Async stuff
 tokio = { version = "1", features = ["full"] }
-# tokio-util = "0.7"
+tokio-util = "0.7"
 futures = "0.3"
 async-trait = "0.1"
 
