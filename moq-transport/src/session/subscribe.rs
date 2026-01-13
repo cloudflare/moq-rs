@@ -22,9 +22,6 @@ pub struct SubscribeInfo {
     pub subscriber_priority: u8,
     pub group_order: GroupOrder,
 
-    /// Forward Flag
-    pub forward: bool,
-
     /// Filter type
     pub filter_type: FilterType,
 
@@ -48,7 +45,6 @@ impl SubscribeInfo {
             track_name: msg.track_name.clone(),
             subscriber_priority: msg.subscriber_priority,
             group_order: msg.group_order,
-            forward: msg.forward,
             filter_type: msg.filter_type,
             start_location: msg.start_location,
             end_group_id: msg.end_group_id,
@@ -96,7 +92,6 @@ impl Subscribe {
             // TODO add prioritization logic on the publisher side
             subscriber_priority: 127, // default to mid value, see: https://github.com/moq-wg/moq-transport/issues/504
             group_order: GroupOrder::Publisher, // defer to publisher send order
-            forward: true,            // default to forwarding objects
             filter_type: FilterType::LargestObject,
             start_location: None,
             end_group_id: None,

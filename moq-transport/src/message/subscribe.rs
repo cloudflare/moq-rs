@@ -20,9 +20,6 @@ pub struct Subscribe {
     pub subscriber_priority: u8,
     pub group_order: GroupOrder,
 
-    /// Forward Flag
-    pub forward: bool,
-
     /// Filter type
     pub filter_type: FilterType,
 
@@ -44,8 +41,6 @@ impl Decode for Subscribe {
 
         let subscriber_priority = u8::decode(r)?;
         let group_order = GroupOrder::decode(r)?;
-
-        let forward = bool::decode(r)?;
 
         let filter_type = FilterType::decode(r)?;
         let start_location: Option<Location>;
@@ -73,7 +68,6 @@ impl Decode for Subscribe {
             track_name,
             subscriber_priority,
             group_order,
-            forward,
             filter_type,
             start_location,
             end_group_id,
@@ -91,8 +85,6 @@ impl Encode for Subscribe {
 
         self.subscriber_priority.encode(w)?;
         self.group_order.encode(w)?;
-
-        self.forward.encode(w)?;
 
         self.filter_type.encode(w)?;
         match self.filter_type {
@@ -145,7 +137,6 @@ mod tests {
             track_name: "audiotrack".to_string(),
             subscriber_priority: 127,
             group_order: GroupOrder::Publisher,
-            forward: true,
             filter_type: FilterType::NextGroupStart,
             start_location: None,
             end_group_id: None,
@@ -162,7 +153,6 @@ mod tests {
             track_name: "audiotrack".to_string(),
             subscriber_priority: 127,
             group_order: GroupOrder::Publisher,
-            forward: true,
             filter_type: FilterType::AbsoluteStart,
             start_location: Some(Location::new(12345, 67890)),
             end_group_id: None,
@@ -179,7 +169,6 @@ mod tests {
             track_name: "audiotrack".to_string(),
             subscriber_priority: 127,
             group_order: GroupOrder::Publisher,
-            forward: true,
             filter_type: FilterType::AbsoluteRange,
             start_location: Some(Location::new(12345, 67890)),
             end_group_id: Some(23456),
@@ -201,7 +190,6 @@ mod tests {
             track_name: "audiotrack".to_string(),
             subscriber_priority: 127,
             group_order: GroupOrder::Publisher,
-            forward: true,
             filter_type: FilterType::AbsoluteStart,
             start_location: None,
             end_group_id: None,
@@ -217,7 +205,6 @@ mod tests {
             track_name: "audiotrack".to_string(),
             subscriber_priority: 127,
             group_order: GroupOrder::Publisher,
-            forward: true,
             filter_type: FilterType::AbsoluteRange,
             start_location: None,
             end_group_id: None,
@@ -233,7 +220,6 @@ mod tests {
             track_name: "audiotrack".to_string(),
             subscriber_priority: 127,
             group_order: GroupOrder::Publisher,
-            forward: true,
             filter_type: FilterType::AbsoluteRange,
             start_location: Some(Location::new(12345, 67890)),
             end_group_id: None,
