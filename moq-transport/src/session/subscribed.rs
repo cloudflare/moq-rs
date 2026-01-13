@@ -102,13 +102,12 @@ impl Subscribed {
         // Send SubscribeOk using send_message_and_wait to ensure it is sent at least to the QUIC stack before
         // we start serving the track.  If a subscriber gets the stream before SubscribeOk
         // then they won't recognize the track_alias in the stream header.
+        let track_alias = self.publisher.next_track_alias();
         self.publisher
             .send_message_and_wait(message::SubscribeOk {
                 id: self.info.id,
-                track_alias: self.info.id, // use subscription id as track alias
-                group_order: message::GroupOrder::Descending, // TODO: resolve correct value from publisher / subscriber prefs
-                content_exists: largest_location.is_some(),
-                largest_location,
+                track_alias,
+                track_extensions: Default::default(),
                 params: Default::default(),
             })
             .await;
@@ -203,7 +202,7 @@ impl Subscribed {
                             track_alias: self.info.id, // use subscription id as track_alias
                             group_id: subgroup.group_id,
                             subgroup_id: Some(subgroup.subgroup_id),
-                            publisher_priority: subgroup.priority,
+                            publisher_priority: Some(subgroup.priority),
                         };
 
                         let publisher = self.publisher.clone();
@@ -250,7 +249,7 @@ impl Subscribed {
         let mut writer = Writer::new(send_stream);
 
         log::debug!(
-            "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
+            "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={:?}, header_type={:?}",
             header.track_alias,
             header.group_id,
             header.subgroup_id,
@@ -375,7 +374,7 @@ impl Subscribed {
                 track_alias: self.info.id, // use subscription id as track_alias
                 group_id: datagram.group_id,
                 object_id: Some(datagram.object_id),
-                publisher_priority: datagram.priority,
+                publisher_priority: Some(datagram.priority),
                 extension_headers: if has_extension_headers {
                     Some(datagram.extension_headers.clone())
                 } else {
@@ -394,7 +393,7 @@ impl Subscribed {
             encoded_datagram.encode(&mut buffer)?;
 
             log::debug!(
-                "[PUBLISHER] serve_datagrams: sending datagram #{} - track_alias={}, group_id={}, object_id={}, priority={}, payload_len={}, extension_headers={:?}, total_encoded_len={}",
+                "[PUBLISHER] serve_datagrams: sending datagram #{} - track_alias={}, group_id={}, object_id={}, priority={:?}, payload_len={}, extension_headers={:?}, total_encoded_len={}",
                 datagram_count + 1,
                 encoded_datagram.track_alias,
                 encoded_datagram.group_id,

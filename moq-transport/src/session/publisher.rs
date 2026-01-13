@@ -49,6 +49,10 @@ pub struct Publisher {
     /// increment by 2 for each request (odd numbers).
     next_requestid: Arc<atomic::AtomicU64>,
 
+    /// When we need a new Track Alias for sending a request, we can get it from here.
+    /// track alias is used in publish and subscribe_ok message
+    next_track_alias: Arc<atomic::AtomicU64>,
+
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
@@ -68,8 +72,14 @@ impl Publisher {
             unknown_track_status_requested: Default::default(),
             outgoing,
             next_requestid,
+            next_track_alias: Arc::new(atomic::AtomicU64::new(0)),
             mlog,
         }
+    }
+
+    pub fn next_track_alias(&self) -> u64 {
+        self.next_track_alias
+            .fetch_add(1, atomic::Ordering::Relaxed)
     }
 
     pub async fn accept(

@@ -696,7 +696,7 @@ impl Subscriber {
             // Look up the subscribe by id
             if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&subscribe_id) {
                 log::trace!(
-                    "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                    "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
                     datagram.track_alias,
                     datagram.group_id,
                     datagram.object_id.unwrap_or(0),
@@ -707,7 +707,7 @@ impl Subscriber {
             }
         } else {
             log::warn!(
-                "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
                 datagram.track_alias,
                 datagram.group_id,
                 datagram.object_id.unwrap_or(0),

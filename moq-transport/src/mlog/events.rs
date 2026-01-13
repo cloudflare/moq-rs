@@ -235,25 +235,12 @@ pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Server) -> E
 
 /// Helper to convert SUBSCRIBE message to JSON
 fn subscribe_to_json(msg: &message::Subscribe) -> JsonValue {
-    let mut json = json!({
+    let json = json!({
         "subscribe_id": msg.id,
         "track_namespace": msg.track_namespace.to_string(),
         "track_name": &msg.track_name,
-        "subscriber_priority": msg.subscriber_priority,
-        "group_order": format!("{:?}", msg.group_order),
-        "filter_type": format!("{:?}", msg.filter_type),
         "parameters": key_value_pairs_to_vec(&msg.params.0),
     });
-
-    // Add optional fields based on filter type
-    if let Some(start_loc) = &msg.start_location {
-        json["start_group"] = json!(start_loc.group_id);
-        json["start_object"] = json!(start_loc.object_id);
-    }
-    if let Some(end_group) = msg.end_group_id {
-        json["end_group"] = json!(end_group);
-    }
-
     json
 }
 
@@ -269,22 +256,11 @@ pub fn subscribe_created(time: f64, stream_id: u64, msg: &message::Subscribe) ->
 
 /// Helper to convert SUBSCRIBE_OK message to JSON
 fn subscribe_ok_to_json(msg: &message::SubscribeOk) -> JsonValue {
-    let mut json = json!({
+    let json = json!({
         "subscribe_id": msg.id,
         "track_alias": msg.track_alias,
-        "group_order": format!("{:?}", msg.group_order),
-        "content_exists": msg.content_exists,
         "parameters": key_value_pairs_to_vec(&msg.params.0),
     });
-
-    // Add optional largest_location fields if content exists
-    if msg.content_exists {
-        if let Some(largest) = &msg.largest_location {
-            json["largest_group_id"] = json!(largest.group_id);
-            json["largest_object_id"] = json!(largest.object_id);
-        }
-    }
-
     json
 }
 
