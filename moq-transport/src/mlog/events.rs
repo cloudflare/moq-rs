@@ -272,7 +272,6 @@ fn subscribe_ok_to_json(msg: &message::SubscribeOk) -> JsonValue {
     let mut json = json!({
         "subscribe_id": msg.id,
         "track_alias": msg.track_alias,
-        "expires": msg.expires,
         "group_order": format!("{:?}", msg.group_order),
         "content_exists": msg.content_exists,
         "parameters": key_value_pairs_to_vec(&msg.params.0),

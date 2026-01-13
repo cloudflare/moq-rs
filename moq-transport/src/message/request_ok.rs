@@ -1,5 +1,3 @@
-use bytes::buf;
-
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
 
 /// Reqeust Ok

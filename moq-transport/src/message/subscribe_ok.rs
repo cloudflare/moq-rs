@@ -10,9 +10,6 @@ pub struct SubscribeOk {
     /// The identifier used for this track in Subgroups or Datagrams.
     pub track_alias: u64,
 
-    /// The time in milliseconds after which the subscription is not longer valid.
-    pub expires: u64,
-
     /// Order groups will be delivered in
     pub group_order: GroupOrder,
 
@@ -29,7 +26,6 @@ impl Decode for SubscribeOk {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
         let track_alias = u64::decode(r)?;
-        let expires = u64::decode(r)?;
         let group_order = GroupOrder::decode(r)?;
         let content_exists = bool::decode(r)?;
         let largest_location = match content_exists {
@@ -41,7 +37,6 @@ impl Decode for SubscribeOk {
         Ok(Self {
             id,
             track_alias,
-            expires,
             group_order,
             content_exists,
             largest_location,
@@ -54,7 +49,6 @@ impl Encode for SubscribeOk {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.id.encode(w)?;
         self.track_alias.encode(w)?;
-        self.expires.encode(w)?;
         self.group_order.encode(w)?;
         self.content_exists.encode(w)?;
         if self.content_exists {
@@ -86,7 +80,6 @@ mod tests {
         let msg = SubscribeOk {
             id: 12345,
             track_alias: 100,
-            expires: 3600,
             group_order: GroupOrder::Publisher,
             content_exists: true,
             largest_location: Some(Location::new(2, 3)),
@@ -104,7 +97,6 @@ mod tests {
         let msg = SubscribeOk {
             id: 12345,
             track_alias: 100,
-            expires: 3600,
             group_order: GroupOrder::Publisher,
             content_exists: true,
             largest_location: None,
