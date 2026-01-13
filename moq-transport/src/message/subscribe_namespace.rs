@@ -58,6 +58,7 @@ mod tests {
 
         let msg = SubscribeNamespace {
             id: 12345,
+            forward: 0,
             track_namespace_prefix: TrackNamespace::from_utf8_path("path/prefix"),
             params: kvps,
         };

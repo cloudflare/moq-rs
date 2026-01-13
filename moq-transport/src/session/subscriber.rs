@@ -149,9 +149,7 @@ impl Subscriber {
             message::Publisher::RequestError(msg) => self.recv_request_error(msg),
             message::Publisher::TrackStatusOk(msg) => self.recv_track_status_ok(msg),
             message::Publisher::FetchOk(_msg) => Err(SessionError::unimplemented("FETCH_OK")),
-            message::Publisher::SubscribeNamespaceOk(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE_OK"))
-            }
+            message::Publisher::RequestOk(_msg) => Err(SessionError::unimplemented("REQUEST_OK")),
             message::Publisher::SubscribeNamespaceError(_msg) => {
                 Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE_ERROR"))
             }

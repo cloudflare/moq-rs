@@ -382,39 +382,25 @@ pub fn publish_namespace_created(
 }
 
 /// Helper to convert PUBLISH_NAMESPACE_OK message to JSON
-fn publish_namespace_ok_to_json(msg: &message::PublishNamespaceOk) -> JsonValue {
+fn request_ok_to_json(msg: &message::RequestOk) -> JsonValue {
     json!({
         "request_id": msg.id,
     })
 }
 
-/// Create a control_message_parsed event for PUBLISH_NAMESPACE_OK (was ANNOUNCE_OK)
-pub fn publish_namespace_ok_parsed(
-    time: f64,
-    stream_id: u64,
-    msg: &message::PublishNamespaceOk,
-) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        true,
-        "publish_namespace_ok",
-        publish_namespace_ok_to_json(msg),
-    )
+/// Create a control_message_parsed event for REQUEST_OK
+pub fn request_ok_parsed(time: f64, stream_id: u64, msg: &message::RequestOk) -> Event {
+    create_control_message_event(time, stream_id, true, "request_ok", request_ok_to_json(msg))
 }
 
-/// Create a control_message_created event for PUBLISH_NAMESPACE_OK
-pub fn publish_namespace_ok_created(
-    time: f64,
-    stream_id: u64,
-    msg: &message::PublishNamespaceOk,
-) -> Event {
+/// Create a control_message_created event for Reqeust OK
+pub fn reqeust_ok_created(time: f64, stream_id: u64, msg: &message::RequestOk) -> Event {
     create_control_message_event(
         time,
         stream_id,
         false,
-        "publish_namespace_ok",
-        publish_namespace_ok_to_json(msg),
+        "request_ok",
+        request_ok_to_json(msg),
     )
 }
 

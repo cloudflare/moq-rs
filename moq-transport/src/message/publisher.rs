@@ -53,7 +53,7 @@ publisher_msgs! {
     SubscribeOk,
     TrackStatusOk,
     FetchOk,
-    SubscribeNamespaceOk,
+    RequestOk,
     SubscribeNamespaceError,
     RequestError,
 }

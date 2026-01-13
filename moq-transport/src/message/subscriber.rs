@@ -55,7 +55,7 @@ subscriber_msgs! {
     SubscribeNamespace,
     UnsubscribeNamespace,
     PublishNamespaceCancel,
-    PublishNamespaceOk,
+    RequestOk,
     PublishNamespaceError,
     PublishOk,
     RequestError,

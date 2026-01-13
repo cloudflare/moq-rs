@@ -20,15 +20,14 @@ mod publish_done;
 mod publish_namespace;
 mod publish_namespace_cancel;
 mod publish_namespace_error;
-mod publish_namespace_ok;
 mod publish_ok;
 mod publisher;
 mod request_error;
+mod request_ok;
 mod requests_blocked;
 mod subscribe;
 mod subscribe_namespace;
 mod subscribe_namespace_error;
-mod subscribe_namespace_ok;
 mod subscribe_ok;
 mod subscribe_update;
 mod subscriber;
@@ -52,15 +51,14 @@ pub use publish_done::*;
 pub use publish_namespace::*;
 pub use publish_namespace_cancel::*;
 pub use publish_namespace_error::*;
-pub use publish_namespace_ok::*;
 pub use publish_ok::*;
 pub use publisher::*;
 pub use request_error::*;
+pub use request_ok::*;
 pub use requests_blocked::*;
 pub use subscribe::*;
 pub use subscribe_namespace::*;
 pub use subscribe_namespace_error::*;
-pub use subscribe_namespace_ok::*;
 pub use subscribe_ok::*;
 pub use subscribe_update::*;
 pub use subscriber::*;
@@ -186,7 +184,7 @@ message_types! {
     PublishNamespace = 0x6,
     PublishNamespaceDone = 0x9,
     // ANNOUNCE family, sent by subscriber
-    PublishNamespaceOk = 0x7,
+    RequestOk = 0x7,
     PublishNamespaceError = 0x8,
     PublishNamespaceCancel = 0xc,
 
@@ -199,7 +197,6 @@ message_types! {
     SubscribeNamespace = 0x11,
     UnsubscribeNamespace = 0x14,
     // NAMESPACE family, sent by publisher
-    SubscribeNamespaceOk = 0x12,
     SubscribeNamespaceError = 0x13,
 
     // FETCH family, sent by subscriber

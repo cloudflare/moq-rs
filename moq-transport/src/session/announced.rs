@@ -51,8 +51,9 @@ impl Announced {
             return Err(ServeError::Duplicate);
         }
 
-        self.session.send_message(message::PublishNamespaceOk {
+        self.session.send_message(message::RequestOk {
             id: self.info.request_id,
+            params: Default::default(),
         });
 
         self.ok = true;

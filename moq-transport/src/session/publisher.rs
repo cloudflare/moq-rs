@@ -235,7 +235,7 @@ impl Publisher {
             message::Subscriber::PublishNamespaceCancel(msg) => {
                 self.recv_publish_namespace_cancel(msg)
             }
-            message::Subscriber::PublishNamespaceOk(msg) => self.recv_publish_namespace_ok(msg),
+            message::Subscriber::RequestOk(msg) => self.recv_request_ok(msg),
             message::Subscriber::PublishNamespaceError(msg) => {
                 self.recv_publish_namespace_error(msg)
             }
@@ -252,10 +252,9 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_publish_namespace_ok(
-        &mut self,
-        msg: message::PublishNamespaceOk,
-    ) -> Result<(), SessionError> {
+    // NOTE(itzmanish): since request ok is common for [subscribe/publish]_namespace need to test if
+    // it is a subscribe namespace or publish namespace
+    fn recv_request_ok(&mut self, msg: message::RequestOk) -> Result<(), SessionError> {
         // We need to find the announce request using the request id, however the self.announces data structure
         // is a HashMap indexed by Namespace (which is needed for handling PUBLISH_NAMESPACE_CANCEL).  TODO - make more efficient.
         // For now iterate through all self.annouces until we find the matching id.
