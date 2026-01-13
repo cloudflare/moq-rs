@@ -9,6 +9,9 @@ pub struct SubscribeNamespace {
     /// The track namespace prefix
     pub track_namespace_prefix: TrackNamespace,
 
+    /// The Forward value that new subscriptions resulting from this SUBSCRIBE_NAMESPACE will have
+    pub forward: u8,
+
     /// Optional parameters
     pub params: KeyValuePairs,
 }
@@ -17,11 +20,13 @@ impl Decode for SubscribeNamespace {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
         let track_namespace_prefix = TrackNamespace::decode(r)?;
+        let forward = u8::decode(r)?;
         let params = KeyValuePairs::decode(r)?;
 
         Ok(Self {
             id,
             track_namespace_prefix,
+            forward,
             params,
         })
     }
@@ -31,6 +36,7 @@ impl Encode for SubscribeNamespace {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.id.encode(w)?;
         self.track_namespace_prefix.encode(w)?;
+        self.forward.encode(w)?;
         self.params.encode(w)?;
 
         Ok(())

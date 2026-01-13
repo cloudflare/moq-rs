@@ -240,8 +240,8 @@ impl Publisher {
                 self.recv_publish_namespace_error(msg)
             }
             message::Subscriber::PublishOk(_msg) => Err(SessionError::unimplemented("PUBLISH_OK")),
-            message::Subscriber::PublishError(_msg) => {
-                Err(SessionError::unimplemented("PUBLISH_ERROR"))
+            message::Subscriber::RequestError(_msg) => {
+                Err(SessionError::unimplemented("REQUEST ERROR"))
             }
         };
 
@@ -397,7 +397,7 @@ impl Publisher {
         let msg = msg.into();
         match &msg {
             message::Publisher::PublishDone(m) => self.drop_subscribe(m.id),
-            message::Publisher::SubscribeError(m) => self.drop_subscribe(m.id),
+            message::Publisher::RequestError(m) => self.drop_subscribe(m.id),
             message::Publisher::PublishNamespaceDone(m) => {
                 self.drop_publish_namespace(&m.track_namespace);
             }

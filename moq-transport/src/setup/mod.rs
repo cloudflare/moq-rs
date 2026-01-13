@@ -14,4 +14,4 @@ pub use param_types::*;
 pub use server::*;
 pub use version::*;
 
-pub const ALPN: &[u8] = b"moq-00";
+pub const ALPN: &[u8] = b"moqt-16";

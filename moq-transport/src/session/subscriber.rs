@@ -146,13 +146,9 @@ impl Subscriber {
             message::Publisher::Publish(_msg) => Err(SessionError::unimplemented("PUBLISH")),
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg),
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg),
-            message::Publisher::SubscribeError(msg) => self.recv_subscribe_error(msg),
+            message::Publisher::RequestError(msg) => self.recv_request_error(msg),
             message::Publisher::TrackStatusOk(msg) => self.recv_track_status_ok(msg),
-            message::Publisher::TrackStatusError(_msg) => {
-                Err(SessionError::unimplemented("TRACK_STATUS_ERROR"))
-            }
             message::Publisher::FetchOk(_msg) => Err(SessionError::unimplemented("FETCH_OK")),
-            message::Publisher::FetchError(_msg) => Err(SessionError::unimplemented("FETCH_ERROR")),
             message::Publisher::SubscribeNamespaceOk(_msg) => {
                 Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE_OK"))
             }
@@ -240,12 +236,22 @@ impl Subscriber {
         }
     }
 
-    /// Handle the reception of a SubscribeError message from the publisher.
-    fn recv_subscribe_error(&mut self, msg: &message::SubscribeError) -> Result<(), SessionError> {
+    /// Handle incoming request error which can be for fetch, subscribe and track status
+    /// TODO(itzmanish): correlate the request id with active fetch, subscribe and track_status request
+    /// and operate on the error.
+    /// For now since we don't support other than subscribe message, we can just treat it as a subscribe error
+    fn recv_request_error(&mut self, msg: &message::RequestError) -> Result<(), SessionError> {
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
             subscribe.error(ServeError::Closed(msg.error_code))?;
+        } else {
+            log::warn!(
+                "[SUBSCRIBER] recv_request_error: request id {} not found or not a subscribe request",
+                msg.id
+            );
+            Err(SessionError::unimplemented(
+                "request error for non-subscribe request",
+            ))?;
         }
-
         Ok(())
     }
 

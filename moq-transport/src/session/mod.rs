@@ -52,14 +52,6 @@ pub struct Session {
 }
 
 impl Session {
-    // Helper for determining the largest supported version
-    fn largest_common<T: Ord + Clone + Eq>(a: &[T], b: &[T]) -> Option<T> {
-        a.iter()
-            .filter(|x| b.contains(x)) // keep only items also in b
-            .cloned() // clone because we return T, not &T
-            .max() // take the largest
-    }
-
     fn new(
         webtransport: web_transport::Session,
         sender: Writer,
@@ -113,16 +105,10 @@ impl Session {
         let mut sender = Writer::new(control.0);
         let mut recver = Reader::new(control.1);
 
-        let versions: setup::Versions = [setup::Version::DRAFT_14].into();
-
-        // TODO SLG - make configurable?
         let mut params = KeyValuePairs::default();
         params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
-        let client = setup::Client {
-            versions: versions.clone(),
-            params,
-        };
+        let client = setup::Client { params };
 
         log::debug!("sending CLIENT_SETUP: {:?}", client);
         sender.encode(&client).await?;
@@ -163,35 +149,24 @@ impl Session {
             let _ = mlog.add_event(event);
         }
 
-        let server_versions = setup::Versions(vec![setup::Version::DRAFT_14]);
+        // TODO SLG - make configurable?
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
-        if let Some(largest_common_version) =
-            Self::largest_common(&server_versions, &client.versions)
-        {
-            // TODO SLG - make configurable?
-            let mut params = KeyValuePairs::default();
-            params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
+        let server = setup::Server { params };
 
-            let server = setup::Server {
-                version: largest_common_version,
-                params,
-            };
+        log::debug!("sending SERVER_SETUP: {:?}", server);
 
-            log::debug!("sending SERVER_SETUP: {:?}", server);
-
-            // Emit mlog event for SERVER_SETUP created
-            if let Some(ref mut mlog) = mlog {
-                let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
-                let _ = mlog.add_event(event);
-            }
-
-            sender.encode(&server).await?;
-
-            // We are the server, so the first request id is 1
-            Ok(Session::new(session, sender, recver, 1, mlog))
-        } else {
-            Err(SessionError::Version(client.versions, server_versions))
+        // Emit mlog event for SERVER_SETUP created
+        if let Some(ref mut mlog) = mlog {
+            let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
+            let _ = mlog.add_event(event);
         }
+
+        sender.encode(&server).await?;
+
+        // We are the server, so the first request id is 1
+        Ok(Session::new(session, sender, recver, 1, mlog))
     }
 
     /// Run Tasks for the session, including sending of control messages, receiving and processing
@@ -229,8 +204,8 @@ impl Session {
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_created(time, stream_id, m))
                         }
-                        Message::SubscribeError(m) => {
-                            Some(mlog::events::subscribe_error_created(time, stream_id, m))
+                        Message::RequestError(m) => {
+                            Some(mlog::events::reqeust_error_created(time, stream_id, m))
                         }
                         Message::Unsubscribe(m) => {
                             Some(mlog::events::unsubscribe_created(time, stream_id, m))
@@ -291,8 +266,8 @@ impl Session {
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_parsed(time, stream_id, m))
                         }
-                        Message::SubscribeError(m) => {
-                            Some(mlog::events::subscribe_error_parsed(time, stream_id, m))
+                        Message::RequestError(m) => {
+                            Some(mlog::events::request_error_parsed(time, stream_id, m))
                         }
                         Message::Unsubscribe(m) => {
                             Some(mlog::events::unsubscribe_parsed(time, stream_id, m))

@@ -207,7 +207,6 @@ fn create_control_message_event(
 
 /// Create a control_message_parsed event for CLIENT_SETUP
 pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Event {
-    let versions: Vec<String> = msg.versions.0.iter().map(|v| format!("{:?}", v)).collect();
     create_control_message_event(
         time,
         stream_id,
@@ -215,8 +214,6 @@ pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Ev
         "client_setup",
         json!(
         {
-            "number_of_supported_versions": msg.versions.0.len(),
-            "supported_versions": versions,
             "parameters": key_value_pairs_to_vec(&msg.params.0),
         }),
     )
@@ -231,7 +228,6 @@ pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Server) -> E
         "server_setup",
         json!(
         {
-            "selected_version": format!("{:?}", msg.version),
             "parameters": key_value_pairs_to_vec(&msg.params.0),
         }),
     )
@@ -316,33 +312,33 @@ pub fn subscribe_ok_created(time: f64, stream_id: u64, msg: &message::SubscribeO
 }
 
 /// Helper to convert SUBSCRIBE_ERROR message to JSON
-fn subscribe_error_to_json(msg: &message::SubscribeError) -> JsonValue {
+fn request_error_to_json(msg: &message::RequestError) -> JsonValue {
     json!({
-        "subscribe_id": msg.id,
+        "request_id": msg.id,
         "error_code": msg.error_code,
         "reason_phrase": &msg.reason_phrase.0,
     })
 }
 
 /// Create a control_message_parsed event for SUBSCRIBE_ERROR
-pub fn subscribe_error_parsed(time: f64, stream_id: u64, msg: &message::SubscribeError) -> Event {
+pub fn request_error_parsed(time: f64, stream_id: u64, msg: &message::RequestError) -> Event {
     create_control_message_event(
         time,
         stream_id,
         true,
-        "subscribe_error",
-        subscribe_error_to_json(msg),
+        "request_error",
+        request_error_to_json(msg),
     )
 }
 
 /// Create a control_message_created event for SUBSCRIBE_ERROR
-pub fn subscribe_error_created(time: f64, stream_id: u64, msg: &message::SubscribeError) -> Event {
+pub fn reqeust_error_created(time: f64, stream_id: u64, msg: &message::RequestError) -> Event {
     create_control_message_event(
         time,
         stream_id,
         false,
-        "subscribe_error",
-        subscribe_error_to_json(msg),
+        "request_error",
+        request_error_to_json(msg),
     )
 }
 

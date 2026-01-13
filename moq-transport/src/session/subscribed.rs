@@ -178,7 +178,7 @@ impl Drop for Subscribed {
                 reason: ReasonPhrase(err.to_string()),
             });
         } else {
-            self.publisher.send_message(message::SubscribeError {
+            self.publisher.send_message(message::RequestError {
                 id: self.info.id,
                 error_code: err.code(),
                 reason_phrase: ReasonPhrase(err.to_string()),

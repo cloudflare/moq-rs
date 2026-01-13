@@ -1,14 +1,9 @@
-use super::Version;
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
 
 /// Sent by the server in response to a client setup.
 /// This SERVER_SETUP message is used by moq-transport draft versions 11 and later.
-/// Id = 0x21 vs 0x41 for versions <= 10.
 #[derive(Debug)]
 pub struct Server {
-    /// The list of supported versions in preferred order.
-    pub version: Version,
-
     /// Setup Parameters, ie: MAX_REQUEST_ID, MAX_AUTH_TOKEN_CACHE_SIZE,
     /// AUTHORIZATION_TOKEN, etc.
     pub params: KeyValuePairs,
@@ -26,10 +21,9 @@ impl Decode for Server {
         let _len = u16::decode(r)?;
         // TODO: Check the length of the message.
 
-        let version = Version::decode(r)?;
         let params = KeyValuePairs::decode(r)?;
 
-        Ok(Self { version, params })
+        Ok(Self { params })
     }
 }
 
@@ -44,7 +38,6 @@ impl Encode for Server {
         //       write the length later, to avoid the copy of the message bytes?
         let mut buf = Vec::new();
 
-        self.version.encode(&mut buf).unwrap();
         self.params.encode(&mut buf).unwrap();
 
         // Make sure buf.len() <= u16::MAX
@@ -75,10 +68,7 @@ mod tests {
         let mut params = KeyValuePairs::default();
         params.set_intvalue(ParameterType::MaxRequestId.into(), 1000);
 
-        let server = Server {
-            version: Version::DRAFT_14,
-            params,
-        };
+        let server = Server { params };
 
         server.encode(&mut buf).unwrap();
 
@@ -95,7 +85,6 @@ mod tests {
         );
 
         let decoded = Server::decode(&mut buf).unwrap();
-        assert_eq!(decoded.version, server.version);
         assert_eq!(decoded.params, server.params);
     }
 }

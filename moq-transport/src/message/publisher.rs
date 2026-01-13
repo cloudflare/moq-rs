@@ -51,11 +51,9 @@ publisher_msgs! {
     Publish,
     PublishDone,
     SubscribeOk,
-    SubscribeError,
     TrackStatusOk,
-    TrackStatusError,
     FetchOk,
-    FetchError,
     SubscribeNamespaceOk,
     SubscribeNamespaceError,
+    RequestError,
 }
