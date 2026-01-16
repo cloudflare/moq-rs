@@ -1,6 +1,7 @@
 use crate::coding::{
     Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location, TrackNamespace,
 };
+use crate::data::ExtensionHeaders;
 use crate::message::GroupOrder;
 
 /// Sent by publisher to initiate a subscription to a track.
@@ -22,6 +23,9 @@ pub struct Publish {
 
     /// Optional parameters
     pub params: KeyValuePairs,
+
+    /// Track extensions
+    pub track_extensions: ExtensionHeaders,
 }
 
 impl Decode for Publish {
@@ -46,6 +50,7 @@ impl Decode for Publish {
         let forward = bool::decode(r)?;
 
         let params = KeyValuePairs::decode(r)?;
+        let track_extensions = ExtensionHeaders::decode(r)?;
 
         Ok(Self {
             id,
@@ -57,6 +62,7 @@ impl Decode for Publish {
             largest_location,
             forward,
             params,
+            track_extensions,
         })
     }
 }
@@ -85,6 +91,7 @@ impl Encode for Publish {
         }
         self.forward.encode(w)?;
         self.params.encode(w)?;
+        self.track_extensions.encode(w)?;
 
         Ok(())
     }
@@ -114,6 +121,7 @@ mod tests {
             largest_location: Some(Location::new(2, 3)),
             forward: true,
             params: kvps.clone(),
+            track_extensions: Default::default(),
         };
         msg.encode(&mut buf).unwrap();
         let decoded = Publish::decode(&mut buf).unwrap();
@@ -130,6 +138,7 @@ mod tests {
             largest_location: None,
             forward: true,
             params: kvps.clone(),
+            track_extensions: Default::default(),
         };
         msg.encode(&mut buf).unwrap();
         let decoded = Publish::decode(&mut buf).unwrap();
@@ -150,6 +159,7 @@ mod tests {
             largest_location: None,
             forward: true,
             params: Default::default(),
+            track_extensions: Default::default(),
         };
         let encoded = msg.encode(&mut buf);
         assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
@@ -169,6 +179,7 @@ mod tests {
             largest_location: None,
             forward: true,
             params: Default::default(),
+            track_extensions: Default::default(),
         };
         let encoded = msg.encode(&mut buf);
         assert!(matches!(encoded.unwrap_err(), EncodeError::InvalidValue));

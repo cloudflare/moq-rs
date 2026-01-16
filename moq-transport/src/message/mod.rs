@@ -5,6 +5,7 @@
 //! The only exception are OBJECT "messages", which are sent over dedicated QUIC streams.
 //!
 
+mod dynamic_groups;
 mod fetch;
 mod fetch_cancel;
 mod fetch_ok;
@@ -33,6 +34,7 @@ mod track_status;
 mod track_status_ok;
 mod unsubscribe;
 
+pub use dynamic_groups::*;
 pub use fetch::*;
 pub use fetch_cancel::*;
 pub use fetch_ok::*;

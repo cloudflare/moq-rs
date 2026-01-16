@@ -150,6 +150,22 @@ impl KeyValuePairs {
     pub fn get(&self, key: u64) -> Option<&KeyValuePair> {
         self.0.iter().find(|k| k.key == key)
     }
+
+    /// Get an integer value by key, returning None if not found or if the value is not an integer
+    pub fn get_intvalue(&self, key: u64) -> Option<u64> {
+        self.get(key).and_then(|kvp| match &kvp.value {
+            Value::IntValue(v) => Some(*v),
+            Value::BytesValue(_) => None,
+        })
+    }
+
+    /// Get a bytes value by key, returning None if not found or if the value is not bytes
+    pub fn get_bytesvalue(&self, key: u64) -> Option<&Vec<u8>> {
+        self.get(key).and_then(|kvp| match &kvp.value {
+            Value::IntValue(_) => None,
+            Value::BytesValue(v) => Some(v),
+        })
+    }
 }
 
 impl Decode for KeyValuePairs {

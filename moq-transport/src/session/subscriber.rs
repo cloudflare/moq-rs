@@ -509,6 +509,20 @@ impl Subscriber {
                             }
                         }
 
+                        // Check for Prior Object ID Gap (type 0x3E = 62)
+                        if object.extension_headers.has(0x3E) {
+                            log::info!(
+                                "[SUBSCRIBER] recv_subgroup: object #{} contains PRIOR OBJECT ID GAP (type 0x3E)",
+                                object_count + 1
+                            );
+                            if let Some(gap_ext) = object.extension_headers.get(0x3E) {
+                                log::debug!(
+                                    "[SUBSCRIBER] recv_subgroup: prior object id gap details: {:?}",
+                                    gap_ext
+                                );
+                            }
+                        }
+
                         let obj_copy = object.clone();
                         (
                             object.payload_length,
@@ -674,6 +688,19 @@ impl Subscriber {
                 if let Some(gap_ext) = ext_headers.get(0x3C) {
                     log::debug!(
                         "[SUBSCRIBER] recv_datagram: prior group id gap details: {:?}",
+                        gap_ext
+                    );
+                }
+            }
+
+            // Check for Prior Object ID Gap (type 0x3E = 62)
+            if ext_headers.has(0x3E) {
+                log::info!(
+                    "[SUBSCRIBER] recv_datagram: datagram contains PRIOR OBJECT ID GAP (type 0x3E)"
+                );
+                if let Some(gap_ext) = ext_headers.get(0x3E) {
+                    log::debug!(
+                        "[SUBSCRIBER] recv_datagram: prior object id gap details: {:?}",
                         gap_ext
                     );
                 }
