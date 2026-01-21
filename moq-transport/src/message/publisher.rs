@@ -51,8 +51,8 @@ publisher_msgs! {
     Publish,
     PublishDone,
     SubscribeOk,
-    TrackStatusOk,
     FetchOk,
     RequestOk,
     RequestError,
+    Namespace,
 }

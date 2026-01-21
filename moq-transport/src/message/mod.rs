@@ -14,7 +14,8 @@ mod filter_type;
 mod go_away;
 mod group_order;
 mod max_request_id;
-mod parameters;
+mod namespace;
+mod namespace_done;
 mod pubilsh_namespace_done;
 mod publish;
 mod publish_done;
@@ -24,14 +25,13 @@ mod publish_ok;
 mod publisher;
 mod request_error;
 mod request_ok;
+mod request_update;
 mod requests_blocked;
 mod subscribe;
 mod subscribe_namespace;
 mod subscribe_ok;
-mod subscribe_update;
 mod subscriber;
 mod track_status;
-mod track_status_ok;
 mod unsubscribe;
 
 pub use dynamic_groups::*;
@@ -43,7 +43,8 @@ pub use filter_type::*;
 pub use go_away::*;
 pub use group_order::*;
 pub use max_request_id::*;
-pub use parameters::*;
+pub use namespace::*;
+pub use namespace_done::*;
 pub use pubilsh_namespace_done::*;
 pub use publish::*;
 pub use publish_done::*;
@@ -53,14 +54,13 @@ pub use publish_ok::*;
 pub use publisher::*;
 pub use request_error::*;
 pub use request_ok::*;
+pub use request_update::*;
 pub use requests_blocked::*;
 pub use subscribe::*;
 pub use subscribe_namespace::*;
 pub use subscribe_ok::*;
-pub use subscribe_update::*;
 pub use subscriber::*;
 pub use track_status::*;
-pub use track_status_ok::*;
 pub use unsubscribe::*;
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
@@ -170,7 +170,7 @@ message_types! {
     RequestsBlocked = 0x1a,
 
     // SUBSCRIBE family, sent by subscriber
-    SubscribeUpdate = 0x2,
+    RequestUpdate = 0x2,
     Subscribe = 0x3,
     Unsubscribe = 0xa,
     // SUBSCRIBE family, sent by publisher
@@ -183,13 +183,14 @@ message_types! {
     RequestOk = 0x7,
     PublishNamespaceCancel = 0xc,
 
-    // TRACK_STATUS family, sent by subscriber
+    // TRACK_STATUS, sent by subscriber (response is REQUEST_OK per draft-16)
     TrackStatus = 0xd,
-    // TRACK_STATUS family, sent by publisher
-    TrackStatusOk = 0xe,
 
     // NAMESPACE family, sent by subscriber
     SubscribeNamespace = 0x11,
+    // NAMESPACE family, sent by publisher
+    Namespace = 0x8,
+    NamespaceDone = 0xe,
 
     // FETCH family, sent by subscriber
     Fetch = 0x16,

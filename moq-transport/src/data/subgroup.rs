@@ -310,8 +310,15 @@ impl Decode for SubgroupObjectExt {
             }
         };
 
-        //Self::decode_remaining(r, payload_length);
-        //let payload = r.copy_to_bytes(payload_length);
+        if let Some(ref s) = status {
+            if *s != ObjectStatus::NormalObject && !extension_headers.is_empty() {
+                log::warn!(
+                    "[DECODE] SubgroupObjectExt: extension headers not allowed for non-Normal status {:?}",
+                    s
+                );
+                return Err(DecodeError::InvalidValue);
+            }
+        }
 
         log::debug!(
             "[DECODE] SubgroupObjectExt complete: object_id_delta={}, payload_length={}, status={:?}, buffer_remaining={} bytes",
@@ -326,7 +333,6 @@ impl Decode for SubgroupObjectExt {
             extension_headers,
             payload_length,
             status,
-            //payload,
         })
     }
 }
@@ -340,6 +346,16 @@ impl Encode for SubgroupObjectExt {
             self.status,
             self.extension_headers
         );
+
+        if let Some(ref s) = self.status {
+            if *s != ObjectStatus::NormalObject && !self.extension_headers.is_empty() {
+                log::error!(
+                    "[ENCODE] SubgroupObjectExt: extension headers not allowed for non-Normal status {:?}",
+                    s
+                );
+                return Err(EncodeError::InvalidValue);
+            }
+        }
 
         self.object_id_delta.encode(w)?;
         log::trace!(
@@ -365,8 +381,6 @@ impl Encode for SubgroupObjectExt {
                 return Err(EncodeError::MissingField("Status".to_string()));
             }
         }
-        //Self::encode_remaining(w, self.payload.len())?;
-        //w.put_slice(&self.payload);
 
         log::debug!("[ENCODE] SubgroupObjectExt complete");
 

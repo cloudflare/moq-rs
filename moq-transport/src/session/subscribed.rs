@@ -114,6 +114,9 @@ impl Subscribed {
 
         self.ok = true; // So we send SubscribeDone on drop
 
+        // TODO(itzmanish): check the forward state before sending the track data
+        // if forward state is not 0 then only send the track data
+
         // Serve based on track mode
         match track.mode().await? {
             // TODO cancel track/datagrams on closed
@@ -179,6 +182,7 @@ impl Drop for Subscribed {
             self.publisher.send_message(message::RequestError {
                 id: self.info.id,
                 error_code: err.code(),
+                retry_interval: 0,
                 reason_phrase: ReasonPhrase(err.to_string()),
             });
         };

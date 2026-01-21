@@ -1,14 +1,15 @@
 use std::ops;
 
 use crate::{
-    coding::{KeyValuePairs, TrackNamespace},
-    data, message,
+    coding::TrackNamespace,
+    data::{self, Parameters},
+    message,
     serve::{self, ServeError, TrackWriter, TrackWriterMode},
 };
 
 use crate::watch::State;
 
-use super::Subscriber;
+use super::{Subscriber, SubscriptionState, SubscriptionTransition};
 
 // TODO rename to SubscriptionInfo when used for Publishes as well?
 #[derive(Debug, Clone)]
@@ -17,7 +18,7 @@ pub struct SubscribeInfo {
     pub track_namespace: TrackNamespace,
     pub track_name: String,
     /// Optional parameters
-    pub params: KeyValuePairs,
+    pub params: Parameters,
 
     // Set to true if this is a track_status request only
     pub track_status: bool,
@@ -33,10 +34,16 @@ impl SubscribeInfo {
             track_status: false,
         }
     }
+
+    pub fn forward_state(&self) -> Result<u64, ServeError> {
+        self.params
+            .get_forward()
+            .ok_or(ServeError::MissingParameter("forward".to_string()))
+    }
 }
 
 struct SubscribeState {
-    ok: bool,
+    subscription_state: SubscriptionState,
     track_alias: Option<u64>,
     closed: Result<(), ServeError>,
 }
@@ -44,7 +51,7 @@ struct SubscribeState {
 impl Default for SubscribeState {
     fn default() -> Self {
         Self {
-            ok: Default::default(),
+            subscription_state: SubscriptionState::Idle,
             track_alias: None,
             closed: Ok(()),
         }
@@ -76,7 +83,13 @@ impl Subscribe {
 
         subscriber.send_message(subscribe_message);
 
-        let (send, recv) = State::default().split();
+        let mut initial_state = SubscribeState::default();
+        initial_state.subscription_state = initial_state
+            .subscription_state
+            .transition(SubscriptionTransition::Subscribe)
+            .unwrap_or(SubscriptionState::Pending);
+
+        let (send, recv) = State::new(initial_state).split();
 
         let send = Subscribe {
             state: send,
@@ -131,12 +144,15 @@ pub(super) struct SubscribeRecv {
 impl SubscribeRecv {
     pub fn ok(&mut self, alias: u64) -> Result<(), ServeError> {
         let state = self.state.lock();
-        if state.ok {
+        if state.subscription_state == SubscriptionState::Established {
             return Err(ServeError::Duplicate);
         }
 
         if let Some(mut state) = state.into_mut() {
-            state.ok = true;
+            state.subscription_state = state
+                .subscription_state
+                .transition(SubscriptionTransition::SubscribeOk)
+                .unwrap_or(SubscriptionState::Established);
             state.track_alias = Some(alias);
         }
 
@@ -149,14 +165,22 @@ impl SubscribeRecv {
     }
 
     pub fn error(mut self, err: ServeError) -> Result<(), ServeError> {
+        let state = self.state.lock();
+        if state.subscription_state == SubscriptionState::Terminated {
+            return Err(ServeError::Duplicate);
+        }
+
         if let Some(writer) = self.writer.take() {
             writer.close(err.clone())?;
         }
 
-        let state = self.state.lock();
         state.closed.clone()?;
 
         let mut state = state.into_mut().ok_or(ServeError::Cancel)?;
+        state.subscription_state = state
+            .subscription_state
+            .transition(SubscriptionTransition::RequestError)
+            .unwrap_or(SubscriptionState::Terminated);
         state.closed = Err(err);
 
         Ok(())

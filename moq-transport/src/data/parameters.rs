@@ -1,3 +1,5 @@
+use crate::coding::KeyValuePairs;
+
 /// Version-Specific Message Parameter Types
 /// Used in SUBSCRIBE, SUBSCRIBE_OK, PUBLISH, FETCH, REQUEST_UPDATE, etc.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,5 +35,17 @@ pub enum ParameterType {
 impl From<ParameterType> for u64 {
     fn from(value: ParameterType) -> Self {
         value as u64
+    }
+}
+
+pub type Parameters = KeyValuePairs;
+
+impl Parameters {
+    pub fn get_delivery_timeout(&self) -> Option<u64> {
+        self.get_intvalue(ParameterType::DeliveryTimeout.into())
+    }
+
+    pub fn get_forward(&self) -> Option<u64> {
+        self.get_intvalue(ParameterType::Forward.into())
     }
 }

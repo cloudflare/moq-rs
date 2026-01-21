@@ -324,7 +324,7 @@ Special values:
 
 - [ ] **Bidirectional SUBSCRIBE_NAMESPACE stream** - SUBSCRIBE_NAMESPACE now uses bidirectional stream, response messages (NAMESPACE, NAMESPACE_DONE) sent on response half.
 
-- [ ] **Track Extensions in control messages** - Add Track Extensions field to SUBSCRIBE_OK, PUBLISH, FETCH_OK.
+- [x] **Track Extensions in control messages** - Add Track Extensions field to SUBSCRIBE_OK, PUBLISH, FETCH_OK.
 
 - [ ] **FETCH Joining calculation** - Update joining fetch end location calculation per Section 9.16.2.1.
 
@@ -374,10 +374,10 @@ Based on the codebase structure:
 3. Update FETCH object serialization
 
 ### Phase 3: New Features
-1. Authorization Token support
-2. Extension Headers (Immutable, Prior Gap headers)
-3. Dynamic Groups support
-4. Track Extensions
+1. ~~Authorization Token support~~ (DONE - auth_token.rs with cache and alias management)
+2. ~~Extension Headers (Immutable, Prior Gap headers)~~ (DONE - extension_types.rs with constants, detection in subscriber)
+3. ~~Dynamic Groups support~~ (DONE - dynamic_groups.rs with helper traits and config)
+4. ~~Track Extensions~~ (DONE - added to PUBLISH and FETCH_OK messages)
 
 ### Phase 4: Session Management
 1. Subscription state machine

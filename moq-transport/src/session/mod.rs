@@ -6,6 +6,7 @@ mod reader;
 mod subscribe;
 mod subscribed;
 mod subscriber;
+mod subscription_state;
 mod track_status_requested;
 mod writer;
 
@@ -16,6 +17,7 @@ pub use publisher::*;
 pub use subscribe::*;
 pub use subscribed::*;
 pub use subscriber::*;
+pub use subscription_state::*;
 pub use track_status_requested::*;
 
 use reader::*;
@@ -31,14 +33,14 @@ use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
 
+pub struct ControlStream(Writer, Reader);
+
 /// Session object for managing all communications in a single QUIC connection.
 #[must_use = "run() must be called"]
 pub struct Session {
     webtransport: web_transport::Session,
 
-    /// Control Stream Reader and Writer (QUIC bi-directional stream)
-    sender: Writer, // Control Stream Sender
-    recver: Reader, // Control Stream Receiver
+    control_stream: ControlStream,
 
     publisher: Option<Publisher>, // Contains Publisher side logic, uses outgoing message queue to send control messages
     subscriber: Option<Subscriber>, // Contains Subscriber side logic, uses outgoing message queue to send control messages
@@ -79,8 +81,7 @@ impl Session {
 
         let session = Self {
             webtransport,
-            sender,
-            recver,
+            control_stream: ControlStream(sender, recver),
             publisher: publisher.clone(),
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
@@ -143,7 +144,8 @@ impl Session {
         let client: setup::Client = recver.decode().await?;
         log::debug!("received CLIENT_SETUP: {:?}", client);
 
-        // Emit mlog event for CLIENT_SETUP parsed
+        client.validate()?;
+
         if let Some(ref mut mlog) = mlog {
             let event = mlog::events::client_setup_parsed(mlog.elapsed_ms(), 0, &client);
             let _ = mlog.add_event(event);
@@ -174,8 +176,8 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone()) => res,
-            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
+            res = Self::run_recv(self.control_stream.1, self.publisher, self.subscriber.clone(), self.mlog.clone()) => res,
+            res = Self::run_send(self.control_stream.0, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
         }

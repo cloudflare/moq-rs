@@ -47,7 +47,7 @@ macro_rules! subscriber_msgs {
 // Defines messages that a SUBSCRIBER would send, or that a PUBLISHER would handle
 subscriber_msgs! {
     Subscribe,
-    SubscribeUpdate,
+    RequestUpdate,
     Unsubscribe,
     Fetch,
     FetchCancel,

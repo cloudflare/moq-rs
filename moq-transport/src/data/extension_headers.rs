@@ -1,5 +1,7 @@
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePair};
+use crate::data::extension_types::{IMMUTABLE_EXTENSIONS, PRIOR_GROUP_ID_GAP, PRIOR_OBJECT_ID_GAP};
 use bytes::Buf;
+use std::collections::HashSet;
 use std::fmt;
 
 /// A collection of KeyValuePair entries, where the length in bytes of key-value-pairs are encoded/decoded first.
@@ -44,29 +46,36 @@ impl ExtensionHeaders {
     }
 }
 
+impl ExtensionHeaders {
+    fn is_known_extension_type(key: u64) -> bool {
+        key == IMMUTABLE_EXTENSIONS || key == PRIOR_GROUP_ID_GAP || key == PRIOR_OBJECT_ID_GAP
+    }
+}
+
 impl Decode for ExtensionHeaders {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        // Read total byte length of the encoded kvps
-        // Note: this is the difference between KeyValuePairs and ExtensionHeaders.
-        // KeyValuePairs encodes the count of kvps, whereas ExtensionHeaders encodes the total byte length.
         let length = usize::decode(r)?;
 
-        // Ensure we have that many bytes available in the input
         Self::decode_remaining(r, length)?;
 
-        // If zero length, return empty map
         if length == 0 {
             return Ok(ExtensionHeaders::new());
         }
 
-        // Copy the exact slice that contains the encoded kvps and decode from it
         let mut buf = vec![0u8; length];
         r.copy_to_slice(&mut buf);
         let mut kvps_bytes = bytes::Bytes::from(buf);
 
         let mut kvps = Vec::new();
+        let mut seen_keys: HashSet<u64> = HashSet::new();
+
         while kvps_bytes.has_remaining() {
             let kvp = KeyValuePair::decode(&mut kvps_bytes)?;
+
+            if Self::is_known_extension_type(kvp.key) && seen_keys.contains(&kvp.key) {
+                return Err(DecodeError::DuplicateParameter(kvp.key));
+            }
+            seen_keys.insert(kvp.key);
             kvps.push(kvp);
         }
 

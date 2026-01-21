@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 use crate::{
     coding::{Decode, TrackNamespace},
     data,
-    message::{self, FilterType, GroupOrder, Message},
+    message::{self, Message},
     mlog,
     serve::{self, ServeError},
 };
@@ -100,12 +100,6 @@ impl Subscriber {
             id: self.get_next_request_id(),
             track_namespace: track_namespace.clone(),
             track_name: track_name.to_string(),
-            subscriber_priority: 127, // default to mid value, see: https://github.com/moq-wg/moq-transport/issues/504
-            group_order: GroupOrder::Publisher, // defer to publisher send order
-            forward: true,            // default to forwarding objects
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
             params: Default::default(),
         });
         // TODO make async and wait for response?
@@ -136,15 +130,15 @@ impl Subscriber {
     /// Receive a message from the publisher via the control stream.
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
         let res = match &msg {
-            message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg),
             message::Publisher::PublishNamespaceDone(msg) => self.recv_publish_namespace_done(msg),
-            message::Publisher::Publish(_msg) => Err(SessionError::unimplemented("PUBLISH")),
+            message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg),
+            message::Publisher::Publish(msg) => self.recv_publish(msg),
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg),
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg),
             message::Publisher::RequestError(msg) => self.recv_request_error(msg),
-            message::Publisher::TrackStatusOk(msg) => self.recv_track_status_ok(msg),
             message::Publisher::FetchOk(_msg) => Err(SessionError::unimplemented("FETCH_OK")),
-            message::Publisher::RequestOk(_msg) => Err(SessionError::unimplemented("REQUEST_OK")),
+            message::Publisher::RequestOk(msg) => self.recv_request_ok(msg),
+            message::Publisher::Namespace(_msg) => Err(SessionError::unimplemented("NAMESPACE")),
         };
 
         if let Err(SessionError::Serve(err)) = res {
@@ -155,11 +149,16 @@ impl Subscriber {
         res
     }
 
-    /// Handle the reception of a PublishNamespace message from the publisher.
     fn recv_publish_namespace(
         &mut self,
         msg: &message::PublishNamespace,
     ) -> Result<(), SessionError> {
+        // TODO(itzmanish): implement publish namespace
+        Err(SessionError::unimplemented("PUBLISH_NAMESPACE"))
+    }
+
+    /// Handle the reception of a PublishNamespace message from the publisher.
+    fn recv_publish(&mut self, msg: &message::Publish) -> Result<(), SessionError> {
         let mut announces = self.announced.lock().unwrap();
 
         // Check for duplicate namespace announcement
@@ -175,6 +174,8 @@ impl Subscriber {
             return Ok(());
         }
         entry.insert(recv);
+
+        // TODO(itzmanish): check the map for susbscribe_namespace entries and forward the message to them
 
         Ok(())
     }
@@ -254,11 +255,9 @@ impl Subscriber {
         Ok(())
     }
 
-    /// Handle the reception of a TrackStatusOk message from the publisher.
-    fn recv_track_status_ok(&mut self, _msg: &message::TrackStatusOk) -> Result<(), SessionError> {
-        // TODO: Expose this somehow?
-        // TODO: Also add a way to send a Track Status Request in the first place
-
+    fn recv_request_ok(&mut self, _msg: &message::RequestOk) -> Result<(), SessionError> {
+        // REQUEST_OK is sent in response to REQUEST_UPDATE, TRACK_STATUS, SUBSCRIBE_NAMESPACE, PUBLISH_NAMESPACE
+        // TODO: Track which request types are outstanding and handle accordingly
         Ok(())
     }
 

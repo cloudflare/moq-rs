@@ -96,37 +96,20 @@ mod tests {
     }
 
     #[test]
-    fn encode_missing_fields() {
+    fn encode_default_params() {
+        // Test that a Subscribe with default (empty) params encodes correctly
+        // In draft-16, filter_type, start_location, etc. are moved to parameters
+        // and are optional, so no MissingField errors should occur
         let mut buf = BytesMut::new();
 
-        // FilterType = AbsoluteStart - missing start_location
         let msg = Subscribe {
             id: 12345,
             track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
             track_name: "audiotrack".to_string(),
             params: Default::default(),
         };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-
-        // FilterType = AbsoluteRange - missing start_location
-        let msg = Subscribe {
-            id: 12345,
-            track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
-            track_name: "audiotrack".to_string(),
-            params: Default::default(),
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
-
-        // FilterType = AbsoluteRange - missing end_group_id
-        let msg = Subscribe {
-            id: 12345,
-            track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
-            track_name: "audiotrack".to_string(),
-            params: Default::default(),
-        };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
+        msg.encode(&mut buf).unwrap();
+        let decoded = Subscribe::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
     }
 }

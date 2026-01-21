@@ -1,4 +1,5 @@
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
+use crate::setup::{AuthTokenType, ParameterType};
 
 /// Sent by the client to setup the session.
 /// This CLIENT_SETUP message is used by moq-transport draft versions 11 and later.
@@ -7,6 +8,23 @@ pub struct Client {
     /// Setup Parameters, ie: PATH, MAX_REQUEST_ID,
     /// MAX_AUTH_TOKEN_CACHE_SIZE, AUTHORIZATION_TOKEN, etc.
     pub params: KeyValuePairs,
+}
+
+impl Client {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if let Some(auth_bytes) = self
+            .params
+            .get_bytesvalue(ParameterType::AuthorizationToken as u64)
+        {
+            if !auth_bytes.is_empty() {
+                let token_type = auth_bytes[0];
+                if token_type == AuthTokenType::UseAlias as u8 {
+                    return Err(DecodeError::InvalidAuthTokenType);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Decode for Client {
@@ -77,9 +95,7 @@ mod tests {
             buf.to_vec(),
             vec![
                 0x20, // Type
-                0x00, 0x14, // Length
-                0x01, // 1 Version
-                0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0D, // Version DRAFT_13 (0xff00000D)
+                0x00, 0x0b, // Length (11 bytes: 1 param count + 10 param bytes)
                 0x01, // 1 Param
                 0x01, 0x08, 0x74, 0x65, 0x73, 0x74, 0x70, 0x61, 0x74, 0x68, // Key=1 (Path), Value="testpath"
             ]

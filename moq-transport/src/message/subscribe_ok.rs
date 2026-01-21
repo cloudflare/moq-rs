@@ -68,7 +68,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_missing_fields() {
+    fn encode_default_params() {
         let mut buf = BytesMut::new();
 
         let msg = SubscribeOk {
@@ -77,7 +77,8 @@ mod tests {
             params: Default::default(),
             track_extensions: Default::default(),
         };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
+        msg.encode(&mut buf).unwrap();
+        let decoded = SubscribeOk::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
     }
 }

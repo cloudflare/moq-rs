@@ -5,7 +5,7 @@
 //! publishers to create new groups on demand.
 
 use crate::coding::KeyValuePairs;
-use crate::message::ParameterType;
+use crate::data::ParameterType;
 
 /// Helper trait for Dynamic Groups parameter operations on KeyValuePairs.
 pub trait DynamicGroupsExt {

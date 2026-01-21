@@ -2,7 +2,7 @@
 // - SubscribeUpdate (parsed/created)
 // - PublishNamespaceDone (parsed/created)
 // - PublishNamespaceCancel (parsed/created)
-// - TrackStatus, TrackStatusOk (parsed/created)
+// - TrackStatus (parsed/created) - response is REQUEST_OK per draft-16
 // - SubscribeNamespace (parsed/created)
 // - Fetch, FetchOk, FetchCancel (parsed/created)
 // - Publish, PublishOk, PublishError, PublishDone (parsed/created)

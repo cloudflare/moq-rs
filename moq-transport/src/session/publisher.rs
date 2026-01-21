@@ -181,6 +181,9 @@ impl Publisher {
             subscribed.info.track_namespace.clone(),
             &subscribed.info.track_name,
         ) {
+            // TODO(itzmanish): check the forward state of the subscribed if it's 1 and the publisher's forward state is
+            // 0, send a request update to publisher to make forward state 1
+
             subscribed.serve(track).await?;
         } else {
             let namespace = subscribed.info.track_namespace.clone();
@@ -229,16 +232,14 @@ impl Publisher {
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
         let res = match msg {
             message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg),
-            message::Subscriber::SubscribeUpdate(msg) => self.recv_subscribe_update(msg),
+            message::Subscriber::RequestUpdate(msg) => self.recv_request_update(msg),
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg),
             message::Subscriber::Fetch(_msg) => Err(SessionError::unimplemented("FETCH")),
             message::Subscriber::FetchCancel(_msg) => {
                 Err(SessionError::unimplemented("FETCH_CANCEL"))
             }
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg),
-            message::Subscriber::SubscribeNamespace(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE"))
-            }
+            message::Subscriber::SubscribeNamespace(_msg) => self.recv_subscribe_namespace(),
             message::Subscriber::PublishNamespaceCancel(msg) => {
                 self.recv_publish_namespace_cancel(msg)
             }
@@ -292,6 +293,11 @@ impl Publisher {
         Ok(())
     }
 
+    fn recv_subscribe_namespace(&mut self) -> Result<(), SessionError> {
+        // TODO(itzmanish): implement subscribe namespace handler
+        Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE"))
+    }
+
     fn recv_publish_namespace_cancel(
         &mut self,
         msg: message::PublishNamespaceCancel,
@@ -343,12 +349,30 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_subscribe_update(
-        &mut self,
-        _msg: message::SubscribeUpdate,
-    ) -> Result<(), SessionError> {
-        // TODO: Implement updating subscriptions.
-        Err(SessionError::unimplemented("SUBSCRIBE_UPDATE"))
+    fn recv_request_update(&mut self, msg: message::RequestUpdate) -> Result<(), SessionError> {
+        let subscription_exists = self
+            .subscribeds
+            .lock()
+            .unwrap()
+            .contains_key(&msg.existing_request_id);
+
+        if subscription_exists {
+            self.send_message(message::RequestOk {
+                id: msg.id,
+                params: Default::default(),
+            });
+        } else {
+            self.send_message(message::RequestError {
+                id: msg.id,
+                error_code: 0x10,
+                retry_interval: 0,
+                reason_phrase: crate::coding::ReasonPhrase(format!(
+                    "Subscription {} not found",
+                    msg.existing_request_id
+                )),
+            });
+        }
+        Ok(())
     }
 
     fn recv_track_status(&mut self, msg: message::TrackStatus) -> Result<(), SessionError> {
