@@ -151,7 +151,7 @@ impl Subscriber {
 
     fn recv_publish_namespace(
         &mut self,
-        msg: &message::PublishNamespace,
+        _msg: &message::PublishNamespace,
     ) -> Result<(), SessionError> {
         // TODO(itzmanish): implement publish namespace
         Err(SessionError::unimplemented("PUBLISH_NAMESPACE"))
