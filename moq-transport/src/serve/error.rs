@@ -36,6 +36,9 @@ pub enum ServeError {
 
     #[error("not implemented: {0} [error:{1}]")]
     NotImplementedWithId(String, uuid::Uuid),
+
+    #[error("missing parameter: {0}")]
+    MissingParameter(String),
 }
 
 impl ServeError {
@@ -57,6 +60,7 @@ impl ServeError {
             // NOT_SUPPORTED (0x3) - appears in multiple error code registries
             Self::Mode => 0x3,
             Self::Size => 0x3,
+            Self::MissingParameter(_) => 0x3,
             Self::NotImplemented(_) | Self::NotImplementedWithId(_, _) => 0x3,
             // INTERNAL_ERROR (0x0) - per-request error registries use 0x0
             Self::Internal(_) | Self::InternalWithId(_, _) => 0x0,

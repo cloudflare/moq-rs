@@ -1,4 +1,5 @@
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location};
+use crate::data::ExtensionHeaders;
 use crate::message::GroupOrder;
 
 /// A publisher sends a FETCH_OK control message in response to successful fetches.
@@ -18,6 +19,9 @@ pub struct FetchOk {
 
     /// Optional parameters
     pub params: KeyValuePairs,
+
+    /// Track extensions
+    pub track_extensions: ExtensionHeaders,
 }
 
 impl Decode for FetchOk {
@@ -33,6 +37,7 @@ impl Decode for FetchOk {
         let end_of_track = bool::decode(r)?;
         let end_location = Location::decode(r)?;
         let params = KeyValuePairs::decode(r)?;
+        let track_extensions = ExtensionHeaders::decode(r)?;
 
         Ok(Self {
             id,
@@ -40,6 +45,7 @@ impl Decode for FetchOk {
             end_of_track,
             end_location,
             params,
+            track_extensions,
         })
     }
 }
@@ -57,6 +63,7 @@ impl Encode for FetchOk {
         self.end_of_track.encode(w)?;
         self.end_location.encode(w)?;
         self.params.encode(w)?;
+        self.track_extensions.encode(w)?;
 
         Ok(())
     }
@@ -81,6 +88,7 @@ mod tests {
             end_of_track: true,
             end_location: Location::new(2, 3),
             params: kvps.clone(),
+            track_extensions: Default::default(),
         };
         msg.encode(&mut buf).unwrap();
         let decoded = FetchOk::decode(&mut buf).unwrap();
@@ -97,6 +105,7 @@ mod tests {
             end_of_track: true,
             end_location: Location::new(2, 3),
             params: Default::default(),
+            track_extensions: Default::default(),
         };
         let encoded = msg.encode(&mut buf);
         assert!(matches!(encoded.unwrap_err(), EncodeError::InvalidValue));

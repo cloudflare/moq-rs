@@ -21,9 +21,10 @@ impl TrackStatusRequested {
         error_code: u64,
         error_message: &str,
     ) -> Result<(), SessionError> {
-        let status_error = message::TrackStatusError {
+        let status_error = message::RequestError {
             id: self.request_msg.id,
             error_code,
+            retry_interval: 0,
             reason_phrase: ReasonPhrase(error_message.to_string()),
         };
         self.publisher.send_message(status_error);
@@ -31,15 +32,20 @@ impl TrackStatusRequested {
     }
 
     pub fn respond_ok(mut self, track: &serve::TrackReader) -> Result<(), SessionError> {
-        // Send TrackStatusOk
-        self.publisher.send_message(message::TrackStatusOk {
+        use crate::coding::{Encode, KeyValuePairs};
+        use crate::data::ParameterType;
+
+        let mut params = KeyValuePairs::new();
+
+        if let Some(largest) = track.largest_location() {
+            let mut buf = Vec::new();
+            largest.encode(&mut buf).ok();
+            params.set_bytesvalue(ParameterType::LargestObject.into(), buf);
+        }
+
+        self.publisher.send_message(message::RequestOk {
             id: self.request_msg.id,
-            track_alias: self.request_msg.id, // TODO SLG does a track alias make sense in track_status response?  Using track_status request id for now
-            expires: 0,                       // TODO SLG
-            group_order: message::GroupOrder::Ascending, // TODO: resolve correct value from publisher / subscriber prefs
-            content_exists: track.largest_location().is_some(),
-            largest_location: track.largest_location(),
-            params: Default::default(),
+            params,
         });
 
         Ok(())

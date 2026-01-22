@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 use crate::{
     coding::{Decode, TrackNamespace},
     data,
-    message::{self, FilterType, GroupOrder, Message},
+    message::{self, Message},
     mlog,
     serve::{self, ServeError},
 };
@@ -100,12 +100,6 @@ impl Subscriber {
             id: self.get_next_request_id(),
             track_namespace: track_namespace.clone(),
             track_name: track_name.to_string(),
-            subscriber_priority: 127, // default to mid value, see: https://github.com/moq-wg/moq-transport/issues/504
-            group_order: GroupOrder::Publisher, // defer to publisher send order
-            forward: true,            // default to forwarding objects
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
             params: Default::default(),
         });
         // TODO make async and wait for response?
@@ -125,13 +119,8 @@ impl Subscriber {
         let msg = msg.into();
 
         // Remove our entry on terminal state.
-        match &msg {
-            message::Subscriber::PublishNamespaceCancel(msg) => {
-                self.drop_publish_namespace(&msg.track_namespace)
-            }
-            // TODO SLG - there is no longer a namespace in the error, need to map via request id
-            message::Subscriber::PublishNamespaceError(_msg) => {} // Not implemented yet - need request id mapping
-            _ => {}
+        if let message::Subscriber::PublishNamespaceCancel(msg) = &msg {
+            self.drop_publish_namespace(&msg.track_namespace)
         }
 
         // TODO report dropped messages?
@@ -141,24 +130,15 @@ impl Subscriber {
     /// Receive a message from the publisher via the control stream.
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
         let res = match &msg {
-            message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg),
             message::Publisher::PublishNamespaceDone(msg) => self.recv_publish_namespace_done(msg),
-            message::Publisher::Publish(_msg) => Err(SessionError::unimplemented("PUBLISH")),
+            message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg),
+            message::Publisher::Publish(msg) => self.recv_publish(msg),
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg),
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg),
-            message::Publisher::SubscribeError(msg) => self.recv_subscribe_error(msg),
-            message::Publisher::TrackStatusOk(msg) => self.recv_track_status_ok(msg),
-            message::Publisher::TrackStatusError(_msg) => {
-                Err(SessionError::unimplemented("TRACK_STATUS_ERROR"))
-            }
+            message::Publisher::RequestError(msg) => self.recv_request_error(msg),
             message::Publisher::FetchOk(_msg) => Err(SessionError::unimplemented("FETCH_OK")),
-            message::Publisher::FetchError(_msg) => Err(SessionError::unimplemented("FETCH_ERROR")),
-            message::Publisher::SubscribeNamespaceOk(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE_OK"))
-            }
-            message::Publisher::SubscribeNamespaceError(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE_ERROR"))
-            }
+            message::Publisher::RequestOk(msg) => self.recv_request_ok(msg),
+            message::Publisher::Namespace(_msg) => Err(SessionError::unimplemented("NAMESPACE")),
         };
 
         if let Err(SessionError::Serve(err)) = res {
@@ -169,11 +149,16 @@ impl Subscriber {
         res
     }
 
-    /// Handle the reception of a PublishNamespace message from the publisher.
     fn recv_publish_namespace(
         &mut self,
-        msg: &message::PublishNamespace,
+        _msg: &message::PublishNamespace,
     ) -> Result<(), SessionError> {
+        // TODO(itzmanish): implement publish namespace
+        Err(SessionError::unimplemented("PUBLISH_NAMESPACE"))
+    }
+
+    /// Handle the reception of a PublishNamespace message from the publisher.
+    fn recv_publish(&mut self, msg: &message::Publish) -> Result<(), SessionError> {
         let mut announces = self.announced.lock().unwrap();
 
         // Check for duplicate namespace announcement
@@ -189,6 +174,8 @@ impl Subscriber {
             return Ok(());
         }
         entry.insert(recv);
+
+        // TODO(itzmanish): check the map for susbscribe_namespace entries and forward the message to them
 
         Ok(())
     }
@@ -240,12 +227,22 @@ impl Subscriber {
         }
     }
 
-    /// Handle the reception of a SubscribeError message from the publisher.
-    fn recv_subscribe_error(&mut self, msg: &message::SubscribeError) -> Result<(), SessionError> {
+    /// Handle incoming request error which can be for fetch, subscribe and track status
+    /// TODO(itzmanish): correlate the request id with active fetch, subscribe and track_status request
+    /// and operate on the error.
+    /// For now since we don't support other than subscribe message, we can just treat it as a subscribe error
+    fn recv_request_error(&mut self, msg: &message::RequestError) -> Result<(), SessionError> {
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
             subscribe.error(ServeError::Closed(msg.error_code))?;
+        } else {
+            log::warn!(
+                "[SUBSCRIBER] recv_request_error: request id {} not found or not a subscribe request",
+                msg.id
+            );
+            Err(SessionError::unimplemented(
+                "request error for non-subscribe request",
+            ))?;
         }
-
         Ok(())
     }
 
@@ -258,11 +255,9 @@ impl Subscriber {
         Ok(())
     }
 
-    /// Handle the reception of a TrackStatusOk message from the publisher.
-    fn recv_track_status_ok(&mut self, _msg: &message::TrackStatusOk) -> Result<(), SessionError> {
-        // TODO: Expose this somehow?
-        // TODO: Also add a way to send a Track Status Request in the first place
-
+    fn recv_request_ok(&mut self, _msg: &message::RequestOk) -> Result<(), SessionError> {
+        // REQUEST_OK is sent in response to REQUEST_UPDATE, TRACK_STATUS, SUBSCRIBE_NAMESPACE, PUBLISH_NAMESPACE
+        // TODO: Track which request types are outstanding and handle accordingly
         Ok(())
     }
 
@@ -513,6 +508,20 @@ impl Subscriber {
                             }
                         }
 
+                        // Check for Prior Object ID Gap (type 0x3E = 62)
+                        if object.extension_headers.has(0x3E) {
+                            log::info!(
+                                "[SUBSCRIBER] recv_subgroup: object #{} contains PRIOR OBJECT ID GAP (type 0x3E)",
+                                object_count + 1
+                            );
+                            if let Some(gap_ext) = object.extension_headers.get(0x3E) {
+                                log::debug!(
+                                    "[SUBSCRIBER] recv_subgroup: prior object id gap details: {:?}",
+                                    gap_ext
+                                );
+                            }
+                        }
+
                         let obj_copy = object.clone();
                         (
                             object.payload_length,
@@ -682,6 +691,19 @@ impl Subscriber {
                     );
                 }
             }
+
+            // Check for Prior Object ID Gap (type 0x3E = 62)
+            if ext_headers.has(0x3E) {
+                log::info!(
+                    "[SUBSCRIBER] recv_datagram: datagram contains PRIOR OBJECT ID GAP (type 0x3E)"
+                );
+                if let Some(gap_ext) = ext_headers.get(0x3E) {
+                    log::debug!(
+                        "[SUBSCRIBER] recv_datagram: prior object id gap details: {:?}",
+                        gap_ext
+                    );
+                }
+            }
         }
 
         // Look up the subscribe id for this track alias
@@ -692,7 +714,7 @@ impl Subscriber {
             // Look up the subscribe by id
             if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&subscribe_id) {
                 log::trace!(
-                    "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                    "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
                     datagram.track_alias,
                     datagram.group_id,
                     datagram.object_id.unwrap_or(0),
@@ -703,7 +725,7 @@ impl Subscriber {
             }
         } else {
             log::warn!(
-                "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
                 datagram.track_alias,
                 datagram.group_id,
                 datagram.object_id.unwrap_or(0),

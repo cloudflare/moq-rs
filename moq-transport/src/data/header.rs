@@ -6,6 +6,7 @@ use std::fmt;
 #[repr(u64)]
 #[derive(Copy, Debug, Clone, Eq, PartialEq)]
 pub enum StreamHeaderType {
+    // Priority Present variants (0x10-0x1D)
     SubgroupZeroId = 0x10,
     SubgroupZeroIdExt = 0x11,
     SubgroupFirstObjectId = 0x12,
@@ -18,13 +19,27 @@ pub enum StreamHeaderType {
     SubgroupFirstObjectIdExtEndOfGroup = 0x1b,
     SubgroupIdEndOfGroup = 0x1c,
     SubgroupIdExtEndOfGroup = 0x1d,
+    // Priority Not Present variants (0x30-0x3D)
+    SubgroupZeroIdNoPriority = 0x30,
+    SubgroupZeroIdExtNoPriority = 0x31,
+    SubgroupFirstObjectIdNoPriority = 0x32,
+    SubgroupFirstObjectIdExtNoPriority = 0x33,
+    SubgroupIdNoPriority = 0x34,
+    SubgroupIdExtNoPriority = 0x35,
+    SubgroupZeroIdEndOfGroupNoPriority = 0x38,
+    SubgroupZeroIdExtEndOfGroupNoPriority = 0x39,
+    SubgroupFirstObjectIdEndOfGroupNoPriority = 0x3a,
+    SubgroupFirstObjectIdExtEndOfGroupNoPriority = 0x3b,
+    SubgroupIdEndOfGroupNoPriority = 0x3c,
+    SubgroupIdExtEndOfGroupNoPriority = 0x3d,
+    // Fetch
     Fetch = 0x5,
 }
 
 impl StreamHeaderType {
     pub fn is_subgroup(&self) -> bool {
         let header_type = *self as u64;
-        (0x10..=0x1d).contains(&header_type)
+        (0x10..=0x1d).contains(&header_type) || (0x30..=0x3d).contains(&header_type)
     }
 
     pub fn is_fetch(&self) -> bool {
@@ -40,6 +55,12 @@ impl StreamHeaderType {
                 | StreamHeaderType::SubgroupZeroIdExtEndOfGroup
                 | StreamHeaderType::SubgroupFirstObjectIdExtEndOfGroup
                 | StreamHeaderType::SubgroupIdExtEndOfGroup
+                | StreamHeaderType::SubgroupZeroIdExtNoPriority
+                | StreamHeaderType::SubgroupFirstObjectIdExtNoPriority
+                | StreamHeaderType::SubgroupIdExtNoPriority
+                | StreamHeaderType::SubgroupZeroIdExtEndOfGroupNoPriority
+                | StreamHeaderType::SubgroupFirstObjectIdExtEndOfGroupNoPriority
+                | StreamHeaderType::SubgroupIdExtEndOfGroupNoPriority
                 | StreamHeaderType::Fetch
         )
     }
@@ -51,7 +72,18 @@ impl StreamHeaderType {
                 | StreamHeaderType::SubgroupIdExt
                 | StreamHeaderType::SubgroupIdEndOfGroup
                 | StreamHeaderType::SubgroupIdExtEndOfGroup
+                | StreamHeaderType::SubgroupIdNoPriority
+                | StreamHeaderType::SubgroupIdExtNoPriority
+                | StreamHeaderType::SubgroupIdEndOfGroupNoPriority
+                | StreamHeaderType::SubgroupIdExtEndOfGroupNoPriority
         )
+    }
+
+    pub fn has_priority(&self) -> bool {
+        let header_type = *self as u64;
+        // Priority Present variants are 0x10-0x1D
+        // Priority Not Present variants are 0x30-0x3D
+        (0x10..=0x1d).contains(&header_type)
     }
 }
 
@@ -83,6 +115,7 @@ impl Decode for StreamHeaderType {
         );
 
         let header_type = match type_value {
+            // Priority Present variants (0x10-0x1D)
             0x10_u64 => Ok(Self::SubgroupZeroId),
             0x11_u64 => Ok(Self::SubgroupZeroIdExt),
             0x12_u64 => Ok(Self::SubgroupFirstObjectId),
@@ -95,6 +128,20 @@ impl Decode for StreamHeaderType {
             0x1b_u64 => Ok(Self::SubgroupFirstObjectIdExtEndOfGroup),
             0x1c_u64 => Ok(Self::SubgroupIdEndOfGroup),
             0x1d_u64 => Ok(Self::SubgroupIdExtEndOfGroup),
+            // Priority Not Present variants (0x30-0x3D)
+            0x30_u64 => Ok(Self::SubgroupZeroIdNoPriority),
+            0x31_u64 => Ok(Self::SubgroupZeroIdExtNoPriority),
+            0x32_u64 => Ok(Self::SubgroupFirstObjectIdNoPriority),
+            0x33_u64 => Ok(Self::SubgroupFirstObjectIdExtNoPriority),
+            0x34_u64 => Ok(Self::SubgroupIdNoPriority),
+            0x35_u64 => Ok(Self::SubgroupIdExtNoPriority),
+            0x38_u64 => Ok(Self::SubgroupZeroIdEndOfGroupNoPriority),
+            0x39_u64 => Ok(Self::SubgroupZeroIdExtEndOfGroupNoPriority),
+            0x3a_u64 => Ok(Self::SubgroupFirstObjectIdEndOfGroupNoPriority),
+            0x3b_u64 => Ok(Self::SubgroupFirstObjectIdExtEndOfGroupNoPriority),
+            0x3c_u64 => Ok(Self::SubgroupIdEndOfGroupNoPriority),
+            0x3d_u64 => Ok(Self::SubgroupIdExtEndOfGroupNoPriority),
+            // Fetch
             0x05_u64 => Ok(Self::Fetch),
             _ => {
                 log::error!(
@@ -290,7 +337,7 @@ mod tests {
                 track_alias: 10,
                 group_id: 0,
                 subgroup_id: Some(1),
-                publisher_priority: 100,
+                publisher_priority: Some(100),
             }),
             fetch_header: None,
         };
@@ -300,5 +347,30 @@ mod tests {
         assert!(sh.header_type.is_subgroup());
         assert!(!sh.header_type.is_fetch());
         assert!(sh.header_type.has_subgroup_id());
+    }
+
+    #[test]
+    fn encode_decode_stream_header_no_priority() {
+        let mut buf = BytesMut::new();
+
+        // Test a NoPriority subgroup header type
+        let sh = StreamHeader {
+            header_type: StreamHeaderType::SubgroupIdNoPriority,
+            subgroup_header: Some(SubgroupHeader {
+                header_type: StreamHeaderType::SubgroupIdNoPriority,
+                track_alias: 10,
+                group_id: 0,
+                subgroup_id: Some(1),
+                publisher_priority: None,
+            }),
+            fetch_header: None,
+        };
+        sh.encode(&mut buf).unwrap();
+        let decoded = StreamHeader::decode(&mut buf).unwrap();
+        assert_eq!(decoded, sh);
+        assert!(sh.header_type.is_subgroup());
+        assert!(!sh.header_type.is_fetch());
+        assert!(sh.header_type.has_subgroup_id());
+        assert!(!sh.header_type.has_priority());
     }
 }

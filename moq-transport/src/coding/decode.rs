@@ -76,6 +76,9 @@ pub enum DecodeError {
 
     #[error("invalid datagram type")]
     InvalidDatagramType,
+
+    #[error("invalid authorization token type in CLIENT_SETUP")]
+    InvalidAuthTokenType,
 }
 
 impl From<io::Error> for DecodeError {

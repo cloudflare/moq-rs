@@ -45,14 +45,15 @@ impl Announced {
         (send, recv)
     }
 
-    // Send an ANNOUNCE_OK
+    // Send an PublishOk
     pub fn ok(&mut self) -> Result<(), ServeError> {
         if self.ok {
             return Err(ServeError::Duplicate);
         }
 
-        self.session.send_message(message::PublishNamespaceOk {
+        self.session.send_message(message::PublishOk {
             id: self.info.request_id,
+            params: Default::default(),
         });
 
         self.ok = true;
@@ -98,9 +99,10 @@ impl Drop for Announced {
                 reason_phrase: ReasonPhrase(err.to_string()),
             });
         } else {
-            self.session.send_message(message::PublishNamespaceError {
+            self.session.send_message(message::RequestError {
                 id: self.info.request_id,
                 error_code: err.code(),
+                retry_interval: 0,
                 reason_phrase: ReasonPhrase(err.to_string()),
             });
         }

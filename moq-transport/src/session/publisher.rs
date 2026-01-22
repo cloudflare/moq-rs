@@ -49,6 +49,10 @@ pub struct Publisher {
     /// increment by 2 for each request (odd numbers).
     next_requestid: Arc<atomic::AtomicU64>,
 
+    /// When we need a new Track Alias for sending a request, we can get it from here.
+    /// track alias is used in publish and subscribe_ok message
+    next_track_alias: Arc<atomic::AtomicU64>,
+
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 }
@@ -68,8 +72,14 @@ impl Publisher {
             unknown_track_status_requested: Default::default(),
             outgoing,
             next_requestid,
+            next_track_alias: Arc::new(atomic::AtomicU64::new(0)),
             mlog,
         }
+    }
+
+    pub fn next_track_alias(&self) -> u64 {
+        self.next_track_alias
+            .fetch_add(1, atomic::Ordering::Relaxed)
     }
 
     pub async fn accept(
@@ -171,6 +181,9 @@ impl Publisher {
             subscribed.info.track_namespace.clone(),
             &subscribed.info.track_name,
         ) {
+            // TODO(itzmanish): check the forward state of the subscribed if it's 1 and the publisher's forward state is
+            // 0, send a request update to publisher to make forward state 1
+
             subscribed.serve(track).await?;
         } else {
             let namespace = subscribed.info.track_namespace.clone();
@@ -219,30 +232,20 @@ impl Publisher {
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
         let res = match msg {
             message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg),
-            message::Subscriber::SubscribeUpdate(msg) => self.recv_subscribe_update(msg),
+            message::Subscriber::RequestUpdate(msg) => self.recv_request_update(msg),
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg),
             message::Subscriber::Fetch(_msg) => Err(SessionError::unimplemented("FETCH")),
             message::Subscriber::FetchCancel(_msg) => {
                 Err(SessionError::unimplemented("FETCH_CANCEL"))
             }
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg),
-            message::Subscriber::SubscribeNamespace(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE"))
-            }
-            message::Subscriber::UnsubscribeNamespace(_msg) => {
-                Err(SessionError::unimplemented("UNSUBSCRIBE_NAMESPACE"))
-            }
+            message::Subscriber::SubscribeNamespace(_msg) => self.recv_subscribe_namespace(),
             message::Subscriber::PublishNamespaceCancel(msg) => {
                 self.recv_publish_namespace_cancel(msg)
             }
-            message::Subscriber::PublishNamespaceOk(msg) => self.recv_publish_namespace_ok(msg),
-            message::Subscriber::PublishNamespaceError(msg) => {
-                self.recv_publish_namespace_error(msg)
-            }
+            message::Subscriber::RequestOk(msg) => self.recv_request_ok(msg),
             message::Subscriber::PublishOk(_msg) => Err(SessionError::unimplemented("PUBLISH_OK")),
-            message::Subscriber::PublishError(_msg) => {
-                Err(SessionError::unimplemented("PUBLISH_ERROR"))
-            }
+            message::Subscriber::RequestError(msg) => self.recv_request_error(msg),
         };
 
         if let Err(err) = res {
@@ -252,10 +255,9 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_publish_namespace_ok(
-        &mut self,
-        msg: message::PublishNamespaceOk,
-    ) -> Result<(), SessionError> {
+    // NOTE(itzmanish): since request ok is common for [subscribe/publish]_namespace need to test if
+    // it is a subscribe namespace or publish namespace
+    fn recv_request_ok(&mut self, msg: message::RequestOk) -> Result<(), SessionError> {
         // We need to find the announce request using the request id, however the self.announces data structure
         // is a HashMap indexed by Namespace (which is needed for handling PUBLISH_NAMESPACE_CANCEL).  TODO - make more efficient.
         // For now iterate through all self.annouces until we find the matching id.
@@ -269,13 +271,10 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_publish_namespace_error(
-        &mut self,
-        msg: message::PublishNamespaceError,
-    ) -> Result<(), SessionError> {
-        // We need to find the announce request using the request id, however the self.announces data structure
-        // is a HashMap indexed by Namespace (which is needed for handling PUBLISH_NAMESPACE_CANCEL).  TODO - make more efficient.
-        // For now iterate through all self.annouces until we find the matching id.
+    fn recv_request_error(&mut self, msg: message::RequestError) -> Result<(), SessionError> {
+        // REQUEST_ERROR is the unified error response for multiple request types.
+        // We need to find the request using the request id. Currently we check announces.
+        // TODO: Also check other request types (subscribe_namespace, etc.) when implemented.
         let mut announces = self.announces.lock().unwrap();
 
         // Find the key first (immutable borrow only)
@@ -287,12 +286,16 @@ impl Publisher {
         // Remove from HashMap and take ownership
         if let Some(key) = key_opt {
             if let Some((_ns, v)) = announces.remove_entry(&key) {
-                // Step 3: call recv_error, consuming v
                 v.recv_error(ServeError::Closed(msg.error_code))?;
             }
         }
 
         Ok(())
+    }
+
+    fn recv_subscribe_namespace(&mut self) -> Result<(), SessionError> {
+        // TODO(itzmanish): implement subscribe namespace handler
+        Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE"))
     }
 
     fn recv_publish_namespace_cancel(
@@ -346,12 +349,30 @@ impl Publisher {
         Ok(())
     }
 
-    fn recv_subscribe_update(
-        &mut self,
-        _msg: message::SubscribeUpdate,
-    ) -> Result<(), SessionError> {
-        // TODO: Implement updating subscriptions.
-        Err(SessionError::unimplemented("SUBSCRIBE_UPDATE"))
+    fn recv_request_update(&mut self, msg: message::RequestUpdate) -> Result<(), SessionError> {
+        let subscription_exists = self
+            .subscribeds
+            .lock()
+            .unwrap()
+            .contains_key(&msg.existing_request_id);
+
+        if subscription_exists {
+            self.send_message(message::RequestOk {
+                id: msg.id,
+                params: Default::default(),
+            });
+        } else {
+            self.send_message(message::RequestError {
+                id: msg.id,
+                error_code: 0x10,
+                retry_interval: 0,
+                reason_phrase: crate::coding::ReasonPhrase(format!(
+                    "Subscription {} not found",
+                    msg.existing_request_id
+                )),
+            });
+        }
+        Ok(())
     }
 
     fn recv_track_status(&mut self, msg: message::TrackStatus) -> Result<(), SessionError> {
@@ -397,7 +418,7 @@ impl Publisher {
         let msg = msg.into();
         match &msg {
             message::Publisher::PublishDone(m) => self.drop_subscribe(m.id),
-            message::Publisher::SubscribeError(m) => self.drop_subscribe(m.id),
+            message::Publisher::RequestError(m) => self.drop_subscribe(m.id),
             message::Publisher::PublishNamespaceDone(m) => {
                 self.drop_publish_namespace(&m.track_namespace);
             }

@@ -6,6 +6,7 @@ mod reader;
 mod subscribe;
 mod subscribed;
 mod subscriber;
+mod subscription_state;
 mod track_status_requested;
 mod writer;
 
@@ -16,6 +17,7 @@ pub use publisher::*;
 pub use subscribe::*;
 pub use subscribed::*;
 pub use subscriber::*;
+pub use subscription_state::*;
 pub use track_status_requested::*;
 
 use reader::*;
@@ -31,14 +33,14 @@ use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
 
+pub struct ControlStream(Writer, Reader);
+
 /// Session object for managing all communications in a single QUIC connection.
 #[must_use = "run() must be called"]
 pub struct Session {
     webtransport: web_transport::Session,
 
-    /// Control Stream Reader and Writer (QUIC bi-directional stream)
-    sender: Writer, // Control Stream Sender
-    recver: Reader, // Control Stream Receiver
+    control_stream: ControlStream,
 
     publisher: Option<Publisher>, // Contains Publisher side logic, uses outgoing message queue to send control messages
     subscriber: Option<Subscriber>, // Contains Subscriber side logic, uses outgoing message queue to send control messages
@@ -52,14 +54,6 @@ pub struct Session {
 }
 
 impl Session {
-    // Helper for determining the largest supported version
-    fn largest_common<T: Ord + Clone + Eq>(a: &[T], b: &[T]) -> Option<T> {
-        a.iter()
-            .filter(|x| b.contains(x)) // keep only items also in b
-            .cloned() // clone because we return T, not &T
-            .max() // take the largest
-    }
-
     fn new(
         webtransport: web_transport::Session,
         sender: Writer,
@@ -87,8 +81,7 @@ impl Session {
 
         let session = Self {
             webtransport,
-            sender,
-            recver,
+            control_stream: ControlStream(sender, recver),
             publisher: publisher.clone(),
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
@@ -113,16 +106,10 @@ impl Session {
         let mut sender = Writer::new(control.0);
         let mut recver = Reader::new(control.1);
 
-        let versions: setup::Versions = [setup::Version::DRAFT_14].into();
-
-        // TODO SLG - make configurable?
         let mut params = KeyValuePairs::default();
         params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
-        let client = setup::Client {
-            versions: versions.clone(),
-            params,
-        };
+        let client = setup::Client { params };
 
         log::debug!("sending CLIENT_SETUP: {:?}", client);
         sender.encode(&client).await?;
@@ -157,41 +144,31 @@ impl Session {
         let client: setup::Client = recver.decode().await?;
         log::debug!("received CLIENT_SETUP: {:?}", client);
 
-        // Emit mlog event for CLIENT_SETUP parsed
+        client.validate()?;
+
         if let Some(ref mut mlog) = mlog {
             let event = mlog::events::client_setup_parsed(mlog.elapsed_ms(), 0, &client);
             let _ = mlog.add_event(event);
         }
 
-        let server_versions = setup::Versions(vec![setup::Version::DRAFT_14]);
+        // TODO SLG - make configurable?
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
-        if let Some(largest_common_version) =
-            Self::largest_common(&server_versions, &client.versions)
-        {
-            // TODO SLG - make configurable?
-            let mut params = KeyValuePairs::default();
-            params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
+        let server = setup::Server { params };
 
-            let server = setup::Server {
-                version: largest_common_version,
-                params,
-            };
+        log::debug!("sending SERVER_SETUP: {:?}", server);
 
-            log::debug!("sending SERVER_SETUP: {:?}", server);
-
-            // Emit mlog event for SERVER_SETUP created
-            if let Some(ref mut mlog) = mlog {
-                let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
-                let _ = mlog.add_event(event);
-            }
-
-            sender.encode(&server).await?;
-
-            // We are the server, so the first request id is 1
-            Ok(Session::new(session, sender, recver, 1, mlog))
-        } else {
-            Err(SessionError::Version(client.versions, server_versions))
+        // Emit mlog event for SERVER_SETUP created
+        if let Some(ref mut mlog) = mlog {
+            let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
+            let _ = mlog.add_event(event);
         }
+
+        sender.encode(&server).await?;
+
+        // We are the server, so the first request id is 1
+        Ok(Session::new(session, sender, recver, 1, mlog))
     }
 
     /// Run Tasks for the session, including sending of control messages, receiving and processing
@@ -199,8 +176,8 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone()) => res,
-            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
+            res = Self::run_recv(self.control_stream.1, self.publisher, self.subscriber.clone(), self.mlog.clone()) => res,
+            res = Self::run_send(self.control_stream.0, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
         }
@@ -229,8 +206,8 @@ impl Session {
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_created(time, stream_id, m))
                         }
-                        Message::SubscribeError(m) => {
-                            Some(mlog::events::subscribe_error_created(time, stream_id, m))
+                        Message::RequestError(m) => {
+                            Some(mlog::events::reqeust_error_created(time, stream_id, m))
                         }
                         Message::Unsubscribe(m) => {
                             Some(mlog::events::unsubscribe_created(time, stream_id, m))
@@ -238,12 +215,9 @@ impl Session {
                         Message::PublishNamespace(m) => {
                             Some(mlog::events::publish_namespace_created(time, stream_id, m))
                         }
-                        Message::PublishNamespaceOk(m) => Some(
-                            mlog::events::publish_namespace_ok_created(time, stream_id, m),
-                        ),
-                        Message::PublishNamespaceError(m) => Some(
-                            mlog::events::publish_namespace_error_created(time, stream_id, m),
-                        ),
+                        Message::RequestOk(m) => {
+                            Some(mlog::events::reqeust_ok_created(time, stream_id, m))
+                        }
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_created(time, stream_id, m))
                         }
@@ -291,8 +265,8 @@ impl Session {
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_parsed(time, stream_id, m))
                         }
-                        Message::SubscribeError(m) => {
-                            Some(mlog::events::subscribe_error_parsed(time, stream_id, m))
+                        Message::RequestError(m) => {
+                            Some(mlog::events::request_error_parsed(time, stream_id, m))
                         }
                         Message::Unsubscribe(m) => {
                             Some(mlog::events::unsubscribe_parsed(time, stream_id, m))
@@ -300,12 +274,9 @@ impl Session {
                         Message::PublishNamespace(m) => {
                             Some(mlog::events::publish_namespace_parsed(time, stream_id, m))
                         }
-                        Message::PublishNamespaceOk(m) => Some(
-                            mlog::events::publish_namespace_ok_parsed(time, stream_id, m),
-                        ),
-                        Message::PublishNamespaceError(m) => Some(
-                            mlog::events::publish_namespace_error_parsed(time, stream_id, m),
-                        ),
+                        Message::RequestOk(m) => {
+                            Some(mlog::events::request_ok_parsed(time, stream_id, m))
+                        }
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_parsed(time, stream_id, m))
                         }
