@@ -66,9 +66,9 @@ impl Relay {
             anyhow::bail!("cannot specify both bind and endpoints");
         }
 
-        let endpoints = if config.bind.is_some() {
+        let endpoints = if let Some(bind) = config.bind {
             let endpoint = quic::Endpoint::new(quic::Config::new(
-                config.bind.unwrap(),
+                bind,
                 config.qlog_dir.clone(),
                 config.tls.clone(),
             ))?;
