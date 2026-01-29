@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.8](https://github.com/cloudflare/moq-rs/compare/moq-pub-v0.8.7...moq-pub-v0.8.8) - 2026-01-29
+
+### Other
+
+- fix unnecessary_unwrap clippy lint
+
 ## [0.8.7](https://github.com/cloudflare/moq-rs/compare/moq-pub-v0.8.6...moq-pub-v0.8.7) - 2025-12-18
 
 ### Other
