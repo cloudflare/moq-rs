@@ -443,8 +443,10 @@ fn sample_keyframe(moof: &mp4::MoofBox) -> bool {
                 None => default_flags,
             };
 
-            if i == 0 && trun.first_sample_flags.is_some() {
-                flags = trun.first_sample_flags.unwrap();
+            if i == 0 {
+                if let Some(first_flags) = trun.first_sample_flags {
+                    flags = first_flags;
+                }
             }
 
             // https://chromium.googlesource.com/chromium/src/media/+/master/formats/mp4/track_run_iterator.cc#177
