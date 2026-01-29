@@ -98,6 +98,10 @@ impl Encode for KeyValuePair {
                 if self.key.is_multiple_of(2) {
                     return Err(EncodeError::InvalidValue);
                 }
+                // size of value must be less then 2^16-1 bytes
+                if v.len() > u16::MAX as usize {
+                    return Err(EncodeError::InvalidValue);
+                }
                 self.key.encode(w)?;
                 v.len().encode(w)?;
                 Self::encode_remaining(w, v.len())?;
@@ -270,5 +274,15 @@ mod tests {
         assert_eq!(3, buf_vec[0]); // 3 KeyValuePairs
         let decoded = KeyValuePairs::decode(&mut buf).unwrap();
         assert_eq!(decoded, kvps);
+    }
+
+    #[test]
+    fn encode_bytes_length_exceeded() {
+        let mut buf = BytesMut::new();
+
+        let huge_bytes = vec![0u8; u16::MAX as usize + 1];
+        let kvp = KeyValuePair::new_bytes(1, huge_bytes);
+        let result = kvp.encode(&mut buf);
+        assert!(result.is_err(), "must rejected because bytes > 65535");
     }
 }
