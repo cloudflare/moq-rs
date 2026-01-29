@@ -194,6 +194,16 @@ impl TrackReader {
             .await;
         }
     }
+
+    /// Check if the track is closed or the writer has been dropped.
+    /// This is used to detect stale cached TrackReaders that should not be reused.
+    pub fn is_closed(&self) -> bool {
+        let state = self.state.lock();
+        // Track is closed if:
+        // 1. It was explicitly closed with an error, OR
+        // 2. The writer side has been dropped (modified() returns None)
+        state.closed.is_err() || state.modified().is_none()
+    }
 }
 
 impl Deref for TrackReader {
