@@ -207,18 +207,50 @@ impl Subscriber {
 
     /// Handle the reception of a SubscribeOk message from the publisher.
     fn recv_subscribe_ok(&mut self, msg: &message::SubscribeOk) -> Result<(), SessionError> {
-        if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&msg.id) {
+        let subscribes = self.subscribes.lock().unwrap();
+        let subscribe_ids: Vec<u64> = subscribes.keys().cloned().collect();
+        log::debug!(
+            "[SUBSCRIBER] recv_subscribe_ok: id={}, track_alias={}, existing_subscribe_ids={:?}",
+            msg.id,
+            msg.track_alias,
+            subscribe_ids
+        );
+
+        if let Some(subscribe) = subscribes.get(&msg.id) {
             // Map track alias to subscription id for quick lookup when receiving streams/datagrams
+            log::debug!(
+                "[SUBSCRIBER] recv_subscribe_ok: MAPPING track_alias={} -> subscribe_id={}",
+                msg.track_alias,
+                msg.id
+            );
+            drop(subscribes); // Release the lock before acquiring another
+
             self.subscribe_alias_map
                 .lock()
                 .unwrap()
                 .insert(msg.track_alias, msg.id);
 
+            // Log current alias map state
+            let alias_map = self.subscribe_alias_map.lock().unwrap();
+            log::debug!(
+                "[SUBSCRIBER] recv_subscribe_ok: alias_map now contains: {:?}",
+                alias_map.iter().collect::<Vec<_>>()
+            );
+            drop(alias_map);
+
             // Notify waiting tasks that the alias map has been updated
             self.subscribe_alias_notify.notify_waiters();
 
             // Notify the subscribe of the successful subscription
-            subscribe.ok(msg.track_alias)?;
+            let mut subscribes = self.subscribes.lock().unwrap();
+            if let Some(subscribe) = subscribes.get_mut(&msg.id) {
+                subscribe.ok(msg.track_alias)?;
+            }
+        } else {
+            log::warn!(
+                "[SUBSCRIBER] recv_subscribe_ok: subscribe_id={} NOT FOUND in subscribes map!",
+                msg.id
+            );
         }
 
         Ok(())
@@ -487,7 +519,7 @@ impl Subscriber {
 
                         // Check for Immutable Extensions (type 0xB = 11)
                         if object.extension_headers.has(0xB) {
-                            log::info!(
+                            log::debug!(
                                 "[SUBSCRIBER] recv_subgroup: object #{} contains IMMUTABLE EXTENSIONS (type 0xB) - will be forwarded",
                                 object_count + 1
                             );
@@ -501,7 +533,7 @@ impl Subscriber {
 
                         // Check for Prior Group ID Gap (type 0x3C = 60)
                         if object.extension_headers.has(0x3C) {
-                            log::info!(
+                            log::debug!(
                                 "[SUBSCRIBER] recv_subgroup: object #{} contains PRIOR GROUP ID GAP (type 0x3C)",
                                 object_count + 1
                             );
@@ -624,7 +656,7 @@ impl Subscriber {
             object_count += 1;
         }
 
-        log::info!(
+        log::debug!(
             "[SUBSCRIBER] recv_subgroup: completed subgroup (group_id={}, subgroup_id={}, {} objects received)",
             subgroup_writer.info.group_id,
             subgroup_writer.info.subgroup_id,
@@ -659,7 +691,7 @@ impl Subscriber {
 
             // Check for Immutable Extensions (type 0xB = 11)
             if ext_headers.has(0xB) {
-                log::info!(
+                log::debug!(
                     "[SUBSCRIBER] recv_datagram: datagram contains IMMUTABLE EXTENSIONS (type 0xB)"
                 );
                 if let Some(immutable_ext) = ext_headers.get(0xB) {
@@ -672,7 +704,7 @@ impl Subscriber {
 
             // Check for Prior Group ID Gap (type 0x3C = 60)
             if ext_headers.has(0x3C) {
-                log::info!(
+                log::debug!(
                     "[SUBSCRIBER] recv_datagram: datagram contains PRIOR GROUP ID GAP (type 0x3C)"
                 );
                 if let Some(gap_ext) = ext_headers.get(0x3C) {
@@ -684,6 +716,16 @@ impl Subscriber {
             }
         }
 
+        // Log current alias map state before lookup
+        {
+            let alias_map = self.subscribe_alias_map.lock().unwrap();
+            log::debug!(
+                "[SUBSCRIBER] recv_datagram: looking up track_alias={}, current alias_map={:?}",
+                datagram.track_alias,
+                alias_map.iter().collect::<Vec<_>>()
+            );
+        }
+
         // Look up the subscribe id for this track alias
         if let Some(subscribe_id) = self
             .get_subscribe_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
@@ -691,25 +733,23 @@ impl Subscriber {
         {
             // Look up the subscribe by id
             if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&subscribe_id) {
-                log::trace!(
-                    "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                log::debug!(
+                    "[SUBSCRIBER] recv_datagram: FOUND track_alias={} -> subscribe_id={}, forwarding datagram",
                     datagram.track_alias,
-                    datagram.group_id,
-                    datagram.object_id.unwrap_or(0),
-                    datagram.publisher_priority,
-                    datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
-                    datagram.payload.as_ref().map_or(0, |p| p.len()));
+                    subscribe_id
+                );
                 subscribe.datagram(datagram)?;
             }
         } else {
+            // Log the full state for debugging
+            let alias_map = self.subscribe_alias_map.lock().unwrap();
+            let subscribes = self.subscribes.lock().unwrap();
             log::warn!(
-                "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                "[SUBSCRIBER] recv_datagram: UNKNOWN track_alias={}, alias_map={:?}, subscribe_ids={:?}",
                 datagram.track_alias,
-                datagram.group_id,
-                datagram.object_id.unwrap_or(0),
-                datagram.publisher_priority,
-                datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
-                datagram.payload.as_ref().map_or(0, |p| p.len()));
+                alias_map.iter().collect::<Vec<_>>(),
+                subscribes.keys().collect::<Vec<_>>()
+            );
         }
 
         Ok(())

@@ -1,8 +1,12 @@
-use std::{fmt, sync::Arc};
+use std::{collections::VecDeque, fmt, sync::Arc};
 
 use crate::watch::State;
 
 use super::{ServeError, Track};
+
+/// Maximum number of datagrams to buffer before dropping old ones.
+/// This prevents unbounded memory growth while allowing burst handling.
+const MAX_DATAGRAM_BUFFER: usize = 1024;
 
 pub struct Datagrams {
     pub track: Arc<Track>,
@@ -20,11 +24,14 @@ impl Datagrams {
 }
 
 struct DatagramsState {
-    // The latest datagram
-    latest: Option<Datagram>,
+    // Queue of pending datagrams (FIFO)
+    queue: VecDeque<Datagram>,
 
-    // Increased each time datagram changes.
-    epoch: u64,
+    // Global write counter - incremented each time a datagram is added
+    write_count: u64,
+
+    // Number of datagrams dropped from front due to buffer overflow
+    dropped_count: u64,
 
     // Set when the writer or all readers are dropped.
     closed: Result<(), ServeError>,
@@ -33,8 +40,9 @@ struct DatagramsState {
 impl Default for DatagramsState {
     fn default() -> Self {
         Self {
-            latest: None,
-            epoch: 0,
+            queue: VecDeque::with_capacity(256),
+            write_count: 0,
+            dropped_count: 0,
             closed: Ok(()),
         }
     }
@@ -53,8 +61,14 @@ impl DatagramsWriter {
     pub fn write(&mut self, datagram: Datagram) -> Result<(), ServeError> {
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
-        state.latest = Some(datagram);
-        state.epoch += 1;
+        // If queue is full, drop oldest datagram to make room
+        if state.queue.len() >= MAX_DATAGRAM_BUFFER {
+            state.queue.pop_front();
+            state.dropped_count += 1;
+        }
+
+        state.queue.push_back(datagram);
+        state.write_count += 1;
 
         Ok(())
     }
@@ -75,15 +89,23 @@ pub struct DatagramsReader {
     state: State<DatagramsState>,
     pub track: Arc<Track>,
 
-    epoch: u64,
+    // Track how many datagrams this reader has consumed (absolute count)
+    // This allows us to calculate our position in the queue
+    consumed_count: u64,
 }
 
 impl DatagramsReader {
     fn new(state: State<DatagramsState>, track: Arc<Track>) -> Self {
+        // Initialize consumed_count to current dropped_count so we start from current position
+        let initial_dropped = {
+            let state = state.lock();
+            state.dropped_count
+        };
+
         Self {
             state,
             track,
-            epoch: 0,
+            consumed_count: initial_dropped,
         }
     }
 
@@ -91,9 +113,24 @@ impl DatagramsReader {
         loop {
             {
                 let state = self.state.lock();
-                if self.epoch < state.epoch {
-                    self.epoch = state.epoch;
-                    return Ok(state.latest.clone());
+
+                // Calculate our index in the current queue
+                // queue index = consumed_count - dropped_count
+                // If consumed_count < dropped_count, we missed some datagrams (they were dropped)
+                let queue_index = if self.consumed_count >= state.dropped_count {
+                    (self.consumed_count - state.dropped_count) as usize
+                } else {
+                    // We're behind - some datagrams were dropped that we haven't seen
+                    // Skip to the beginning of current queue
+                    self.consumed_count = state.dropped_count;
+                    0
+                };
+
+                // Check if there's a datagram we haven't read yet
+                if queue_index < state.queue.len() {
+                    let datagram = state.queue.get(queue_index).cloned();
+                    self.consumed_count += 1;
+                    return Ok(datagram);
                 }
 
                 state.closed.clone()?;
@@ -106,12 +143,12 @@ impl DatagramsReader {
         }
     }
 
-    // Returns the largest group/sequence
+    // Returns the largest group/sequence from the most recent datagram
     pub fn latest(&self) -> Option<(u64, u64)> {
         let state = self.state.lock();
         state
-            .latest
-            .as_ref()
+            .queue
+            .back()
             .map(|datagram| (datagram.group_id, datagram.object_id))
     }
 }
