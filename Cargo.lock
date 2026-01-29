@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "moq-pub"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1245,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "moq-relay-ietf"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "moq-transport"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "bytes",
  "futures",

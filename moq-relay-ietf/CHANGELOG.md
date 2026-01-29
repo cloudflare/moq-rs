@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.10](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.9...moq-relay-ietf-v0.7.10) - 2026-01-29
+
+### Other
+
+- fix unnecessary_unwrap clippy lint
+
 ## [0.7.9](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.8...moq-relay-ietf-v0.7.9) - 2025-12-19
 
 ### Added
