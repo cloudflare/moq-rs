@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
-use crate::coding::{Encode, Location, ReasonPhrase, TrackNamespace};
+use crate::coding::{Encode, Location, ReasonPhrase};
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
@@ -16,18 +16,20 @@ use super::{Publisher, SessionError, SubscribeInfo, Writer};
 
 #[derive(Debug)]
 struct SubscribedState {
-    track_namespace: TrackNamespace,
     largest_location: Option<Location>,
     closed: Result<(), ServeError>,
 }
 
-impl SubscribedState {
-    fn new(ns: TrackNamespace) -> Self {
+impl Default for SubscribedState {
+    fn default() -> Self {
         Self {
-            track_namespace: ns,
-            ..Default::default()
+            largest_location: None,
+            closed: Ok(()),
         }
     }
+}
+
+impl SubscribedState {
     fn update_largest_location(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
         if let Some(current_largest_location) = self.largest_location {
             let update_largest_location = Location::new(group_id, object_id);
@@ -37,16 +39,6 @@ impl SubscribedState {
         }
 
         Ok(())
-    }
-}
-
-impl Default for SubscribedState {
-    fn default() -> Self {
-        Self {
-            track_namespace: Default::default(),
-            largest_location: None,
-            closed: Ok(()),
-        }
     }
 }
 
@@ -74,7 +66,7 @@ impl Subscribed {
         msg: message::Subscribe,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> (Self, SubscribedRecv) {
-        let (send, recv) = State::new(SubscribedState::new(msg.track_namespace.clone())).split();
+        let (send, recv) = State::new(SubscribedState::default()).split();
         let info = SubscribeInfo::new_from_subscribe(&msg);
         let send = Self {
             publisher,
@@ -454,10 +446,6 @@ pub(super) struct SubscribedRecv {
 }
 
 impl SubscribedRecv {
-    pub fn get_namespace(&self) -> TrackNamespace {
-        self.state.lock().track_namespace.clone()
-    }
-
     pub fn recv_unsubscribe(&mut self) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;

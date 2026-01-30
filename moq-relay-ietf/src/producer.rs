@@ -162,6 +162,8 @@ impl Producer {
             match self.publisher.publish_namespace(namespace.clone()).await {
                 Ok(_publish_ns) => {
                     log::debug!("sent PUBLISH_NAMESPACE for {:?}", namespace);
+                    // FIX:: on drop of publish_ns PUBLISH_NAMESPACE_DONE will be sent,
+                    // need to handle that as well
                 }
                 Err(e) => {
                     log::warn!(

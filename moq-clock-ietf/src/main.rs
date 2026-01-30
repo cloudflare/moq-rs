@@ -1,6 +1,7 @@
 use moq_native_ietf::quic;
 
 use anyhow::Context;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 
 mod cli;
 mod clock;
@@ -18,15 +19,26 @@ async fn serve_subscriptions(
     mut publisher: Publisher,
     tracks: TracksReader,
 ) -> Result<(), SessionError> {
-    while let Some(subscribed) = publisher.subscribed().await {
-        let info = subscribed.info.clone();
-        log::info!("serving subscribe: {:?}", info);
+    let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
+        FuturesUnordered::new();
 
-        if let Err(err) = Publisher::serve_subscribe(subscribed, tracks.clone()).await {
-            log::warn!("failed serving subscribe: {:?}, error: {}", info, err);
+    loop {
+        tokio::select! {
+            Some(subscribed) = publisher.subscribed() => {
+                let info = subscribed.info.clone();
+                let tracks = tracks.clone();
+                log::info!("serving subscribe: {:?}", info);
+
+                tasks.push(async move {
+                    if let Err(err) = Publisher::serve_subscribe(subscribed, tracks).await {
+                        log::warn!("failed serving subscribe: {:?}, error: {}", info, err);
+                    }
+                }.boxed());
+            }
+            _ = tasks.next(), if !tasks.is_empty() => {}
+            else => return Ok(()),
         }
     }
-    Ok(())
 }
 
 #[tokio::main]
