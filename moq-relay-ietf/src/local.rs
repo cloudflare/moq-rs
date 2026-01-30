@@ -73,6 +73,26 @@ impl Locals {
 
         best_match
     }
+
+    pub fn matching_namespaces(&self, prefix: &TrackNamespace) -> Vec<TrackNamespace> {
+        let lookup = self.lookup.lock().unwrap();
+
+        lookup
+            .keys()
+            .filter(|ns| {
+                if ns.fields.len() >= prefix.fields.len() {
+                    prefix
+                        .fields
+                        .iter()
+                        .zip(ns.fields.iter())
+                        .all(|(a, b)| a == b)
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 pub struct Registration {
