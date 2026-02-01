@@ -36,6 +36,7 @@ mod producer;
 mod relay;
 mod remote;
 mod session;
+pub mod stats;
 mod web;
 
 pub use api::*;
