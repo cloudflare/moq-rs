@@ -30,6 +30,10 @@ impl Default for SubscribedState {
 }
 
 impl SubscribedState {
+    fn is_closed(&self) -> bool {
+        self.closed.is_err()
+    }
+
     fn update_largest_location(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
         if let Some(current_largest_location) = self.largest_location {
             let update_largest_location = Location::new(group_id, object_id);
@@ -273,6 +277,16 @@ impl Subscribed {
 
         let mut object_count = 0;
         while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
+            if state.lock().is_closed() {
+                log::debug!(
+                    "[PUBLISHER] serve_subgroup: subscription cancelled, stopping (group_id={}, subgroup_id={:?}, {} objects sent)",
+                    subgroup_reader.group_id,
+                    subgroup_reader.subgroup_id,
+                    object_count
+                );
+                return Ok(());
+            }
+
             let subgroup_object = data::SubgroupObjectExt {
                 object_id_delta: 0, // before delta logic, used to be subgroup_object_reader.object_id,
                 extension_headers: subgroup_object_reader.extension_headers.clone(), // Pass through extension headers
@@ -325,6 +339,13 @@ impl Subscribed {
             let mut chunks_sent = 0;
             let mut bytes_sent = 0;
             while let Some(chunk) = subgroup_object_reader.read().await? {
+                if state.lock().is_closed() {
+                    log::debug!(
+                        "[PUBLISHER] serve_subgroup: subscription cancelled during payload transfer"
+                    );
+                    return Ok(());
+                }
+
                 log::trace!(
                     "[PUBLISHER] serve_subgroup: sending payload chunk #{} for object #{} ({} bytes)",
                     chunks_sent + 1,
@@ -363,7 +384,14 @@ impl Subscribed {
 
         let mut datagram_count = 0;
         while let Some(datagram) = datagrams.read().await? {
-            // Determine datagram type based on extension headers presence
+            if self.state.lock().is_closed() {
+                log::debug!(
+                    "[PUBLISHER] serve_datagrams: subscription cancelled, stopping ({} datagrams sent)",
+                    datagram_count
+                );
+                return Ok(());
+            }
+
             let has_extension_headers = !datagram.extension_headers.is_empty();
             let datagram_type = if has_extension_headers {
                 data::DatagramType::ObjectIdPayloadExt
