@@ -1289,6 +1289,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "moq-test-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "log",
+ "moq-native-ietf",
+ "moq-transport",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "web-transport",
+]
+
+[[package]]
 name = "moq-transport"
 version = "0.12.2"
 dependencies = [

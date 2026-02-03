@@ -37,7 +37,7 @@ pub struct Args {
     /// Danger: Disable TLS certificate verification.
     ///
     /// Fine for local development and between relays, but should be used in caution in production.
-    #[arg(long = "tls-disable-verify")]
+    #[arg(long = "tls-disable-verify", env = "TLS_DISABLE_VERIFY")]
     pub disable_verify: bool,
 }
 
