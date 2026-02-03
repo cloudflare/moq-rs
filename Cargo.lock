@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "moq-clock-ietf"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "moq-native-ietf"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "moq-sub"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "clap",
