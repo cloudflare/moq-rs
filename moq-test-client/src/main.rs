@@ -32,7 +32,12 @@ mod scenarios;
 #[command(about = "MoQT Interoperability Test Client", long_about = None)]
 pub struct Args {
     /// Relay URL to test against (e.g., https://localhost:4443)
-    #[arg(short, long, default_value = "https://localhost:4443", env = "RELAY_URL")]
+    #[arg(
+        short,
+        long,
+        default_value = "https://localhost:4443",
+        env = "RELAY_URL"
+    )]
     pub relay: Url,
 
     /// Specific test to run (runs all if not specified)
