@@ -56,7 +56,7 @@ impl Refresh {
 
     /// Update the origin registration in moq-api.
     async fn update(&self) -> Result<(), moq_api::ApiError> {
-        log::debug!(
+        tracing::debug!(
             "registering origin: namespace={} url={}",
             self.namespace,
             self.origin.url
@@ -82,7 +82,7 @@ impl Drop for Refresh {
         // TODO this is really lazy
         let namespace = self.namespace.clone();
         let client = self.client.clone();
-        log::debug!("removing origin: namespace={}", namespace,);
+        tracing::debug!("removing origin: namespace={}", namespace,);
         tokio::spawn(async move { client.delete_origin(&namespace).await });
     }
 }

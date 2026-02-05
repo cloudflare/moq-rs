@@ -85,11 +85,11 @@ impl RemotesProducer {
                     tasks.push(async move {
                         let info = remote.info.clone();
 
-                        log::warn!("serving remote: {:?}", info);
+                        tracing::warn!("serving remote: {:?}", info);
 
                         // Run the remote producer
                         if let Err(err) = remote.run().await {
-                            log::warn!("failed serving remote: {:?}, error: {}", info, err);
+                            tracing::warn!("failed serving remote: {:?}, error: {}", info, err);
                         }
 
                         url
@@ -278,7 +278,7 @@ impl RemoteProducer {
 
                     tasks.push(async move {
                         if let Err(err) = subscriber.subscribe(track).await {
-                            log::warn!("failed serving track: {:?}, error: {}", info, err);
+                            tracing::warn!("failed serving track: {:?}, error: {}", info, err);
                         }
                     });
                 }

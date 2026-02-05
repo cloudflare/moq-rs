@@ -162,7 +162,7 @@ impl Subscriber {
         };
 
         if let Err(SessionError::Serve(err)) = res {
-            log::debug!("failed to process message: {:?} {}", msg, err);
+            tracing::debug!("failed to process message: {:?} {}", msg, err);
             return Ok(());
         }
 
@@ -323,12 +323,12 @@ impl Subscriber {
         mut self,
         stream: web_transport::RecvStream,
     ) -> Result<(), SessionError> {
-        log::trace!("[SUBSCRIBER] recv_stream: new stream received, decoding header");
+        tracing::trace!("[SUBSCRIBER] recv_stream: new stream received, decoding header");
         let mut reader = Reader::new(stream);
 
         // Decode the stream header
         let stream_header: data::StreamHeader = reader.decode().await?;
-        log::debug!(
+        tracing::debug!(
             "[SUBSCRIBER] recv_stream: decoded stream header type={:?}",
             stream_header.header_type
         );
@@ -351,7 +351,7 @@ impl Subscriber {
         }
 
         let track_alias = stream_header.subgroup_header.as_ref().unwrap().track_alias;
-        log::trace!(
+        tracing::trace!(
             "[SUBSCRIBER] recv_stream: stream for subscription track_alias={}",
             track_alias
         );
@@ -359,7 +359,7 @@ impl Subscriber {
         let mlog = self.mlog.clone();
         let res = self.recv_stream_inner(reader, stream_header, mlog).await;
         if let Err(SessionError::Serve(err)) = &res {
-            log::warn!(
+            tracing::warn!(
                 "[SUBSCRIBER] recv_stream: stream processing error for track_alias={}: {:?}",
                 track_alias,
                 err
@@ -384,7 +384,7 @@ impl Subscriber {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let track_alias = stream_header.subgroup_header.as_ref().unwrap().track_alias;
-        log::trace!(
+        tracing::trace!(
             "[SUBSCRIBER] recv_stream_inner: processing stream for track_alias={}",
             track_alias
         );
@@ -412,7 +412,7 @@ impl Subscriber {
 
                 // Create the appropriate writer based on the stream header type
                 if stream_header.header_type.is_subgroup() {
-                    log::trace!("[SUBSCRIBER] recv_stream_inner: creating subgroup writer");
+                    tracing::trace!("[SUBSCRIBER] recv_stream_inner: creating subgroup writer");
                     Writer::Subgroup(subscribe.subgroup(stream_header.subgroup_header.unwrap())?)
                 } else {
                     return Err(SessionError::Serve(ServeError::internal_ctx(format!(
@@ -432,13 +432,13 @@ impl Subscriber {
         match writer {
             //Writer::Fetch(fetch) => Self::recv_fetch(fetch, reader).await?,
             Writer::Subgroup(subgroup_writer) => {
-                log::trace!("[SUBSCRIBER] recv_stream_inner: receiving subgroup data");
+                tracing::trace!("[SUBSCRIBER] recv_stream_inner: receiving subgroup data");
                 Self::recv_subgroup(stream_header.header_type, subgroup_writer, reader, mlog)
                     .await?
             }
         };
 
-        log::debug!(
+        tracing::debug!(
             "[SUBSCRIBER] recv_stream_inner: completed processing stream for track_alias={}",
             track_alias
         );
@@ -452,7 +452,7 @@ impl Subscriber {
         mut reader: Reader,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
-        log::debug!(
+        tracing::debug!(
             "[SUBSCRIBER] recv_subgroup: starting - group_id={}, subgroup_id={}, priority={}",
             subgroup_writer.info.group_id,
             subgroup_writer.info.subgroup_id,
@@ -462,7 +462,7 @@ impl Subscriber {
         let mut object_count = 0;
         let mut current_object_id = 0u64;
         while !reader.done().await? {
-            log::trace!(
+            tracing::trace!(
                 "[SUBSCRIBER] recv_subgroup: reading object #{} (has_ext_headers={})",
                 object_count + 1,
                 stream_header_type.has_extension_headers()
@@ -474,7 +474,7 @@ impl Subscriber {
                 match stream_header_type.has_extension_headers() {
                     true => {
                         let object = reader.decode::<data::SubgroupObjectExt>().await?;
-                        log::debug!(
+                        tracing::debug!(
                         "[SUBSCRIBER] recv_subgroup: object #{} with extension headers - object_id_delta={}, payload_length={}, status={:?}, extension_headers={:?}",
                         object_count + 1,
                         object.object_id_delta,
@@ -487,12 +487,12 @@ impl Subscriber {
 
                         // Check for Immutable Extensions (type 0xB = 11)
                         if object.extension_headers.has(0xB) {
-                            log::info!(
+                            tracing::info!(
                                 "[SUBSCRIBER] recv_subgroup: object #{} contains IMMUTABLE EXTENSIONS (type 0xB) - will be forwarded",
                                 object_count + 1
                             );
                             if let Some(immutable_ext) = object.extension_headers.get(0xB) {
-                                log::debug!(
+                                tracing::debug!(
                                     "[SUBSCRIBER] recv_subgroup: immutable extension details: {:?}",
                                     immutable_ext
                                 );
@@ -501,12 +501,12 @@ impl Subscriber {
 
                         // Check for Prior Group ID Gap (type 0x3C = 60)
                         if object.extension_headers.has(0x3C) {
-                            log::info!(
+                            tracing::info!(
                                 "[SUBSCRIBER] recv_subgroup: object #{} contains PRIOR GROUP ID GAP (type 0x3C)",
                                 object_count + 1
                             );
                             if let Some(gap_ext) = object.extension_headers.get(0x3C) {
-                                log::debug!(
+                                tracing::debug!(
                                     "[SUBSCRIBER] recv_subgroup: prior group id gap details: {:?}",
                                     gap_ext
                                 );
@@ -523,7 +523,7 @@ impl Subscriber {
                     }
                     false => {
                         let object = reader.decode::<data::SubgroupObject>().await?;
-                        log::debug!(
+                        tracing::debug!(
                         "[SUBSCRIBER] recv_subgroup: object #{} - object_id_delta={}, payload_length={}, status={:?}",
                         object_count + 1,
                         object.object_id_delta,
@@ -585,7 +585,7 @@ impl Subscriber {
             // TODO SLG - object_id_delta and object status are still being ignored
 
             let mut object_writer = subgroup_writer.create(remaining_bytes, extension_headers)?;
-            log::trace!(
+            tracing::trace!(
                 "[SUBSCRIBER] recv_subgroup: reading payload for object #{} ({} bytes)",
                 object_count + 1,
                 remaining_bytes
@@ -597,14 +597,14 @@ impl Subscriber {
                     .read_chunk(remaining_bytes)
                     .await?
                     .ok_or_else(|| {
-                        log::error!(
+                        tracing::error!(
                             "[SUBSCRIBER] recv_subgroup: ERROR - stream ended with {} bytes remaining for object #{}",
                             remaining_bytes,
                             object_count + 1
                         );
                         SessionError::WrongSize
                     })?;
-                log::trace!(
+                tracing::trace!(
                     "[SUBSCRIBER] recv_subgroup: received payload chunk #{} for object #{} ({} bytes, {} remaining)",
                     chunks_read + 1,
                     object_count + 1,
@@ -616,7 +616,7 @@ impl Subscriber {
                 chunks_read += 1;
             }
 
-            log::trace!(
+            tracing::trace!(
                 "[SUBSCRIBER] recv_subgroup: completed object #{} ({} chunks)",
                 object_count + 1,
                 chunks_read
@@ -624,7 +624,7 @@ impl Subscriber {
             object_count += 1;
         }
 
-        log::info!(
+        tracing::info!(
             "[SUBSCRIBER] recv_subgroup: completed subgroup (group_id={}, subgroup_id={}, {} objects received)",
             subgroup_writer.info.group_id,
             subgroup_writer.info.subgroup_id,
@@ -650,7 +650,7 @@ impl Subscriber {
 
         // Check for extension headers in the datagram
         if let Some(ref ext_headers) = datagram.extension_headers {
-            log::debug!(
+            tracing::debug!(
                 "[SUBSCRIBER] recv_datagram: datagram contains extension headers: {:?}",
                 ext_headers
             );
@@ -659,11 +659,11 @@ impl Subscriber {
 
             // Check for Immutable Extensions (type 0xB = 11)
             if ext_headers.has(0xB) {
-                log::info!(
+                tracing::info!(
                     "[SUBSCRIBER] recv_datagram: datagram contains IMMUTABLE EXTENSIONS (type 0xB)"
                 );
                 if let Some(immutable_ext) = ext_headers.get(0xB) {
-                    log::debug!(
+                    tracing::debug!(
                         "[SUBSCRIBER] recv_datagram: immutable extension details: {:?}",
                         immutable_ext
                     );
@@ -672,11 +672,11 @@ impl Subscriber {
 
             // Check for Prior Group ID Gap (type 0x3C = 60)
             if ext_headers.has(0x3C) {
-                log::info!(
+                tracing::info!(
                     "[SUBSCRIBER] recv_datagram: datagram contains PRIOR GROUP ID GAP (type 0x3C)"
                 );
                 if let Some(gap_ext) = ext_headers.get(0x3C) {
-                    log::debug!(
+                    tracing::debug!(
                         "[SUBSCRIBER] recv_datagram: prior group id gap details: {:?}",
                         gap_ext
                     );
@@ -691,7 +691,7 @@ impl Subscriber {
         {
             // Look up the subscribe by id
             if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&subscribe_id) {
-                log::trace!(
+                tracing::trace!(
                     "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
                     datagram.track_alias,
                     datagram.group_id,
@@ -702,7 +702,7 @@ impl Subscriber {
                 subscribe.datagram(datagram)?;
             }
         } else {
-            log::warn!(
+            tracing::warn!(
                 "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
                 datagram.track_alias,
                 datagram.group_id,

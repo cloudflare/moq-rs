@@ -210,14 +210,14 @@ fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
-
-    // Disable tracing so we don't get a bunch of Quinn spam
-    let tracer = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    // Ignore error if subscriber is already set (e.g., in tests)
-    let _ = tracing::subscriber::set_global_default(tracer);
+    // Initialize tracing with env filter (respects RUST_LOG environment variable)
+    // Default to info level, but suppress quinn's verbose output
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
+        )
+        .init();
 
     let args = Args::parse();
 

@@ -79,7 +79,7 @@ impl Drop for NamespaceUnregisterHandle {
         // Spawn a task to unregister since we can't do async in drop
         tokio::spawn(async move {
             if let Err(err) = unregister_namespace_async(&client, &namespace).await {
-                log::warn!("failed to unregister namespace on drop: {}", err);
+                tracing::warn!("failed to unregister namespace on drop: {}", err);
             }
         });
     }
@@ -88,7 +88,7 @@ impl Drop for NamespaceUnregisterHandle {
 /// Async helper for unregistering a namespace
 async fn unregister_namespace_async(client: &Client, namespace: &TrackNamespace) -> Result<()> {
     let namespace_str = namespace.to_utf8_path();
-    log::debug!("unregistering namespace from API: {}", namespace_str);
+    tracing::debug!("unregistering namespace from API: {}", namespace_str);
 
     client
         .delete_origin(&namespace_str)
@@ -147,15 +147,15 @@ impl ApiCoordinator {
 
                         match client.patch_origin(&namespace_str, origin).await {
                             Ok(()) => {
-                                log::trace!("refreshed namespace registration: {}", namespace_str);
+                                tracing::trace!("refreshed namespace registration: {}", namespace_str);
                             }
                             Err(err) => {
-                                log::warn!("failed to refresh namespace registration: {}", err);
+                                tracing::warn!("failed to refresh namespace registration: {}", err);
                             }
                         }
                     }
                     _ = &mut shutdown_rx => {
-                        log::debug!("namespace refresh task shutting down");
+                        tracing::debug!("namespace refresh task shutting down");
                         break;
                     }
                 }
@@ -175,7 +175,7 @@ impl Coordinator for ApiCoordinator {
             url: self.config.relay_url.clone(),
         };
 
-        log::info!(
+        tracing::info!(
             "registering namespace in API: {} -> {}",
             namespace_str,
             self.config.relay_url
@@ -211,7 +211,7 @@ impl Coordinator for ApiCoordinator {
 
     async fn unregister_namespace(&self, namespace: &TrackNamespace) -> CoordinatorResult<()> {
         let namespace_str = namespace.to_utf8_path();
-        log::info!("unregistering namespace from API: {}", namespace_str);
+        tracing::info!("unregistering namespace from API: {}", namespace_str);
 
         self.client
             .delete_origin(&namespace_str)
@@ -227,7 +227,7 @@ impl Coordinator for ApiCoordinator {
         namespace: &TrackNamespace,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
         let namespace_str = namespace.to_utf8_path();
-        log::debug!("looking up namespace in API: {}", namespace_str);
+        tracing::debug!("looking up namespace in API: {}", namespace_str);
 
         // Query the API for the namespace
         let result = self
@@ -239,21 +239,21 @@ impl Coordinator for ApiCoordinator {
 
         match result {
             Some(origin) => {
-                log::debug!("found namespace {} at {}", namespace_str, origin.url);
+                tracing::debug!("found namespace {} at {}", namespace_str, origin.url);
                 Ok((
                     NamespaceOrigin::new(namespace.clone(), origin.url, None),
                     None,
                 ))
             }
             None => {
-                log::debug!("namespace not found: {}", namespace_str);
+                tracing::debug!("namespace not found: {}", namespace_str);
                 Err(CoordinatorError::NamespaceNotFound)
             }
         }
     }
 
     async fn shutdown(&self) -> CoordinatorResult<()> {
-        log::info!("shutting down API coordinator");
+        tracing::info!("shutting down API coordinator");
         // The moq-api client uses reqwest which handles connection cleanup internally
         Ok(())
     }

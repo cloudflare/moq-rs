@@ -106,7 +106,7 @@ impl Session {
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
-                .map_err(|e| log::warn!("Failed to create mlog: {}", e))
+                .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
                 .ok()
         });
         let control = session.open_bi().await?;
@@ -124,13 +124,13 @@ impl Session {
             params,
         };
 
-        log::debug!("sending CLIENT_SETUP: {:?}", client);
+        tracing::debug!("sending CLIENT_SETUP: {:?}", client);
         sender.encode(&client).await?;
 
         // TODO: emit client_setup_created event when we add that
 
         let server: setup::Server = recver.decode().await?;
-        log::debug!("received SERVER_SETUP: {:?}", server);
+        tracing::debug!("received SERVER_SETUP: {:?}", server);
 
         // TODO: emit server_setup_parsed event
 
@@ -147,7 +147,7 @@ impl Session {
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
-                .map_err(|e| log::warn!("Failed to create mlog: {}", e))
+                .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
                 .ok()
         });
         let control = session.accept_bi().await?;
@@ -155,7 +155,7 @@ impl Session {
         let mut recver = Reader::new(control.1);
 
         let client: setup::Client = recver.decode().await?;
-        log::debug!("received CLIENT_SETUP: {:?}", client);
+        tracing::debug!("received CLIENT_SETUP: {:?}", client);
 
         // Emit mlog event for CLIENT_SETUP parsed
         if let Some(ref mut mlog) = mlog {
@@ -177,7 +177,7 @@ impl Session {
                 params,
             };
 
-            log::debug!("sending SERVER_SETUP: {:?}", server);
+            tracing::debug!("sending SERVER_SETUP: {:?}", server);
 
             // Emit mlog event for SERVER_SETUP created
             if let Some(ref mut mlog) = mlog {
@@ -213,7 +213,7 @@ impl Session {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         while let Some(msg) = outgoing.pop().await {
-            log::debug!("sending message: {:?}", msg);
+            tracing::debug!("sending message: {:?}", msg);
 
             // Emit mlog event for sent control messages
             if let Some(ref mlog) = mlog {
@@ -275,7 +275,7 @@ impl Session {
     ) -> Result<(), SessionError> {
         loop {
             let msg: message::Message = recver.decode().await?;
-            log::debug!("received message: {:?}", msg);
+            tracing::debug!("received message: {:?}", msg);
 
             // Emit mlog event for received control messages
             if let Some(ref mlog) = mlog {
@@ -341,7 +341,7 @@ impl Session {
             };
 
             // TODO GOAWAY, MAX_REQUEST_ID, REQUESTS_BLOCKED
-            log::warn!("Unimplemented message type received: {:?}", msg);
+            tracing::warn!("Unimplemented message type received: {:?}", msg);
             return Err(SessionError::unimplemented(&format!(
                 "message type {:?}",
                 msg
@@ -366,7 +366,7 @@ impl Session {
 
                     tasks.push(async move {
                         if let Err(err) = Subscriber::recv_stream(subscriber, stream).await {
-                            log::warn!("failed to serve stream: {}", err);
+                            tracing::warn!("failed to serve stream: {}", err);
                         };
                     });
                 },

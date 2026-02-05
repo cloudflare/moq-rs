@@ -10,13 +10,14 @@ use moq_transport::{coding::TrackNamespace, serve::Tracks};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
-    // Disable tracing so we don't get a bunch of Quinn spam.
-    let tracer = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    tracing::subscriber::set_global_default(tracer).unwrap();
+    // Initialize tracing with env filter (respects RUST_LOG environment variable)
+    // Default to info level, but suppress quinn's verbose output
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
+        )
+        .init();
 
     let out = tokio::io::stdout();
 
@@ -26,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (session, connection_id) = quic.client.connect(&config.url, None).await?;
 
-    log::info!(
+    tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );

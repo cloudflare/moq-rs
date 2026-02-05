@@ -133,7 +133,7 @@ impl Publisher {
                             subscribe_tasks.push(async move {
                                 let info = subscribed.info.clone();
                                 if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
-                                    log::warn!("failed serving subscribe: {:?}, error: {}", info, err)
+                                    tracing::warn!("failed serving subscribe: {:?}, error: {}", info, err)
                                 }
                             });
                         },
@@ -149,7 +149,7 @@ impl Publisher {
                             status_tasks.push(async move {
                                 let request_msg = status.request_msg.clone();
                                 if let Err(err) = Self::serve_track_status(status, tracks).await {
-                                    log::warn!("failed serving track status request: {:?}, error: {}", request_msg, err)
+                                    tracing::warn!("failed serving track status request: {:?}, error: {}", request_msg, err)
                                 }
                             });
                         },
@@ -246,7 +246,7 @@ impl Publisher {
         };
 
         if let Err(err) = res {
-            log::warn!("failed to process message: {}", err);
+            tracing::warn!("failed to process message: {}", err);
         }
 
         Ok(())

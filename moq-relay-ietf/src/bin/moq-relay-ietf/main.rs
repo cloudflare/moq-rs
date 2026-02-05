@@ -88,13 +88,14 @@ pub struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
-    // Disable tracing so we don't get a bunch of Quinn spam.
-    let tracer = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    tracing::subscriber::set_global_default(tracer).unwrap();
+    // Initialize tracing with env filter (respects RUST_LOG environment variable)
+    // Default to info level, but suppress quinn's verbose output
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
+        )
+        .init();
 
     let cli = Cli::parse();
 
@@ -122,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
         // Register metric descriptions (shows as # HELP in Prometheus output)
         moq_relay_ietf::metrics::describe_metrics();
 
-        log::info!(
+        tracing::info!(
             "metrics exporter listening on http://{}/metrics",
             metrics_addr
         );
@@ -130,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(not(feature = "metrics-prometheus"))]
     if cli.metrics_addr.is_some() {
-        log::warn!(
+        tracing::warn!(
             "--metrics-addr was provided but the metrics-prometheus feature is not enabled. \
              Rebuild with --features metrics-prometheus to enable the Prometheus exporter."
         );
@@ -169,10 +170,10 @@ async fn main() -> anyhow::Result<()> {
     let coordinator: Arc<dyn Coordinator> = if let Some(api_url) = &cli.api_url {
         let config = ApiCoordinatorConfig::new(api_url.clone(), relay_url).with_ttl(cli.api_ttl);
         let api_coordinator = ApiCoordinator::new(config);
-        log::info!("using API coordinator: {}", api_url);
+        tracing::info!("using API coordinator: {}", api_url);
         Arc::new(api_coordinator)
     } else {
-        log::info!("using file coordinator: {}", cli.coordinator_file.display());
+        tracing::info!("using file coordinator: {}", cli.coordinator_file.display());
         Arc::new(FileCoordinator::new(&cli.coordinator_file, relay_url))
     };
 

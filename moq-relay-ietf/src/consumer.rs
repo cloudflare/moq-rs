@@ -47,11 +47,11 @@ impl Consumer {
 
                     tasks.push(async move {
                         let info = announce.clone();
-                        log::info!("serving announce: {:?}", info);
+                        tracing::info!("serving announce: {:?}", info);
 
                         // Serve the announce request
                         if let Err(err) = this.serve(announce).await {
-                            log::warn!("failed serving announce: {:?}, error: {}", info, err);
+                            tracing::warn!("failed serving announce: {:?}, error: {}", info, err);
                             // Note: phase-specific error counters are incremented in serve()
                         }
                     });
@@ -114,7 +114,7 @@ impl Consumer {
         if let Some(mut forward) = self.forward {
             tasks.push(
                 async move {
-                    log::info!("forwarding announce: {:?}", reader.info);
+                    tracing::info!("forwarding announce: {:?}", reader.info);
                     forward
                         .announce(reader)
                         .await
@@ -137,11 +137,11 @@ impl Consumer {
                     // Spawn a new task to handle the subscribe
                     tasks.push(async move {
                         let info = track.clone();
-                        log::info!("forwarding subscribe: {:?}", info);
+                        tracing::info!("forwarding subscribe: {:?}", info);
 
                         // Forward the subscribe request
                         if let Err(err) = subscriber.subscribe(track).await {
-                            log::warn!("failed forwarding subscribe: {:?}, error: {}", info, err)
+                            tracing::warn!("failed forwarding subscribe: {:?}, error: {}", info, err)
                         }
 
                         Ok(())
