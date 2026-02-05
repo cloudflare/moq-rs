@@ -171,7 +171,10 @@ impl Producer {
                 &track_status_requested.request_msg.track_namespace,
                 &track_status_requested.request_msg.track_name,
             ) {
-                let namespace = track_status_requested.request_msg.track_namespace.to_utf8_path();
+                let namespace = track_status_requested
+                    .request_msg
+                    .track_namespace
+                    .to_utf8_path();
                 let track_name = &track_status_requested.request_msg.track_name;
                 tracing::info!(namespace = %namespace, track = %track_name, source = "local", "serving track_status from local: {:?}", track.info);
                 return Ok(track_status_requested.respond_ok(&track)?);

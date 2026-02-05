@@ -78,7 +78,10 @@ impl Consumer {
 
         // should we allow the same namespace being served from multiple relays??
 
+        let ns = reader.namespace.to_utf8_path();
+
         // Register namespace with the coordinator
+        tracing::debug!(namespace = %ns, "registering namespace with coordinator");
         let _namespace_registration = match self
             .coordinator
             .register_namespace(&reader.namespace)
@@ -91,8 +94,10 @@ impl Consumer {
                 return Err(err.into());
             }
         };
+        tracing::debug!(namespace = %ns, "namespace registered with coordinator");
 
         // Register the local tracks, unregister on drop
+        tracing::debug!(namespace = %ns, "registering namespace in locals");
         let _register = match self.locals.register(reader.clone()).await {
             Ok(reg) => reg,
             Err(err) => {
@@ -101,12 +106,14 @@ impl Consumer {
                 return Err(err);
             }
         };
+        tracing::debug!(namespace = %ns, "namespace registered in locals");
 
         // Accept the announce with an OK response
         if let Err(err) = announce.ok() {
             metrics::counter!("moq_relay_announce_errors_total", "phase" => "send_ok").increment(1);
             return Err(err.into());
         }
+        tracing::debug!(namespace = %ns, "sent ANNOUNCE_OK");
 
         // Successfully sent ANNOUNCE_OK
         metrics::counter!("moq_relay_announce_ok_total").increment(1);
@@ -130,7 +137,11 @@ impl Consumer {
         loop {
             tokio::select! {
                 // If the announce is closed, return the error
-                Err(err) = announce.closed() => return Err(err.into()),
+                Err(err) = announce.closed() => {
+                    let ns = announce.namespace.to_utf8_path();
+                    tracing::info!(namespace = %ns, error = %err, "announce closed");
+                    return Err(err.into());
+                },
 
                 // Wait for the next subscriber and serve the track.
                 Some(track) = request.next() => {

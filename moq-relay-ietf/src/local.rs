@@ -88,6 +88,8 @@ pub struct Registration {
 /// Deregister local tracks on drop.
 impl Drop for Registration {
     fn drop(&mut self) {
+        let ns = self.namespace.to_utf8_path();
+        tracing::debug!(namespace = %ns, "deregistering namespace from locals");
         self.locals.lookup.lock().unwrap().remove(&self.namespace);
     }
 }

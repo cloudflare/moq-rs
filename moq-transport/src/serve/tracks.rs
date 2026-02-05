@@ -135,7 +135,16 @@ impl Deref for TracksRequest {
 impl Drop for TracksRequest {
     fn drop(&mut self) {
         // Close any tracks still in the Queue
-        for track in self.incoming.take().unwrap().close() {
+        let pending_tracks = self.incoming.take().unwrap().close();
+        if !pending_tracks.is_empty() {
+            tracing::debug!(
+                target: "moq_transport::tracks",
+                namespace = %self.info.namespace.to_utf8_path(),
+                count = pending_tracks.len(),
+                "TracksRequest dropped with pending track requests"
+            );
+        }
+        for track in pending_tracks {
             let _ = track.close(ServeError::not_found_ctx(
                 "tracks request dropped before track handled",
             ));
@@ -198,10 +207,22 @@ impl TracksReader {
         if let Some(track_reader) = state.tracks.get(&full_name) {
             if !track_reader.is_closed() {
                 // Track is still active, return the cached reader
+                tracing::debug!(
+                    target: "moq_transport::tracks",
+                    namespace = %namespace.to_utf8_path(),
+                    track = %track_name,
+                    "track cache hit (active)"
+                );
                 return Some(track_reader.clone());
             }
             // Track is closed/stale, fall through to create a new one
             // We'll remove the stale entry and request a fresh track from the publisher
+            tracing::debug!(
+                target: "moq_transport::tracks",
+                namespace = %namespace.to_utf8_path(),
+                track = %track_name,
+                "track cache hit but stale, will evict and re-request"
+            );
         }
 
         let mut state = state.into_mut()?;
@@ -216,6 +237,12 @@ impl TracksReader {
         .produce();
 
         if self.queue.push(track_writer_reader.0).is_err() {
+            tracing::debug!(
+                target: "moq_transport::tracks",
+                namespace = %namespace.to_utf8_path(),
+                track = %track_name,
+                "track request queue closed"
+            );
             return None;
         }
 
@@ -223,6 +250,13 @@ impl TracksReader {
         state
             .tracks
             .insert(full_name, track_writer_reader.1.clone());
+
+        tracing::debug!(
+            target: "moq_transport::tracks",
+            namespace = %namespace.to_utf8_path(),
+            track = %track_name,
+            "track cache miss, requested from upstream"
+        );
 
         Some(track_writer_reader.1)
     }
