@@ -35,7 +35,6 @@
 //!
 //! | Name | Labels | Description |
 //! |------|--------|-------------|
-//! | `moq_relay_connection_duration_seconds` | - | Duration of client connections |
 //! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found) |
 //!
 //! # Usage
@@ -105,6 +104,7 @@ pub struct TimingGuard {
 
 #[cfg(feature = "metrics")]
 impl TimingGuard {
+    #[allow(dead_code)] // Keep API available for future histograms without labels
     pub fn new(name: &'static str) -> Self {
         Self {
             name,
@@ -150,6 +150,7 @@ pub struct TimingGuard;
 #[cfg(not(feature = "metrics"))]
 impl TimingGuard {
     #[inline]
+    #[allow(dead_code)] // Keep API available for future histograms without labels
     pub fn new(_name: &'static str) -> Self {
         Self
     }

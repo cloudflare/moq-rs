@@ -7,7 +7,7 @@ use moq_native_ietf::quic::{self, Endpoint};
 use url::Url;
 
 use crate::{
-    metrics::{GaugeGuard, TimingGuard},
+    metrics::GaugeGuard,
     Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer, RemotesProducer, Session,
 };
 
@@ -226,8 +226,6 @@ impl Relay {
 
                     // Spawn a new task to handle the connection
                     tasks.push(async move {
-                        // Track connection duration - records histogram on drop
-                        let _timing_guard = TimingGuard::new("moq_relay_connection_duration_seconds");
                         // Track active connections - decrements when task completes
                         let _conn_guard = GaugeGuard::new("moq_relay_active_connections");
 
