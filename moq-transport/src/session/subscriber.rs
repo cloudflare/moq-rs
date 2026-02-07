@@ -208,11 +208,22 @@ impl Subscriber {
     /// Handle the reception of a SubscribeOk message from the publisher.
     fn recv_subscribe_ok(&mut self, msg: &message::SubscribeOk) -> Result<(), SessionError> {
         if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&msg.id) {
-            // Map track alias to subscription id for quick lookup when receiving streams/datagrams
-            self.subscribe_alias_map
-                .lock()
-                .unwrap()
-                .insert(msg.track_alias, msg.id);
+            // Check for duplicate track alias - per spec, if the track_alias is already
+            // in use for a different subscription, we must close the session
+            {
+                let mut alias_map = self.subscribe_alias_map.lock().unwrap();
+                if let Some(&existing_id) = alias_map.get(&msg.track_alias) {
+                    if existing_id != msg.id {
+                        log::error!(
+                            "Duplicate track_alias={} received: already mapped to subscribe_id={}, new subscribe_id={}",
+                            msg.track_alias, existing_id, msg.id
+                        );
+                        return Err(SessionError::Duplicate);
+                    }
+                }
+                // Map track alias to subscription id for quick lookup when receiving streams/datagrams
+                alias_map.insert(msg.track_alias, msg.id);
+            }
 
             // Notify waiting tasks that the alias map has been updated
             self.subscribe_alias_notify.notify_waiters();
