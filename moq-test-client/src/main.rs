@@ -155,32 +155,10 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
     }
 }
 
-fn print_result(result: &TestResult, verbose: bool) {
-    let status = if result.passed { "✓" } else { "✗" };
+fn print_tap_result(test_number: usize, result: &TestResult, _verbose: bool) {
+    let status = if result.passed { "ok" } else { "not ok" };
     let name = result.test_case.name();
-    let duration_ms = result.duration.as_millis();
-
-    // Format CIDs for display
-    let cid_str = if result.cids.is_empty() {
-        String::new()
-    } else {
-        format!(" [CID: {}]", result.cids.join(", "))
-    };
-
-    if result.passed {
-        println!("{} {} ({} ms){}", status, name, duration_ms, cid_str);
-    } else {
-        println!("{} {} ({} ms){}", status, name, duration_ms, cid_str);
-        if let Some(ref msg) = result.message {
-            if verbose {
-                println!("  Error: {}", msg);
-            } else {
-                // Show first line of error
-                let first_line = msg.lines().next().unwrap_or(msg);
-                println!("  Error: {}", first_line);
-            }
-        }
-    }
+    println!("{} {} - {}", status, test_number, name);
 }
 
 #[tokio::main]
@@ -205,39 +183,29 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("MoQT Interop Test Client");
-    println!("========================");
-    println!("Relay: {}", args.relay);
-    println!();
-
     let tests_to_run = match args.test {
         Some(tc) => vec![tc],
         None => TestCase::all(),
     };
 
-    let mut passed = 0;
+    // TAP version 14 header
+    println!("TAP version 14");
+    println!("1..{}", tests_to_run.len());
+
     let mut failed = 0;
 
-    for test_case in tests_to_run {
-        let result = run_test(&args, test_case).await;
-        print_result(&result, args.verbose);
+    for (i, test_case) in tests_to_run.iter().enumerate() {
+        let result = run_test(&args, *test_case).await;
+        print_tap_result(i + 1, &result, args.verbose);
 
-        if result.passed {
-            passed += 1;
-        } else {
+        if !result.passed {
             failed += 1;
         }
     }
 
-    println!();
-    println!("Results: {} passed, {} failed", passed, failed);
-
-    // Standard test output for parsing
     if failed == 0 {
-        println!("\nMOQT_TEST_RESULT: SUCCESS");
         Ok(())
     } else {
-        println!("\nMOQT_TEST_RESULT: FAILURE");
         std::process::exit(1);
     }
 }
