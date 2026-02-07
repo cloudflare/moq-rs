@@ -4,18 +4,18 @@ use moq_transport::{
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
 };
 
-use crate::{Locals, RemotesConsumer};
+use crate::{Locals, RemoteManager};
 
 /// Producer of tracks to a remote Subscriber
 #[derive(Clone)]
 pub struct Producer {
     publisher: Publisher,
     locals: Locals,
-    remotes: Option<RemotesConsumer>,
+    remotes: RemoteManager,
 }
 
 impl Producer {
-    pub fn new(publisher: Publisher, locals: Locals, remotes: Option<RemotesConsumer>) -> Self {
+    pub fn new(publisher: Publisher, locals: Locals, remotes: RemoteManager) -> Self {
         Self {
             publisher,
             locals,
@@ -89,20 +89,15 @@ impl Producer {
             }
         }
 
-        if let Some(remotes) = self.remotes {
-            // Check remote tracks second, and serve from remote if possible
-            match remotes.route(&namespace).await {
-                Ok(remote) => {
-                    if let Some(remote) = remote {
-                        if let Some(track) = remote.subscribe(&namespace, &track_name)? {
-                            log::info!("serving subscribe from remote: {:?}", track.info);
-                            return Ok(subscribed.serve(track.reader).await?);
-                        }
-                    }
+        match self.remotes.subscribe(&namespace, &track_name).await {
+            Ok(track) => {
+                if let Some(track) = track {
+                    log::info!("serving subscribe from remote: {:?}", track.info);
+                    return Ok(subscribed.serve(track).await?);
                 }
-                Err(e) => {
-                    log::error!("failed to route to remote: {}", e);
-                }
+            }
+            Err(e) => {
+                log::error!("failed to route to remote: {}", e);
             }
         }
         // Track not found - close the subscription with not found error
