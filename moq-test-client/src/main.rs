@@ -155,32 +155,57 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
     }
 }
 
-fn print_result(result: &TestResult, verbose: bool) {
-    let status = if result.passed { "✓" } else { "✗" };
+fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
+    let status = if result.passed { "ok" } else { "not ok" };
     let name = result.test_case.name();
-    let duration_ms = result.duration.as_millis();
+    println!("{} {} - {}", status, test_number, name);
 
-    // Format CIDs for display
-    let cid_str = if result.cids.is_empty() {
-        String::new()
-    } else {
-        format!(" [CID: {}]", result.cids.join(", "))
-    };
+    // YAML diagnostic block
+    println!("  ---");
+    println!("  duration_ms: {}", result.duration.as_millis());
 
-    if result.passed {
-        println!("{} {} ({} ms){}", status, name, duration_ms, cid_str);
-    } else {
-        println!("{} {} ({} ms){}", status, name, duration_ms, cid_str);
-        if let Some(ref msg) = result.message {
-            if verbose {
-                println!("  Error: {}", msg);
+    // Connection IDs for mlog correlation
+    match result.cids.len() {
+        0 => {}
+        1 => println!("  connection_id: {}", result.cids[0]),
+        2 => {
+            // Multi-connection tests: first is publisher, second is subscriber
+            // (except subscribe-before-announce where subscriber connects first)
+            if result.test_case == TestCase::SubscribeBeforeAnnounce {
+                println!("  subscriber_connection_id: {}", result.cids[0]);
+                println!("  publisher_connection_id: {}", result.cids[1]);
             } else {
-                // Show first line of error
-                let first_line = msg.lines().next().unwrap_or(msg);
-                println!("  Error: {}", first_line);
+                println!("  publisher_connection_id: {}", result.cids[0]);
+                println!("  subscriber_connection_id: {}", result.cids[1]);
+            }
+        }
+        _ => {
+            // More than 2 CIDs - just list them all
+            for (i, cid) in result.cids.iter().enumerate() {
+                println!("  connection_id_{}: {}", i + 1, cid);
             }
         }
     }
+
+    // Error message for failed tests
+    if let Some(ref msg) = result.message {
+        // Escape quotes and newlines for YAML string
+        let escaped = if verbose {
+            msg.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        } else {
+            // Non-verbose: just first line
+            msg.lines()
+                .next()
+                .unwrap_or(msg)
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        };
+        println!("  message: \"{}\"", escaped);
+    }
+
+    println!("  ...");
 }
 
 #[tokio::main]
@@ -205,39 +230,31 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("MoQT Interop Test Client");
-    println!("========================");
-    println!("Relay: {}", args.relay);
-    println!();
-
     let tests_to_run = match args.test {
         Some(tc) => vec![tc],
         None => TestCase::all(),
     };
 
-    let mut passed = 0;
+    // TAP version 14 header with run-level comments
+    println!("TAP version 14");
+    println!("# moq-test-client v{}", env!("CARGO_PKG_VERSION"));
+    println!("# Relay: {}", args.relay);
+    println!("1..{}", tests_to_run.len());
+
     let mut failed = 0;
 
-    for test_case in tests_to_run {
-        let result = run_test(&args, test_case).await;
-        print_result(&result, args.verbose);
+    for (i, test_case) in tests_to_run.iter().enumerate() {
+        let result = run_test(&args, *test_case).await;
+        print_tap_result(i + 1, &result, args.verbose);
 
-        if result.passed {
-            passed += 1;
-        } else {
+        if !result.passed {
             failed += 1;
         }
     }
 
-    println!();
-    println!("Results: {} passed, {} failed", passed, failed);
-
-    // Standard test output for parsing
     if failed == 0 {
-        println!("\nMOQT_TEST_RESULT: SUCCESS");
         Ok(())
     } else {
-        println!("\nMOQT_TEST_RESULT: FAILURE");
         std::process::exit(1);
     }
 }
