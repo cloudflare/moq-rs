@@ -23,6 +23,15 @@ uuid = { version = "1", features = ["v4"] }
 
 web-transport = { workspace = true }
 
+# Used for is_graceful_close() to structurally match on connection errors
+# and decode WebTransport error codes. This couples moq-transport to the
+# quinn-based WebTransport implementation. When transitioning to a different
+# backend (e.g., tokio-quiche), these dependencies should be replaced with
+# equivalent types from the new implementation.
+web-transport-quinn = "0.3"
+web-transport-proto = "0.2"
+quinn = "0.11"
+
 paste = "1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

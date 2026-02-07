@@ -121,18 +121,29 @@ impl Producer {
                     }
                 }
                 Err(e) => {
+                    // Route error = infrastructure failure (couldn't reach coordinator/upstream)
+                    // This is different from "not found" - we don't know if the track exists
                     log::error!("failed to route to remote: {}", e);
+                    timing_guard.set_label("source", "route_error");
                     #[cfg(feature = "metrics")]
-                    metrics::counter!("moq_relay_subscribe_failures_total", "reason" => "route_error")
-                        .increment(1);
+                    metrics::counter!("moq_relay_subscribe_route_errors_total").increment(1);
+
+                    // Return an internal error rather than "not found" since we couldn't check
+                    // TODO: Consider returning a more specific error to the subscriber
+                    let err = ServeError::internal_ctx(format!(
+                        "route error for namespace '{}': {}",
+                        namespace, e
+                    ));
+                    subscribed.close(err.clone())?;
+                    return Err(err.into());
                 }
             }
         }
-        // Track not found - close the subscription with not found error
+
+        // Track not found - we checked all sources and the track doesn't exist
         // timing_guard label already set to "not_found", will record on drop
         #[cfg(feature = "metrics")]
-        metrics::counter!("moq_relay_subscribe_failures_total", "reason" => "not_found")
-            .increment(1);
+        metrics::counter!("moq_relay_subscribe_not_found_total").increment(1);
 
         let err = ServeError::not_found_ctx(format!(
             "track '{}/{}' not found in local or remote tracks",

@@ -18,7 +18,8 @@
 //! | `moq_relay_announce_ok_total` | - | Successful ANNOUNCE_OK responses sent |
 //! | `moq_relay_announce_errors_total` | `phase` | Announce failures (phase: coordinator_register, local_register, send_ok) |
 //! | `moq_relay_subscribers_total` | - | Total subscribers (SUBSCRIBE requests) received |
-//! | `moq_relay_subscribe_failures_total` | `reason` | Subscription failures (reason: not_found, route_error) |
+//! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
+//! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
 //! | `moq_relay_upstream_errors_total` | `stage` | Upstream connection failures (stage: connect, session) |
 //!
 //! ## Gauges
@@ -36,7 +37,7 @@
 //!
 //! | Name | Labels | Description |
 //! |------|--------|-------------|
-//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found) |
+//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error) |
 //!
 //! # Usage
 //!

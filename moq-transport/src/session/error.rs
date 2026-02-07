@@ -83,44 +83,37 @@ impl SessionError {
     /// (NO_ERROR). This is normal session termination, not an error condition.
     ///
     /// This method checks for:
-    /// - Quinn's `ApplicationClosed` with code 0
+    /// - WebTransport close with code 0 (HTTP/3 encoded as 0x52e4a40fa8db)
+    /// - Raw QUIC `ApplicationClosed` with code 0
     /// - The local side closing the connection (`LocallyClosed`)
     ///
-    /// Note: This uses string matching on the error message because the underlying
-    /// quinn types are not directly accessible without adding quinn as a dependency.
-    /// This approach is transport-agnostic and will work with future WebTransport
-    /// implementations (e.g., tokio-quiche) as long as they use similar error messages.
+    /// ## Implementation Notes
+    ///
+    /// We pattern match on `web_transport_quinn::SessionError` variants to access the
+    /// underlying `quinn::ConnectionError`. For WebTransport connections, the close code
+    /// is encoded using HTTP/3 error code space, which we decode using
+    /// `web_transport_proto::error_from_http3()`.
+    ///
+    /// **Coupling note**: This implementation is coupled to `web-transport-quinn` and
+    /// `quinn`. When transitioning to a different WebTransport backend (e.g., tokio-quiche),
+    /// ensure the replacement provides equivalent error introspection, or update this
+    /// method to handle the new error types.
     pub fn is_graceful_close(&self) -> bool {
         match self {
-            Self::Session(session_err) => {
-                let err_str = session_err.to_string();
-                // Quinn's ApplicationClosed with code 0: "closed by peer: 0" or "closed by peer: reason (code 0)"
-                // Quinn's LocallyClosed: "closed"
-                if err_str == "connection error: closed" {
-                    return true;
-                }
-                if err_str.starts_with("connection error: closed by peer:") {
-                    // Check if error code is 0
-                    // Format: "closed by peer: 0" or "closed by peer: reason (code 0)"
-                    if err_str.ends_with(": 0") || err_str.ends_with("(code 0)") {
-                        return true;
-                    }
+            Self::Session(session_err) => is_session_error_graceful(session_err),
+            Self::Read(read_err) => {
+                // ReadError::SessionError wraps SessionError
+                if let web_transport::ReadError::SessionError(session_err) = read_err {
+                    return is_session_error_graceful(session_err);
                 }
                 false
             }
-            // Read/Write errors during graceful shutdown can also indicate clean close
-            Self::Read(read_err) => {
-                let err_str = read_err.to_string();
-                // Stream closed during graceful shutdown
-                err_str.contains("closed by peer: 0")
-                    || err_str.contains("(code 0)")
-                    || err_str == "session error: connection error: closed"
-            }
             Self::Write(write_err) => {
-                let err_str = write_err.to_string();
-                err_str.contains("closed by peer: 0")
-                    || err_str.contains("(code 0)")
-                    || err_str == "session error: connection error: closed"
+                // WriteError::SessionError wraps SessionError
+                if let web_transport::WriteError::SessionError(session_err) = write_err {
+                    return is_session_error_graceful(session_err);
+                }
+                false
             }
             _ => false,
         }
@@ -133,5 +126,50 @@ impl From<SessionError> for serve::ServeError {
             SessionError::Serve(err) => err,
             _ => serve::ServeError::internal_ctx(format!("session error: {}", err)),
         }
+    }
+}
+
+/// Helper to check if a `web_transport::SessionError` represents a graceful close.
+///
+/// This handles both:
+/// - Raw QUIC connections: `ApplicationClosed` with code 0
+/// - WebTransport connections: `ApplicationClosed` with HTTP/3 encoded code that decodes to 0
+fn is_session_error_graceful(err: &web_transport::SessionError) -> bool {
+    use web_transport_quinn::SessionError;
+
+    match err {
+        SessionError::ConnectionError(conn_err) => is_connection_error_graceful(conn_err),
+        // WebTransportError doesn't represent connection close in 0.3.x
+        SessionError::WebTransportError(_) => false,
+        // SendDatagramError doesn't represent connection close
+        SessionError::SendDatagramError(_) => false,
+    }
+}
+
+/// Helper to check if a `quinn::ConnectionError` represents a graceful close.
+fn is_connection_error_graceful(err: &quinn::ConnectionError) -> bool {
+    use quinn::ConnectionError;
+
+    match err {
+        ConnectionError::ApplicationClosed(close) => {
+            let code = close.error_code.into_inner();
+
+            // Check for raw QUIC code 0 (direct MoQ-over-QUIC)
+            if code == 0 {
+                return true;
+            }
+
+            // Check for WebTransport code 0 (HTTP/3 encoded)
+            // WebTransport code 0 maps to HTTP/3 code 0x52e4a40fa8db
+            if let Some(wt_code) = web_transport_proto::error_from_http3(code) {
+                return wt_code == 0;
+            }
+
+            false
+        }
+        // LocallyClosed means we closed the connection ourselves
+        ConnectionError::LocallyClosed => true,
+        // Other errors are not graceful closes
+        _ => false,
     }
 }

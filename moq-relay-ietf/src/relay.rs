@@ -235,7 +235,11 @@ impl Relay {
                             Err(err) => {
                                 log::warn!("failed to accept MoQ session: {}", err);
                                 #[cfg(feature = "metrics")]
-                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
+                                {
+                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
+                                    // Maintain invariant: connections_total - connections_closed_total == active_connections
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                }
                                 return Ok(());
                             }
                         };

@@ -1422,6 +1422,7 @@ dependencies = [
  "futures",
  "log",
  "paste",
+ "quinn",
  "serde",
  "serde_json",
  "serde_with",
@@ -1429,6 +1430,8 @@ dependencies = [
  "tokio",
  "uuid",
  "web-transport",
+ "web-transport-proto",
+ "web-transport-quinn",
 ]
 
 [[package]]
