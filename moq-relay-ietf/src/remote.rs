@@ -240,7 +240,6 @@ impl RemoteProducer {
         let (session, _quic_client_initial_cid) = match client.connect(&self.url, self.addr).await {
             Ok(session) => session,
             Err(err) => {
-                #[cfg(feature = "metrics")]
                 metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
                     .increment(1);
                 return Err(err);
@@ -250,7 +249,6 @@ impl RemoteProducer {
         {
             Ok(session) => session,
             Err(err) => {
-                #[cfg(feature = "metrics")]
                 metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
                     .increment(1);
                 return Err(err.into());

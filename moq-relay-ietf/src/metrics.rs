@@ -1,7 +1,13 @@
 //! Metrics instrumentation for moq-relay-ietf
 //!
-//! When the `metrics` feature is enabled, these emit to the `metrics` crate facade.
-//! When disabled, they compile to nothing.
+//! Metrics are always compiled in via the [`metrics`] crate facade. When no
+//! recorder is installed the overhead is negligible (an atomic load + early
+//! return per call site), similar to how the `log` crate works when no logger
+//! is configured.
+//!
+//! To actually collect metrics, install a recorder at startup. The optional
+//! `metrics-prometheus` feature adds a Prometheus exporter — see the binary
+//! in `src/bin/moq-relay-ietf/main.rs` for an example.
 //!
 //! # Available Metrics
 //!
@@ -38,32 +44,17 @@
 //! | Name | Labels | Description |
 //! |------|--------|-------------|
 //! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error) |
-//!
-//! # Usage
-//!
-//! Enable the `metrics` feature in your `Cargo.toml`:
-//!
-//! ```toml
-//! [dependencies]
-//! moq-relay-ietf = { version = "0.7", features = ["metrics"] }
-//! ```
-//!
-//! Then install a metrics recorder (e.g., `metrics-exporter-prometheus`) before
-//! starting the relay. See the `metrics` crate documentation for details.
 
 // ============================================================================
 // GaugeGuard - RAII guard for gauge increment/decrement
 // ============================================================================
 
 /// RAII guard that increments a gauge on creation and decrements on drop.
-/// No-op when metrics feature is disabled.
-#[cfg(feature = "metrics")]
 #[must_use = "GaugeGuard must be held for the duration you want the gauge incremented"]
 pub struct GaugeGuard {
     name: &'static str,
 }
 
-#[cfg(feature = "metrics")]
 impl GaugeGuard {
     pub fn new(name: &'static str) -> Self {
         metrics::gauge!(name).increment(1.0);
@@ -71,22 +62,9 @@ impl GaugeGuard {
     }
 }
 
-#[cfg(feature = "metrics")]
 impl Drop for GaugeGuard {
     fn drop(&mut self) {
         metrics::gauge!(self.name).decrement(1.0);
-    }
-}
-
-#[cfg(not(feature = "metrics"))]
-#[must_use = "GaugeGuard must be held for the duration you want the gauge incremented"]
-pub struct GaugeGuard;
-
-#[cfg(not(feature = "metrics"))]
-impl GaugeGuard {
-    #[inline]
-    pub fn new(_name: &'static str) -> Self {
-        Self
     }
 }
 
@@ -95,8 +73,6 @@ impl GaugeGuard {
 // ============================================================================
 
 /// RAII guard that records elapsed time to a histogram on drop.
-/// No-op when metrics feature is disabled.
-#[cfg(feature = "metrics")]
 #[must_use = "TimingGuard must be held for the duration you want to measure"]
 pub struct TimingGuard {
     name: &'static str,
@@ -104,7 +80,6 @@ pub struct TimingGuard {
     labels: Option<(&'static str, &'static str)>,
 }
 
-#[cfg(feature = "metrics")]
 impl TimingGuard {
     #[allow(dead_code)] // Keep API available for future histograms without labels
     pub fn new(name: &'static str) -> Self {
@@ -133,7 +108,6 @@ impl TimingGuard {
     }
 }
 
-#[cfg(feature = "metrics")]
 impl Drop for TimingGuard {
     fn drop(&mut self) {
         let elapsed = self.start.elapsed().as_secs_f64();
@@ -143,29 +117,4 @@ impl Drop for TimingGuard {
             metrics::histogram!(self.name).record(elapsed);
         }
     }
-}
-
-#[cfg(not(feature = "metrics"))]
-#[must_use = "TimingGuard must be held for the duration you want to measure"]
-pub struct TimingGuard;
-
-#[cfg(not(feature = "metrics"))]
-impl TimingGuard {
-    #[inline]
-    #[allow(dead_code)] // Keep API available for future histograms without labels
-    pub fn new(_name: &'static str) -> Self {
-        Self
-    }
-
-    #[inline]
-    pub fn with_label(
-        _name: &'static str,
-        _label_key: &'static str,
-        _label_value: &'static str,
-    ) -> Self {
-        Self
-    }
-
-    #[inline]
-    pub fn set_label(&mut self, _label_key: &'static str, _label_value: &'static str) {}
 }

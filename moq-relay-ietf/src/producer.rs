@@ -44,7 +44,6 @@ impl Producer {
             tokio::select! {
                 // Handle a new subscribe request
                 Some(subscribed) = publisher_subscribed.subscribed() => {
-                    #[cfg(feature = "metrics")]
                     metrics::counter!("moq_relay_subscribers_total").increment(1);
 
                     let this = self.clone();
@@ -125,7 +124,6 @@ impl Producer {
                     // This is different from "not found" - we don't know if the track exists
                     log::error!("failed to route to remote: {}", e);
                     timing_guard.set_label("source", "route_error");
-                    #[cfg(feature = "metrics")]
                     metrics::counter!("moq_relay_subscribe_route_errors_total").increment(1);
 
                     // Return an internal error rather than "not found" since we couldn't check
@@ -142,7 +140,6 @@ impl Producer {
 
         // Track not found - we checked all sources and the track doesn't exist
         // timing_guard label already set to "not_found", will record on drop
-        #[cfg(feature = "metrics")]
         metrics::counter!("moq_relay_subscribe_not_found_total").increment(1);
 
         let err = ServeError::not_found_ctx(format!(

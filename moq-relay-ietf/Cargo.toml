@@ -63,8 +63,10 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 thiserror = "2.0.17"
 
-# Metrics (optional)
-metrics = { version = "0.24", optional = true }
+# Metrics — always compiled in; the metrics crate is effectively zero-cost
+# when no recorder is installed (similar to how the log crate works).
+# The metrics-prometheus feature adds the optional Prometheus exporter.
+metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
 
 # misc
@@ -72,5 +74,4 @@ metrics-exporter-prometheus = { version = "0.16", optional = true }
 
 [features]
 default = []
-metrics = ["dep:metrics"]
-metrics-prometheus = ["metrics", "dep:metrics-exporter-prometheus"]
+metrics-prometheus = ["dep:metrics-exporter-prometheus"]

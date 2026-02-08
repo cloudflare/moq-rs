@@ -212,7 +212,6 @@ impl Relay {
 
                     let (conn, connection_id) = conn_result.context("failed to accept QUIC connection")?;
 
-                    #[cfg(feature = "metrics")]
                     metrics::counter!("moq_relay_connections_total").increment(1);
 
                     // Construct mlog path from connection ID if mlog directory is configured
@@ -234,12 +233,9 @@ impl Relay {
                             Ok(session) => session,
                             Err(err) => {
                                 log::warn!("failed to accept MoQ session: {}", err);
-                                #[cfg(feature = "metrics")]
-                                {
-                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
-                                    // Maintain invariant: connections_total - connections_closed_total == active_connections
-                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
-                                }
+                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
+                                // Maintain invariant: connections_total - connections_closed_total == active_connections
+                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 return Ok(());
                             }
                         };
@@ -255,23 +251,18 @@ impl Relay {
                         match session.run().await {
                             Ok(()) => {
                                 // Session ended cleanly (uncommon - usually ends via close)
-                                #[cfg(feature = "metrics")]
                                 metrics::counter!("moq_relay_connections_closed_total").increment(1);
                             }
                             Err(err) if err.is_graceful_close() => {
                                 // Graceful close - peer sent APPLICATION_CLOSE with code 0
                                 log::debug!("MoQ session closed gracefully");
-                                #[cfg(feature = "metrics")]
                                 metrics::counter!("moq_relay_connections_closed_total").increment(1);
                             }
                             Err(err) => {
                                 // Actual error - protocol violation, timeout, etc.
                                 log::warn!("MoQ session error: {}", err);
-                                #[cfg(feature = "metrics")]
-                                {
-                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_run").increment(1);
-                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
-                                }
+                                metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_run").increment(1);
+                                metrics::counter!("moq_relay_connections_closed_total").increment(1);
                             }
                         }
 

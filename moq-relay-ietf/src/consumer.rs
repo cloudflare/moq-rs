@@ -41,7 +41,6 @@ impl Consumer {
             tokio::select! {
                 // Handle a new announce request
                 Some(announce) = self.subscriber.announced() => {
-                    #[cfg(feature = "metrics")]
                     metrics::counter!("moq_relay_publishers_total").increment(1);
 
                     let this = self.clone();
@@ -86,7 +85,6 @@ impl Consumer {
         {
             Ok(reg) => reg,
             Err(err) => {
-                #[cfg(feature = "metrics")]
                 metrics::counter!("moq_relay_announce_errors_total", "phase" => "coordinator_register")
                     .increment(1);
                 return Err(err.into());
@@ -97,7 +95,6 @@ impl Consumer {
         let _register = match self.locals.register(reader.clone()).await {
             Ok(reg) => reg,
             Err(err) => {
-                #[cfg(feature = "metrics")]
                 metrics::counter!("moq_relay_announce_errors_total", "phase" => "local_register")
                     .increment(1);
                 return Err(err);
@@ -106,13 +103,11 @@ impl Consumer {
 
         // Accept the announce with an OK response
         if let Err(err) = announce.ok() {
-            #[cfg(feature = "metrics")]
             metrics::counter!("moq_relay_announce_errors_total", "phase" => "send_ok").increment(1);
             return Err(err.into());
         }
 
         // Successfully sent ANNOUNCE_OK
-        #[cfg(feature = "metrics")]
         metrics::counter!("moq_relay_announce_ok_total").increment(1);
 
         // Forward the announce, if needed
