@@ -60,7 +60,7 @@ impl Default for PublishedState {
     fn default() -> Self {
         Self {
             ok: false,
-            forward: false,
+            forward: true,
             subscriber_priority: 128,
             group_order: message::GroupOrder::Ascending,
             largest_location: None,
