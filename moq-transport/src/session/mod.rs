@@ -394,7 +394,7 @@ impl Session {
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for
     /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
     pub async fn connect(
-        mut session: web_transport::Session,
+        session: web_transport::Session,
         mlog_path: Option<PathBuf>,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let mlog = mlog_path.and_then(|path| {
@@ -447,7 +447,7 @@ impl Session {
     /// Accepts an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for
     /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
     pub async fn accept(
-        mut session: web_transport::Session,
+        session: web_transport::Session,
         mlog_path: Option<PathBuf>,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|path| {
@@ -673,7 +673,7 @@ impl Session {
     /// Will read stream header to know what type of stream it is and create
     /// the appropriate stream handlers.
     async fn run_streams(
-        mut webtransport: web_transport::Session,
+        webtransport: web_transport::Session,
         subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
@@ -697,7 +697,7 @@ impl Session {
 
     /// Receives QUIC datagrams and processes them using the Subscriber logic
     async fn run_datagrams(
-        mut webtransport: web_transport::Session,
+        webtransport: web_transport::Session,
         mut subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         loop {

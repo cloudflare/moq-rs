@@ -2,14 +2,8 @@ use crate::{coding, serve, setup};
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum SessionError {
-    #[error("webtransport session: {0}")]
-    Session(#[from] web_transport::SessionError),
-
-    #[error("webtransport write: {0}")]
-    Write(#[from] web_transport::WriteError),
-
-    #[error("webtransport read: {0}")]
-    Read(#[from] web_transport::ReadError),
+    #[error("webtransport error: {0}")]
+    WebTransport(#[from] web_transport::Error),
 
     #[error("encode error: {0}")]
     Encode(#[from] coding::EncodeError),
@@ -53,9 +47,7 @@ impl SessionError {
             // PROTOCOL_VIOLATION (0x3) - The role negotiated in the handshake was violated
             Self::RoleViolation => 0x3,
             // INTERNAL_ERROR (0x1) - Generic internal errors
-            Self::Session(_) => 0x1,
-            Self::Read(_) => 0x1,
-            Self::Write(_) => 0x1,
+            Self::WebTransport(_) => 0x1,
             Self::Encode(_) => 0x1,
             Self::BoundsExceeded(_) => 0x1,
             Self::Internal => 0x1,
@@ -100,21 +92,24 @@ impl SessionError {
     /// method to handle the new error types.
     pub fn is_graceful_close(&self) -> bool {
         match self {
-            Self::Session(session_err) => is_session_error_graceful(session_err),
-            Self::Read(read_err) => {
-                // ReadError::SessionError wraps SessionError
-                if let web_transport::ReadError::SessionError(session_err) = read_err {
-                    return is_session_error_graceful(session_err);
+            Self::WebTransport(wt_err) => match wt_err {
+                web_transport::Error::Session(session_err) => {
+                    is_session_error_graceful(session_err)
                 }
-                false
-            }
-            Self::Write(write_err) => {
-                // WriteError::SessionError wraps SessionError
-                if let web_transport::WriteError::SessionError(session_err) = write_err {
-                    return is_session_error_graceful(session_err);
+                web_transport::Error::Read(read_err) => {
+                    if let web_transport::quinn::ReadError::SessionError(session_err) = read_err {
+                        return is_session_error_graceful(session_err);
+                    }
+                    false
                 }
-                false
-            }
+                web_transport::Error::Write(write_err) => {
+                    if let web_transport::quinn::WriteError::SessionError(session_err) = write_err {
+                        return is_session_error_graceful(session_err);
+                    }
+                    false
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -129,17 +124,17 @@ impl From<SessionError> for serve::ServeError {
     }
 }
 
-/// Helper to check if a `web_transport::SessionError` represents a graceful close.
+/// Helper to check if a `web_transport_quinn::SessionError` represents a graceful close.
 ///
 /// This handles both:
 /// - Raw QUIC connections: `ApplicationClosed` with code 0
 /// - WebTransport connections: `ApplicationClosed` with HTTP/3 encoded code that decodes to 0
-fn is_session_error_graceful(err: &web_transport::SessionError) -> bool {
-    use web_transport_quinn::SessionError;
+fn is_session_error_graceful(err: &web_transport::quinn::SessionError) -> bool {
+    use web_transport::quinn::SessionError;
 
     match err {
         SessionError::ConnectionError(conn_err) => is_connection_error_graceful(conn_err),
-        // WebTransportError doesn't represent connection close in 0.3.x
+        // WebTransportError doesn't represent connection close
         SessionError::WebTransportError(_) => false,
         // SendDatagramError doesn't represent connection close
         SessionError::SendDatagramError(_) => false,

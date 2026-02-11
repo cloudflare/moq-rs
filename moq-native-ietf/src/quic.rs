@@ -160,7 +160,7 @@ impl Endpoint {
 
         if let Some(mut config) = config.tls.server {
             config.alpn_protocols = vec![
-                web_transport_quinn::ALPN.to_vec(),
+                web_transport_quinn::ALPN.as_bytes().to_vec(),
                 moq_transport::setup::ALPN.to_vec(),
             ];
             config.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -305,22 +305,28 @@ impl Server {
             server_name,
         );
 
-        let session = match alpn.as_bytes() {
-            web_transport_quinn::ALPN => {
-                // Wait for the CONNECT request.
-                let request = web_transport_quinn::accept(conn)
-                    .await
-                    .context("failed to receive WebTransport request")?;
+        let alpn_bytes = alpn.as_bytes();
+        let session = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
+            // Wait for the WebTransport CONNECT request (includes H3 SETTINGS exchange).
+            let request = web_transport_quinn::Request::accept(conn)
+                .await
+                .context("failed to receive WebTransport request")?;
 
-                // Accept the CONNECT request.
-                request
-                    .ok()
-                    .await
-                    .context("failed to respond to WebTransport request")?
-            }
-            // A bit of a hack to pretend like we're a WebTransport session
-            moq_transport::setup::ALPN => conn.into(),
-            _ => anyhow::bail!("unsupported ALPN: {}", alpn),
+            // Accept the CONNECT request.
+            request
+                .ok()
+                .await
+                .context("failed to respond to WebTransport request")?
+        } else if alpn_bytes == moq_transport::setup::ALPN {
+            // Raw QUIC mode — create a "fake" WebTransport session with no H3 framing.
+            let request = url::Url::parse("moqt://localhost").unwrap();
+            web_transport_quinn::Session::raw(
+                conn,
+                request,
+                web_transport_quinn::proto::ConnectResponse::default(),
+            )
+        } else {
+            anyhow::bail!("unsupported ALPN: {}", alpn)
         };
 
         Ok((session.into(), connection_id_hex))
@@ -373,7 +379,7 @@ impl Client {
 
         // TODO support connecting to both ALPNs at the same time
         config.alpn_protocols = vec![match url.scheme() {
-            "https" => web_transport_quinn::ALPN.to_vec(),
+            "https" => web_transport_quinn::ALPN.as_bytes().to_vec(),
             "moqt" => moq_transport::setup::ALPN.to_vec(),
             _ => anyhow::bail!("url scheme must be 'https' or 'moqt'"),
         }];
@@ -426,8 +432,12 @@ impl Client {
             .to_string();
 
         let session = match url.scheme() {
-            "https" => web_transport_quinn::connect_with(connection, url).await?,
-            "moqt" => connection.into(),
+            "https" => web_transport_quinn::Session::connect(connection, url.clone()).await?,
+            "moqt" => web_transport_quinn::Session::raw(
+                connection,
+                url.clone(),
+                web_transport_quinn::proto::ConnectResponse::default(),
+            ),
             _ => unreachable!(),
         };
 

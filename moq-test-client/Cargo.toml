@@ -18,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 moq-transport = { path = "../moq-transport", version = "0.12" }
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.7" }
-web-transport = "0.3"
+web-transport = { workspace = true }
 
 url = "2"
 

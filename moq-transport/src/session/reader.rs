@@ -68,7 +68,7 @@ impl Reader {
             // We always read at least once to avoid an infinite loop if some dingus puts remain=0
             loop {
                 let before_read = self.buffer.len();
-                if !self.stream.read_buf(&mut self.buffer).await? {
+                if self.stream.read_buf(&mut self.buffer).await?.is_none() {
                     tracing::warn!(
                         "[READER] decode: stream ended while waiting for data (have={} bytes, need={})",
                         self.buffer.len(),
@@ -113,7 +113,7 @@ impl Reader {
             return Ok(Some(data));
         }
 
-        let chunk = self.stream.read_chunk(max).await?;
+        let chunk = self.stream.read(max).await?;
         if let Some(ref data) = chunk {
             tracing::trace!("[READER] read_chunk: read {} bytes from stream", data.len());
         } else {
@@ -127,6 +127,6 @@ impl Reader {
             return Ok(false);
         }
 
-        Ok(!self.stream.read_buf(&mut self.buffer).await?)
+        Ok(self.stream.read_buf(&mut self.buffer).await?.is_none())
     }
 }
