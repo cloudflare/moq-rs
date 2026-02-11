@@ -199,6 +199,12 @@ impl SubgroupsReader {
             .as_ref()
             .map(|group| (group.group_id, group.latest()))
     }
+
+    /// Check if the subgroups writer has been closed or dropped.
+    pub fn is_closed(&self) -> bool {
+        let state = self.state.lock();
+        state.closed.is_err() || state.modified().is_none()
+    }
 }
 
 impl Deref for SubgroupsReader {

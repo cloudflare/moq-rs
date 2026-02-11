@@ -201,7 +201,6 @@ impl TracksReader {
                 return Some(track_reader.clone());
             }
             // Track is closed/stale, fall through to create a new one
-            // We'll remove the stale entry and request a fresh track from the publisher
         }
 
         let mut state = state.into_mut()?;
@@ -321,6 +320,73 @@ mod tests {
         assert!(
             closed_result_2.is_err(),
             "track_reader_2 should NOT be immediately closed - it should be a fresh track"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_track_not_stale_after_subgroups_transition() {
+        let namespace = TrackNamespace::from_utf8_path("test/namespace");
+        let track_name = "test-track";
+
+        let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        let _track_reader_1 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("first subscribe should succeed");
+
+        let track_writer = request
+            .next()
+            .await
+            .expect("publisher should receive track request");
+
+        let _subgroups_writer = track_writer
+            .subgroups()
+            .expect("subgroups transition should succeed");
+
+        let _track_reader_2 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("second subscribe should succeed");
+
+        let maybe_second_request =
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.next()).await;
+
+        assert!(
+            maybe_second_request.is_err(),
+            "publisher should NOT get a second request while SubgroupsWriter is alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_track_stale_after_subgroups_writer_dropped() {
+        let namespace = TrackNamespace::from_utf8_path("test/namespace");
+        let track_name = "test-track";
+
+        let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        let _track_reader_1 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("first subscribe should succeed");
+
+        let track_writer = request
+            .next()
+            .await
+            .expect("publisher should receive track request");
+
+        let subgroups_writer = track_writer
+            .subgroups()
+            .expect("subgroups transition should succeed");
+        drop(subgroups_writer);
+
+        let _track_reader_2 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("second subscribe should succeed");
+
+        let maybe_second_request =
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.next()).await;
+
+        assert!(
+            maybe_second_request.is_ok(),
+            "publisher should get a new request after SubgroupsWriter is dropped"
         );
     }
 
