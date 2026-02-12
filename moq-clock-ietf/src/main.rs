@@ -1,6 +1,7 @@
 use moq_native_ietf::quic;
 
 use anyhow::Context;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 
 mod cli;
 mod clock;
@@ -10,11 +11,36 @@ use cli::Cli;
 
 use moq_transport::{
     coding::TrackNamespace,
-    serve,
-    session::{Publisher, Subscriber},
+    serve::{self, TracksReader},
+    session::{Publisher, SessionError, Subscriber},
 };
 
-/// The main entry point for the MoQ Clock IETF example.
+async fn serve_subscriptions(
+    mut publisher: Publisher,
+    tracks: TracksReader,
+) -> Result<(), SessionError> {
+    let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
+        FuturesUnordered::new();
+
+    loop {
+        tokio::select! {
+            Some(subscribed) = publisher.subscribed() => {
+                let info = subscribed.info.clone();
+                let tracks = tracks.clone();
+                log::info!("serving subscribe: {:?}", info);
+
+                tasks.push(async move {
+                    if let Err(err) = Publisher::serve_subscribe(subscribed, tracks).await {
+                        log::warn!("failed serving subscribe: {:?}, error: {}", info, err);
+                    }
+                }.boxed());
+            }
+            _ = tasks.next(), if !tasks.is_empty() => {}
+            else => return Ok(()),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -59,10 +85,16 @@ async fn main() -> anyhow::Result<()> {
             let track_writer = tracks_writer.create(&config.track).unwrap();
             let clock_publisher = clock::Publisher::new_datagram(track_writer.datagrams()?);
 
+            let publish_ns = publisher
+                .publish_namespace(tracks_reader.namespace.clone())
+                .await
+                .context("failed to register namespace")?;
+
             tokio::select! {
                 res = session.run() => res.context("session error")?,
                 res = clock_publisher.run() => res.context("clock error")?,
-                res = publisher.announce(tracks_reader) => res.context("failed to serve tracks")?,
+                res = serve_subscriptions(publisher, tracks_reader) => res.context("failed to serve tracks")?,
+                res = publish_ns.closed() => res.context("namespace closed")?,
             }
         } else {
             log::info!("publishing clock via streams");
@@ -75,10 +107,16 @@ async fn main() -> anyhow::Result<()> {
             let track_writer = tracks_writer.create(&config.track).unwrap();
             let clock_publisher = clock::Publisher::new(track_writer.subgroups()?);
 
+            let publish_ns = publisher
+                .publish_namespace(tracks_reader.namespace.clone())
+                .await
+                .context("failed to register namespace")?;
+
             tokio::select! {
                 res = session.run() => res.context("session error")?,
                 res = clock_publisher.run() => res.context("clock error")?,
-                res = publisher.announce(tracks_reader) => res.context("failed to serve tracks")?,
+                res = serve_subscriptions(publisher, tracks_reader) => res.context("failed to serve tracks")?,
+                res = publish_ns.closed() => res.context("namespace closed")?,
             }
         }
     } else {

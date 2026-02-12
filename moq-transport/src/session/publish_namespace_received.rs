@@ -4,30 +4,30 @@ use crate::coding::{ReasonPhrase, TrackNamespace};
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
-use super::{AnnounceInfo, Subscriber};
+use super::{PublishNamespaceInfo, Subscriber};
 
-// There's currently no feedback from the peer, so the shared state is empty.
-// If Unannounce contained an error code then we'd be talking.
 #[derive(Default)]
-struct AnnouncedState {}
+struct PublishNamespaceReceivedState {}
 
-pub struct Announced {
+/// Represents an inbound PUBLISH_NAMESPACE that was received (subscriber side).
+/// When dropped, sends PUBLISH_NAMESPACE_CANCEL (if ok'd) or PUBLISH_NAMESPACE_ERROR.
+pub struct PublishNamespaceReceived {
     session: Subscriber,
-    state: State<AnnouncedState>,
+    state: State<PublishNamespaceReceivedState>,
 
-    pub info: AnnounceInfo,
+    pub info: PublishNamespaceInfo,
 
     ok: bool,
     error: Option<ServeError>,
 }
 
-impl Announced {
+impl PublishNamespaceReceived {
     pub(super) fn new(
         session: Subscriber,
         request_id: u64,
         namespace: TrackNamespace,
-    ) -> (Announced, AnnouncedRecv) {
-        let info = AnnounceInfo {
+    ) -> (PublishNamespaceReceived, PublishNamespaceReceivedRecv) {
+        let info = PublishNamespaceInfo {
             request_id,
             namespace,
         };
@@ -40,19 +40,19 @@ impl Announced {
             error: None,
             state: send,
         };
-        let recv = AnnouncedRecv { _state: recv };
+        let recv = PublishNamespaceReceivedRecv { _state: recv };
 
         (send, recv)
     }
 
-    // Send an ANNOUNCE_OK
     pub fn ok(&mut self) -> Result<(), ServeError> {
         if self.ok {
             return Err(ServeError::Duplicate);
         }
 
-        self.session.send_message(message::PublishNamespaceOk {
+        self.session.send_message(message::RequestOk {
             id: self.info.request_id,
+            params: Default::default(),
         });
 
         self.ok = true;
@@ -62,8 +62,6 @@ impl Announced {
 
     pub async fn closed(&self) -> Result<(), ServeError> {
         loop {
-            // Wow this is dumb and yet pretty cool.
-            // Basically loop until the state changes and exit when Recv is dropped.
             self.state
                 .lock()
                 .modified()
@@ -78,19 +76,18 @@ impl Announced {
     }
 }
 
-impl ops::Deref for Announced {
-    type Target = AnnounceInfo;
+impl ops::Deref for PublishNamespaceReceived {
+    type Target = PublishNamespaceInfo;
 
-    fn deref(&self) -> &AnnounceInfo {
+    fn deref(&self) -> &PublishNamespaceInfo {
         &self.info
     }
 }
 
-impl Drop for Announced {
+impl Drop for PublishNamespaceReceived {
     fn drop(&mut self) {
         let err = self.error.clone().unwrap_or(ServeError::Done);
 
-        // TODO SLG - ServeError's do not align with draft-13 Announce error codes (section 8.25)
         if self.ok {
             self.session.send_message(message::PublishNamespaceCancel {
                 track_namespace: self.namespace.clone(),
@@ -98,7 +95,7 @@ impl Drop for Announced {
                 reason_phrase: ReasonPhrase(err.to_string()),
             });
         } else {
-            self.session.send_message(message::PublishNamespaceError {
+            self.session.send_message(message::RequestError {
                 id: self.info.request_id,
                 error_code: err.code(),
                 reason_phrase: ReasonPhrase(err.to_string()),
@@ -107,13 +104,12 @@ impl Drop for Announced {
     }
 }
 
-pub(super) struct AnnouncedRecv {
-    _state: State<AnnouncedState>,
+pub(super) struct PublishNamespaceReceivedRecv {
+    _state: State<PublishNamespaceReceivedState>,
 }
 
-impl AnnouncedRecv {
-    pub fn recv_unannounce(self) -> Result<(), ServeError> {
-        // Will cause the state to be dropped
+impl PublishNamespaceReceivedRecv {
+    pub fn recv_done(self) -> Result<(), ServeError> {
         Ok(())
     }
 }

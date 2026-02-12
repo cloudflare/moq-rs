@@ -53,10 +53,8 @@ subscriber_msgs! {
     FetchCancel,
     TrackStatus,
     SubscribeNamespace,
-    UnsubscribeNamespace,
     PublishNamespaceCancel,
-    PublishNamespaceOk,
-    PublishNamespaceError,
+    RequestOk,
     PublishOk,
-    PublishError,
+    RequestError,
 }

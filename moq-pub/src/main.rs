@@ -4,11 +4,16 @@ use url::Url;
 
 use anyhow::Context;
 use clap::Parser;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::io::AsyncReadExt;
 
 use moq_native_ietf::quic;
 use moq_pub::Media;
-use moq_transport::{coding::TrackNamespace, serve, session::Publisher};
+use moq_transport::{
+    coding::TrackNamespace,
+    serve::{self, TracksReader},
+    session::{Publisher, SessionError},
+};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -37,6 +42,32 @@ pub struct Cli {
     /// The TLS configuration.
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
+}
+
+async fn serve_subscriptions(
+    mut publisher: Publisher,
+    tracks: TracksReader,
+) -> Result<(), SessionError> {
+    let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
+        FuturesUnordered::new();
+
+    loop {
+        tokio::select! {
+            Some(subscribed) = publisher.subscribed() => {
+                let info = subscribed.info.clone();
+                let tracks = tracks.clone();
+                log::info!("serving subscribe: {:?}", info);
+
+                tasks.push(async move {
+                    if let Err(err) = Publisher::serve_subscribe(subscribed, tracks).await {
+                        log::warn!("failed serving subscribe: {:?}, error: {}", info, err);
+                    }
+                }.boxed());
+            }
+            _ = tasks.next(), if !tasks.is_empty() => {}
+            else => return Ok(()),
+        }
+    }
 }
 
 #[tokio::main]
@@ -71,16 +102,25 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let (session, mut publisher) = Publisher::connect(session)
+    let (session, publisher) = Publisher::connect(session)
         .await
         .context("failed to create MoQ Transport publisher")?;
 
+    let namespace = reader.namespace.clone();
+
+    let publish_ns = publisher
+        .clone()
+        .publish_namespace(namespace)
+        .await
+        .context("failed to register namespace")?;
+
+    log::info!("namespace registered, starting media and subscription handling");
+
     tokio::select! {
         res = session.run() => res.context("session error")?,
-        res = run_media(media) => {
-            res.context("media error")?
-        },
-        res = publisher.announce(reader) => res.context("publisher error")?,
+        res = run_media(media) => res.context("media error")?,
+        res = serve_subscriptions(publisher, reader) => res.context("publisher error")?,
+        res = publish_ns.closed() => res.context("publisher error")?,
     }
 
     Ok(())

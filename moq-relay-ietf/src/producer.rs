@@ -1,7 +1,11 @@
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
+    coding::TrackNamespace,
     serve::{ServeError, TracksReader},
-    session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
+    session::{
+        PublishNamespace, Publisher, SessionError, SubscribeNamespaceReceived, Subscribed,
+        TrackStatusRequested,
+    },
 };
 
 use crate::{Locals, RemotesConsumer};
@@ -23,12 +27,15 @@ impl Producer {
         }
     }
 
-    /// Announce new tracks to the remote server.
-    pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        self.publisher.announce(tracks).await
+    pub async fn publish_namespace(
+        &mut self,
+        tracks: TracksReader,
+    ) -> Result<PublishNamespace, SessionError> {
+        self.publisher
+            .publish_namespace(tracks.namespace.clone())
+            .await
     }
 
-    /// Run the producer to serve subscribe requests.
     pub async fn run(self) -> Result<(), SessionError> {
         //let mut tasks = FuturesUnordered::new();
         let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
@@ -37,6 +44,7 @@ impl Producer {
         loop {
             let mut publisher_subscribed = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
+            let mut publisher_subscribe_ns = self.publisher.clone();
 
             tokio::select! {
                 // Handle a new subscribe request
@@ -69,28 +77,60 @@ impl Producer {
                         }
                     }.boxed())
                 },
+                Some(subscribe_ns) = publisher_subscribe_ns.subscribe_namespace_received() => {
+                    let this = self.clone();
+
+                    tasks.push(async move {
+                        let info = subscribe_ns.info.clone();
+                        log::info!("serving subscribe_namespace: {:?}", info);
+
+                        if let Err(err) = this.serve_subscribe_namespace(subscribe_ns).await {
+                            log::warn!("failed serving subscribe_namespace: {:?}, error: {}", info, err)
+                        }
+                    }.boxed())
+                },
                 _= tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(()),
             };
         }
     }
 
-    /// Serve a subscribe request.
     async fn serve_subscribe(self, subscribed: Subscribed) -> Result<(), anyhow::Error> {
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();
 
-        // Check local tracks first, and serve from local if possible
-        if let Some(mut local) = self.locals.retrieve(&namespace) {
-            // Pass the full requested namespace, not the announced prefix
-            if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
-                log::info!("serving subscribe from local: {:?}", track.info);
-                return Ok(subscribed.serve(track).await?);
+        if let Some(track_info) = self
+            .locals
+            .get_or_create_track_info(&namespace, &track_name)
+        {
+            if track_info.should_subscribe_upstream() {
+                log::info!(
+                    "subscribe needs upstream request: {}/{}",
+                    namespace,
+                    track_name
+                );
+
+                if let Some(reader) = self.locals.subscribe_upstream(track_info.clone()) {
+                    log::info!(
+                        "forwarding subscribe upstream via TrackInfo: {}/{}",
+                        namespace,
+                        track_name
+                    );
+                    return Ok(subscribed.serve(reader).await?);
+                }
             }
+
+            let reader = track_info.get_reader();
+            log::info!(
+                "serving subscribe from local: {}/{} (state: {:?})",
+                namespace,
+                track_name,
+                track_info.state()
+            );
+            return Ok(subscribed.serve(reader).await?);
         }
 
         if let Some(remotes) = self.remotes {
-            // Check remote tracks second, and serve from remote if possible
             match remotes.route(&namespace).await {
                 Ok(remote) => {
                     if let Some(remote) = remote {
@@ -105,7 +145,7 @@ impl Producer {
                 }
             }
         }
-        // Track not found - close the subscription with not found error
+
         let err = ServeError::not_found_ctx(format!(
             "track '{}/{}' not found in local or remote tracks",
             namespace, track_name
@@ -114,7 +154,51 @@ impl Producer {
         Err(err.into())
     }
 
-    /// Serve a track_status request.
+    async fn serve_subscribe_namespace(
+        mut self,
+        mut subscribe_ns: SubscribeNamespaceReceived,
+    ) -> Result<(), anyhow::Error> {
+        let namespace_prefix = subscribe_ns.namespace_prefix.clone();
+
+        let matching_namespaces: Vec<TrackNamespace> = self
+            .locals
+            .matching_namespaces(&namespace_prefix)
+            .into_iter()
+            .collect();
+
+        if matching_namespaces.is_empty() {
+            subscribe_ns.reject(0x4, "Namespace prefix not found")?;
+            return Ok(());
+        }
+
+        subscribe_ns.ok()?;
+
+        for namespace in matching_namespaces {
+            log::info!(
+                "sending PUBLISH_NAMESPACE for {:?} (matched prefix {:?})",
+                namespace,
+                namespace_prefix
+            );
+            match self.publisher.publish_namespace(namespace.clone()).await {
+                Ok(_publish_ns) => {
+                    log::debug!("sent PUBLISH_NAMESPACE for {:?}", namespace);
+                    // FIX:: on drop of publish_ns PUBLISH_NAMESPACE_DONE will be sent,
+                    // need to handle that as well
+                }
+                Err(e) => {
+                    log::warn!(
+                        "failed to send PUBLISH_NAMESPACE for {:?}: {}",
+                        namespace,
+                        e
+                    );
+                }
+            }
+        }
+
+        subscribe_ns.closed().await?;
+        Ok(())
+    }
+
     async fn serve_track_status(
         self,
         mut track_status_requested: TrackStatusRequested,

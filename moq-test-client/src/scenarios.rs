@@ -10,7 +10,11 @@ use anyhow::{Context, Result};
 use tokio::time::{timeout, Duration};
 
 use moq_native_ietf::quic;
-use moq_transport::{coding::TrackNamespace, serve::Tracks, session::Session};
+use moq_transport::{
+    coding::TrackNamespace,
+    serve::Tracks,
+    session::{Publisher, Session},
+};
 
 use crate::Args;
 
@@ -20,7 +24,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Namespace used for test operations
 const TEST_NAMESPACE: &str = "moq-test/interop";
 
-/// Track name used for test operations  
+/// Track name used for test operations
 const TEST_TRACK: &str = "test-track";
 
 /// Helper to connect to a relay and establish a session
@@ -72,10 +76,10 @@ pub async fn test_setup_only(args: &Args) -> Result<TestConnectionIds> {
     .context("test timed out")?
 }
 
-/// T0.2: Announce Only
+/// T0.2: Publish namespace Only
 ///
-/// Connect to relay, announce a namespace, receive PUBLISH_NAMESPACE_OK, close.
-pub async fn test_announce_only(args: &Args) -> Result<TestConnectionIds> {
+/// Connect to relay, publish a namespace, receive PUBLISH_NAMESPACE_OK, close.
+pub async fn test_publish_namespace_only(args: &Args) -> Result<TestConnectionIds> {
     timeout(TEST_TIMEOUT, async {
         let (session, cid) = connect(args).await.context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
@@ -86,32 +90,31 @@ pub async fn test_announce_only(args: &Args) -> Result<TestConnectionIds> {
             .context("SETUP exchange failed")?;
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
-        let (_, _, reader) = Tracks::new(namespace.clone()).produce();
 
-        log::info!("Announcing namespace: {}", TEST_NAMESPACE);
+        log::info!("Publishing namespace: {}", TEST_NAMESPACE);
 
-        // Run announce with a timeout - we want to verify we get PUBLISH_NAMESPACE_OK.
-        // NOTE: The announce() method blocks waiting for subscriptions after getting OK.
+        // Run publish namespace with a timeout - we want to verify we get PUBLISH_NAMESPACE_OK.
+        // NOTE: The publish_namespace() method sends PUBLISH_NAMESPACE and wait for OK or ERROR.
         // If we get PUBLISH_NAMESPACE_ERROR instead of OK, the method returns Err immediately.
-        // So timing out here means: either (a) got OK and waiting for subs, or (b) relay never responded.
-        // We accept this limitation since (b) would indicate a broken relay anyway.
-        // TODO: For stricter verification, use lower-level Announce::ok() method directly.
-        let announce_result = tokio::select! {
-            res = publisher.announce(reader) => res,
+        // So timing out here means relay never responded and connection may be broken.
+        let publish_ns = publisher.publish_namespace(namespace).await?;
+
+        let publish_ns_result = tokio::select! {
+            res = publish_ns.ok() => res,
             res = session.run() => {
                 res.context("session error")?;
                 anyhow::bail!("session ended before announce completed");
             }
             _ = tokio::time::sleep(Duration::from_secs(2)) => {
                 // If we got an error from the relay, announce() would have returned already.
-                // Timing out means we're past the OK and now waiting for subscriptions.
-                log::info!("Announce succeeded (no error received, waiting for subscriptions timed out)");
-                return Ok(cids);
+                // Timing out means the relay never responded and connection may be broken.
+                log::info!("Publishing namespace failed (relay did not reply)");
+                return Err(anyhow::anyhow!("publish namespace timed out"));
             }
         };
 
-        // If we get here, announce completed (which means it errored or namespace was cancelled)
-        announce_result.context("announce failed")?;
+        // If we get here, publish namespace completed (which means it errored or namespace was cancelled)
+        publish_ns_result.context("publish namespace failed")?;
 
         Ok(cids)
     })
@@ -190,11 +193,11 @@ pub async fn test_subscribe_error(args: &Args) -> Result<TestConnectionIds> {
     .context("test timed out")?
 }
 
-/// T0.4: Announce + Subscribe
+/// T0.4: Publish Namespace + Subscribe
 ///
-/// Two clients: publisher announces a namespace, subscriber subscribes to a track.
+/// Two clients: publisher publishes a namespace, subscriber subscribes to a track.
 /// Verifies the relay correctly routes the subscription to the publisher.
-pub async fn test_announce_subscribe(args: &Args) -> Result<TestConnectionIds> {
+pub async fn test_publish_namespace_subscribe(args: &Args) -> Result<TestConnectionIds> {
     timeout(TEST_TIMEOUT, async {
         let mut cids = TestConnectionIds::default();
 
@@ -222,7 +225,12 @@ pub async fn test_announce_subscribe(args: &Args) -> Result<TestConnectionIds> {
         // Create the track that subscriber will request
         let _track_writer = pub_writer.create(TEST_TRACK);
 
-        log::info!("Publisher announcing namespace: {}", TEST_NAMESPACE);
+        log::info!("Publisher publishing namespace: {}", TEST_NAMESPACE);
+
+        let publish_ns = publisher
+            .publish_namespace(namespace.clone())
+            .await
+            .context("publish_namespace call failed")?;
 
         // Subscriber: set up tracks and subscribe
         let (mut sub_writer, _, _sub_reader) = Tracks::new(namespace.clone()).produce();
@@ -230,37 +238,51 @@ pub async fn test_announce_subscribe(args: &Args) -> Result<TestConnectionIds> {
             .create(TEST_TRACK)
             .ok_or_else(|| anyhow::anyhow!("failed to create subscriber track"))?;
 
-        log::info!(
-            "Subscriber subscribing to track: {}/{}",
-            TEST_NAMESPACE,
-            TEST_TRACK
-        );
-
-        // Run everything concurrently. We expect the subscriber to get a response
-        // (either SUBSCRIBE_OK or error) within the timeout.
+        // Run everything concurrently. Session::run() consumes self, so
+        // publish_namespace→subscribe must be sequenced inside a single async
+        // block running alongside both sessions.
+        let mut pub_subscriber_handler = publisher.clone();
         tokio::select! {
-            // Publisher announces and waits for subscriptions
-            res = publisher.announce(pub_reader) => {
-                res.context("publisher announce failed")?;
-                log::info!("Publisher announce completed");
-            }
-            // Subscriber subscribes - this is the main thing we're testing
-            res = subscriber.subscribe(sub_track) => {
-                match res {
+            // Publisher publishes namespace, then subscriber subscribes
+            res = async {
+                publish_ns.ok().await.context("publish namespace failed")?;
+                log::info!("Publisher got PUBLISH_NAMESPACE_OK");
+
+                log::info!("Subscribing to track: {}/{}", TEST_NAMESPACE, TEST_TRACK);
+                // Subscriber subscribes - this is the main thing we're testing
+                match subscriber.subscribe(sub_track).await {
                     Ok(()) => log::info!("Subscriber got SUBSCRIBE_OK - relay routed subscription correctly"),
                     Err(e) => log::info!("Subscriber got error: {} - subscription was processed", e),
                 }
+                Ok::<_, anyhow::Error>(())
+            } => {
+                res?;
+            }
+            // Serve incoming subscriptions forwarded by the relay to the publisher
+            res = async {
+                while let Some(subscribed) = pub_subscriber_handler.subscribed().await {
+                    let info = subscribed.info.clone();
+                    log::info!("Publisher serving subscribe: {:?}", info);
+                    if let Err(err) = Publisher::serve_subscribe(subscribed, pub_reader.clone()).await {
+                        log::warn!("Failed serving subscribe: {:?}, error: {}", info, err);
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            } => {
+                res?;
             }
             // Run publisher session
             res = pub_session.run() => {
                 res.context("publisher session error")?;
+                anyhow::bail!("publisher session ended unexpectedly");
             }
             // Run subscriber session
             res = sub_session.run() => {
                 res.context("subscriber session error")?;
+                anyhow::bail!("subscriber session ended unexpectedly");
             }
             // Timeout: give the relay time to route the subscription
-            _ = tokio::time::sleep(Duration::from_secs(3)) => {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 // If we hit this timeout, the subscription may still be pending.
                 // This isn't necessarily a failure - some relays may hold subscriptions
                 // until the track has data. Log for visibility.
@@ -289,27 +311,30 @@ pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionId
             .context("SETUP exchange failed")?;
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
-        let (_, _, reader) = Tracks::new(namespace.clone()).produce();
 
-        log::info!("Announcing namespace: {}", TEST_NAMESPACE);
+        log::info!("publishing namespace: {}", TEST_NAMESPACE);
 
         // Run announce and wait for OK, then explicitly drop to send PUBLISH_NAMESPACE_DONE.
         // See note in test_announce_only about timeout-based verification.
-        let result = tokio::select! {
-            res = publisher.announce(reader) => res,
+        let publish_ns = publisher.publish_namespace(namespace).await?;
+
+        let publish_ns_result = tokio::select! {
+            res = publish_ns.ok() => res,
             res = session.run() => {
                 res.context("session error")?;
                 anyhow::bail!("session ended before announce completed");
             }
             _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                // No error received - announce is active and waiting for subscriptions
-                log::info!("Announce active, now sending PUBLISH_NAMESPACE_DONE");
-                // Dropping out of this block will drop the announce, which sends PUBLISH_NAMESPACE_DONE
-                Ok(())
+                // If we got an error from the relay, announce() would have returned already.
+                // Timing out means the relay never responded and connection may be broken.
+                log::info!("Publishing namespace failed (relay did not reply)");
+                return Err(anyhow::anyhow!("publish namespace timed out"));
             }
         };
 
-        result.context("announce failed")?;
+        publish_ns_result.context("publish namespace failed")?;
+
+        drop(publish_ns);
 
         // Small delay to ensure PUBLISH_NAMESPACE_DONE is sent before we close
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -374,17 +399,16 @@ pub async fn test_subscribe_before_announce(args: &Args) -> Result<TestConnectio
             .await
             .context("publisher SETUP failed")?;
 
-        let (mut pub_writer, _, pub_reader) = Tracks::new(namespace.clone()).produce();
-        let _track_writer = pub_writer.create(TEST_TRACK);
-
         log::info!(
             "Publisher announcing namespace (after subscriber): {}",
             TEST_NAMESPACE
         );
 
+        let publish_ns = publisher.publish_namespace(namespace).await?;
+
         // Run publisher announce
         tokio::select! {
-            res = publisher.announce(pub_reader) => {
+            res = publish_ns.ok() => {
                 res.context("publisher announce failed")?;
             }
             res = pub_session.run() => {

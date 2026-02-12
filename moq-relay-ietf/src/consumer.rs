@@ -3,8 +3,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    serve::Tracks,
-    session::{Announced, SessionError, Subscriber},
+    coding::KeyValuePairs,
+    message::PublishOk,
+    serve::{ServeError, Tracks},
+    session::{PublishNamespaceReceived, PublishReceived, SessionError, Subscriber},
 };
 
 use crate::{Coordinator, Locals, Producer};
@@ -33,25 +35,39 @@ impl Consumer {
         }
     }
 
-    /// Run the consumer to serve announce requests.
-    pub async fn run(mut self) -> Result<(), SessionError> {
-        let mut tasks = FuturesUnordered::new();
+    /// Run the consumer to serve announce requests and track-level publish messages.
+    pub async fn run(self) -> Result<(), SessionError> {
+        let mut tasks: FuturesUnordered<futures::future::BoxFuture<'_, ()>> =
+            FuturesUnordered::new();
 
         loop {
+            let mut subscriber_ns = self.subscriber.clone();
+            let mut subscriber_publish = self.subscriber.clone();
+
             tokio::select! {
-                // Handle a new announce request
-                Some(announce) = self.subscriber.announced() => {
+                Some(publish_ns) = subscriber_ns.publish_ns_recvd() => {
                     let this = self.clone();
 
                     tasks.push(async move {
-                        let info = announce.clone();
-                        log::info!("serving announce: {:?}", info);
+                        let info = publish_ns.clone();
+                        log::info!("serving publish_namespace: {:?}", info);
 
-                        // Serve the announce request
-                        if let Err(err) = this.serve(announce).await {
-                            log::warn!("failed serving announce: {:?}, error: {}", info, err)
+                        if let Err(err) = this.serve_publish_namespace(publish_ns).await {
+                            log::warn!("failed serving publish_namespace: {:?}, error: {}", info, err)
                         }
-                    });
+                    }.boxed());
+                },
+                Some(publish) = subscriber_publish.publish_received() => {
+                    let this = self.clone();
+
+                    tasks.push(async move {
+                        let info = publish.info.clone();
+                        log::info!("serving publish (track-level): {:?}", info);
+
+                        if let Err(err) = this.serve_publish(publish).await {
+                            log::warn!("failed serving publish: {:?}, error: {}", info, err)
+                        }
+                    }.boxed());
                 },
                 _ = tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(()),
@@ -59,12 +75,13 @@ impl Consumer {
         }
     }
 
-    /// Serve an announce request.
-    async fn serve(mut self, mut announce: Announced) -> Result<(), anyhow::Error> {
+    async fn serve_publish_namespace(
+        mut self,
+        mut publish_ns: PublishNamespaceReceived,
+    ) -> Result<(), anyhow::Error> {
         let mut tasks = FuturesUnordered::new();
 
-        // Produce the tracks for this announce and return the reader
-        let (_, mut request, reader) = Tracks::new(announce.namespace.clone()).produce();
+        let (writer, mut request, reader) = Tracks::new(publish_ns.namespace.clone()).produce();
 
         // NOTE(mpandit): once the track is pulled from origin, internally it will be relayed
         // from this metal only, because now coordinator will have entry for the namespace.
@@ -78,20 +95,27 @@ impl Consumer {
             .await?;
 
         // Register the local tracks, unregister on drop
-        let _register = self.locals.register(reader.clone()).await?;
+        let _register = self.locals.register(reader.clone(), writer).await?;
 
-        // Accept the announce with an OK response
-        announce.ok()?;
+        publish_ns.ok()?;
 
-        // Forward the announce, if needed
-        if let Some(mut forward) = self.forward {
+        if let Some(mut forward) = self.forward.clone() {
+            let reader_clone = reader.clone();
             tasks.push(
                 async move {
-                    log::info!("forwarding announce: {:?}", reader.info);
-                    forward
-                        .announce(reader)
+                    log::info!("forwarding publish_namespace: {:?}", reader_clone.info);
+                    let publish_ns = forward
+                        .publish_namespace(reader_clone)
                         .await
-                        .context("failed forwarding announce")
+                        .context("failed forwarding publish_namespace")?;
+                    publish_ns
+                        .ok()
+                        .await
+                        .context("publish_namespace not accepted")?;
+                    publish_ns
+                        .closed()
+                        .await
+                        .context("publish_namespace closed with error")
                 }
                 .boxed(),
             );
@@ -100,8 +124,7 @@ impl Consumer {
         // Serve subscribe requests
         loop {
             tokio::select! {
-                // If the announce is closed, return the error
-                Err(err) = announce.closed() => return Err(err.into()),
+                Err(err) = publish_ns.closed() => return Err(err.into()),
 
                 // Wait for the next subscriber and serve the track.
                 Some(track) = request.next() => {
@@ -124,5 +147,74 @@ impl Consumer {
                 else => return Ok(()),
             }
         }
+    }
+
+    async fn serve_publish(self, publish: PublishReceived) -> Result<(), anyhow::Error> {
+        let namespace = publish.info.track_namespace.clone();
+        let track_name = publish.info.track_name.clone();
+
+        log::info!("received PUBLISH for track: {}/{}", namespace, track_name);
+
+        let track_info = match self
+            .locals
+            .get_or_create_track_info(&namespace, &track_name)
+        {
+            Some(info) => info,
+            None => {
+                log::warn!(
+                    "PUBLISH rejected: no PUBLISH_NAMESPACE registered for namespace {}",
+                    namespace
+                );
+                publish.reject(0x4, "Namespace not announced via PUBLISH_NAMESPACE")?;
+                return Err(ServeError::NotFound.into());
+            }
+        };
+
+        let writer = match track_info.publish_arrived() {
+            Ok(w) => w,
+            Err(ServeError::Uninterested) => {
+                log::info!(
+                    "PUBLISH rejected: already subscribed to {}/{}",
+                    namespace,
+                    track_name
+                );
+                publish.reject(ServeError::Uninterested.code(), "Already subscribed")?;
+                return Err(ServeError::Uninterested.into());
+            }
+            Err(ServeError::Duplicate) => {
+                log::info!(
+                    "PUBLISH rejected: already publishing {}/{}",
+                    namespace,
+                    track_name
+                );
+                publish.reject(ServeError::Duplicate.code(), "Already publishing")?;
+                return Err(ServeError::Duplicate.into());
+            }
+            Err(e) => {
+                publish.reject(e.code(), &e.to_string())?;
+                return Err(e.into());
+            }
+        };
+
+        let reader = track_info.get_reader();
+
+        self.locals
+            .insert_track(&namespace, reader)
+            .context("failed to insert track into namespace")?;
+
+        let msg = PublishOk {
+            id: publish.info.id,
+            params: KeyValuePairs::default(),
+        };
+
+        publish.accept(writer, msg)?;
+
+        log::info!(
+            "PUBLISH accepted, track {}/{} now in Publishing state",
+            namespace,
+            track_name
+        );
+
+        Ok(())
     }
 }

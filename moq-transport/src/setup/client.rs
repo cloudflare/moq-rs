@@ -1,14 +1,9 @@
-use super::Versions;
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
 
 /// Sent by the client to setup the session.
 /// This CLIENT_SETUP message is used by moq-transport draft versions 11 and later.
-/// Id = 0x20 vs 0x40 for versions <= 10.
 #[derive(Debug)]
 pub struct Client {
-    /// The list of supported versions in preferred order.
-    pub versions: Versions,
-
     /// Setup Parameters, ie: PATH, MAX_REQUEST_ID,
     /// MAX_AUTH_TOKEN_CACHE_SIZE, AUTHORIZATION_TOKEN, etc.
     pub params: KeyValuePairs,
@@ -26,10 +21,9 @@ impl Decode for Client {
         let _len = u16::decode(r)?;
         // TODO: Check the length of the message.
 
-        let versions = Versions::decode(r)?;
         let params = KeyValuePairs::decode(r)?;
 
-        Ok(Self { versions, params })
+        Ok(Self { params })
     }
 }
 
@@ -45,7 +39,6 @@ impl Encode for Client {
         //       write the length later, to avoid the copy of the message bytes?
         let mut buf = Vec::new();
 
-        self.versions.encode(&mut buf).unwrap();
         self.params.encode(&mut buf).unwrap();
 
         // Make sure buf.len() <= u16::MAX
@@ -66,7 +59,7 @@ impl Encode for Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::setup::{ParameterType, Version};
+    use crate::setup::ParameterType;
     use bytes::BytesMut;
 
     #[test]
@@ -76,10 +69,7 @@ mod tests {
         let mut params = KeyValuePairs::default();
         params.set_bytesvalue(ParameterType::Path.into(), "testpath".as_bytes().to_vec());
 
-        let client = Client {
-            versions: [Version::DRAFT_13].into(),
-            params,
-        };
+        let client = Client { params };
         client.encode(&mut buf).unwrap();
 
         #[rustfmt::skip]
@@ -95,7 +85,6 @@ mod tests {
             ]
         );
         let decoded = Client::decode(&mut buf).unwrap();
-        assert_eq!(decoded.versions, client.versions);
         assert_eq!(decoded.params, client.params);
     }
 }

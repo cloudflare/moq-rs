@@ -16,7 +16,8 @@ pub struct SubgroupHeader {
     pub subgroup_id: Option<u64>,
 
     /// Publisher priority, where **smaller** values are sent first.
-    pub publisher_priority: u8,
+    /// Optional when using NoPriority header types (0x30-0x3D).
+    pub publisher_priority: Option<u8>,
 }
 
 // Note:  Not using the Decode trait, since we need to know the header_type to properly parse this, and it
@@ -52,12 +53,20 @@ impl SubgroupHeader {
             }
         };
 
-        let publisher_priority = u8::decode(r)?;
-        log::trace!(
-            "[DECODE] SubgroupHeader: publisher_priority={}, buffer_remaining={} bytes",
-            publisher_priority,
-            r.remaining()
-        );
+        let publisher_priority = if header_type.has_priority() {
+            let priority = u8::decode(r)?;
+            log::trace!(
+                "[DECODE] SubgroupHeader: publisher_priority={}, buffer_remaining={} bytes",
+                priority,
+                r.remaining()
+            );
+            Some(priority)
+        } else {
+            log::trace!(
+                "[DECODE] SubgroupHeader: publisher_priority=None (not present for NoPriority header type)"
+            );
+            None
+        };
 
         let result = Self {
             header_type,
@@ -68,7 +77,7 @@ impl SubgroupHeader {
         };
 
         log::debug!(
-            "[DECODE] SubgroupHeader complete: track_alias={}, group_id={}, subgroup_id={:?}, priority={}",
+            "[DECODE] SubgroupHeader complete: track_alias={}, group_id={}, subgroup_id={:?}, priority={:?}",
             result.track_alias,
             result.group_id,
             result.subgroup_id,
@@ -82,7 +91,7 @@ impl SubgroupHeader {
 impl Encode for SubgroupHeader {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         log::trace!(
-            "[ENCODE] SubgroupHeader: starting encode - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
+            "[ENCODE] SubgroupHeader: starting encode - track_alias={}, group_id={}, subgroup_id={:?}, priority={:?}, header_type={:?}",
             self.track_alias,
             self.group_id,
             self.subgroup_id,
@@ -125,11 +134,25 @@ impl Encode for SubgroupHeader {
             log::trace!("[ENCODE] SubgroupHeader: subgroup_id not encoded (not required for this header type)");
         }
 
-        self.publisher_priority.encode(w)?;
-        log::trace!(
-            "[ENCODE] SubgroupHeader: encoded publisher_priority={}",
-            self.publisher_priority
-        );
+        if self.header_type.has_priority() {
+            if let Some(publisher_priority) = self.publisher_priority {
+                publisher_priority.encode(w)?;
+                log::trace!(
+                    "[ENCODE] SubgroupHeader: encoded publisher_priority={}",
+                    publisher_priority
+                );
+            } else {
+                log::error!(
+                    "[ENCODE] SubgroupHeader: MISSING publisher_priority for header_type={:?}",
+                    self.header_type
+                );
+                return Err(EncodeError::MissingField("PublisherPriority".to_string()));
+            }
+        } else {
+            log::trace!(
+                "[ENCODE] SubgroupHeader: publisher_priority not encoded (NoPriority header type)"
+            );
+        }
 
         let bytes_written = start_pos - w.remaining_mut();
         log::debug!(

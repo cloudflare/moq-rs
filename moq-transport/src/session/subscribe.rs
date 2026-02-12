@@ -1,9 +1,8 @@
 use std::ops;
 
 use crate::{
-    coding::{KeyValuePairs, Location, TrackNamespace},
-    data,
-    message::{self, FilterType, GroupOrder},
+    coding::{KeyValuePairs, TrackNamespace},
+    data, message,
     serve::{self, ServeError, TrackWriter, TrackWriterMode},
 };
 
@@ -17,22 +16,6 @@ pub struct SubscribeInfo {
     pub id: u64,
     pub track_namespace: TrackNamespace,
     pub track_name: String,
-
-    /// Subscriber Priority
-    pub subscriber_priority: u8,
-    pub group_order: GroupOrder,
-
-    /// Forward Flag
-    pub forward: bool,
-
-    /// Filter type
-    pub filter_type: FilterType,
-
-    /// The starting location for this subscription. Only present for "AbsoluteStart" and "AbsoluteRange" filter types.
-    pub start_location: Option<Location>,
-    /// End group id, inclusive, for the subscription, if applicable. Only present for "AbsoluteRange" filter type.
-    pub end_group_id: Option<u64>,
-
     /// Optional parameters
     pub params: KeyValuePairs,
 
@@ -46,12 +29,6 @@ impl SubscribeInfo {
             id: msg.id,
             track_namespace: msg.track_namespace.clone(),
             track_name: msg.track_name.clone(),
-            subscriber_priority: msg.subscriber_priority,
-            group_order: msg.group_order,
-            forward: msg.forward,
-            filter_type: msg.filter_type,
-            start_location: msg.start_location,
-            end_group_id: msg.end_group_id,
             params: msg.params.clone(),
             track_status: false,
         }
@@ -93,13 +70,6 @@ impl Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
-            // TODO add prioritization logic on the publisher side
-            subscriber_priority: 127, // default to mid value, see: https://github.com/moq-wg/moq-transport/issues/504
-            group_order: GroupOrder::Publisher, // defer to publisher send order
-            forward: true,            // default to forwarding objects
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
             params: Default::default(),
         };
         let info = SubscribeInfo::new_from_subscribe(&subscribe_message);
@@ -209,7 +179,8 @@ impl SubscribeRecv {
             group_id: header.group_id,
             // When subgroup_id is not present in the header type, it implicitly means subgroup 0
             subgroup_id: header.subgroup_id.unwrap_or(0),
-            priority: header.publisher_priority,
+            // When priority is not present (NoPriority header types), default to 0
+            priority: header.publisher_priority.unwrap_or(0),
         })?;
 
         self.writer = Some(subgroups.into());
@@ -227,7 +198,8 @@ impl SubscribeRecv {
                 datagrams.write(serve::Datagram {
                     group_id: datagram.group_id,
                     object_id: datagram.object_id.unwrap_or(0),
-                    priority: datagram.publisher_priority,
+                    // When priority is not present (NoPriority datagram types), default to 0
+                    priority: datagram.publisher_priority.unwrap_or(0),
                     payload: datagram.payload.unwrap_or_default(),
                     extension_headers: datagram.extension_headers.unwrap_or_default(),
                 })?;
@@ -238,7 +210,8 @@ impl SubscribeRecv {
                 datagrams.write(serve::Datagram {
                     group_id: datagram.group_id,
                     object_id: datagram.object_id.unwrap_or(0),
-                    priority: datagram.publisher_priority,
+                    // When priority is not present (NoPriority datagram types), default to 0
+                    priority: datagram.publisher_priority.unwrap_or(0),
                     payload: datagram.payload.unwrap_or_default(),
                     extension_headers: datagram.extension_headers.unwrap_or_default(),
                 })?;
