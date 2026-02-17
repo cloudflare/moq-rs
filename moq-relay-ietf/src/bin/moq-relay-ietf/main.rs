@@ -122,7 +122,10 @@ async fn main() -> anyhow::Result<()> {
         // Register metric descriptions (shows as # HELP in Prometheus output)
         moq_relay_ietf::metrics::describe_metrics();
 
-        log::info!("metrics exporter listening on http://{}/metrics", metrics_addr);
+        log::info!(
+            "metrics exporter listening on http://{}/metrics",
+            metrics_addr
+        );
     }
 
     #[cfg(not(feature = "metrics-prometheus"))]

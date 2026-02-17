@@ -7,8 +7,8 @@ use moq_native_ietf::quic::{self, Endpoint};
 use url::Url;
 
 use crate::{
-    metrics::GaugeGuard,
-    Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer, RemotesProducer, Session,
+    metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer,
+    RemotesProducer, Session,
 };
 
 // A type alias for boxed future
