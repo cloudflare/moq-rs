@@ -173,6 +173,8 @@ impl Producer {
 
         subscribe_ns.ok()?;
 
+        let mut active_publish_namespaces = Vec::new();
+
         for namespace in matching_namespaces {
             log::info!(
                 "sending PUBLISH_NAMESPACE for {:?} (matched prefix {:?})",
@@ -180,10 +182,9 @@ impl Producer {
                 namespace_prefix
             );
             match self.publisher.publish_namespace(namespace.clone()).await {
-                Ok(_publish_ns) => {
+                Ok(publish_ns) => {
                     log::debug!("sent PUBLISH_NAMESPACE for {:?}", namespace);
-                    // FIX:: on drop of publish_ns PUBLISH_NAMESPACE_DONE will be sent,
-                    // need to handle that as well
+                    active_publish_namespaces.push(publish_ns);
                 }
                 Err(e) => {
                     log::warn!(
@@ -196,6 +197,7 @@ impl Producer {
         }
 
         subscribe_ns.closed().await?;
+        drop(active_publish_namespaces);
         Ok(())
     }
 

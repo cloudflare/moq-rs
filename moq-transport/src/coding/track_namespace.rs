@@ -62,7 +62,7 @@ impl Hash for TrackNamespace {
 impl Decode for TrackNamespace {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let count = usize::decode(r)?;
-        if count > Self::MAX_FIELDS {
+        if count == 0 || count > Self::MAX_FIELDS {
             return Err(DecodeError::FieldBoundsExceeded(
                 "TrackNamespace tuples".to_string(),
             ));
@@ -78,7 +78,7 @@ impl Decode for TrackNamespace {
 
 impl Encode for TrackNamespace {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        if self.fields.len() > Self::MAX_FIELDS {
+        if self.fields.is_empty() || self.fields.len() > Self::MAX_FIELDS {
             return Err(EncodeError::FieldBoundsExceeded(
                 "TrackNamespace tuples".to_string(),
             ));
@@ -237,6 +237,28 @@ mod tests {
         assert!(matches!(
             decoded.unwrap_err(),
             DecodeError::FieldBoundsExceeded(_)
+        ));
+    }
+
+    #[test]
+    fn decode_empty_namespace_rejected() {
+        let data: Vec<u8> = vec![0x00];
+        let mut buf: Bytes = data.into();
+        let decoded = TrackNamespace::decode(&mut buf);
+        assert!(matches!(
+            decoded.unwrap_err(),
+            DecodeError::FieldBoundsExceeded(_)
+        ));
+    }
+
+    #[test]
+    fn encode_empty_namespace_rejected() {
+        let mut buf = BytesMut::new();
+        let t = TrackNamespace::new();
+        let encoded = t.encode(&mut buf);
+        assert!(matches!(
+            encoded.unwrap_err(),
+            EncodeError::FieldBoundsExceeded(_)
         ));
     }
 

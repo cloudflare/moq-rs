@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    coding::TrackNamespace,
+    coding::{ReasonPhrase, TrackNamespace},
     message::{self, GroupOrder, Message},
     mlog,
     serve::{self, ServeError, TracksReader},
@@ -399,6 +399,29 @@ impl Publisher {
             .unwrap()
             .remove(&namespace_prefix);
 
+        // Check for namespace prefix overlap (MUST per draft-14 9.28).
+        // "if a publisher receives a SUBSCRIBE_NAMESPACE with a Track Namespace Prefix
+        //  that is a prefix of, suffix of, or equal to an active SUBSCRIBE_NAMESPACE,
+        //  it MUST respond with SUBSCRIBE_NAMESPACE_ERROR, with error code
+        //  NAMESPACE_PREFIX_OVERLAP (0x5)."
+        let has_overlap = {
+            let entries = self.subscribe_namespaces_received.lock().unwrap();
+            entries.iter().any(|(_id, recv)| {
+                Self::namespaces_overlap(recv.namespace_prefix(), &namespace_prefix)
+            })
+        };
+
+        if has_overlap {
+            self.send_message(message::SubscribeNamespaceError {
+                id: msg.id,
+                error_code: 0x5u64,
+                reason_phrase: ReasonPhrase(
+                    "Namespace prefix overlaps with existing subscription".to_string(),
+                ),
+            });
+            return Ok(());
+        }
+
         let mut entries = self.subscribe_namespaces_received.lock().unwrap();
 
         let entry = match entries.entry(msg.id) {
@@ -416,6 +439,12 @@ impl Publisher {
         entry.insert(recv);
 
         Ok(())
+    }
+
+    /// True if either prefix is a prefix of the other (or equal). Draft-14 §9.28.
+    fn namespaces_overlap(a: &TrackNamespace, b: &TrackNamespace) -> bool {
+        let min_len = a.fields.len().min(b.fields.len());
+        a.fields[..min_len] == b.fields[..min_len]
     }
 
     fn recv_unsubscribe_namespace(
