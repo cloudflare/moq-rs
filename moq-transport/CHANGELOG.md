@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.12.3...moq-transport-v0.13.0) - 2026-02-18
+
+### Fixed
+
+- handle WebTransport graceful close in is_graceful_close()
+
+### Other
+
+- soften absolute claims about error conversion paths
+- remove unused direct deps from moq-transport
+- clarify graceful close semantics for WebTransport vs raw QUIC
+- Upgrade web-transport crates to v0.10.1
+
 ## [0.12.3](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.12.2...moq-transport-v0.12.3) - 2026-02-18
 
 ### Added

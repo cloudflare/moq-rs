@@ -5,7 +5,7 @@ authors = []
 repository = "https://github.com/cloudflare/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 keywords = ["quic", "webtransport", "moqt", "testing", "interop"]
@@ -16,7 +16,7 @@ name = "moq-test-client"
 path = "src/main.rs"
 
 [dependencies]
-moq-transport = { path = "../moq-transport", version = "0.12" }
+moq-transport = { path = "../moq-transport", version = "0.13" }
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.7" }
 web-transport = { workspace = true }
 

@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.7.2...moq-native-ietf-v0.7.3) - 2026-02-18
+
+### Other
+
+- Upgrade web-transport crates to v0.10.1
+
 ## [0.7.2](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.7.1...moq-native-ietf-v0.7.2) - 2026-02-18
 
 ### Other

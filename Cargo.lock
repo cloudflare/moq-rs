@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "moq-api"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "axum",
  "clap",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "moq-clock-ietf"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "moq-native-ietf"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1301,13 +1301,13 @@ dependencies = [
  "tracing",
  "url",
  "web-transport",
- "web-transport-quinn 0.11.4",
+ "web-transport-quinn",
  "webpki",
 ]
 
 [[package]]
 name = "moq-pub"
-version = "0.8.9"
+version = "0.8.10"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "moq-relay-ietf"
-version = "0.7.11"
+version = "0.7.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "moq-sub"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "moq-test-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1386,12 +1386,11 @@ dependencies = [
 
 [[package]]
 name = "moq-transport"
-version = "0.12.3"
+version = "0.13.0"
 dependencies = [
  "bytes",
  "futures",
  "paste",
- "quinn",
  "serde",
  "serde_json",
  "serde_with",
@@ -1400,8 +1399,6 @@ dependencies = [
  "tracing",
  "uuid",
  "web-transport",
- "web-transport-proto 0.2.8",
- "web-transport-quinn 0.3.4",
 ]
 
 [[package]]
@@ -2930,20 +2927,8 @@ dependencies = [
  "bytes",
  "thiserror 2.0.17",
  "url",
- "web-transport-quinn 0.11.4",
+ "web-transport-quinn",
  "web-transport-wasm",
-]
-
-[[package]]
-name = "web-transport-proto"
-version = "0.2.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "974fa1e325e6cc5327de8887f189a441fcff4f8eedcd31ec87f0ef0cc5283fbc"
-dependencies = [
- "bytes",
- "http",
- "thiserror 2.0.17",
- "url",
 ]
 
 [[package]]
@@ -2962,24 +2947,6 @@ dependencies = [
 
 [[package]]
 name = "web-transport-quinn"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3020b51cda10472a365e42d9a701916d4f04d74cc743de08246ef6a421c2d137"
-dependencies = [
- "bytes",
- "futures",
- "http",
- "log",
- "quinn",
- "quinn-proto",
- "thiserror 1.0.61",
- "tokio",
- "url",
- "web-transport-proto 0.2.8",
-]
-
-[[package]]
-name = "web-transport-quinn"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96b195557749e84091d7b912a25e190e9606283b5121d041faf538b0b55f40d7"
@@ -2994,7 +2961,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "web-transport-proto 0.5.2",
+ "web-transport-proto",
  "web-transport-trait",
 ]
 
