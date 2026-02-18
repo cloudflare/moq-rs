@@ -43,7 +43,8 @@ struct NamespaceUnregisterHandle {
 impl Drop for NamespaceUnregisterHandle {
     fn drop(&mut self) {
         if let Err(err) = unregister_namespace_sync(&self.file_path, &self.namespace) {
-            log::warn!("failed to unregister namespace on drop: {}", err);
+            let namespace = self.namespace.to_utf8_path();
+            tracing::warn!(namespace = %namespace, error = %err, "failed to unregister namespace on drop: {}", err);
         }
     }
 }
@@ -62,7 +63,7 @@ fn unregister_namespace_sync(file_path: &Path, namespace: &TrackNamespace) -> Re
     let mut data = read_data(&file)?;
     let key = CoordinatorData::namespace_key(namespace);
 
-    log::debug!("unregistering namespace: {}", key);
+    tracing::debug!(namespace = %key, "unregistering namespace: {}", key);
     data.namespaces.remove(&key);
 
     write_data(&file, &data)?;
@@ -149,7 +150,7 @@ impl Coordinator for FileCoordinator {
             let mut data = read_data(&file)?;
             let key = CoordinatorData::namespace_key(&ns_clone);
 
-            log::info!("registering namespace: {} -> {}", key, relay_url);
+            tracing::info!(namespace = %key, relay_url = %relay_url, "registering namespace: {} -> {}", key, relay_url);
             data.namespaces.insert(key, relay_url);
 
             write_data(&file, &data)?;
@@ -200,7 +201,7 @@ impl Coordinator for FileCoordinator {
                 let data = read_data(&file)?;
                 let key = CoordinatorData::namespace_key(&namespace);
 
-                log::debug!("looking up namespace: {}", key);
+                tracing::debug!(namespace = %key, "looking up namespace: {}", key);
 
                 // Try exact match first
                 if let Some(relay_url) = data.namespaces.get(&key) {

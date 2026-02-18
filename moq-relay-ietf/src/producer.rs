@@ -51,11 +51,13 @@ impl Producer {
                     // Spawn a new task to handle the subscribe
                     tasks.push(async move {
                         let info = subscribed.clone();
-                        log::info!("serving subscribe: {:?}", info);
+                        let namespace = info.track_namespace.to_utf8_path();
+                        let track_name = info.track_name.clone();
+                        tracing::info!(namespace = %namespace, track = %track_name, "serving subscribe: {:?}", info);
 
                         // Serve the subscribe request
                         if let Err(err) = this.serve_subscribe(subscribed).await {
-                            log::warn!("failed serving subscribe: {:?}, error: {}", info, err);
+                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving subscribe: {:?}, error: {}", info, err);
                         }
                     }.boxed())
                 },
@@ -66,11 +68,13 @@ impl Producer {
                     // Spawn a new task to handle the track_status request
                     tasks.push(async move {
                         let info = track_status_requested.request_msg.clone();
-                        log::info!("serving track_status: {:?}", info);
+                        let namespace = info.track_namespace.to_utf8_path();
+                        let track_name = info.track_name.clone();
+                        tracing::info!(namespace = %namespace, track = %track_name, "serving track_status: {:?}", info);
 
                         // Serve the track_status request
                         if let Err(err) = this.serve_track_status(track_status_requested).await {
-                            log::warn!("failed serving track_status: {:?}, error: {}", info, err)
+                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving track_status: {:?}, error: {}", info, err)
                         }
                     }.boxed())
                 },
@@ -95,7 +99,8 @@ impl Producer {
         if let Some(mut local) = self.locals.retrieve(&namespace) {
             // Pass the full requested namespace, not the announced prefix
             if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
-                log::info!("serving subscribe from local: {:?}", track.info);
+                let ns = namespace.to_utf8_path();
+                tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
                 // Update label to indicate local source, timing recorded on drop
                 timing_guard.set_label("source", "local");
                 // Track active tracks - decrements when serve completes
@@ -110,7 +115,8 @@ impl Producer {
                 Ok(remote) => {
                     if let Some(remote) = remote {
                         if let Some(track) = remote.subscribe(&namespace, &track_name)? {
-                            log::info!("serving subscribe from remote: {:?}", track.info);
+                            let ns = namespace.to_utf8_path();
+                            tracing::info!(namespace = %ns, track = %track_name, source = "remote", "serving subscribe from remote: {:?}", track.info);
                             // Update label to indicate remote source, timing recorded on drop
                             timing_guard.set_label("source", "remote");
                             // Track active tracks - decrements when serve completes
@@ -122,7 +128,8 @@ impl Producer {
                 Err(e) => {
                     // Route error = infrastructure failure (couldn't reach coordinator/upstream)
                     // This is different from "not found" - we don't know if the track exists
-                    log::error!("failed to route to remote: {}", e);
+                    let ns = namespace.to_utf8_path();
+                    tracing::error!(namespace = %ns, track = %track_name, error = %e, "failed to route to remote: {}", e);
                     timing_guard.set_label("source", "route_error");
                     metrics::counter!("moq_relay_subscribe_route_errors_total").increment(1);
 
@@ -164,7 +171,12 @@ impl Producer {
                 &track_status_requested.request_msg.track_namespace,
                 &track_status_requested.request_msg.track_name,
             ) {
-                log::info!("serving track_status from local: {:?}", track.info);
+                let namespace = track_status_requested
+                    .request_msg
+                    .track_namespace
+                    .to_utf8_path();
+                let track_name = &track_status_requested.request_msg.track_name;
+                tracing::info!(namespace = %namespace, track = %track_name, source = "local", "serving track_status from local: {:?}", track.info);
                 return Ok(track_status_requested.respond_ok(&track)?);
             }
         }
@@ -178,7 +190,7 @@ impl Producer {
                 if let Some(track) =
                     remote.subscribe(subscribe.track_namespace.clone(), subscribe.track_name.clone())?
                 {
-                    log::info!("serving from remote: {:?} {:?}", remote.info, track.info);
+                    tracing::info!("serving from remote: {:?} {:?}", remote.info, track.info);
 
                     // NOTE: Depends on drop(track) being called afterwards
                     return Ok(subscribe.serve(track.reader).await?);

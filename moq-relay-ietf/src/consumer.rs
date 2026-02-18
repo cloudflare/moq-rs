@@ -47,11 +47,12 @@ impl Consumer {
 
                     tasks.push(async move {
                         let info = announce.clone();
-                        log::info!("serving announce: {:?}", info);
+                        let namespace = info.namespace.to_utf8_path();
+                        tracing::info!(namespace = %namespace, "serving announce: {:?}", info);
 
                         // Serve the announce request
                         if let Err(err) = this.serve(announce).await {
-                            log::warn!("failed serving announce: {:?}, error: {}", info, err);
+                            tracing::warn!(namespace = %namespace, error = %err, "failed serving announce: {:?}, error: {}", info, err);
                             // Note: phase-specific error counters are incremented in serve()
                         }
                     });
@@ -77,7 +78,10 @@ impl Consumer {
 
         // should we allow the same namespace being served from multiple relays??
 
+        let ns = reader.namespace.to_utf8_path();
+
         // Register namespace with the coordinator
+        tracing::debug!(namespace = %ns, "registering namespace with coordinator");
         let _namespace_registration = match self
             .coordinator
             .register_namespace(&reader.namespace)
@@ -90,8 +94,10 @@ impl Consumer {
                 return Err(err.into());
             }
         };
+        tracing::debug!(namespace = %ns, "namespace registered with coordinator");
 
         // Register the local tracks, unregister on drop
+        tracing::debug!(namespace = %ns, "registering namespace in locals");
         let _register = match self.locals.register(reader.clone()).await {
             Ok(reg) => reg,
             Err(err) => {
@@ -100,12 +106,14 @@ impl Consumer {
                 return Err(err);
             }
         };
+        tracing::debug!(namespace = %ns, "namespace registered in locals");
 
         // Accept the announce with an OK response
         if let Err(err) = announce.ok() {
             metrics::counter!("moq_relay_announce_errors_total", "phase" => "send_ok").increment(1);
             return Err(err.into());
         }
+        tracing::debug!(namespace = %ns, "sent ANNOUNCE_OK");
 
         // Successfully sent ANNOUNCE_OK
         metrics::counter!("moq_relay_announce_ok_total").increment(1);
@@ -114,7 +122,8 @@ impl Consumer {
         if let Some(mut forward) = self.forward {
             tasks.push(
                 async move {
-                    log::info!("forwarding announce: {:?}", reader.info);
+                    let namespace = reader.namespace.to_utf8_path();
+                    tracing::info!(namespace = %namespace, "forwarding announce: {:?}", reader.info);
                     forward
                         .announce(reader)
                         .await
@@ -128,7 +137,11 @@ impl Consumer {
         loop {
             tokio::select! {
                 // If the announce is closed, return the error
-                Err(err) = announce.closed() => return Err(err.into()),
+                Err(err) = announce.closed() => {
+                    let ns = announce.namespace.to_utf8_path();
+                    tracing::info!(namespace = %ns, error = %err, "announce closed");
+                    return Err(err.into());
+                },
 
                 // Wait for the next subscriber and serve the track.
                 Some(track) = request.next() => {
@@ -137,11 +150,13 @@ impl Consumer {
                     // Spawn a new task to handle the subscribe
                     tasks.push(async move {
                         let info = track.clone();
-                        log::info!("forwarding subscribe: {:?}", info);
+                        let namespace = info.namespace.to_utf8_path();
+                        let track_name = info.name.clone();
+                        tracing::info!(namespace = %namespace, track = %track_name, "forwarding subscribe: {:?}", info);
 
                         // Forward the subscribe request
                         if let Err(err) = subscriber.subscribe(track).await {
-                            log::warn!("failed forwarding subscribe: {:?}, error: {}", info, err)
+                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed forwarding subscribe: {:?}, error: {}", info, err)
                         }
 
                         Ok(())

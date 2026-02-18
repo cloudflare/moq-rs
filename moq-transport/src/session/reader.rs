@@ -20,7 +20,7 @@ impl Reader {
     }
 
     pub async fn decode<T: Decode>(&mut self) -> Result<T, SessionError> {
-        log::trace!(
+        tracing::trace!(
             "[READER] decode: attempting to decode {} (buffer_len={})",
             std::any::type_name::<T>(),
             self.buffer.len()
@@ -34,7 +34,7 @@ impl Reader {
                 Ok(msg) => {
                     let consumed = cursor.position() as usize;
                     self.buffer.advance(consumed);
-                    log::debug!(
+                    tracing::debug!(
                         "[READER] decode: successfully decoded {} (consumed={} bytes, buffer_remaining={})",
                         std::any::type_name::<T>(),
                         consumed,
@@ -44,7 +44,7 @@ impl Reader {
                 }
                 Err(DecodeError::More(required)) => {
                     let total_needed = self.buffer.len() + required;
-                    log::trace!(
+                    tracing::trace!(
                         "[READER] decode: need more data for {} (current={} bytes, need={} more, total_required={})",
                         std::any::type_name::<T>(),
                         self.buffer.len(),
@@ -54,7 +54,7 @@ impl Reader {
                     total_needed
                 }
                 Err(err) => {
-                    log::error!(
+                    tracing::error!(
                         "[READER] decode: ERROR decoding {} - {:?} (buffer_len={})",
                         std::any::type_name::<T>(),
                         err,
@@ -69,7 +69,7 @@ impl Reader {
             loop {
                 let before_read = self.buffer.len();
                 if !self.stream.read_buf(&mut self.buffer).await? {
-                    log::warn!(
+                    tracing::warn!(
                         "[READER] decode: stream ended while waiting for data (have={} bytes, need={})",
                         self.buffer.len(),
                         required
@@ -78,14 +78,14 @@ impl Reader {
                 };
 
                 let read_amount = self.buffer.len() - before_read;
-                log::trace!(
+                tracing::trace!(
                     "[READER] decode: read {} bytes from stream (buffer_len={})",
                     read_amount,
                     self.buffer.len()
                 );
 
                 if self.buffer.len() >= required {
-                    log::trace!(
+                    tracing::trace!(
                         "[READER] decode: have enough data now (buffer_len={}), retrying decode",
                         self.buffer.len()
                     );
@@ -96,7 +96,7 @@ impl Reader {
     }
 
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, SessionError> {
-        log::trace!(
+        tracing::trace!(
             "[READER] read_chunk: requested max={} bytes (buffer_len={})",
             max,
             self.buffer.len()
@@ -105,7 +105,7 @@ impl Reader {
         if !self.buffer.is_empty() {
             let size = cmp::min(max, self.buffer.len());
             let data = self.buffer.split_to(size).freeze();
-            log::trace!(
+            tracing::trace!(
                 "[READER] read_chunk: returned {} bytes from buffer (buffer_remaining={})",
                 data.len(),
                 self.buffer.len()
@@ -115,9 +115,9 @@ impl Reader {
 
         let chunk = self.stream.read_chunk(max).await?;
         if let Some(ref data) = chunk {
-            log::trace!("[READER] read_chunk: read {} bytes from stream", data.len());
+            tracing::trace!("[READER] read_chunk: read {} bytes from stream", data.len());
         } else {
-            log::trace!("[READER] read_chunk: stream returned None");
+            tracing::trace!("[READER] read_chunk: stream returned None");
         }
         Ok(chunk)
     }

@@ -57,10 +57,8 @@ clap = { version = "4", features = ["derive"] }
 
 
 # Logging
-log = { workspace = true }
-env_logger = { workspace = true }
-tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 thiserror = "2.0.17"
 
 # Metrics — always compiled in; the metrics crate is effectively zero-cost

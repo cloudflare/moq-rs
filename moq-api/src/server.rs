@@ -37,7 +37,7 @@ impl Server {
     }
 
     pub async fn run(self) -> Result<(), ApiError> {
-        log::info!("connecting to redis: url={}", self.config.redis);
+        tracing::info!("connecting to redis: url={}", self.config.redis);
 
         // Create the redis client.
         let redis = redis::Client::open(self.config.redis)?;
@@ -53,7 +53,7 @@ impl Server {
             )
             .with_state(redis);
 
-        log::info!("serving requests: bind={}", self.config.bind);
+        tracing::info!("serving requests: bind={}", self.config.bind);
 
         let listener = tokio::net::TcpListener::bind(&self.config.bind).await?;
         axum::serve(listener, app.into_make_service()).await?;

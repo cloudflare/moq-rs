@@ -1,7 +1,6 @@
 use std::{io::Cursor, sync::Arc};
 
 use anyhow::Context;
-use log::{debug, info, trace, warn};
 use moq_transport::serve::{
     SubgroupObjectReader, SubgroupReader, TrackReader, TrackReaderMode, Tracks, TracksReader,
     TracksWriter,
@@ -13,6 +12,7 @@ use tokio::{
     sync::Mutex,
     task::JoinSet,
 };
+use tracing::{debug, info, trace, warn};
 
 pub struct Media<O> {
     subscriber: Subscriber,

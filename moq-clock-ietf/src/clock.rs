@@ -51,7 +51,7 @@ impl Publisher {
                 // Spawn a new task to handle sending the object every second
                 tokio::spawn(async move {
                     if let Err(err) = Self::send_subgroup_objects(subgroup_writer, now).await {
-                        log::warn!("failed to send minute: {:?}", err);
+                        tracing::warn!("failed to send minute: {:?}", err);
                     }
                 });
 

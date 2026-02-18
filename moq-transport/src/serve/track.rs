@@ -85,7 +85,14 @@ impl TrackWriter {
         .produce();
 
         // Lock state to modify it
-        let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+        let mut state = self.state.lock_mut().ok_or_else(|| {
+            tracing::debug!(
+                namespace = %self.info.namespace.to_utf8_path(),
+                track = %self.info.name,
+                "track state dropped (Cancel) in stream()"
+            );
+            ServeError::Cancel
+        })?;
 
         // Set the Stream mode to TrackReaderMode::Stream
         state.reader_mode = Some(reader.into());
@@ -101,7 +108,14 @@ impl TrackWriter {
         .produce();
 
         // Lock state to modify it
-        let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+        let mut state = self.state.lock_mut().ok_or_else(|| {
+            tracing::debug!(
+                namespace = %self.info.namespace.to_utf8_path(),
+                track = %self.info.name,
+                "track state dropped (Cancel) in subgroups()"
+            );
+            ServeError::Cancel
+        })?;
 
         // Set the Stream mode to TrackReaderMode::Subgroups
         state.reader_mode = Some(reader.into());
@@ -115,7 +129,14 @@ impl TrackWriter {
         .produce();
 
         // Lock state to modify it
-        let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
+        let mut state = self.state.lock_mut().ok_or_else(|| {
+            tracing::debug!(
+                namespace = %self.info.namespace.to_utf8_path(),
+                track = %self.info.name,
+                "track state dropped (Cancel) in datagrams()"
+            );
+            ServeError::Cancel
+        })?;
 
         // Set the Stream mode to TrackReaderMode::Datagrams
         state.reader_mode = Some(reader.into());
@@ -124,10 +145,23 @@ impl TrackWriter {
 
     /// Close the track with an error.
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
+        tracing::debug!(
+            namespace = %self.info.namespace.to_utf8_path(),
+            track = %self.info.name,
+            error = %err,
+            "track closing"
+        );
         let state = self.state.lock();
         state.closed.clone()?;
 
-        let mut state = state.into_mut().ok_or(ServeError::Cancel)?;
+        let mut state = state.into_mut().ok_or_else(|| {
+            tracing::debug!(
+                namespace = %self.info.namespace.to_utf8_path(),
+                track = %self.info.name,
+                "track state already dropped during close"
+            );
+            ServeError::Cancel
+        })?;
         state.closed = Err(err);
         Ok(())
     }

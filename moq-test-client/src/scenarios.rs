@@ -60,7 +60,7 @@ pub async fn test_setup_only(args: &Args) -> Result<TestConnectionIds> {
             .await
             .context("SETUP exchange failed")?;
 
-        log::info!("SETUP exchange completed successfully");
+        tracing::info!("SETUP exchange completed successfully");
 
         // We don't need to run the session, just verify setup worked
         // Dropping the session will close the connection
@@ -88,7 +88,7 @@ pub async fn test_announce_only(args: &Args) -> Result<TestConnectionIds> {
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
         let (_, _, reader) = Tracks::new(namespace.clone()).produce();
 
-        log::info!("Announcing namespace: {}", TEST_NAMESPACE);
+        tracing::info!("Announcing namespace: {}", TEST_NAMESPACE);
 
         // Run announce with a timeout - we want to verify we get PUBLISH_NAMESPACE_OK.
         // NOTE: The announce() method blocks waiting for subscriptions after getting OK.
@@ -105,7 +105,7 @@ pub async fn test_announce_only(args: &Args) -> Result<TestConnectionIds> {
             _ = tokio::time::sleep(Duration::from_secs(2)) => {
                 // If we got an error from the relay, announce() would have returned already.
                 // Timing out means we're past the OK and now waiting for subscriptions.
-                log::info!("Announce succeeded (no error received, waiting for subscriptions timed out)");
+                tracing::info!("Announce succeeded (no error received, waiting for subscriptions timed out)");
                 return Ok(cids);
             }
         };
@@ -140,7 +140,7 @@ pub async fn test_subscribe_error(args: &Args) -> Result<TestConnectionIds> {
             .create(TEST_TRACK)
             .ok_or_else(|| anyhow::anyhow!("failed to create track (already exists?)"))?;
 
-        log::info!(
+        tracing::info!(
             "Subscribing to non-existent track: {}/{}",
             "nonexistent/namespace",
             TEST_TRACK
@@ -173,10 +173,10 @@ pub async fn test_subscribe_error(args: &Args) -> Result<TestConnectionIds> {
                     || err_str.contains("unknown");
 
                 if is_expected_error {
-                    log::info!("Got expected 'not found' error: {}", e);
+                    tracing::info!("Got expected 'not found' error: {}", e);
                 } else {
                     // Log warning but still pass - relay may use different error text
-                    log::warn!(
+                    tracing::warn!(
                         "Got error but not clearly 'not found': {}. \
                         This may indicate a different error type than expected.",
                         e
@@ -222,7 +222,7 @@ pub async fn test_announce_subscribe(args: &Args) -> Result<TestConnectionIds> {
         // Create the track that subscriber will request
         let _track_writer = pub_writer.create(TEST_TRACK);
 
-        log::info!("Publisher announcing namespace: {}", TEST_NAMESPACE);
+        tracing::info!("Publisher announcing namespace: {}", TEST_NAMESPACE);
 
         // Subscriber: set up tracks and subscribe
         let (mut sub_writer, _, _sub_reader) = Tracks::new(namespace.clone()).produce();
@@ -230,7 +230,7 @@ pub async fn test_announce_subscribe(args: &Args) -> Result<TestConnectionIds> {
             .create(TEST_TRACK)
             .ok_or_else(|| anyhow::anyhow!("failed to create subscriber track"))?;
 
-        log::info!(
+        tracing::info!(
             "Subscriber subscribing to track: {}/{}",
             TEST_NAMESPACE,
             TEST_TRACK
@@ -242,13 +242,13 @@ pub async fn test_announce_subscribe(args: &Args) -> Result<TestConnectionIds> {
             // Publisher announces and waits for subscriptions
             res = publisher.announce(pub_reader) => {
                 res.context("publisher announce failed")?;
-                log::info!("Publisher announce completed");
+                tracing::info!("Publisher announce completed");
             }
             // Subscriber subscribes - this is the main thing we're testing
             res = subscriber.subscribe(sub_track) => {
                 match res {
-                    Ok(()) => log::info!("Subscriber got SUBSCRIBE_OK - relay routed subscription correctly"),
-                    Err(e) => log::info!("Subscriber got error: {} - subscription was processed", e),
+                    Ok(()) => tracing::info!("Subscriber got SUBSCRIBE_OK - relay routed subscription correctly"),
+                    Err(e) => tracing::info!("Subscriber got error: {} - subscription was processed", e),
                 }
             }
             // Run publisher session
@@ -264,7 +264,7 @@ pub async fn test_announce_subscribe(args: &Args) -> Result<TestConnectionIds> {
                 // If we hit this timeout, the subscription may still be pending.
                 // This isn't necessarily a failure - some relays may hold subscriptions
                 // until the track has data. Log for visibility.
-                log::info!("Test timeout reached - subscription routing may still be in progress");
+                tracing::info!("Test timeout reached - subscription routing may still be in progress");
             }
         };
 
@@ -291,7 +291,7 @@ pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionId
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
         let (_, _, reader) = Tracks::new(namespace.clone()).produce();
 
-        log::info!("Announcing namespace: {}", TEST_NAMESPACE);
+        tracing::info!("Announcing namespace: {}", TEST_NAMESPACE);
 
         // Run announce and wait for OK, then explicitly drop to send PUBLISH_NAMESPACE_DONE.
         // See note in test_announce_only about timeout-based verification.
@@ -303,7 +303,7 @@ pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionId
             }
             _ = tokio::time::sleep(Duration::from_secs(2)) => {
                 // No error received - announce is active and waiting for subscriptions
-                log::info!("Announce active, now sending PUBLISH_NAMESPACE_DONE");
+                tracing::info!("Announce active, now sending PUBLISH_NAMESPACE_DONE");
                 // Dropping out of this block will drop the announce, which sends PUBLISH_NAMESPACE_DONE
                 Ok(())
             }
@@ -314,7 +314,7 @@ pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionId
         // Small delay to ensure PUBLISH_NAMESPACE_DONE is sent before we close
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        log::info!("PUBLISH_NAMESPACE_DONE sent successfully");
+        tracing::info!("PUBLISH_NAMESPACE_DONE sent successfully");
         Ok(cids)
     })
     .await
@@ -346,7 +346,7 @@ pub async fn test_subscribe_before_announce(args: &Args) -> Result<TestConnectio
             .create(TEST_TRACK)
             .ok_or_else(|| anyhow::anyhow!("failed to create subscriber track"))?;
 
-        log::info!(
+        tracing::info!(
             "Subscriber subscribing BEFORE announce: {}/{}",
             TEST_NAMESPACE,
             TEST_TRACK
@@ -377,7 +377,7 @@ pub async fn test_subscribe_before_announce(args: &Args) -> Result<TestConnectio
         let (mut pub_writer, _, pub_reader) = Tracks::new(namespace.clone()).produce();
         let _track_writer = pub_writer.create(TEST_TRACK);
 
-        log::info!(
+        tracing::info!(
             "Publisher announcing namespace (after subscriber): {}",
             TEST_NAMESPACE
         );
@@ -391,7 +391,7 @@ pub async fn test_subscribe_before_announce(args: &Args) -> Result<TestConnectio
                 res.context("publisher session error")?;
             }
             _ = tokio::time::sleep(Duration::from_secs(3)) => {
-                log::info!("Publisher announce timeout (expected)");
+                tracing::info!("Publisher announce timeout (expected)");
             }
         };
 
@@ -399,13 +399,13 @@ pub async fn test_subscribe_before_announce(args: &Args) -> Result<TestConnectio
         tokio::select! {
             res = sub_handle => {
                 match res {
-                    Ok(Ok(())) => log::info!("Subscriber completed successfully"),
-                    Ok(Err(e)) => log::info!("Subscriber got error: {} (may be expected)", e),
-                    Err(e) => log::warn!("Subscriber task panicked: {}", e),
+                    Ok(Ok(())) => tracing::info!("Subscriber completed successfully"),
+                    Ok(Err(e)) => tracing::info!("Subscriber got error: {} (may be expected)", e),
+                    Err(e) => tracing::warn!("Subscriber task panicked: {}", e),
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                log::info!("Subscriber still waiting (test complete)");
+                tracing::info!("Subscriber still waiting (test complete)");
             }
         };
 
