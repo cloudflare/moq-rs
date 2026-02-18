@@ -76,9 +76,9 @@ impl SessionError {
     /// Both are normal session termination, not error conditions.
     ///
     /// This method checks for:
-    /// - WebTransport `Closed(0, _)` — web-transport-quinn v0.11+ converts HTTP/3-encoded
-    ///   `ApplicationClosed` codes into `WebTransportError::Closed(code, reason)` at the
-    ///   `SessionError` level (see `SessionError::from(quinn::ConnectionError)`)
+    /// - WebTransport `Closed(0, _)` — web-transport-quinn v0.11+ typically converts
+    ///   HTTP/3-encoded `ApplicationClosed` codes into `WebTransportError::Closed(code, reason)`
+    ///   during `SessionError` conversion when decoding via `error_from_http3` succeeds
     /// - Raw QUIC `ApplicationClosed` with code 0
     /// - The local side closing the connection (`LocallyClosed`)
     ///
@@ -130,9 +130,10 @@ impl From<SessionError> for serve::ServeError {
 /// Helper to check if a `web_transport_quinn::SessionError` represents a graceful close.
 ///
 /// This handles:
-/// - WebTransport connections: `WebTransportError::Closed(0, _)` — the new web-transport-quinn
-///   v0.11 crate decodes HTTP/3-encoded close codes at this layer, so a WebTransport graceful
-///   close (code 0) arrives here rather than as a raw `ConnectionError::ApplicationClosed`.
+/// - WebTransport connections: `WebTransportError::Closed(0, _)` — web-transport-quinn v0.11+
+///   typically decodes HTTP/3-encoded close codes at this layer (when `SessionError` conversion
+///   applies), so graceful closes usually arrive here rather than as a raw
+///   `ConnectionError::ApplicationClosed`.
 /// - Raw QUIC connections: `ConnectionError::ApplicationClosed` with code 0
 /// - Local close: `ConnectionError::LocallyClosed`
 fn is_session_error_graceful(err: &web_transport::quinn::SessionError) -> bool {
@@ -152,9 +153,9 @@ fn is_session_error_graceful(err: &web_transport::quinn::SessionError) -> bool {
 /// Helper to check if a `quinn::ConnectionError` represents a graceful close.
 ///
 /// Note: In web-transport-quinn v0.11+, WebTransport `ApplicationClosed` with an HTTP/3-encoded
-/// close code is converted to `WebTransportError::Closed` before reaching here. So this function
-/// primarily handles raw QUIC (moqt:// ALPN) connections where the close code is not HTTP/3
-/// encoded.
+/// close code is usually converted to `WebTransportError::Closed` during `SessionError` conversion
+/// when decoding succeeds. This function primarily handles raw QUIC (moqt:// ALPN) connections
+/// or non-decodable cases where the close code is not HTTP/3 encoded.
 fn is_connection_error_graceful(err: &web_transport::quinn::quinn::ConnectionError) -> bool {
     use web_transport::quinn::quinn::ConnectionError;
 
