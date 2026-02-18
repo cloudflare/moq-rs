@@ -71,12 +71,14 @@ impl SessionError {
 
     /// Returns true if this error represents a graceful connection close.
     ///
-    /// A graceful close occurs when the peer sends APPLICATION_CLOSE with error code 0
-    /// (NO_ERROR). This is normal session termination, not an error condition.
+    /// For WebTransport, a graceful close is a `CLOSE_WEBTRANSPORT_SESSION` capsule
+    /// with code 0. For raw QUIC, it's `APPLICATION_CLOSE` with code 0 (NO_ERROR).
+    /// Both are normal session termination, not error conditions.
     ///
     /// This method checks for:
-    /// - WebTransport `Closed(0, _)` — decoded by web-transport-quinn v0.11+ from
-    ///   HTTP/3 encoded close codes
+    /// - WebTransport `Closed(0, _)` — web-transport-quinn v0.11+ converts HTTP/3-encoded
+    ///   `ApplicationClosed` codes into `WebTransportError::Closed(code, reason)` at the
+    ///   `SessionError` level (see `SessionError::from(quinn::ConnectionError)`)
     /// - Raw QUIC `ApplicationClosed` with code 0
     /// - The local side closing the connection (`LocallyClosed`)
     ///
