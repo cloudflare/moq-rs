@@ -58,6 +58,62 @@ pub struct Session {
 }
 
 impl Session {
+    const MAX_CONNECTION_PATH_LEN: usize = 1024;
+
+    fn normalize_connection_path(raw: &str) -> Result<Option<String>, SessionError> {
+        if raw.is_empty() || raw == "/" {
+            return Ok(None);
+        }
+
+        if raw.len() > Self::MAX_CONNECTION_PATH_LEN {
+            return Err(SessionError::InvalidPath("path too long".to_string()));
+        }
+
+        if !raw.starts_with('/') {
+            return Err(SessionError::InvalidPath("path must start with '/'".to_string()));
+        }
+
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let mut segments = trimmed.split('/');
+        let _ = segments.next();
+        for segment in segments {
+            if segment.is_empty() {
+                return Err(SessionError::InvalidPath("path contains empty segment".to_string()));
+            }
+            if segment == "." || segment == ".." {
+                return Err(SessionError::InvalidPath("path contains invalid segment".to_string()));
+            }
+        }
+
+        Ok(Some(trimmed.to_string()))
+    }
+
+    fn decode_client_setup_path(
+        params: &KeyValuePairs,
+    ) -> Result<Option<String>, SessionError> {
+        let Some(kvp) = params.get(setup::ParameterType::Path.into()) else {
+            return Ok(None);
+        };
+
+        let bytes = match &kvp.value {
+            Value::BytesValue(bytes) => bytes,
+            _ => return Ok(None),
+        };
+
+        if bytes.len() > Self::MAX_CONNECTION_PATH_LEN {
+            return Err(SessionError::InvalidPath("path too long".to_string()));
+        }
+
+        let path = std::str::from_utf8(bytes)
+            .map_err(|_| SessionError::InvalidPath("path must be UTF-8".to_string()))?;
+
+        Self::normalize_connection_path(path)
+    }
+
     /// Returns the connection path, if one was present on the incoming connection.
     ///
     /// For server-side sessions (created via `accept()`), this is derived from:
@@ -426,11 +482,7 @@ impl Session {
         // This aligns with the unified moqt:// URI scheme direction (IETF PR #1486)
         // where the path is always part of the URI regardless of transport.
         let url_path = session.url().path();
-        let path = if url_path.is_empty() || url_path == "/" {
-            None
-        } else {
-            Some(url_path.to_string())
-        };
+        let path = Self::normalize_connection_path(url_path)?;
         let mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
                 .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
@@ -511,24 +563,18 @@ impl Session {
             "MoQT control message"
         );
 
-        // Extract CLIENT_SETUP PATH parameter (key 0x1, BytesValue).
-        // Used for raw QUIC connections where there's no HTTP CONNECT URL.
-        let client_setup_path = client
-            .params
-            .get(setup::ParameterType::Path.into())
-            .and_then(|kvp| match &kvp.value {
-                Value::BytesValue(bytes) => String::from_utf8(bytes.clone()).ok(),
-                _ => None,
-            });
-
         // Extract WebTransport URL path from the underlying session.
         // For WebTransport connections, this comes from the HTTP/3 CONNECT :path.
         // For raw QUIC, this is the placeholder URL ("moqt://localhost") and has no meaningful path.
         let wt_url_path = session.url().path();
-        let wt_path = if wt_url_path.is_empty() || wt_url_path == "/" {
-            None
+        let wt_path = Self::normalize_connection_path(wt_url_path)?;
+
+        // Extract CLIENT_SETUP PATH parameter (key 0x1, BytesValue).
+        // Used for raw QUIC connections where there's no HTTP CONNECT URL.
+        let client_setup_path = if wt_path.is_none() {
+            Self::decode_client_setup_path(&client.params)?
         } else {
-            Some(wt_url_path.to_string())
+            None
         };
 
         // Combine: WebTransport URL path takes precedence over CLIENT_SETUP PATH.
