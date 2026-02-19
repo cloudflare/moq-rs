@@ -173,7 +173,14 @@ pub trait Coordinator: Send + Sync {
     /// # Arguments
     ///
     /// * `namespace` - The namespace to unregister
-    async fn unregister_namespace(&self, namespace: &TrackNamespace) -> CoordinatorResult<()>;
+    /// * `connection_path` - The connection path (App ID / MoQT scope) from the
+    ///   incoming connection, if any. Coordinators can use this to scope
+    ///   unregistration to a particular application.
+    async fn unregister_namespace(
+        &self,
+        namespace: &TrackNamespace,
+        connection_path: Option<&str>,
+    ) -> CoordinatorResult<()>;
 
     /// Lookup where a namespace is served from.
     ///

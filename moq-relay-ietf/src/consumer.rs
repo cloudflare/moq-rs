@@ -102,7 +102,11 @@ impl Consumer {
 
         // Register the local tracks, unregister on drop
         tracing::debug!(namespace = %ns, "registering namespace in locals");
-        let _register = match self.locals.register(reader.clone()).await {
+        let _register = match self
+            .locals
+            .register(self.connection_path.as_deref(), reader.clone())
+            .await
+        {
             Ok(reg) => reg,
             Err(err) => {
                 metrics::counter!("moq_relay_announce_errors_total", "phase" => "local_register")

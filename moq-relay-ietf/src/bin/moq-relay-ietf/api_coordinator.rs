@@ -60,7 +60,7 @@ impl ApiCoordinatorConfig {
 
 /// Handle that unregisters a namespace when dropped and manages TTL refresh
 struct NamespaceUnregisterHandle {
-    namespace: TrackNamespace,
+    namespace_key: String,
     client: Client,
     /// Channel to signal the refresh task to stop (wrapped in Option so we can take it in drop)
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -73,31 +73,45 @@ impl Drop for NamespaceUnregisterHandle {
             let _ = tx.send(());
         }
 
-        let namespace = self.namespace.clone();
+        let namespace_key = self.namespace_key.clone();
         let client = self.client.clone();
 
         // Spawn a task to unregister since we can't do async in drop
         tokio::spawn(async move {
-            if let Err(err) = unregister_namespace_async(&client, &namespace).await {
-                let ns = namespace.to_utf8_path();
-                tracing::warn!(namespace = %ns, error = %err, "failed to unregister namespace on drop: {}", err);
+            if let Err(err) = unregister_namespace_async(&client, &namespace_key).await {
+                tracing::warn!(namespace = %namespace_key, error = %err, "failed to unregister namespace on drop: {}", err);
             }
         });
     }
 }
 
 /// Async helper for unregistering a namespace
-async fn unregister_namespace_async(client: &Client, namespace: &TrackNamespace) -> Result<()> {
-    let namespace_str = namespace.to_utf8_path();
-    tracing::debug!(namespace = %namespace_str, "unregistering namespace from API: {}", namespace_str);
+async fn unregister_namespace_async(client: &Client, namespace_key: &str) -> Result<()> {
+    tracing::debug!(namespace = %namespace_key, "unregistering namespace from API: {}", namespace_key);
 
     client
-        .delete_origin(&namespace_str)
+        .delete_origin(namespace_key)
         .await
         .context("failed to delete namespace from API")?;
 
     Ok(())
 }
+
+// Tuple-encoding helper kept for potential future scoped API updates.
+// fn namespace_key(namespace: &TrackNamespace, connection_path: Option<&str>) -> String {
+//     let namespace_str = namespace.to_utf8_path();
+//     let path = connection_path.unwrap_or("");
+//     let mut key = String::with_capacity(path.len() + namespace_str.len() + 32);
+//     key.push('p');
+//     key.push_str(&path.len().to_string());
+//     key.push(':');
+//     key.push_str(path);
+//     key.push('n');
+//     key.push_str(&namespace_str.len().to_string());
+//     key.push(':');
+//     key.push_str(&namespace_str);
+//     key
+// }
 
 /// A coordinator that uses moq-api for state storage.
 ///
@@ -107,6 +121,9 @@ async fn unregister_namespace_async(client: &Client, namespace: &TrackNamespace)
 /// - HTTP-based registration and lookup
 /// - TTL-based automatic expiration of stale registrations
 /// - Background refresh tasks to maintain registrations
+///
+/// Note: moq-api does not scope namespaces by connection path, so this
+/// coordinator treats all namespaces as global.
 pub struct ApiCoordinator {
     /// moq-api client
     client: Client,
@@ -131,7 +148,7 @@ impl ApiCoordinator {
     /// Start a background task to refresh namespace registration
     fn start_refresh_task(
         client: Client,
-        namespace: TrackNamespace,
+        namespace_key: String,
         relay_url: Url,
         refresh_interval: Duration,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
@@ -143,15 +160,14 @@ impl ApiCoordinator {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let namespace_str = namespace.to_utf8_path();
                         let origin = Origin { url: relay_url.clone() };
 
-                        match client.patch_origin(&namespace_str, origin).await {
+                        match client.patch_origin(&namespace_key, origin).await {
                             Ok(()) => {
-                                tracing::trace!(namespace = %namespace_str, "refreshed namespace registration: {}", namespace_str);
+                                tracing::trace!(namespace = %namespace_key, "refreshed namespace registration: {}", namespace_key);
                             }
                             Err(err) => {
-                                tracing::warn!(namespace = %namespace_str, error = %err, "failed to refresh namespace registration: {}", err);
+                                tracing::warn!(namespace = %namespace_key, error = %err, "failed to refresh namespace registration: {}", err);
                             }
                         }
                     }
@@ -170,8 +186,9 @@ impl Coordinator for ApiCoordinator {
     async fn register_namespace(
         &self,
         namespace: &TrackNamespace,
-        _connection_path: Option<&str>,
+        connection_path: Option<&str>,
     ) -> CoordinatorResult<NamespaceRegistration> {
+        let _connection_path = connection_path;
         let namespace_str = namespace.to_utf8_path();
         let origin = Origin {
             url: self.config.relay_url.clone(),
@@ -198,14 +215,14 @@ impl Coordinator for ApiCoordinator {
         // Start background refresh task
         Self::start_refresh_task(
             self.client.clone(),
-            namespace.clone(),
+            namespace_str.clone(),
             self.config.relay_url.clone(),
             Duration::from_secs(self.config.refresh_interval_secs),
             shutdown_rx,
         );
 
         let handle = NamespaceUnregisterHandle {
-            namespace: namespace.clone(),
+            namespace_key: namespace_str,
             client: self.client.clone(),
             shutdown_tx: Some(shutdown_tx),
         };
@@ -213,7 +230,12 @@ impl Coordinator for ApiCoordinator {
         Ok(NamespaceRegistration::new(handle))
     }
 
-    async fn unregister_namespace(&self, namespace: &TrackNamespace) -> CoordinatorResult<()> {
+    async fn unregister_namespace(
+        &self,
+        namespace: &TrackNamespace,
+        connection_path: Option<&str>,
+    ) -> CoordinatorResult<()> {
+        let _connection_path = connection_path;
         let namespace_str = namespace.to_utf8_path();
         tracing::info!(namespace = %namespace_str, "unregistering namespace from API: {}", namespace_str);
 
@@ -229,8 +251,9 @@ impl Coordinator for ApiCoordinator {
     async fn lookup(
         &self,
         namespace: &TrackNamespace,
-        _connection_path: Option<&str>,
+        connection_path: Option<&str>,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        let _connection_path = connection_path;
         let namespace_str = namespace.to_utf8_path();
         tracing::debug!(namespace = %namespace_str, "looking up namespace in API: {}", namespace_str);
 

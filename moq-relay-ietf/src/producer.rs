@@ -104,7 +104,10 @@ impl Producer {
         let track_name = subscribed.track_name.clone();
 
         // Check local tracks first, and serve from local if possible
-        if let Some(mut local) = self.locals.retrieve(&namespace) {
+        if let Some(mut local) = self
+            .locals
+            .retrieve(self.connection_path.as_deref(), &namespace)
+        {
             // Pass the full requested namespace, not the announced prefix
             if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
                 let ns = namespace.to_utf8_path();
@@ -171,10 +174,10 @@ impl Producer {
         mut track_status_requested: TrackStatusRequested,
     ) -> Result<(), anyhow::Error> {
         // Check local tracks first, and serve from local if possible
-        if let Some(mut local_tracks) = self
-            .locals
-            .retrieve(&track_status_requested.request_msg.track_namespace)
-        {
+        if let Some(mut local_tracks) = self.locals.retrieve(
+            self.connection_path.as_deref(),
+            &track_status_requested.request_msg.track_namespace,
+        ) {
             if let Some(track) = local_tracks.get_track_reader(
                 &track_status_requested.request_msg.track_namespace,
                 &track_status_requested.request_msg.track_name,
