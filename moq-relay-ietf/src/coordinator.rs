@@ -149,6 +149,10 @@ pub trait Coordinator: Send + Sync {
     /// # Arguments
     ///
     /// * `namespace` - The namespace being registered
+    /// * `connection_path` - The connection path (App ID / MoQT scope) from the
+    ///   incoming connection, if any. Derived from the WebTransport URL path or
+    ///   CLIENT_SETUP PATH parameter. Coordinators can use this to scope registrations
+    ///   to a particular application.
     ///
     /// # Returns
     ///
@@ -157,6 +161,7 @@ pub trait Coordinator: Send + Sync {
     async fn register_namespace(
         &self,
         namespace: &TrackNamespace,
+        connection_path: Option<&str>,
     ) -> CoordinatorResult<NamespaceRegistration>;
 
     /// Unregister a namespace.
@@ -181,6 +186,9 @@ pub trait Coordinator: Send + Sync {
     /// # Arguments
     ///
     /// * `namespace` - The namespace to look up
+    /// * `connection_path` - The connection path (App ID / MoQT scope) from the
+    ///   requesting connection, if any. Coordinators can use this to scope lookups
+    ///   (e.g., to call GetAppConfig for the correct application).
     ///
     /// # Returns
     ///
@@ -189,6 +197,7 @@ pub trait Coordinator: Send + Sync {
     async fn lookup(
         &self,
         namespace: &TrackNamespace,
+        connection_path: Option<&str>,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)>;
 
     /// Graceful shutdown of the coordinator.

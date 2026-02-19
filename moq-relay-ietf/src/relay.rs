@@ -146,6 +146,7 @@ impl Relay {
                     .context("failed to establish forward session")?;
 
             // Create a normal looking session, except we never forward or register announces.
+            // Forward connections don't have a connection path — they're outbound from this relay.
             let coordinator = self.coordinator.clone();
             let session = Session {
                 session,
@@ -153,11 +154,13 @@ impl Relay {
                     publisher,
                     self.locals.clone(),
                     remotes.clone(),
+                    None,
                 )),
                 consumer: Some(Consumer::new(
                     subscriber,
                     self.locals.clone(),
                     coordinator,
+                    None,
                     None,
                 )),
             };
@@ -242,10 +245,16 @@ impl Relay {
 
                         // Create our MoQ relay session
                         let moq_session = session;
+
+                        // Extract the connection path (App ID / MoQT scope) from the session.
+                        // This was resolved during accept() from the WebTransport URL path
+                        // or CLIENT_SETUP PATH parameter.
+                        let connection_path = moq_session.connection_path().map(|s| s.to_string());
+
                         let session = Session {
                             session: moq_session,
-                            producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes)),
-                            consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward)),
+                            producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, connection_path.clone())),
+                            consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, connection_path)),
                         };
 
                         match session.run().await {

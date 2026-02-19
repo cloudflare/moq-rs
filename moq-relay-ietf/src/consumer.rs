@@ -16,6 +16,8 @@ pub struct Consumer {
     locals: Locals,
     coordinator: Arc<dyn Coordinator>,
     forward: Option<Producer>, // Forward all announcements to this subscriber
+    /// The connection path (App ID / MoQT scope) for this session, if any.
+    connection_path: Option<String>,
 }
 
 impl Consumer {
@@ -24,12 +26,14 @@ impl Consumer {
         locals: Locals,
         coordinator: Arc<dyn Coordinator>,
         forward: Option<Producer>,
+        connection_path: Option<String>,
     ) -> Self {
         Self {
             subscriber,
             locals,
             coordinator,
             forward,
+            connection_path,
         }
     }
 
@@ -84,7 +88,7 @@ impl Consumer {
         tracing::debug!(namespace = %ns, "registering namespace with coordinator");
         let _namespace_registration = match self
             .coordinator
-            .register_namespace(&reader.namespace)
+            .register_namespace(&reader.namespace, self.connection_path.as_deref())
             .await
         {
             Ok(reg) => reg,

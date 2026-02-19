@@ -24,7 +24,7 @@ use writer::*;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::sync::{atomic, Arc, Mutex};
 
-use crate::coding::KeyValuePairs;
+use crate::coding::{KeyValuePairs, Value};
 use crate::message::Message;
 use crate::mlog;
 use crate::watch::Queue;
@@ -49,9 +49,26 @@ pub struct Session {
     /// Optional mlog writer for MoQ Transport events
     /// Wrapped in Arc<Mutex<>> to share across send/recv tasks when enabled
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// The connection path, derived from the WebTransport URL path or CLIENT_SETUP PATH parameter.
+    /// For incoming connections: extracted during accept() from the WebTransport CONNECT URL
+    /// (takes precedence) or the CLIENT_SETUP PATH parameter (key 0x1).
+    /// For outgoing connections: auto-extracted from the session URL in connect().
+    connection_path: Option<String>,
 }
 
 impl Session {
+    /// Returns the connection path, if one was present on the incoming connection.
+    ///
+    /// For server-side sessions (created via `accept()`), this is derived from:
+    /// 1. The WebTransport CONNECT URL path (takes precedence), or
+    /// 2. The CLIENT_SETUP PATH parameter (key 0x1), used for raw QUIC connections.
+    ///
+    /// Returns `None` if no path was present or if the path was just "/".
+    pub fn connection_path(&self) -> Option<&str> {
+        self.connection_path.as_deref()
+    }
+
     // Helper for determining the largest supported version
     fn largest_common<T: Ord + Clone + Eq>(a: &[T], b: &[T]) -> Option<T> {
         a.iter()
@@ -359,6 +376,7 @@ impl Session {
         recver: Reader,
         first_requestid: u64,
         mlog: Option<mlog::MlogWriter>,
+        connection_path: Option<String>,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let next_requestid = Arc::new(atomic::AtomicU64::new(first_requestid));
         let outgoing = Queue::default().split();
@@ -386,6 +404,7 @@ impl Session {
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
             mlog: mlog_shared,
+            connection_path,
         };
 
         (session, publisher, subscriber)
@@ -393,10 +412,25 @@ impl Session {
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for
     /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
+    ///
+    /// If the session URL contains a non-trivial path (not empty or "/"), the PATH
+    /// parameter (key 0x1) is automatically sent in CLIENT_SETUP. This propagates
+    /// the connection path (App ID / MoQT scope) to the remote peer, which is needed
+    /// for relay-to-relay connections. To connect without sending PATH, use a URL
+    /// with no path component.
     pub async fn connect(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        // Auto-extract path from the session URL.
+        // This aligns with the unified moqt:// URI scheme direction (IETF PR #1486)
+        // where the path is always part of the URI regardless of transport.
+        let url_path = session.url().path();
+        let path = if url_path.is_empty() || url_path == "/" {
+            None
+        } else {
+            Some(url_path.to_string())
+        };
         let mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
                 .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
@@ -412,6 +446,14 @@ impl Session {
         let mut params = KeyValuePairs::default();
         params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
+        // Set PATH parameter in CLIENT_SETUP for relay-to-relay path propagation.
+        if let Some(ref path) = path {
+            params.set_bytesvalue(
+                setup::ParameterType::Path.into(),
+                path.as_bytes().to_vec(),
+            );
+        }
+
         let client = setup::Client {
             versions: versions.clone(),
             params,
@@ -422,6 +464,7 @@ impl Session {
             direction = "sent",
             msg_type = "CLIENT_SETUP",
             versions = ?client.versions,
+            path = path.as_deref(),
             "MoQT control message"
         );
         sender.encode(&client).await?;
@@ -440,7 +483,7 @@ impl Session {
         // TODO: emit server_setup_parsed event
 
         // We are the client, so the first request id is 0
-        let session = Session::new(session, sender, recver, 0, mlog);
+        let session = Session::new(session, sender, recver, 0, mlog, path);
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
@@ -467,6 +510,38 @@ impl Session {
             versions = ?client.versions,
             "MoQT control message"
         );
+
+        // Extract CLIENT_SETUP PATH parameter (key 0x1, BytesValue).
+        // Used for raw QUIC connections where there's no HTTP CONNECT URL.
+        let client_setup_path = client
+            .params
+            .get(setup::ParameterType::Path.into())
+            .and_then(|kvp| match &kvp.value {
+                Value::BytesValue(bytes) => String::from_utf8(bytes.clone()).ok(),
+                _ => None,
+            });
+
+        // Extract WebTransport URL path from the underlying session.
+        // For WebTransport connections, this comes from the HTTP/3 CONNECT :path.
+        // For raw QUIC, this is the placeholder URL ("moqt://localhost") and has no meaningful path.
+        let wt_url_path = session.url().path();
+        let wt_path = if wt_url_path.is_empty() || wt_url_path == "/" {
+            None
+        } else {
+            Some(wt_url_path.to_string())
+        };
+
+        // Combine: WebTransport URL path takes precedence over CLIENT_SETUP PATH.
+        // WebTransport connections always have the path in the CONNECT URL.
+        // Raw QUIC connections only have CLIENT_SETUP PATH.
+        let connection_path = wt_path.or(client_setup_path);
+
+        if connection_path.is_some() {
+            tracing::debug!(
+                connection_path = connection_path.as_deref(),
+                "Connection path resolved"
+            );
+        }
 
         // Emit mlog event for CLIENT_SETUP parsed
         if let Some(ref mut mlog) = mlog {
@@ -505,7 +580,7 @@ impl Session {
             sender.encode(&server).await?;
 
             // We are the server, so the first request id is 1
-            Ok(Session::new(session, sender, recver, 1, mlog))
+            Ok(Session::new(session, sender, recver, 1, mlog, connection_path))
         } else {
             Err(SessionError::Version(client.versions, server_versions))
         }

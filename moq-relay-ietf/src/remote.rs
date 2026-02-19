@@ -131,12 +131,16 @@ impl RemotesConsumer {
     }
 
     /// Route to a remote origin based on the namespace.
+    ///
+    /// `connection_path` is the App ID / MoQT scope from the incoming connection,
+    /// passed through to the coordinator's `lookup()` to scope the search.
     pub async fn route(
         &self,
         namespace: &TrackNamespace,
+        connection_path: Option<&str>,
     ) -> anyhow::Result<Option<RemoteConsumer>> {
         // Always fetch the origin instead of using the (potentially invalid) cache.
-        let (origin, client) = self.coordinator.lookup(namespace).await?;
+        let (origin, client) = self.coordinator.lookup(namespace, connection_path).await?;
 
         // Check if we already have a remote for this origin
         let state = self.state.lock();

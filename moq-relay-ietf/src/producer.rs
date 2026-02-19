@@ -15,14 +15,22 @@ pub struct Producer {
     publisher: Publisher,
     locals: Locals,
     remotes: Option<RemotesConsumer>,
+    /// The connection path (App ID / MoQT scope) for this session, if any.
+    connection_path: Option<String>,
 }
 
 impl Producer {
-    pub fn new(publisher: Publisher, locals: Locals, remotes: Option<RemotesConsumer>) -> Self {
+    pub fn new(
+        publisher: Publisher,
+        locals: Locals,
+        remotes: Option<RemotesConsumer>,
+        connection_path: Option<String>,
+    ) -> Self {
         Self {
             publisher,
             locals,
             remotes,
+            connection_path,
         }
     }
 
@@ -111,7 +119,7 @@ impl Producer {
 
         if let Some(remotes) = self.remotes {
             // Check remote tracks second, and serve from remote if possible
-            match remotes.route(&namespace).await {
+            match remotes.route(&namespace, self.connection_path.as_deref()).await {
                 Ok(remote) => {
                     if let Some(remote) = remote {
                         if let Some(track) = remote.subscribe(&namespace, &track_name)? {

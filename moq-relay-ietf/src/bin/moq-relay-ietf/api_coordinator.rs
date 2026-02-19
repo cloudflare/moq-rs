@@ -170,6 +170,7 @@ impl Coordinator for ApiCoordinator {
     async fn register_namespace(
         &self,
         namespace: &TrackNamespace,
+        _connection_path: Option<&str>,
     ) -> CoordinatorResult<NamespaceRegistration> {
         let namespace_str = namespace.to_utf8_path();
         let origin = Origin {
@@ -228,6 +229,7 @@ impl Coordinator for ApiCoordinator {
     async fn lookup(
         &self,
         namespace: &TrackNamespace,
+        _connection_path: Option<&str>,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
         let namespace_str = namespace.to_utf8_path();
         tracing::debug!(namespace = %namespace_str, "looking up namespace in API: {}", namespace_str);
