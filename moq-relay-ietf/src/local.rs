@@ -13,7 +13,7 @@ use crate::metrics::GaugeGuard;
 /// Registry of local tracks
 #[derive(Clone)]
 pub struct Locals {
-    lookup: Arc<Mutex<HashMap<TrackNamespace, TracksReader>>>,
+    lookup: Arc<Mutex<HashMap<(Option<String>, TrackNamespace), TracksReader>>>,
 }
 
 impl Default for Locals {
@@ -31,17 +31,24 @@ impl Locals {
     }
 
     /// Register new local tracks.
-    pub async fn register(&mut self, tracks: TracksReader) -> anyhow::Result<Registration> {
+    pub async fn register(
+        &mut self,
+        connection_path: Option<&str>,
+        tracks: TracksReader,
+    ) -> anyhow::Result<Registration> {
         let namespace = tracks.namespace.clone();
+        let scope_key = connection_path.map(|path| path.to_string());
+        let lookup_key = (scope_key.clone(), namespace.clone());
 
         // Insert the tracks(TracksReader) into the lookup table
-        match self.lookup.lock().unwrap().entry(namespace.clone()) {
+        match self.lookup.lock().unwrap().entry(lookup_key) {
             hash_map::Entry::Vacant(entry) => entry.insert(tracks),
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
         };
 
         let registration = Registration {
             locals: self.clone(),
+            scope_key,
             namespace,
             _gauge_guard: GaugeGuard::new("moq_relay_announced_namespaces"),
         };
@@ -51,14 +58,22 @@ impl Locals {
 
     /// Retrieve local tracks by namespace using hierarchical prefix matching.
     /// Returns the TracksReader for the longest matching namespace prefix.
-    pub fn retrieve(&self, namespace: &TrackNamespace) -> Option<TracksReader> {
+    pub fn retrieve(
+        &self,
+        connection_path: Option<&str>,
+        namespace: &TrackNamespace,
+    ) -> Option<TracksReader> {
         let lookup = self.lookup.lock().unwrap();
+        let scope_key = connection_path.map(|path| path.to_string());
 
         // Find the longest matching prefix
         let mut best_match: Option<TracksReader> = None;
         let mut best_len = 0;
 
-        for (registered_ns, tracks) in lookup.iter() {
+        for ((registered_scope, registered_ns), tracks) in lookup.iter() {
+            if registered_scope.as_deref() != scope_key.as_deref() {
+                continue;
+            }
             // Check if registered_ns is a prefix of namespace
             if namespace.fields.len() >= registered_ns.fields.len() {
                 let is_prefix = registered_ns
@@ -80,6 +95,7 @@ impl Locals {
 
 pub struct Registration {
     locals: Locals,
+    scope_key: Option<String>,
     namespace: TrackNamespace,
     /// Gauge guard for tracking announced namespaces - decrements on drop
     _gauge_guard: GaugeGuard,
@@ -89,7 +105,12 @@ pub struct Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         let ns = self.namespace.to_utf8_path();
-        tracing::debug!(namespace = %ns, "deregistering namespace from locals");
-        self.locals.lookup.lock().unwrap().remove(&self.namespace);
+        let scope = self.scope_key.as_deref().unwrap_or("<default>");
+        tracing::debug!(namespace = %ns, scope = %scope, "deregistering namespace from locals");
+        self.locals
+            .lookup
+            .lock()
+            .unwrap()
+            .remove(&(self.scope_key.clone(), self.namespace.clone()));
     }
 }

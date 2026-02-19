@@ -74,15 +74,17 @@ impl Publisher {
 
     pub async fn accept(
         session: web_transport::Session,
+        transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::accept(session, None).await?;
+        let (session, publisher, _) = Session::accept(session, None, transport).await?;
         Ok((session, publisher.unwrap()))
     }
 
     pub async fn connect(
         session: web_transport::Session,
+        transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::connect(session, None).await?;
+        let (session, publisher, _) = Session::connect(session, None, transport).await?;
         Ok((session, publisher))
     }
 

@@ -74,14 +74,20 @@ impl Subscriber {
     }
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
-    pub async fn accept(session: web_transport::Session) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::accept(session, None).await?;
+    pub async fn accept(
+        session: web_transport::Session,
+        transport: super::Transport,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) = Session::accept(session, None, transport).await?;
         Ok((session, subscriber.unwrap()))
     }
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
-    pub async fn connect(session: web_transport::Session) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::connect(session, None).await?;
+    pub async fn connect(
+        session: web_transport::Session,
+        transport: super::Transport,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) = Session::connect(session, None, transport).await?;
         Ok((session, subscriber))
     }
 
