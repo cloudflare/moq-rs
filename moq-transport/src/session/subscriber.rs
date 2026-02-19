@@ -22,8 +22,14 @@ use super::{
     Reader, Session, SessionError, Subscribe, SubscribeNs, SubscribeNsRecv, SubscribeRecv,
 };
 
-// Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
+// Default timeout for waiting for track aliases to become available via SUBSCRIBE_OK or PUBLISH (1 second)
 const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
+
+#[derive(Clone, Debug)]
+pub(super) enum TrackOrigin {
+    Subscribe(u64), // subscribe request id
+    Publish(u64),   // publish request id
+}
 
 #[derive(Clone)]
 pub struct Subscriber {
@@ -35,17 +41,13 @@ pub struct Subscriber {
 
     subscribes: Arc<Mutex<HashMap<u64, SubscribeRecv>>>,
 
-    subscribe_alias_map: Arc<Mutex<HashMap<u64, u64>>>,
-
-    subscribe_alias_notify: Arc<Notify>,
-
     publishes_received: Arc<Mutex<HashMap<u64, PublishReceivedRecv>>>,
 
     publish_received_queue: Queue<PublishReceived>,
 
-    publish_alias_map: Arc<Mutex<HashMap<u64, u64>>>,
+    track_alias_map: Arc<Mutex<HashMap<u64, TrackOrigin>>>,
 
-    publish_alias_notify: Arc<Notify>,
+    track_alias_notify: Arc<Notify>,
 
     outgoing: Queue<Message>,
 
@@ -65,12 +67,10 @@ impl Subscriber {
             publish_namespace_received_queue: Default::default(),
             subscribe_namespaces: Default::default(),
             subscribes: Default::default(),
-            subscribe_alias_map: Default::default(),
-            subscribe_alias_notify: Arc::new(Notify::new()),
             publishes_received: Default::default(),
             publish_received_queue: Default::default(),
-            publish_alias_map: Default::default(),
-            publish_alias_notify: Arc::new(Notify::new()),
+            track_alias_map: Default::default(),
+            track_alias_notify: Arc::new(Notify::new()),
             outgoing,
             next_requestid,
             mlog,
@@ -242,11 +242,11 @@ impl Subscriber {
 
         let (publish_received, recv) = PublishReceived::new(self.clone(), msg);
 
-        self.publish_alias_map
+        self.track_alias_map
             .lock()
             .unwrap()
-            .insert(msg.track_alias, msg.id);
-        self.publish_alias_notify.notify_waiters();
+            .insert(msg.track_alias, TrackOrigin::Publish(msg.id));
+        self.track_alias_notify.notify_waiters();
 
         if let Err(publish_received) = self.publish_received_queue.push(publish_received) {
             publish_received.close(ServeError::Cancel)?;
@@ -260,16 +260,12 @@ impl Subscriber {
     /// Handle the reception of a SubscribeOk message from the publisher.
     fn recv_subscribe_ok(&mut self, msg: &message::SubscribeOk) -> Result<(), SessionError> {
         if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&msg.id) {
-            // Map track alias to subscription id for quick lookup when receiving streams/datagrams
-            self.subscribe_alias_map
+            self.track_alias_map
                 .lock()
                 .unwrap()
-                .insert(msg.track_alias, msg.id);
+                .insert(msg.track_alias, TrackOrigin::Subscribe(msg.id));
+            self.track_alias_notify.notify_waiters();
 
-            // Notify waiting tasks that the alias map has been updated
-            self.subscribe_alias_notify.notify_waiters();
-
-            // Notify the subscribe of the successful subscription
             subscribe.ok(msg.track_alias)?;
         }
 
@@ -279,12 +275,8 @@ impl Subscriber {
     /// Remove a subscribe from our map of active subscribes, and the alias map if present.
     fn remove_subscribe(&mut self, id: u64) -> Option<SubscribeRecv> {
         if let Some(subscribe) = self.subscribes.lock().unwrap().remove(&id) {
-            // Remove from alias map if present
             if let Some(track_alias) = subscribe.track_alias() {
-                self.subscribe_alias_map
-                    .lock()
-                    .unwrap()
-                    .remove(&track_alias);
+                self.track_alias_map.lock().unwrap().remove(&track_alias);
             };
             Some(subscribe)
         } else {
@@ -354,7 +346,7 @@ impl Subscriber {
     fn remove_publish_received(&mut self, id: u64) -> Option<PublishReceivedRecv> {
         if let Some(publish_recv) = self.publishes_received.lock().unwrap().remove(&id) {
             if let Some(track_alias) = publish_recv.track_alias() {
-                self.publish_alias_map.lock().unwrap().remove(&track_alias);
+                self.track_alias_map.lock().unwrap().remove(&track_alias);
             }
             Some(publish_recv)
         } else {
@@ -362,16 +354,16 @@ impl Subscriber {
         }
     }
 
-    async fn get_subscribe_id_by_alias(
+    async fn get_track_origin_by_alias(
         &self,
         track_alias: u64,
         timeout_ms: Option<u64>,
-    ) -> Option<u64> {
+    ) -> Option<TrackOrigin> {
         let timeout_ms = match timeout_ms {
             Some(ms) => ms,
             None => {
                 return self
-                    .subscribe_alias_map
+                    .track_alias_map
                     .lock()
                     .unwrap()
                     .get(&track_alias)
@@ -382,55 +374,16 @@ impl Subscriber {
         let timeout_duration = Duration::from_millis(timeout_ms);
         tokio::time::timeout(timeout_duration, async {
             loop {
-                let notified = self.subscribe_alias_notify.notified();
+                let notified = self.track_alias_notify.notified();
 
-                if let Some(id) = self
-                    .subscribe_alias_map
+                if let Some(origin) = self
+                    .track_alias_map
                     .lock()
                     .unwrap()
                     .get(&track_alias)
                     .cloned()
                 {
-                    return id;
-                }
-
-                notified.await;
-            }
-        })
-        .await
-        .ok()
-    }
-
-    async fn get_publish_id_by_alias(
-        &self,
-        track_alias: u64,
-        timeout_ms: Option<u64>,
-    ) -> Option<u64> {
-        let timeout_ms = match timeout_ms {
-            Some(ms) => ms,
-            None => {
-                return self
-                    .publish_alias_map
-                    .lock()
-                    .unwrap()
-                    .get(&track_alias)
-                    .cloned();
-            }
-        };
-
-        let timeout_duration = Duration::from_millis(timeout_ms);
-        tokio::time::timeout(timeout_duration, async {
-            loop {
-                let notified = self.publish_alias_notify.notified();
-
-                if let Some(id) = self
-                    .publish_alias_map
-                    .lock()
-                    .unwrap()
-                    .get(&track_alias)
-                    .cloned()
-                {
-                    return id;
+                    return origin;
                 }
 
                 notified.await;
@@ -488,7 +441,9 @@ impl Subscriber {
             );
             // The writer is closed, so we should terminate.
             // TODO it would be nice to do this immediately when the Writer is closed.
-            if let Some(subscribe_id) = self.get_subscribe_id_by_alias(track_alias, None).await {
+            if let Some(TrackOrigin::Subscribe(subscribe_id)) =
+                self.get_track_origin_by_alias(track_alias, None).await
+            {
                 if let Some(subscribe) = self.remove_subscribe(subscribe_id) {
                     subscribe.error(err.clone())?;
                 }
@@ -510,15 +465,26 @@ impl Subscriber {
             track_alias
         );
 
-        enum Writer {
-            Subgroup(serve::SubgroupWriter),
+        let origin = self
+            .get_track_origin_by_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+            .await
+            .ok_or_else(|| {
+                SessionError::Serve(ServeError::not_found_ctx(format!(
+                    "track_alias={} not found",
+                    track_alias
+                )))
+            })?;
+
+        if !stream_header.header_type.is_subgroup() {
+            return Err(SessionError::Serve(ServeError::internal_ctx(format!(
+                "unsupported stream header type={}",
+                stream_header.header_type
+            ))));
         }
 
-        let writer = {
-            if let Some(subscribe_id) = self
-                .get_subscribe_id_by_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-                .await
-            {
+        let subgroup_header = stream_header.subgroup_header.clone().unwrap();
+        let subgroup_writer = match origin {
+            TrackOrigin::Subscribe(subscribe_id) => {
                 let mut subscribes = self.subscribes.lock().unwrap();
                 let subscribe = subscribes.get_mut(&subscribe_id).ok_or_else(|| {
                     ServeError::not_found_ctx(format!(
@@ -526,24 +492,12 @@ impl Subscriber {
                         subscribe_id, track_alias
                     ))
                 })?;
-
-                if stream_header.header_type.is_subgroup() {
-                    log::trace!(
-                        "[SUBSCRIBER] recv_stream_inner: creating subgroup writer from subscribe"
-                    );
-                    Writer::Subgroup(
-                        subscribe.subgroup(stream_header.subgroup_header.clone().unwrap())?,
-                    )
-                } else {
-                    return Err(SessionError::Serve(ServeError::internal_ctx(format!(
-                        "unsupported stream header type={}",
-                        stream_header.header_type
-                    ))));
-                }
-            } else if let Some(publish_id) = self
-                .get_publish_id_by_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-                .await
-            {
+                log::trace!(
+                    "[SUBSCRIBER] recv_stream_inner: creating subgroup writer from subscribe"
+                );
+                subscribe.subgroup(subgroup_header)?
+            }
+            TrackOrigin::Publish(publish_id) => {
                 let mut publishes = self.publishes_received.lock().unwrap();
                 let publish_recv = publishes.get_mut(&publish_id).ok_or_else(|| {
                     ServeError::not_found_ctx(format!(
@@ -551,35 +505,15 @@ impl Subscriber {
                         publish_id, track_alias
                     ))
                 })?;
-
-                if stream_header.header_type.is_subgroup() {
-                    log::trace!(
-                        "[SUBSCRIBER] recv_stream_inner: creating subgroup writer from publish"
-                    );
-                    Writer::Subgroup(
-                        publish_recv.subgroup(stream_header.subgroup_header.clone().unwrap())?,
-                    )
-                } else {
-                    return Err(SessionError::Serve(ServeError::internal_ctx(format!(
-                        "unsupported stream header type={}",
-                        stream_header.header_type
-                    ))));
-                }
-            } else {
-                return Err(SessionError::Serve(ServeError::not_found_ctx(format!(
-                    "subscription track_alias={} not found",
-                    track_alias
-                ))));
+                log::trace!(
+                    "[SUBSCRIBER] recv_stream_inner: creating subgroup writer from publish"
+                );
+                publish_recv.subgroup(subgroup_header)?
             }
         };
 
-        match writer {
-            Writer::Subgroup(subgroup_writer) => {
-                log::trace!("[SUBSCRIBER] recv_stream_inner: receiving subgroup data");
-                Self::recv_subgroup(stream_header.header_type, subgroup_writer, reader, mlog)
-                    .await?
-            }
-        };
+        log::trace!("[SUBSCRIBER] recv_stream_inner: receiving subgroup data");
+        Self::recv_subgroup(stream_header.header_type, subgroup_writer, reader, mlog).await?;
 
         log::debug!(
             "[SUBSCRIBER] recv_stream_inner: completed processing stream for track_alias={}",
@@ -827,46 +761,52 @@ impl Subscriber {
             }
         }
 
-        if let Some(subscribe_id) = self
-            .get_subscribe_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+        let origin = self
+            .get_track_origin_by_alias(datagram.track_alias, None)
             .await
-        {
-            if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&subscribe_id) {
-                log::trace!(
-                    "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
-                    datagram.track_alias,
-                    datagram.group_id,
-                    datagram.object_id.unwrap_or(0),
-                    datagram.publisher_priority,
-                    datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
-                    datagram.payload.as_ref().map_or(0, |p| p.len()));
-                subscribe.datagram(datagram)?;
-            }
-        } else if let Some(publish_id) = self
-            .get_publish_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-            .await
-        {
-            if let Some(publish_recv) = self.publishes_received.lock().unwrap().get_mut(&publish_id)
-            {
-                log::trace!(
-                    "[SUBSCRIBER] recv_datagram from publish: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
-                    datagram.track_alias,
-                    datagram.group_id,
-                    datagram.object_id.unwrap_or(0),
-                    datagram.publisher_priority,
-                    datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
-                    datagram.payload.as_ref().map_or(0, |p| p.len()));
-                publish_recv.datagram(datagram)?;
-            }
-        } else {
+            .or(self
+                .get_track_origin_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+                .await);
+
+        let Some(origin) = origin else {
             log::warn!(
-                "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}",
                 datagram.track_alias,
                 datagram.group_id,
                 datagram.object_id.unwrap_or(0),
-                datagram.publisher_priority,
-                datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
-                datagram.payload.as_ref().map_or(0, |p| p.len()));
+            );
+            return Ok(());
+        };
+
+        match origin {
+            TrackOrigin::Subscribe(subscribe_id) => {
+                if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&subscribe_id) {
+                    log::trace!(
+                        "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                        datagram.track_alias,
+                        datagram.group_id,
+                        datagram.object_id.unwrap_or(0),
+                        datagram.publisher_priority,
+                        datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
+                        datagram.payload.as_ref().map_or(0, |p| p.len()));
+                    subscribe.datagram(datagram)?;
+                }
+            }
+            TrackOrigin::Publish(publish_id) => {
+                if let Some(publish_recv) =
+                    self.publishes_received.lock().unwrap().get_mut(&publish_id)
+                {
+                    log::trace!(
+                        "[SUBSCRIBER] recv_datagram from publish: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
+                        datagram.track_alias,
+                        datagram.group_id,
+                        datagram.object_id.unwrap_or(0),
+                        datagram.publisher_priority,
+                        datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
+                        datagram.payload.as_ref().map_or(0, |p| p.len()));
+                    publish_recv.datagram(datagram)?;
+                }
+            }
         }
 
         Ok(())

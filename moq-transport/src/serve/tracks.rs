@@ -247,6 +247,17 @@ impl TracksReader {
     pub fn forward_upstream(&mut self, writer: TrackWriter) -> Option<()> {
         self.queue.push(writer).ok()
     }
+
+    /// Get all the tracks that are still active.
+    pub fn get_active_tracks(&self) -> Vec<TrackReader> {
+        let state = self.state.lock();
+        state
+            .tracks
+            .values()
+            .filter(|track_reader| !track_reader.is_closed())
+            .cloned()
+            .collect()
+    }
 }
 
 impl Deref for TracksReader {

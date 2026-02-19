@@ -83,7 +83,7 @@ impl PublishReceived {
     }
 
     pub fn accept(
-        mut self,
+        &mut self,
         track: serve::TrackWriter,
         publish_msg: message::PublishOk,
     ) -> Result<(), ServeError> {
@@ -101,27 +101,6 @@ impl PublishReceived {
         }
 
         self.ok = true;
-
-        std::mem::forget(self);
-
-        Ok(())
-    }
-
-    pub fn reject(mut self, error_code: u64, reason: &str) -> Result<(), ServeError> {
-        let state = self.state.lock();
-        state.closed.clone()?;
-
-        self.subscriber.send_message(message::PublishError {
-            id: self.info.id,
-            error_code,
-            reason_phrase: ReasonPhrase(reason.to_string()),
-        });
-
-        if let Some(mut state) = state.into_mut() {
-            state.closed = Err(ServeError::Closed(error_code));
-        }
-
-        std::mem::forget(self);
 
         Ok(())
     }

@@ -7,7 +7,7 @@ use crate::{
     coding::{ReasonPhrase, TrackNamespace},
     message::{self, GroupOrder, Message},
     mlog,
-    serve::{self, ServeError, TracksReader},
+    serve::{self, ServeError, TrackReader, TracksReader},
 };
 
 use crate::watch::Queue;
@@ -173,7 +173,7 @@ impl Publisher {
         self.subscribe_namespace_received_queue.pop().await
     }
 
-    pub async fn publish(&mut self, track: serve::TrackReader) -> Result<Published, SessionError> {
+    pub async fn publish(&mut self, track: &TrackReader) -> Result<Published, SessionError> {
         let request_id = self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed);
         let track_alias = self
             .next_track_alias
