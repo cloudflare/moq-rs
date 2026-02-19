@@ -65,14 +65,14 @@ async fn main() -> anyhow::Result<()> {
     ))?;
 
     tracing::info!("connecting to relay: url={}", cli.url);
-    let (session, connection_id) = quic.client.connect(&cli.url, None).await?;
+    let (session, connection_id, transport) = quic.client.connect(&cli.url, None).await?;
 
     tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );
 
-    let (session, mut publisher) = Publisher::connect(session)
+    let (session, mut publisher) = Publisher::connect(session, transport)
         .await
         .context("failed to create MoQ Transport publisher")?;
 

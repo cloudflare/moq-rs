@@ -143,10 +143,10 @@ impl FileCoordinator {
 impl Coordinator for FileCoordinator {
     async fn register_namespace(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
-        connection_path: Option<&str>,
     ) -> CoordinatorResult<NamespaceRegistration> {
-        let scope_key = CoordinatorData::scope_key(connection_path);
+        let scope_key = CoordinatorData::scope_key(scope);
         let namespace_key = CoordinatorData::namespace_key(namespace);
         let relay_url = self.relay_url.to_string();
         let file_path = self.file_path.clone();
@@ -192,10 +192,10 @@ impl Coordinator for FileCoordinator {
     // currently unregister happens on drop of namespace
     async fn unregister_namespace(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
-        connection_path: Option<&str>,
     ) -> CoordinatorResult<()> {
-        let scope_key = CoordinatorData::scope_key(connection_path);
+        let scope_key = CoordinatorData::scope_key(scope);
         let namespace_key = CoordinatorData::namespace_key(namespace);
         let file_path = self.file_path.clone();
 
@@ -209,11 +209,11 @@ impl Coordinator for FileCoordinator {
 
     async fn lookup(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
-        connection_path: Option<&str>,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
         let namespace = namespace.clone();
-        let scope_key = CoordinatorData::scope_key(connection_path);
+        let scope_key = CoordinatorData::scope_key(scope);
         let namespace_key = CoordinatorData::namespace_key(&namespace);
         let file_path = self.file_path.clone();
 

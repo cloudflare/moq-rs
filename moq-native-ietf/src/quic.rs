@@ -13,6 +13,8 @@ use anyhow::Context;
 use clap::Parser;
 use url::Url;
 
+use moq_transport::session::Transport;
+
 use crate::tls;
 
 use futures::future::BoxFuture;
@@ -204,13 +206,15 @@ impl Endpoint {
 
 pub struct Server {
     quic: quinn::Endpoint,
-    accept: FuturesUnordered<BoxFuture<'static, anyhow::Result<(web_transport::Session, String)>>>,
+    accept: FuturesUnordered<
+        BoxFuture<'static, anyhow::Result<(web_transport::Session, String, Transport)>>,
+    >,
     qlog_dir: Option<Arc<PathBuf>>,
     base_server_config: Arc<quinn::ServerConfig>,
 }
 
 impl Server {
-    pub async fn accept(&mut self) -> Option<(web_transport::Session, String)> {
+    pub async fn accept(&mut self) -> Option<(web_transport::Session, String, Transport)> {
         loop {
             tokio::select! {
                 res = self.quic.accept() => {
@@ -236,7 +240,7 @@ impl Server {
         conn: quinn::Incoming,
         qlog_dir: Option<Arc<PathBuf>>,
         base_server_config: Arc<quinn::ServerConfig>,
-    ) -> anyhow::Result<(web_transport::Session, String)> {
+    ) -> anyhow::Result<(web_transport::Session, String, Transport)> {
         // Capture the original destination connection ID BEFORE accepting
         // This is the actual QUIC CID that can be used for qlog/mlog correlation
         let orig_dst_cid = conn.orig_dst_cid();
@@ -306,30 +310,32 @@ impl Server {
         );
 
         let alpn_bytes = alpn.as_bytes();
-        let session = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
+        let (session, transport) = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
             // Wait for the WebTransport CONNECT request (includes H3 SETTINGS exchange).
             let request = web_transport_quinn::Request::accept(conn)
                 .await
                 .context("failed to receive WebTransport request")?;
 
             // Accept the CONNECT request.
-            request
+            let session = request
                 .ok()
                 .await
-                .context("failed to respond to WebTransport request")?
+                .context("failed to respond to WebTransport request")?;
+            (session, Transport::WebTransport)
         } else if alpn_bytes == moq_transport::setup::ALPN {
             // Raw QUIC mode — create a "fake" WebTransport session with no H3 framing.
             let request = url::Url::parse("moqt://localhost").unwrap();
-            web_transport_quinn::Session::raw(
+            let session = web_transport_quinn::Session::raw(
                 conn,
                 request,
                 web_transport_quinn::proto::ConnectResponse::default(),
-            )
+            );
+            (session, Transport::RawQuic)
         } else {
             anyhow::bail!("unsupported ALPN: {}", alpn)
         };
 
-        Ok((session.into(), connection_id_hex))
+        Ok((session.into(), connection_id_hex, transport))
     }
 
     pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {
@@ -374,7 +380,7 @@ impl Client {
         &self,
         url: &Url,
         socket_addr: Option<net::SocketAddr>,
-    ) -> anyhow::Result<(web_transport::Session, String)> {
+    ) -> anyhow::Result<(web_transport::Session, String, Transport)> {
         let mut config = self.config.clone();
 
         // TODO support connecting to both ALPNs at the same time
@@ -431,17 +437,23 @@ impl Client {
             .context("CID not captured")?
             .to_string();
 
-        let session = match url.scheme() {
-            "https" => web_transport_quinn::Session::connect(connection, url.clone()).await?,
-            "moqt" => web_transport_quinn::Session::raw(
-                connection,
-                url.clone(),
-                web_transport_quinn::proto::ConnectResponse::default(),
+        let (session, transport) = match url.scheme() {
+            "https" => (
+                web_transport_quinn::Session::connect(connection, url.clone()).await?,
+                Transport::WebTransport,
+            ),
+            "moqt" => (
+                web_transport_quinn::Session::raw(
+                    connection,
+                    url.clone(),
+                    web_transport_quinn::proto::ConnectResponse::default(),
+                ),
+                Transport::RawQuic,
             ),
             _ => unreachable!(),
         };
 
-        Ok((session.into(), connection_id_hex))
+        Ok((session.into(), connection_id_hex, transport))
     }
 
     /// Default DNS resolution logic that filters results by address family.

@@ -31,6 +31,25 @@ use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
 
+/// The transport protocol negotiated for this MoQT connection.
+///
+/// MoQT can run over either WebTransport (HTTP/3 + QUIC) or raw QUIC.
+/// The transport type affects protocol behavior — for example, the PATH
+/// parameter is only sent in CLIENT_SETUP for raw QUIC connections,
+/// since WebTransport carries the path in the HTTP/3 CONNECT URL.
+///
+/// This enum is intentionally extensible for future transport options
+/// (e.g., QMUX, WebSocket fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// WebTransport over HTTP/3 (RFC 9220).
+    /// ALPN: "h3". Path carried in HTTP/3 CONNECT :path pseudo-header.
+    WebTransport,
+    /// Raw QUIC with MoQT framing directly on QUIC streams.
+    /// ALPN: "moq-00". Path carried in CLIENT_SETUP PATH parameter.
+    RawQuic,
+}
+
 /// Session object for managing all communications in a single QUIC connection.
 #[must_use = "run() must be called"]
 pub struct Session {
@@ -49,6 +68,9 @@ pub struct Session {
     /// Optional mlog writer for MoQ Transport events
     /// Wrapped in Arc<Mutex<>> to share across send/recv tasks when enabled
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// The transport protocol negotiated for this connection.
+    transport: Transport,
 
     /// The connection path, derived from the WebTransport URL path or CLIENT_SETUP PATH parameter.
     /// For incoming connections: extracted during accept() from the WebTransport CONNECT URL
@@ -112,6 +134,11 @@ impl Session {
             .map_err(|_| SessionError::InvalidPath("path must be UTF-8".to_string()))?;
 
         Self::normalize_connection_path(path)
+    }
+
+    /// Returns the negotiated transport protocol for this connection.
+    pub fn transport(&self) -> Transport {
+        self.transport
     }
 
     /// Returns the connection path, if one was present on the incoming connection.
@@ -432,6 +459,7 @@ impl Session {
         recver: Reader,
         first_requestid: u64,
         mlog: Option<mlog::MlogWriter>,
+        transport: Transport,
         connection_path: Option<String>,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let next_requestid = Arc::new(atomic::AtomicU64::new(first_requestid));
@@ -460,6 +488,7 @@ impl Session {
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
             mlog: mlog_shared,
+            transport,
             connection_path,
         };
 
@@ -477,6 +506,7 @@ impl Session {
     pub async fn connect(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
+        transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         // Auto-extract path from the session URL.
         // This aligns with the unified moqt:// URI scheme direction (IETF PR #1486)
@@ -498,12 +528,15 @@ impl Session {
         let mut params = KeyValuePairs::default();
         params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
-        // Set PATH parameter in CLIENT_SETUP for relay-to-relay path propagation.
+        // Only send PATH in CLIENT_SETUP for raw QUIC connections.
+        // For WebTransport, the path is already carried in the HTTP/3 CONNECT URL.
         if let Some(ref path) = path {
-            params.set_bytesvalue(
-                setup::ParameterType::Path.into(),
-                path.as_bytes().to_vec(),
-            );
+            if transport == Transport::RawQuic {
+                params.set_bytesvalue(
+                    setup::ParameterType::Path.into(),
+                    path.as_bytes().to_vec(),
+                );
+            }
         }
 
         let client = setup::Client {
@@ -516,6 +549,7 @@ impl Session {
             direction = "sent",
             msg_type = "CLIENT_SETUP",
             versions = ?client.versions,
+            ?transport,
             path = path.as_deref(),
             "MoQT control message"
         );
@@ -535,7 +569,7 @@ impl Session {
         // TODO: emit server_setup_parsed event
 
         // We are the client, so the first request id is 0
-        let session = Session::new(session, sender, recver, 0, mlog, path);
+        let session = Session::new(session, sender, recver, 0, mlog, transport, path);
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
@@ -544,6 +578,7 @@ impl Session {
     pub async fn accept(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
+        transport: Transport,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
@@ -626,7 +661,7 @@ impl Session {
             sender.encode(&server).await?;
 
             // We are the server, so the first request id is 1
-            Ok(Session::new(session, sender, recver, 1, mlog, connection_path))
+            Ok(Session::new(session, sender, recver, 1, mlog, transport, connection_path))
         } else {
             Err(SessionError::Version(client.versions, server_versions))
         }

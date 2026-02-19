@@ -16,7 +16,7 @@ type ServerFuture = Pin<
     Box<
         dyn Future<
             Output = (
-                anyhow::Result<(web_transport::Session, String)>,
+                anyhow::Result<(web_transport::Session, String, moq_transport::session::Transport)>,
                 quic::Server,
             ),
         >,
@@ -133,7 +133,7 @@ impl Relay {
             tracing::info!("forwarding announces to {}", url);
 
             // Establish a QUIC connection to the forward URL
-            let (session, _quic_client_initial_cid) = self.quic_endpoints[0]
+            let (session, _quic_client_initial_cid, transport) = self.quic_endpoints[0]
                 .client
                 .connect(url, None)
                 .await
@@ -141,12 +141,24 @@ impl Relay {
 
             // Create the MoQ session over the connection
             let (session, publisher, subscriber) =
-                moq_transport::session::Session::connect(session, None)
+                moq_transport::session::Session::connect(session, None, transport)
                     .await
                     .context("failed to establish forward session")?;
 
-            // Create a normal looking session, except we never forward or register announces.
-            // Forward connections don't have a connection path — they're outbound from this relay.
+            // Extract scope from the announce URL for the forward connection.
+            // The forward session is scoped to whatever path the announce URL specifies.
+            // TODO: The forward connection uses a single fixed scope from the announce URL.
+            // For multi-scope forwarding (different incoming scopes forwarded to different
+            // upstream scopes), see GitHub issue (to be filed).
+            let forward_scope = {
+                let path = url.path();
+                if path.is_empty() || path == "/" {
+                    None
+                } else {
+                    Some(path.trim_end_matches('/').to_string())
+                }
+            };
+
             let coordinator = self.coordinator.clone();
             let session = Session {
                 session,
@@ -154,14 +166,14 @@ impl Relay {
                     publisher,
                     self.locals.clone(),
                     remotes.clone(),
-                    None,
+                    forward_scope.clone(),
                 )),
                 consumer: Some(Consumer::new(
                     subscriber,
                     self.locals.clone(),
                     coordinator,
                     None,
-                    None,
+                    forward_scope,
                 )),
             };
 
@@ -213,7 +225,7 @@ impl Relay {
                         .boxed(),
                     );
 
-                    let (conn, connection_id) = conn_result.context("failed to accept QUIC connection")?;
+                    let (conn, connection_id, transport) = conn_result.context("failed to accept QUIC connection")?;
 
                     metrics::counter!("moq_relay_connections_total").increment(1);
 
@@ -232,7 +244,7 @@ impl Relay {
                         let _conn_guard = GaugeGuard::new("moq_relay_active_connections");
 
                         // Create the MoQ session over the connection (setup handshake etc)
-                        let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path).await {
+                        let (session, publisher, subscriber) = match moq_transport::session::Session::accept(conn, mlog_path, transport).await {
                             Ok(session) => session,
                             Err(err) => {
                                 tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
@@ -246,15 +258,15 @@ impl Relay {
                         // Create our MoQ relay session
                         let moq_session = session;
 
-                        // Extract the connection path (App ID / MoQT scope) from the session.
+                        // Extract the scope (application context) from the session's connection path.
                         // This was resolved during accept() from the WebTransport URL path
                         // or CLIENT_SETUP PATH parameter.
-                        let connection_path = moq_session.connection_path().map(|s| s.to_string());
+                        let scope = moq_session.connection_path().map(|s| s.to_string());
 
                         let session = Session {
                             session: moq_session,
-                            producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, connection_path.clone())),
-                            consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, connection_path)),
+                            producer: publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope.clone())),
+                            consumer: subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope)),
                         };
 
                         match session.run().await {

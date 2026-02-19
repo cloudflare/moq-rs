@@ -15,8 +15,9 @@ pub struct Producer {
     publisher: Publisher,
     locals: Locals,
     remotes: Option<RemotesConsumer>,
-    /// The connection path (App ID / MoQT scope) for this session, if any.
-    connection_path: Option<String>,
+    /// The application scope for this session, if any.
+    /// Derived from the connection path (WebTransport URL or CLIENT_SETUP PATH).
+    scope: Option<String>,
 }
 
 impl Producer {
@@ -24,13 +25,13 @@ impl Producer {
         publisher: Publisher,
         locals: Locals,
         remotes: Option<RemotesConsumer>,
-        connection_path: Option<String>,
+        scope: Option<String>,
     ) -> Self {
         Self {
             publisher,
             locals,
             remotes,
-            connection_path,
+            scope,
         }
     }
 
@@ -106,7 +107,7 @@ impl Producer {
         // Check local tracks first, and serve from local if possible
         if let Some(mut local) = self
             .locals
-            .retrieve(self.connection_path.as_deref(), &namespace)
+            .retrieve(self.scope.as_deref(), &namespace)
         {
             // Pass the full requested namespace, not the announced prefix
             if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
@@ -122,7 +123,7 @@ impl Producer {
 
         if let Some(remotes) = self.remotes {
             // Check remote tracks second, and serve from remote if possible
-            match remotes.route(&namespace, self.connection_path.as_deref()).await {
+            match remotes.route(self.scope.as_deref(), &namespace).await {
                 Ok(remote) => {
                     if let Some(remote) = remote {
                         if let Some(track) = remote.subscribe(&namespace, &track_name)? {
@@ -175,7 +176,7 @@ impl Producer {
     ) -> Result<(), anyhow::Error> {
         // Check local tracks first, and serve from local if possible
         if let Some(mut local_tracks) = self.locals.retrieve(
-            self.connection_path.as_deref(),
+            self.scope.as_deref(),
             &track_status_requested.request_msg.track_namespace,
         ) {
             if let Some(track) = local_tracks.get_track_reader(

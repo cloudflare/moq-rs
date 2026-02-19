@@ -185,10 +185,10 @@ impl ApiCoordinator {
 impl Coordinator for ApiCoordinator {
     async fn register_namespace(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
-        connection_path: Option<&str>,
     ) -> CoordinatorResult<NamespaceRegistration> {
-        let _connection_path = connection_path;
+        let _scope = scope;
         let namespace_str = namespace.to_utf8_path();
         let origin = Origin {
             url: self.config.relay_url.clone(),
@@ -232,10 +232,10 @@ impl Coordinator for ApiCoordinator {
 
     async fn unregister_namespace(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
-        connection_path: Option<&str>,
     ) -> CoordinatorResult<()> {
-        let _connection_path = connection_path;
+        let _scope = scope;
         let namespace_str = namespace.to_utf8_path();
         tracing::info!(namespace = %namespace_str, "unregistering namespace from API: {}", namespace_str);
 
@@ -250,10 +250,10 @@ impl Coordinator for ApiCoordinator {
 
     async fn lookup(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
-        connection_path: Option<&str>,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
-        let _connection_path = connection_path;
+        let _scope = scope;
         let namespace_str = namespace.to_utf8_path();
         tracing::debug!(namespace = %namespace_str, "looking up namespace in API: {}", namespace_str);
 

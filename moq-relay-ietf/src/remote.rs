@@ -132,15 +132,15 @@ impl RemotesConsumer {
 
     /// Route to a remote origin based on the namespace.
     ///
-    /// `connection_path` is the App ID / MoQT scope from the incoming connection,
+    /// `scope` is the application scope from the incoming connection,
     /// passed through to the coordinator's `lookup()` to scope the search.
     pub async fn route(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
-        connection_path: Option<&str>,
     ) -> anyhow::Result<Option<RemoteConsumer>> {
         // Always fetch the origin instead of using the (potentially invalid) cache.
-        let (origin, client) = self.coordinator.lookup(namespace, connection_path).await?;
+        let (origin, client) = self.coordinator.lookup(scope, namespace).await?;
 
         // Check if we already have a remote for this origin
         let state = self.state.lock();
@@ -239,15 +239,17 @@ impl RemoteProducer {
             &self.quic
         };
         // TODO reuse QUIC and MoQ sessions
-        let (session, _quic_client_initial_cid) = match client.connect(&self.url, self.addr).await {
-            Ok(session) => session,
-            Err(err) => {
-                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
-                    .increment(1);
-                return Err(err);
-            }
-        };
-        let (session, subscriber) = match moq_transport::session::Subscriber::connect(session).await
+        let (session, _quic_client_initial_cid, transport) =
+            match client.connect(&self.url, self.addr).await {
+                Ok(session) => session,
+                Err(err) => {
+                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
+                        .increment(1);
+                    return Err(err);
+                }
+            };
+        let (session, subscriber) =
+            match moq_transport::session::Subscriber::connect(session, transport).await
         {
             Ok(session) => session,
             Err(err) => {

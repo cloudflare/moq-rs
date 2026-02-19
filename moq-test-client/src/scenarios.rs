@@ -24,13 +24,19 @@ const TEST_NAMESPACE: &str = "moq-test/interop";
 const TEST_TRACK: &str = "test-track";
 
 /// Helper to connect to a relay and establish a session
-/// Returns (session, connection_id) so we can report CIDs for mlog correlation
-async fn connect(args: &Args) -> Result<(web_transport::Session, String)> {
+/// Returns (session, connection_id, transport) so we can report CIDs for mlog correlation
+async fn connect(
+    args: &Args,
+) -> Result<(
+    web_transport::Session,
+    String,
+    moq_transport::session::Transport,
+)> {
     let tls = args.tls.load()?;
     let quic = quic::Endpoint::new(quic::Config::new(args.bind, None, tls))?;
 
-    let (session, connection_id) = quic.client.connect(&args.relay, None).await?;
-    Ok((session, connection_id))
+    let (session, connection_id, transport) = quic.client.connect(&args.relay, None).await?;
+    Ok((session, connection_id, transport))
 }
 
 /// Collected connection IDs from a test run
@@ -51,12 +57,12 @@ impl TestConnectionIds {
 /// This is the simplest possible test - if this fails, nothing else will work.
 pub async fn test_setup_only(args: &Args) -> Result<TestConnectionIds> {
     timeout(TEST_TIMEOUT, async {
-        let (session, cid) = connect(args).await.context("failed to connect to relay")?;
+        let (session, cid, transport) = connect(args).await.context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
         cids.add(cid);
 
         // Session::connect performs the SETUP exchange
-        let (session, _publisher, _subscriber) = Session::connect(session, None)
+        let (session, _publisher, _subscriber) = Session::connect(session, None, transport)
             .await
             .context("SETUP exchange failed")?;
 
@@ -77,11 +83,11 @@ pub async fn test_setup_only(args: &Args) -> Result<TestConnectionIds> {
 /// Connect to relay, announce a namespace, receive PUBLISH_NAMESPACE_OK, close.
 pub async fn test_announce_only(args: &Args) -> Result<TestConnectionIds> {
     timeout(TEST_TIMEOUT, async {
-        let (session, cid) = connect(args).await.context("failed to connect to relay")?;
+        let (session, cid, transport) = connect(args).await.context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
         cids.add(cid);
 
-        let (session, mut publisher, _subscriber) = Session::connect(session, None)
+        let (session, mut publisher, _subscriber) = Session::connect(session, None, transport)
             .await
             .context("SETUP exchange failed")?;
 
@@ -124,11 +130,11 @@ pub async fn test_announce_only(args: &Args) -> Result<TestConnectionIds> {
 /// Subscribe to a non-existent track and verify we get SUBSCRIBE_ERROR.
 pub async fn test_subscribe_error(args: &Args) -> Result<TestConnectionIds> {
     timeout(TEST_TIMEOUT, async {
-        let (session, cid) = connect(args).await.context("failed to connect to relay")?;
+        let (session, cid, transport) = connect(args).await.context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
         cids.add(cid);
 
-        let (session, _publisher, mut subscriber) = Session::connect(session, None)
+        let (session, _publisher, mut subscriber) = Session::connect(session, None, transport)
             .await
             .context("SETUP exchange failed")?;
 
@@ -199,18 +205,18 @@ pub async fn test_announce_subscribe(args: &Args) -> Result<TestConnectionIds> {
         let mut cids = TestConnectionIds::default();
 
         // Publisher connection
-        let (pub_session, pub_cid) = connect(args).await.context("publisher failed to connect")?;
+        let (pub_session, pub_cid, pub_transport) = connect(args).await.context("publisher failed to connect")?;
         cids.add(pub_cid);
-        let (pub_session, mut publisher, _) = Session::connect(pub_session, None)
+        let (pub_session, mut publisher, _) = Session::connect(pub_session, None, pub_transport)
             .await
             .context("publisher SETUP failed")?;
 
         // Subscriber connection
-        let (sub_session, sub_cid) = connect(args)
+        let (sub_session, sub_cid, sub_transport) = connect(args)
             .await
             .context("subscriber failed to connect")?;
         cids.add(sub_cid);
-        let (sub_session, _, mut subscriber) = Session::connect(sub_session, None)
+        let (sub_session, _, mut subscriber) = Session::connect(sub_session, None, sub_transport)
             .await
             .context("subscriber SETUP failed")?;
 
@@ -280,11 +286,11 @@ pub async fn test_announce_subscribe(args: &Args) -> Result<TestConnectionIds> {
 /// Verifies the relay handles namespace unpublishing correctly.
 pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionIds> {
     timeout(TEST_TIMEOUT, async {
-        let (session, cid) = connect(args).await.context("failed to connect to relay")?;
+        let (session, cid, transport) = connect(args).await.context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
         cids.add(cid);
 
-        let (session, mut publisher, _subscriber) = Session::connect(session, None)
+        let (session, mut publisher, _subscriber) = Session::connect(session, None, transport)
             .await
             .context("SETUP exchange failed")?;
 
@@ -330,11 +336,11 @@ pub async fn test_subscribe_before_announce(args: &Args) -> Result<TestConnectio
         let mut cids = TestConnectionIds::default();
 
         // Subscriber connection - connects first
-        let (sub_session, sub_cid) = connect(args)
+        let (sub_session, sub_cid, sub_transport) = connect(args)
             .await
             .context("subscriber failed to connect")?;
         cids.add(sub_cid);
-        let (sub_session, _, mut subscriber) = Session::connect(sub_session, None)
+        let (sub_session, _, mut subscriber) = Session::connect(sub_session, None, sub_transport)
             .await
             .context("subscriber SETUP failed")?;
 
@@ -368,9 +374,9 @@ pub async fn test_subscribe_before_announce(args: &Args) -> Result<TestConnectio
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Now publisher connects and announces
-        let (pub_session, pub_cid) = connect(args).await.context("publisher failed to connect")?;
+        let (pub_session, pub_cid, pub_transport) = connect(args).await.context("publisher failed to connect")?;
         cids.add(pub_cid);
-        let (pub_session, mut publisher, _) = Session::connect(pub_session, None)
+        let (pub_session, mut publisher, _) = Session::connect(pub_session, None, pub_transport)
             .await
             .context("publisher SETUP failed")?;
 

@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("connecting to server: url={}", config.url);
 
     // Connect to the server
-    let (session, connection_id) = quic.client.connect(&config.url, None).await?;
+    let (session, connection_id, transport) = quic.client.connect(&config.url, None).await?;
 
     tracing::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     // Depending on whether we are publishing or subscribing, create the appropriate session
     if config.publish {
         // Create the publisher session
-        let (session, mut publisher) = Publisher::connect(session)
+        let (session, mut publisher) = Publisher::connect(session, transport)
             .await
             .context("failed to create MoQ Transport session")?;
 
@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         // Create the subscriber session
-        let (session, mut subscriber) = Subscriber::connect(session)
+        let (session, mut subscriber) = Subscriber::connect(session, transport)
             .await
             .context("failed to create MoQ Transport session")?;
 

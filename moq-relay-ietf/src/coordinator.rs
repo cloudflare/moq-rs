@@ -135,6 +135,21 @@ impl NamespaceOrigin {
 ///
 /// All methods take `&self` and implementations must be thread-safe.
 /// Multiple tasks will call these methods concurrently.
+///
+/// ## Scope
+///
+/// The `scope` parameter on `register_namespace()` and `lookup()` identifies
+/// the application scope (tenant, application instance, etc.) for this
+/// operation. Namespaces exist within scopes — the same namespace in
+/// different scopes may route to different origins or have different
+/// configuration.
+///
+/// Today, the scope is derived from the connection path (WebTransport URL
+/// path or CLIENT_SETUP PATH parameter). In the future, scope derivation
+/// may incorporate the hostname or other connection metadata.
+///
+/// If `scope` is `None`, the operation is not scoped to a specific
+/// application — the Coordinator should apply default behavior.
 #[async_trait]
 pub trait Coordinator: Send + Sync {
     /// Register a namespace as locally available on this relay.
@@ -148,11 +163,10 @@ pub trait Coordinator: Send + Sync {
     ///
     /// # Arguments
     ///
+    /// * `scope` - The application scope for this operation, if any. Derived from
+    ///   the connection path (WebTransport URL path or CLIENT_SETUP PATH parameter).
+    ///   Coordinators can use this to scope registrations to a particular application.
     /// * `namespace` - The namespace being registered
-    /// * `connection_path` - The connection path (App ID / MoQT scope) from the
-    ///   incoming connection, if any. Derived from the WebTransport URL path or
-    ///   CLIENT_SETUP PATH parameter. Coordinators can use this to scope registrations
-    ///   to a particular application.
     ///
     /// # Returns
     ///
@@ -160,8 +174,8 @@ pub trait Coordinator: Send + Sync {
     /// as long as this handle is held. Dropping it unregisters the namespace.
     async fn register_namespace(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
-        connection_path: Option<&str>,
     ) -> CoordinatorResult<NamespaceRegistration>;
 
     /// Unregister a namespace.
@@ -172,14 +186,12 @@ pub trait Coordinator: Send + Sync {
     ///
     /// # Arguments
     ///
+    /// * `scope` - The application scope for this operation, if any.
     /// * `namespace` - The namespace to unregister
-    /// * `connection_path` - The connection path (App ID / MoQT scope) from the
-    ///   incoming connection, if any. Coordinators can use this to scope
-    ///   unregistration to a particular application.
     async fn unregister_namespace(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
-        connection_path: Option<&str>,
     ) -> CoordinatorResult<()>;
 
     /// Lookup where a namespace is served from.
@@ -192,10 +204,10 @@ pub trait Coordinator: Send + Sync {
     ///
     /// # Arguments
     ///
+    /// * `scope` - The application scope for this operation, if any. Coordinators
+    ///   can use this to scope lookups (e.g., to route to the correct origin for
+    ///   a particular application).
     /// * `namespace` - The namespace to look up
-    /// * `connection_path` - The connection path (App ID / MoQT scope) from the
-    ///   requesting connection, if any. Coordinators can use this to scope lookups
-    ///   (e.g., to call GetAppConfig for the correct application).
     ///
     /// # Returns
     ///
@@ -203,8 +215,8 @@ pub trait Coordinator: Send + Sync {
     /// - `Err` - Namespace not found anywhere
     async fn lookup(
         &self,
+        scope: Option<&str>,
         namespace: &TrackNamespace,
-        connection_path: Option<&str>,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)>;
 
     /// Graceful shutdown of the coordinator.
