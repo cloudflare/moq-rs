@@ -1,19 +1,27 @@
-mod announce;
-mod announced;
 mod error;
+mod publish_namespace;
+mod publish_namespace_received;
+mod publish_received;
+mod published;
 mod publisher;
 mod reader;
 mod subscribe;
+mod subscribe_namespace;
+mod subscribe_namespace_received;
 mod subscribed;
 mod subscriber;
 mod track_status_requested;
 mod writer;
 
-pub use announce::*;
-pub use announced::*;
 pub use error::*;
+pub use publish_namespace::*;
+pub use publish_namespace_received::*;
+pub use publish_received::*;
+pub use published::*;
 pub use publisher::*;
 pub use subscribe::*;
+pub use subscribe_namespace::*;
+pub use subscribe_namespace_received::*;
 pub use subscribed::*;
 pub use subscriber::*;
 pub use track_status_requested::*;
@@ -565,7 +573,19 @@ impl Session {
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_created(time, stream_id, m))
                         }
-                        _ => None, // TODO: Add other message types
+                        Message::Publish(m) => {
+                            Some(mlog::events::publish_created(time, stream_id, m))
+                        }
+                        Message::PublishOk(m) => {
+                            Some(mlog::events::publish_ok_created(time, stream_id, m))
+                        }
+                        Message::PublishError(m) => {
+                            Some(mlog::events::publish_error_created(time, stream_id, m))
+                        }
+                        Message::PublishDone(m) => {
+                            Some(mlog::events::publish_done_created(time, stream_id, m))
+                        }
+                        _ => None,
                     };
 
                     if let Some(event) = event {
@@ -629,7 +649,19 @@ impl Session {
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_parsed(time, stream_id, m))
                         }
-                        _ => None, // TODO: Add other message types
+                        Message::Publish(m) => {
+                            Some(mlog::events::publish_parsed(time, stream_id, m))
+                        }
+                        Message::PublishOk(m) => {
+                            Some(mlog::events::publish_ok_parsed(time, stream_id, m))
+                        }
+                        Message::PublishError(m) => {
+                            Some(mlog::events::publish_error_parsed(time, stream_id, m))
+                        }
+                        Message::PublishDone(m) => {
+                            Some(mlog::events::publish_done_parsed(time, stream_id, m))
+                        }
+                        _ => None,
                     };
 
                     if let Some(event) = event {

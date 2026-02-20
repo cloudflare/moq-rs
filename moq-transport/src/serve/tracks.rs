@@ -91,6 +91,21 @@ impl TracksWriter {
         };
         self.state.lock_mut()?.tracks.remove(&full_name)
     }
+
+    /// Insert an existing track reader into the broadcast.
+    /// Returns None if all readers have been dropped or if a track with this name already exists.
+    pub fn insert(&mut self, reader: TrackReader) -> Option<()> {
+        let full_name = FullTrackName {
+            namespace: reader.namespace.clone(),
+            name: reader.name.clone(),
+        };
+        let mut state = self.state.lock_mut()?;
+        if state.tracks.contains_key(&full_name) {
+            return None;
+        }
+        state.tracks.insert(full_name, reader);
+        Some(())
+    }
 }
 
 impl Deref for TracksWriter {
@@ -260,6 +275,24 @@ impl TracksReader {
 
         Some(track_writer_reader.1)
     }
+
+    /// Forward an existing track writer to the upstream subscription queue.
+    /// The writer will be received by [TracksRequest::next()].
+    /// Returns None if the queue is closed.
+    pub fn forward_upstream(&mut self, writer: TrackWriter) -> Option<()> {
+        self.queue.push(writer).ok()
+    }
+
+    /// Get all the tracks that are still active.
+    pub fn get_active_tracks(&self) -> Vec<TrackReader> {
+        let state = self.state.lock();
+        state
+            .tracks
+            .values()
+            .filter(|track_reader| !track_reader.is_closed())
+            .cloned()
+            .collect()
+    }
 }
 
 impl Deref for TracksReader {
@@ -355,6 +388,73 @@ mod tests {
         assert!(
             closed_result_2.is_err(),
             "track_reader_2 should NOT be immediately closed - it should be a fresh track"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_track_not_stale_after_subgroups_transition() {
+        let namespace = TrackNamespace::from_utf8_path("test/namespace");
+        let track_name = "test-track";
+
+        let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        let _track_reader_1 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("first subscribe should succeed");
+
+        let track_writer = request
+            .next()
+            .await
+            .expect("publisher should receive track request");
+
+        let _subgroups_writer = track_writer
+            .subgroups()
+            .expect("subgroups transition should succeed");
+
+        let _track_reader_2 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("second subscribe should succeed");
+
+        let maybe_second_request =
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.next()).await;
+
+        assert!(
+            maybe_second_request.is_err(),
+            "publisher should NOT get a second request while SubgroupsWriter is alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_track_stale_after_subgroups_writer_dropped() {
+        let namespace = TrackNamespace::from_utf8_path("test/namespace");
+        let track_name = "test-track";
+
+        let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        let _track_reader_1 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("first subscribe should succeed");
+
+        let track_writer = request
+            .next()
+            .await
+            .expect("publisher should receive track request");
+
+        let subgroups_writer = track_writer
+            .subgroups()
+            .expect("subgroups transition should succeed");
+        drop(subgroups_writer);
+
+        let _track_reader_2 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("second subscribe should succeed");
+
+        let maybe_second_request =
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.next()).await;
+
+        assert!(
+            maybe_second_request.is_ok(),
+            "publisher should get a new request after SubgroupsWriter is dropped"
         );
     }
 

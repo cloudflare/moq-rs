@@ -36,6 +36,10 @@ pub enum ServeError {
 
     #[error("not implemented: {0} [error:{1}]")]
     NotImplementedWithId(String, uuid::Uuid),
+
+    /// Relay already has an active SUBSCRIBE path, not interested in PUBLISH
+    #[error("uninterested")]
+    Uninterested,
 }
 
 impl ServeError {
@@ -60,6 +64,8 @@ impl ServeError {
             Self::NotImplemented(_) | Self::NotImplementedWithId(_, _) => 0x3,
             // INTERNAL_ERROR (0x0) - per-request error registries use 0x0
             Self::Internal(_) | Self::InternalWithId(_, _) => 0x0,
+            // UNINTERESTED (0x1) - relay already has data path via SUBSCRIBE
+            Self::Uninterested => 0x1,
         }
     }
 
