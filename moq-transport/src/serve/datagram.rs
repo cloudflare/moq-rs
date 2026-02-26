@@ -114,6 +114,11 @@ impl DatagramsReader {
             .as_ref()
             .map(|datagram| (datagram.group_id, datagram.object_id))
     }
+
+    pub fn is_closed(&self) -> bool {
+        let state = self.state.lock();
+        state.closed.is_err() || state.modified().is_none()
+    }
 }
 
 /// Static information about the datagram.

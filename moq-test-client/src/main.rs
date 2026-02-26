@@ -140,9 +140,9 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
 
     let result = match test_case {
         TestCase::SetupOnly => scenarios::test_setup_only(args).await,
-        TestCase::AnnounceOnly => scenarios::test_announce_only(args).await,
+        TestCase::AnnounceOnly => scenarios::test_publish_namespace_only(args).await,
         TestCase::SubscribeError => scenarios::test_subscribe_error(args).await,
-        TestCase::AnnounceSubscribe => scenarios::test_announce_subscribe(args).await,
+        TestCase::AnnounceSubscribe => scenarios::test_publish_namespace_subscribe(args).await,
         TestCase::SubscribeBeforeAnnounce => scenarios::test_subscribe_before_announce(args).await,
         TestCase::PublishNamespaceDone => scenarios::test_publish_namespace_done(args).await,
     };

@@ -1,7 +1,11 @@
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
+    coding::TrackNamespace,
     serve::{ServeError, TracksReader},
-    session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
+    session::{
+        PublishNamespace, Publisher, SessionError, SubscribeNamespaceReceived, Subscribed,
+        TrackStatusRequested,
+    },
 };
 
 use crate::{
@@ -26,12 +30,15 @@ impl Producer {
         }
     }
 
-    /// Announce new tracks to the remote server.
-    pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        self.publisher.announce(tracks).await
+    pub async fn publish_namespace(
+        &mut self,
+        tracks: TracksReader,
+    ) -> Result<PublishNamespace, SessionError> {
+        self.publisher
+            .publish_namespace(tracks.namespace.clone())
+            .await
     }
 
-    /// Run the producer to serve subscribe requests.
     pub async fn run(self) -> Result<(), SessionError> {
         //let mut tasks = FuturesUnordered::new();
         let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
@@ -40,6 +47,7 @@ impl Producer {
         loop {
             let mut publisher_subscribed = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
+            let mut publisher_subscribe_ns = self.publisher.clone();
 
             tokio::select! {
                 // Handle a new subscribe request
@@ -78,13 +86,24 @@ impl Producer {
                         }
                     }.boxed())
                 },
+                Some(subscribe_ns) = publisher_subscribe_ns.subscribe_namespace_received() => {
+                    let this = self.clone();
+
+                    tasks.push(async move {
+                        let info = subscribe_ns.info.clone();
+                        tracing::info!("serving subscribe_namespace: {:?}", info);
+
+                        if let Err(err) = this.serve_subscribe_namespace(subscribe_ns).await {
+                            tracing::warn!("failed serving subscribe_namespace: {:?}, error: {}", info, err)
+                        }
+                    }.boxed())
+                },
                 _= tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(()),
             };
         }
     }
 
-    /// Serve a subscribe request.
     async fn serve_subscribe(self, subscribed: Subscribed) -> Result<(), anyhow::Error> {
         // Track subscribe latency from request to track resolution (records on drop)
         let mut timing_guard =
@@ -94,23 +113,39 @@ impl Producer {
 
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();
+        let ns = namespace.to_utf8_path();
 
-        // Check local tracks first, and serve from local if possible
-        if let Some(mut local) = self.locals.retrieve(&namespace) {
-            // Pass the full requested namespace, not the announced prefix
-            if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
-                let ns = namespace.to_utf8_path();
-                tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
-                // Update label to indicate local source, timing recorded on drop
-                timing_guard.set_label("source", "local");
-                // Track active tracks - decrements when serve completes
-                let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
-                return Ok(subscribed.serve(track).await?);
+        if let Some(track_info) = self
+            .locals
+            .get_or_create_track_info(&namespace, &track_name)
+        {
+            if track_info.should_subscribe_upstream() {
+                tracing::info!(
+                    namespace = %ns, track = %track_name,
+                    "subscribe needs upstream request",
+                );
+
+                if let Some(reader) = self.locals.subscribe_upstream(track_info.clone()) {
+                    tracing::info!(
+                        namespace = %ns, track = %track_name,
+                        "forwarding subscribe upstream via TrackInfo: {}/{}",
+                        ns, track_name
+                    );
+                    return Ok(subscribed.serve(reader).await?);
+                }
             }
+
+            let reader = track_info.get_reader();
+
+            tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", reader.info);
+            // Update label to indicate local source, timing recorded on drop
+            timing_guard.set_label("source", "local");
+            // Track active tracks - decrements when serve completes
+            let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+            return Ok(subscribed.serve(reader).await?);
         }
 
         if let Some(remotes) = self.remotes {
-            // Check remote tracks second, and serve from remote if possible
             match remotes.route(&namespace).await {
                 Ok(remote) => {
                     if let Some(remote) = remote {
@@ -157,7 +192,59 @@ impl Producer {
         Err(err.into())
     }
 
-    /// Serve a track_status request.
+    /// FIXME: Currently the limitation of serve_subscribe_namespace is any
+    /// new publish or publish_namespace coming to the relay is not getting
+    /// forwarded if they match the subscribe namespace's track namespace.
+    async fn serve_subscribe_namespace(
+        mut self,
+        mut subscribe_ns: SubscribeNamespaceReceived,
+    ) -> Result<(), anyhow::Error> {
+        let namespace_prefix = subscribe_ns.namespace_prefix.clone();
+
+        let matching_namespaces: Vec<TrackNamespace> = self
+            .locals
+            .matching_namespaces(&namespace_prefix)
+            .into_iter()
+            .collect();
+
+        if matching_namespaces.is_empty() {
+            subscribe_ns.reject(0x4, "Namespace prefix not found")?;
+            return Ok(());
+        }
+
+        subscribe_ns.ok()?;
+
+        let mut active_publish_namespaces = Vec::new();
+        // FIXME: We currently send all matching namespaces, even if
+        // they are already subscribed to. This is not correct.
+        // Instead, we should only send the ones that are not already
+        // subscribed to.
+        for namespace in matching_namespaces {
+            tracing::info!(
+                "sending PUBLISH_NAMESPACE for {:?} (matched prefix {:?})",
+                namespace,
+                namespace_prefix
+            );
+            match self.publisher.publish_namespace(namespace.clone()).await {
+                Ok(publish_ns) => {
+                    tracing::debug!("sent PUBLISH_NAMESPACE for {:?}", namespace);
+                    active_publish_namespaces.push(publish_ns);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to send PUBLISH_NAMESPACE for {:?}: {}",
+                        namespace,
+                        e
+                    );
+                }
+            }
+        }
+
+        subscribe_ns.closed().await?;
+        drop(active_publish_namespaces);
+        Ok(())
+    }
+
     async fn serve_track_status(
         self,
         mut track_status_requested: TrackStatusRequested,

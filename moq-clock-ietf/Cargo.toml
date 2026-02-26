@@ -22,6 +22,7 @@ url = "2"
 
 # Async stuff
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 
 # CLI, logging, error handling
 clap = { version = "4", features = ["derive"] }

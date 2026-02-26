@@ -5,7 +5,6 @@
 // - TrackStatus, TrackStatusOk, TrackStatusError (parsed/created)
 // - SubscribeNamespace, SubscribeNamespaceOk, SubscribeNamespaceError, UnsubscribeNamespace (parsed/created)
 // - Fetch, FetchOk, FetchError, FetchCancel (parsed/created)
-// - Publish, PublishOk, PublishError, PublishDone (parsed/created)
 // - MaxRequestId (parsed/created)
 // - RequestsBlocked (parsed/created)
 //
@@ -458,6 +457,142 @@ pub fn publish_namespace_error_created(
         false,
         "publish_namespace_error",
         publish_namespace_error_to_json(msg),
+    )
+}
+
+/// Helper to convert PUBLISH message to JSON
+fn publish_to_json(msg: &message::Publish) -> JsonValue {
+    let mut json = json!({
+        "publish_id": msg.id,
+        "track_namespace": msg.track_namespace.to_string(),
+        "track_name": &msg.track_name,
+        "track_alias": msg.track_alias,
+        "group_order": format!("{:?}", msg.group_order),
+        "content_exists": msg.content_exists,
+        "forward": msg.forward,
+        "parameters": key_value_pairs_to_vec(&msg.params.0),
+    });
+
+    // Add optional largest_location fields if content exists
+    if msg.content_exists {
+        if let Some(largest) = &msg.largest_location {
+            json["largest_group_id"] = json!(largest.group_id);
+            json["largest_object_id"] = json!(largest.object_id);
+        }
+    }
+
+    json
+}
+
+/// Create a control_message_parsed event for PUBLISH
+pub fn publish_parsed(time: f64, stream_id: u64, msg: &message::Publish) -> Event {
+    create_control_message_event(time, stream_id, true, "publish", publish_to_json(msg))
+}
+
+/// Create a control_message_created event for PUBLISH
+pub fn publish_created(time: f64, stream_id: u64, msg: &message::Publish) -> Event {
+    create_control_message_event(time, stream_id, false, "publish", publish_to_json(msg))
+}
+
+/// Helper to convert PUBLISH_OK message to JSON
+fn publish_ok_to_json(msg: &message::PublishOk) -> JsonValue {
+    let mut json = json!({
+        "publish_id": msg.id,
+        "forward": msg.forward,
+        "subscriber_priority": msg.subscriber_priority,
+        "group_order": format!("{:?}", msg.group_order),
+        "filter_type": format!("{:?}", msg.filter_type),
+        "parameters": key_value_pairs_to_vec(&msg.params.0),
+    });
+
+    // Add optional fields based on filter type
+    if let Some(start_loc) = &msg.start_location {
+        json["start_group"] = json!(start_loc.group_id);
+        json["start_object"] = json!(start_loc.object_id);
+    }
+    if let Some(end_group) = msg.end_group_id {
+        json["end_group"] = json!(end_group);
+    }
+
+    json
+}
+
+/// Create a control_message_parsed event for PUBLISH_OK
+pub fn publish_ok_parsed(time: f64, stream_id: u64, msg: &message::PublishOk) -> Event {
+    create_control_message_event(time, stream_id, true, "publish_ok", publish_ok_to_json(msg))
+}
+
+/// Create a control_message_created event for PUBLISH_OK
+pub fn publish_ok_created(time: f64, stream_id: u64, msg: &message::PublishOk) -> Event {
+    create_control_message_event(
+        time,
+        stream_id,
+        false,
+        "publish_ok",
+        publish_ok_to_json(msg),
+    )
+}
+
+/// Helper to convert PUBLISH_ERROR message to JSON
+fn publish_error_to_json(msg: &message::PublishError) -> JsonValue {
+    json!({
+        "publish_id": msg.id,
+        "error_code": msg.error_code,
+        "reason_phrase": &msg.reason_phrase.0,
+    })
+}
+
+/// Create a control_message_parsed event for PUBLISH_ERROR
+pub fn publish_error_parsed(time: f64, stream_id: u64, msg: &message::PublishError) -> Event {
+    create_control_message_event(
+        time,
+        stream_id,
+        true,
+        "publish_error",
+        publish_error_to_json(msg),
+    )
+}
+
+/// Create a control_message_created event for PUBLISH_ERROR
+pub fn publish_error_created(time: f64, stream_id: u64, msg: &message::PublishError) -> Event {
+    create_control_message_event(
+        time,
+        stream_id,
+        false,
+        "publish_error",
+        publish_error_to_json(msg),
+    )
+}
+
+/// Helper to convert PUBLISH_DONE message to JSON
+fn publish_done_to_json(msg: &message::PublishDone) -> JsonValue {
+    json!({
+        "publish_id": msg.id,
+        "status_code": msg.status_code,
+        "stream_count": msg.stream_count,
+        "reason": &msg.reason.0,
+    })
+}
+
+/// Create a control_message_parsed event for PUBLISH_DONE
+pub fn publish_done_parsed(time: f64, stream_id: u64, msg: &message::PublishDone) -> Event {
+    create_control_message_event(
+        time,
+        stream_id,
+        true,
+        "publish_done",
+        publish_done_to_json(msg),
+    )
+}
+
+/// Create a control_message_created event for PUBLISH_DONE
+pub fn publish_done_created(time: f64, stream_id: u64, msg: &message::PublishDone) -> Event {
+    create_control_message_event(
+        time,
+        stream_id,
+        false,
+        "publish_done",
+        publish_done_to_json(msg),
     )
 }
 

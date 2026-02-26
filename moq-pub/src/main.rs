@@ -4,11 +4,16 @@ use url::Url;
 
 use anyhow::Context;
 use clap::Parser;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::io::AsyncReadExt;
 
 use moq_native_ietf::quic;
 use moq_pub::Media;
-use moq_transport::{coding::TrackNamespace, serve, session::Publisher};
+use moq_transport::{
+    coding::TrackNamespace,
+    serve::{self, TracksReader},
+    session::{PublishNamespace, Publisher, SessionError},
+};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -37,6 +42,63 @@ pub struct Cli {
     /// The TLS configuration.
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
+
+    /// Whether to publish to the catalog or wait for a subscribe
+    /// aka PUSH based publisher
+    #[arg(long, default_value = "false")]
+    pub publish: bool,
+}
+
+async fn serve_subscriptions(
+    mut publisher: Publisher,
+    tracks: TracksReader,
+    publish_ns: &PublishNamespace,
+    publish: bool,
+) -> Result<(), SessionError> {
+    publish_ns.ok().await?;
+
+    if publish {
+        return publish_track(publisher, tracks).await;
+    }
+    let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
+        FuturesUnordered::new();
+
+    loop {
+        tokio::select! {
+            Some(subscribed) = publisher.subscribed() => {
+                let info = subscribed.info.clone();
+                let tracks = tracks.clone();
+                tracing::info!("serving subscribe: {:?}", info);
+
+                tasks.push(async move {
+                    if let Err(err) = Publisher::serve_subscribe(subscribed, tracks).await {
+                        tracing::warn!("failed serving subscribe: {:?}, error: {}", info, err);
+                    }
+                }.boxed());
+            }
+            _ = tasks.next(), if !tasks.is_empty() => {}
+            else => return Ok(()),
+        }
+    }
+}
+
+async fn publish_track(mut publisher: Publisher, tracks: TracksReader) -> Result<(), SessionError> {
+    let active_tracks = tracks.get_active_tracks();
+    tracing::info!("publishing {} tracks", active_tracks.len());
+
+    let mut tasks = FuturesUnordered::new();
+    for track in active_tracks {
+        let published = publisher.publish(&track).await?;
+        let info = published.info.clone();
+        tasks.push(async move {
+            if let Err(err) = published.serve(track).await {
+                tracing::warn!("failed serving publish: {:?}, error: {}", info, err);
+            }
+        });
+    }
+
+    while tasks.next().await.is_some() {}
+    Ok(())
 }
 
 #[tokio::main]
@@ -72,16 +134,25 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let (session, mut publisher) = Publisher::connect(session)
+    let (session, publisher) = Publisher::connect(session)
         .await
         .context("failed to create MoQ Transport publisher")?;
 
+    let namespace = reader.namespace.clone();
+
+    let publish_ns = publisher
+        .clone()
+        .publish_namespace(namespace)
+        .await
+        .context("failed to register namespace")?;
+
+    tracing::info!("namespace registered, starting media and subscription handling");
+
     tokio::select! {
         res = session.run() => res.context("session error")?,
-        res = run_media(media) => {
-            res.context("media error")?
-        },
-        res = publisher.announce(reader) => res.context("publisher error")?,
+        res = run_media(media) => res.context("media error")?,
+        res = serve_subscriptions(publisher, reader, &publish_ns, cli.publish) => res.context("publisher error")?,
+        res = publish_ns.closed() => res.context("namespace closed")?,
     }
 
     Ok(())
