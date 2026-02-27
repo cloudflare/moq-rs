@@ -38,6 +38,13 @@ pub struct Config {
 	/// Fine for local development, but should be used in caution in production.
 	#[arg(long)]
 	pub tls_disable_verify: bool,
+
+	/// Authentication token to send in CLIENT_SETUP.
+	///
+	/// Sent as AUTHORIZATION_TOKEN (param 0x03) with Token Type OUT_OF_BAND (0x00).
+	/// This is validated by the relay's SimpleTokenValidator.
+	#[arg(long)]
+	pub auth_token: Option<String>,
 }
 
 fn moq_url(s: &str) -> Result<Url, String> {

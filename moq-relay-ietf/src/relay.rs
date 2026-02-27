@@ -140,7 +140,7 @@ impl Relay {
 
             // Create the MoQ session over the connection
             let (session, publisher, subscriber) =
-                moq_transport::session::Session::connect(session, None)
+                moq_transport::session::Session::connect(session, None, None)
                     .await
                     .context("failed to establish forward session")?;
 

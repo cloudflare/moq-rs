@@ -37,6 +37,13 @@ pub struct Cli {
     /// The TLS configuration.
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
+
+    /// Authentication token to send in CLIENT_SETUP.
+    ///
+    /// Sent as AUTHORIZATION_TOKEN (param 0x03) with Token Type OUT_OF_BAND (0x00).
+    /// This is validated by the relay's SimpleTokenValidator.
+    #[arg(long)]
+    pub auth_token: Option<String>,
 }
 
 #[tokio::main]
@@ -71,7 +78,8 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let (session, mut publisher) = Publisher::connect(session)
+    let auth_token = cli.auth_token.map(|t| t.into_bytes());
+    let (session, mut publisher) = Publisher::connect(session, auth_token)
         .await
         .context("failed to create MoQ Transport publisher")?;
 

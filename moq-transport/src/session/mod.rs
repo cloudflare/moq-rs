@@ -103,6 +103,7 @@ impl Session {
     pub async fn connect(
         mut session: web_transport::Session,
         mlog_path: Option<PathBuf>,
+        auth_token: Option<Vec<u8>>,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let mlog = mlog_path.and_then(|path| {
             mlog::MlogWriter::new(path)
@@ -118,6 +119,10 @@ impl Session {
         // TODO SLG - make configurable?
         let mut params = KeyValuePairs::default();
         params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
+        if let Some(token) = auth_token {
+            log::info!("adding auth token to CLIENT_SETUP ({} bytes)", token.len());
+            params.set_bytesvalue(setup::ParameterType::AuthorizationToken.into(), token);
+        }
 
         let client = setup::Client {
             versions: versions.clone(),

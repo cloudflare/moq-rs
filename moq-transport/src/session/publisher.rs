@@ -81,8 +81,9 @@ impl Publisher {
 
     pub async fn connect(
         session: web_transport::Session,
+        auth_token: Option<Vec<u8>>,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::connect(session, None).await?;
+        let (session, publisher, _) = Session::connect(session, None, auth_token).await?;
         Ok((session, publisher))
     }
 

@@ -81,7 +81,7 @@ impl Subscriber {
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
     pub async fn connect(session: web_transport::Session) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::connect(session, None).await?;
+        let (session, _, subscriber) = Session::connect(session, None, None).await?;
         Ok((session, subscriber))
     }
 

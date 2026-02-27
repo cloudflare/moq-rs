@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
     // Depending on whether we are publishing or subscribing, create the appropriate session
     if config.publish {
         // Create the publisher session
-        let (session, mut publisher) = Publisher::connect(session)
+        let (session, mut publisher) = Publisher::connect(session, None)
             .await
             .context("failed to create MoQ Transport session")?;
 
