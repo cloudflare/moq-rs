@@ -8,7 +8,7 @@ use tokio::io::AsyncReadExt;
 
 use moq_native_ietf::quic;
 use moq_pub::Media;
-use moq_transport::{coding::TrackNamespace, serve, session::Publisher};
+use moq_transport::{coding::TrackNamespace, serve, session::Publisher, setup::token};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -42,8 +42,18 @@ pub struct Cli {
     ///
     /// Sent as AUTHORIZATION_TOKEN (param 0x03) with Token Type OUT_OF_BAND (0x00).
     /// This is validated by the relay's SimpleTokenValidator.
-    #[arg(long)]
+    /// Mutually exclusive with --cat-subject.
+    #[arg(long, conflicts_with = "cat_subject")]
     pub auth_token: Option<String>,
+
+    /// Subject for CAT token (e.g., a JWT string for plugin-level auth).
+    ///
+    /// When provided, builds a CAT token (Type 0x10) with this value as the
+    /// CWT "sub" claim. The relay extracts the subject and passes it to the
+    /// plugin's MoqAuthenticator for JWT validation.
+    /// Mutually exclusive with --auth-token.
+    #[arg(long, conflicts_with = "auth_token")]
+    pub cat_subject: Option<String>,
 }
 
 #[tokio::main]
@@ -78,7 +88,21 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let auth_token = cli.auth_token.map(|t| t.into_bytes());
+    // Build the token bytes with proper Token structure wrapping
+    let auth_token = if let Some(ref subject) = cli.cat_subject {
+        let cwt_bytes = moq_pub::cat::build_cwt(subject, 60);
+        log::info!(
+            "built CAT token: sub={} ({} CWT bytes)",
+            subject.chars().take(32).collect::<String>(),
+            cwt_bytes.len()
+        );
+        Some(token::build_cat_token(&cwt_bytes))
+    } else if let Some(ref raw) = cli.auth_token {
+        log::info!("built simple OUT_OF_BAND token ({} bytes)", raw.len());
+        Some(token::build_simple_token(raw.as_bytes()))
+    } else {
+        None
+    };
     let (session, mut publisher) = Publisher::connect(session, auth_token)
         .await
         .context("failed to create MoQ Transport publisher")?;
