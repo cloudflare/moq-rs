@@ -42,58 +42,43 @@ pub struct Event {
 }
 
 /// Union of all MoQ Transport event types
+///
+/// Uses serde untagged representation — the event type is conveyed by
+/// the `name` field on the parent Event struct, not repeated in data.
+/// (Per qlog spec, the "name" field is the event type identifier.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type")]
+#[serde(untagged)]
 pub enum EventData {
-    #[serde(rename = "control_message_parsed")]
     ControlMessageParsed(ControlMessageParsed),
-
-    #[serde(rename = "control_message_created")]
     ControlMessageCreated(ControlMessageCreated),
-
-    #[serde(rename = "subgroup_header_parsed")]
     SubgroupHeaderParsed(SubgroupHeaderParsed),
-
-    #[serde(rename = "subgroup_header_created")]
     SubgroupHeaderCreated(SubgroupHeaderCreated),
-
-    #[serde(rename = "subgroup_object_parsed")]
     SubgroupObjectParsed(SubgroupObjectParsed),
-
-    #[serde(rename = "subgroup_object_created")]
     SubgroupObjectCreated(SubgroupObjectCreated),
-
-    #[serde(rename = "object_datagram_parsed")]
     ObjectDatagramParsed(ObjectDatagramParsed),
-
-    #[serde(rename = "object_datagram_created")]
     ObjectDatagramCreated(ObjectDatagramCreated),
-
-    #[serde(rename = "loglevel")]
     LogLevel(LogLevelEvent),
 }
 
-/// Control message parsed event (Section 4.2 of draft-pardue-moq-qlog-moq-events)
+/// Control message parsed event
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 4.2
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlMessageParsed {
     pub stream_id: u64,
-    pub message_type: String,
 
-    /// Message-specific fields
-    #[serde(flatten)]
+    /// Nested control message object (contains "type" discriminator)
     pub message: JsonValue,
 }
 
-/// Control message created event (Section 4.1 of draft-pardue-moq-qlog-moq-events)
+/// Control message created event
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 4.1
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlMessageCreated {
     pub stream_id: u64,
-    pub message_type: String,
 
-    /// Message-specific fields
-    #[serde(flatten)]
+    /// Nested control message object (contains "type" discriminator)
     pub message: JsonValue,
 }
 
@@ -178,32 +163,45 @@ fn key_value_pairs_to_vec(kvps: &[coding::KeyValuePair]) -> Vec<(String, String)
         .collect()
 }
 
+/// Convert a TrackNamespace to the qlog [*MOQTByteString] format.
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.4
+fn namespace_to_qlog(ns: &coding::TrackNamespace) -> JsonValue {
+    json!(ns
+        .fields
+        .iter()
+        .map(|f| json!({"value": String::from_utf8_lossy(&f.value)}))
+        .collect::<Vec<_>>())
+}
+
+/// Convert a track name string to MOQTByteString format.
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.4
+fn track_name_to_qlog(name: &str) -> JsonValue {
+    json!({"value": name})
+}
+
+/// Convert a Location to MOQTLocation format.
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.5
+fn location_to_qlog(loc: &coding::Location) -> JsonValue {
+    json!({"group": loc.group_id, "object": loc.object_id})
+}
+
 fn create_control_message_event(
     time: f64,
     stream_id: u64,
     is_parsed: bool,
-    msg_type: &str,
     message: JsonValue,
 ) -> Event {
     if is_parsed {
         Event {
             time,
             name: "moqt:control_message_parsed".to_string(),
-            data: EventData::ControlMessageParsed(ControlMessageParsed {
-                stream_id,
-                message_type: msg_type.to_string(),
-                message,
-            }),
+            data: EventData::ControlMessageParsed(ControlMessageParsed { stream_id, message }),
         }
     } else {
         Event {
             time,
             name: "moqt:control_message_created".to_string(),
-            data: EventData::ControlMessageCreated(ControlMessageCreated {
-                stream_id,
-                message_type: msg_type.to_string(),
-                message,
-            }),
+            data: EventData::ControlMessageCreated(ControlMessageCreated { stream_id, message }),
         }
     }
 }
@@ -215,12 +213,12 @@ pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Ev
         time,
         stream_id,
         true,
-        "client_setup",
-        json!(
-        {
+        json!({
+            "type": "client_setup",
             "number_of_supported_versions": msg.versions.0.len(),
             "supported_versions": versions,
-            "parameters": key_value_pairs_to_vec(&msg.params.0),
+            "number_of_parameters": msg.params.0.len(),
+            "setup_parameters": key_value_pairs_to_vec(&msg.params.0),
         }),
     )
 }
@@ -231,31 +229,34 @@ pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Server) -> E
         time,
         stream_id,
         false,
-        "server_setup",
-        json!(
-        {
+        json!({
+            "type": "server_setup",
             "selected_version": format!("{:?}", msg.version),
-            "parameters": key_value_pairs_to_vec(&msg.params.0),
+            "number_of_parameters": msg.params.0.len(),
+            "setup_parameters": key_value_pairs_to_vec(&msg.params.0),
         }),
     )
 }
 
 /// Helper to convert SUBSCRIBE message to JSON
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.6.6
 fn subscribe_to_json(msg: &message::Subscribe) -> JsonValue {
     let mut json = json!({
-        "subscribe_id": msg.id,
-        "track_namespace": msg.track_namespace.to_string(),
-        "track_name": &msg.track_name,
+        "type": "subscribe",
+        "request_id": msg.id,
+        "track_namespace": namespace_to_qlog(&msg.track_namespace),
+        "track_name": track_name_to_qlog(&msg.track_name),
         "subscriber_priority": msg.subscriber_priority,
         "group_order": format!("{:?}", msg.group_order),
+        "forward": msg.forward,
         "filter_type": format!("{:?}", msg.filter_type),
+        "number_of_parameters": msg.params.0.len(),
         "parameters": key_value_pairs_to_vec(&msg.params.0),
     });
 
     // Add optional fields based on filter type
     if let Some(start_loc) = &msg.start_location {
-        json["start_group"] = json!(start_loc.group_id);
-        json["start_object"] = json!(start_loc.object_id);
+        json["start_location"] = location_to_qlog(start_loc);
     }
     if let Some(end_group) = msg.end_group_id {
         json["end_group"] = json!(end_group);
@@ -266,30 +267,32 @@ fn subscribe_to_json(msg: &message::Subscribe) -> JsonValue {
 
 /// Create a control_message_parsed event for SUBSCRIBE
 pub fn subscribe_parsed(time: f64, stream_id: u64, msg: &message::Subscribe) -> Event {
-    create_control_message_event(time, stream_id, true, "subscribe", subscribe_to_json(msg))
+    create_control_message_event(time, stream_id, true, subscribe_to_json(msg))
 }
 
 /// Create a control_message_created event for SUBSCRIBE
 pub fn subscribe_created(time: f64, stream_id: u64, msg: &message::Subscribe) -> Event {
-    create_control_message_event(time, stream_id, false, "subscribe", subscribe_to_json(msg))
+    create_control_message_event(time, stream_id, false, subscribe_to_json(msg))
 }
 
 /// Helper to convert SUBSCRIBE_OK message to JSON
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.6.7
 fn subscribe_ok_to_json(msg: &message::SubscribeOk) -> JsonValue {
     let mut json = json!({
-        "subscribe_id": msg.id,
+        "type": "subscribe_ok",
+        "request_id": msg.id,
         "track_alias": msg.track_alias,
         "expires": msg.expires,
         "group_order": format!("{:?}", msg.group_order),
         "content_exists": msg.content_exists,
+        "number_of_parameters": msg.params.0.len(),
         "parameters": key_value_pairs_to_vec(&msg.params.0),
     });
 
-    // Add optional largest_location fields if content exists
+    // Add optional largest_location if content exists
     if msg.content_exists {
         if let Some(largest) = &msg.largest_location {
-            json["largest_group_id"] = json!(largest.group_id);
-            json["largest_object_id"] = json!(largest.object_id);
+            json["largest_location"] = location_to_qlog(largest);
         }
     }
 
@@ -298,79 +301,54 @@ fn subscribe_ok_to_json(msg: &message::SubscribeOk) -> JsonValue {
 
 /// Create a control_message_parsed event for SUBSCRIBE_OK
 pub fn subscribe_ok_parsed(time: f64, stream_id: u64, msg: &message::SubscribeOk) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        true,
-        "subscribe_ok",
-        subscribe_ok_to_json(msg),
-    )
+    create_control_message_event(time, stream_id, true, subscribe_ok_to_json(msg))
 }
 
 /// Create a control_message_created event for SUBSCRIBE_OK
 pub fn subscribe_ok_created(time: f64, stream_id: u64, msg: &message::SubscribeOk) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        false,
-        "subscribe_ok",
-        subscribe_ok_to_json(msg),
-    )
+    create_control_message_event(time, stream_id, false, subscribe_ok_to_json(msg))
 }
 
 /// Helper to convert SUBSCRIBE_ERROR message to JSON
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.6.8
 fn subscribe_error_to_json(msg: &message::SubscribeError) -> JsonValue {
     json!({
-        "subscribe_id": msg.id,
+        "type": "subscribe_error",
+        "request_id": msg.id,
         "error_code": msg.error_code,
-        "reason_phrase": &msg.reason_phrase.0,
+        "reason": &msg.reason_phrase.0,
     })
 }
 
 /// Create a control_message_parsed event for SUBSCRIBE_ERROR
 pub fn subscribe_error_parsed(time: f64, stream_id: u64, msg: &message::SubscribeError) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        true,
-        "subscribe_error",
-        subscribe_error_to_json(msg),
-    )
+    create_control_message_event(time, stream_id, true, subscribe_error_to_json(msg))
 }
 
 /// Create a control_message_created event for SUBSCRIBE_ERROR
 pub fn subscribe_error_created(time: f64, stream_id: u64, msg: &message::SubscribeError) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        false,
-        "subscribe_error",
-        subscribe_error_to_json(msg),
-    )
+    create_control_message_event(time, stream_id, false, subscribe_error_to_json(msg))
 }
 
 /// Helper to convert PUBLISH_NAMESPACE message to JSON
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.6.22
 fn publish_namespace_to_json(msg: &message::PublishNamespace) -> JsonValue {
     json!({
+        "type": "publish_namespace",
         "request_id": msg.id,
-        "track_namespace": msg.track_namespace.to_string(),
+        "track_namespace": namespace_to_qlog(&msg.track_namespace),
+        "number_of_parameters": msg.params.0.len(),
         "parameters": key_value_pairs_to_vec(&msg.params.0),
     })
 }
 
-/// Create a control_message_parsed event for PUBLISH_NAMESPACE (was ANNOUNCE in earlier drafts)
+/// Create a control_message_parsed event for PUBLISH_NAMESPACE
 pub fn publish_namespace_parsed(
     time: f64,
     stream_id: u64,
     msg: &message::PublishNamespace,
 ) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        true,
-        "publish_namespace",
-        publish_namespace_to_json(msg),
-    )
+    create_control_message_event(time, stream_id, true, publish_namespace_to_json(msg))
 }
 
 /// Create a control_message_created event for PUBLISH_NAMESPACE
@@ -379,35 +357,25 @@ pub fn publish_namespace_created(
     stream_id: u64,
     msg: &message::PublishNamespace,
 ) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        false,
-        "publish_namespace",
-        publish_namespace_to_json(msg),
-    )
+    create_control_message_event(time, stream_id, false, publish_namespace_to_json(msg))
 }
 
 /// Helper to convert PUBLISH_NAMESPACE_OK message to JSON
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.6.23
 fn publish_namespace_ok_to_json(msg: &message::PublishNamespaceOk) -> JsonValue {
     json!({
+        "type": "publish_namespace_ok",
         "request_id": msg.id,
     })
 }
 
-/// Create a control_message_parsed event for PUBLISH_NAMESPACE_OK (was ANNOUNCE_OK)
+/// Create a control_message_parsed event for PUBLISH_NAMESPACE_OK
 pub fn publish_namespace_ok_parsed(
     time: f64,
     stream_id: u64,
     msg: &message::PublishNamespaceOk,
 ) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        true,
-        "publish_namespace_ok",
-        publish_namespace_ok_to_json(msg),
-    )
+    create_control_message_event(time, stream_id, true, publish_namespace_ok_to_json(msg))
 }
 
 /// Create a control_message_created event for PUBLISH_NAMESPACE_OK
@@ -416,37 +384,27 @@ pub fn publish_namespace_ok_created(
     stream_id: u64,
     msg: &message::PublishNamespaceOk,
 ) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        false,
-        "publish_namespace_ok",
-        publish_namespace_ok_to_json(msg),
-    )
+    create_control_message_event(time, stream_id, false, publish_namespace_ok_to_json(msg))
 }
 
 /// Helper to convert PUBLISH_NAMESPACE_ERROR message to JSON
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.6.24
 fn publish_namespace_error_to_json(msg: &message::PublishNamespaceError) -> JsonValue {
     json!({
+        "type": "publish_namespace_error",
         "request_id": msg.id,
         "error_code": msg.error_code,
-        "reason_phrase": &msg.reason_phrase.0,
+        "reason": &msg.reason_phrase.0,
     })
 }
 
-/// Create a control_message_parsed event for PUBLISH_NAMESPACE_ERROR (was ANNOUNCE_ERROR)
+/// Create a control_message_parsed event for PUBLISH_NAMESPACE_ERROR
 pub fn publish_namespace_error_parsed(
     time: f64,
     stream_id: u64,
     msg: &message::PublishNamespaceError,
 ) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        true,
-        "publish_namespace_error",
-        publish_namespace_error_to_json(msg),
-    )
+    create_control_message_event(time, stream_id, true, publish_namespace_error_to_json(msg))
 }
 
 /// Create a control_message_created event for PUBLISH_NAMESPACE_ERROR
@@ -455,73 +413,59 @@ pub fn publish_namespace_error_created(
     stream_id: u64,
     msg: &message::PublishNamespaceError,
 ) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        false,
-        "publish_namespace_error",
-        publish_namespace_error_to_json(msg),
-    )
+    create_control_message_event(time, stream_id, false, publish_namespace_error_to_json(msg))
 }
 
 /// Create a control_message_parsed event for UNSUBSCRIBE
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.6.10
 pub fn unsubscribe_parsed(time: f64, stream_id: u64, msg: &message::Unsubscribe) -> Event {
     create_control_message_event(
         time,
         stream_id,
         true,
-        "unsubscribe",
-        json!({
-            "subscribe_id": msg.id,
-        }),
+        json!({"type": "unsubscribe", "request_id": msg.id}),
     )
 }
 
 /// Create a control_message_created event for UNSUBSCRIBE
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.6.10
 pub fn unsubscribe_created(time: f64, stream_id: u64, msg: &message::Unsubscribe) -> Event {
     create_control_message_event(
         time,
         stream_id,
         false,
-        "unsubscribe",
-        json!({
-            "subscribe_id": msg.id,
-        }),
+        json!({"type": "unsubscribe", "request_id": msg.id}),
     )
 }
 
 /// Create a control_message_parsed event for GOAWAY
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.6.3
 pub fn go_away_parsed(time: f64, stream_id: u64, msg: &message::GoAway) -> Event {
     create_control_message_event(
         time,
         stream_id,
         true,
-        "goaway",
-        json!({
-                    "new_session_uri": &msg.uri.0,
-        }),
+        json!({"type": "goaway", "new_session_uri": &msg.uri.0}),
     )
 }
 
 /// Create a control_message_created event for GOAWAY
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.6.3
 pub fn go_away_created(time: f64, stream_id: u64, msg: &message::GoAway) -> Event {
     create_control_message_event(
         time,
         stream_id,
         false,
-        "goaway",
-        json!({
-                    "new_session_uri": &msg.uri.0,
-        }),
+        json!({"type": "goaway", "new_session_uri": &msg.uri.0}),
     )
 }
 
 // Data plane events
 
 /// Helper to convert SubgroupHeader to JSON
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 4.9
 fn subgroup_header_to_json(header: &data::SubgroupHeader) -> JsonValue {
     let mut json = json!({
-        "header_type": format!("{:?}", header.header_type),
         "track_alias": header.track_alias,
         "group_id": header.group_id,
         "publisher_priority": header.publisher_priority,
@@ -559,6 +503,7 @@ pub fn subgroup_header_created(time: f64, stream_id: u64, header: &data::Subgrou
 }
 
 /// Helper to convert SubgroupObject to JSON
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 4.11
 fn subgroup_object_to_json(
     group_id: u64,
     subgroup_id: u64,
@@ -569,7 +514,8 @@ fn subgroup_object_to_json(
         "group_id": group_id,
         "subgroup_id": subgroup_id,
         "object_id": object_id,
-        // TODO send object_playload itself
+        "extension_headers_length": 0,
+        // TODO send object_payload itself
         "object_payload_length": object.payload_length,
     });
 
@@ -618,7 +564,8 @@ pub fn subgroup_object_created(
     }
 }
 
-/// Helper to convert SubgroupObject to JSON
+/// Helper to convert SubgroupObjectExt to JSON
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 4.11
 fn subgroup_object_ext_to_json(
     group_id: u64,
     subgroup_id: u64,
@@ -629,8 +576,9 @@ fn subgroup_object_ext_to_json(
         "group_id": group_id,
         "subgroup_id": subgroup_id,
         "object_id": object_id,
+        "extension_headers_length": object.extension_headers.0.len(),
         "extension_headers": key_value_pairs_to_vec(&object.extension_headers.0),
-        // TODO send object_playload itself
+        // TODO send object_payload itself
         "object_payload_length": object.payload_length,
     });
 

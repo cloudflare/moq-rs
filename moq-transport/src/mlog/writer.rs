@@ -24,10 +24,11 @@ impl MlogWriter {
         let start_time = Instant::now();
 
         // Write qlog-compatible header as first record
-        // This follows qlog JSON-SEQ format (RFC 7464)
+        // This follows qlog JSON-SEQ format (RFC 7464) per
+        // draft-ietf-quic-qlog-main-schema-13 Section 5
         let header = serde_json::json!({
-            "qlog_version": "0.3",
-            "qlog_format": "JSON-SEQ",
+            "file_schema": "urn:ietf:params:qlog:file:sequential",
+            "serialization_format": "JSON-SEQ",
             "title": "moq-relay",
             "description": "MoQ Transport events",
             "trace": {
@@ -35,8 +36,7 @@ impl MlogWriter {
                     "type": "server"
                 },
                 "event_schemas": [
-                    "urn:ietf:params:qlog:events:loglevel",
-                    "urn:ietf:params:qlog:events:moqt"
+                    "urn:ietf:params:qlog:events:moqt-03"
                 ]
             }
         });
