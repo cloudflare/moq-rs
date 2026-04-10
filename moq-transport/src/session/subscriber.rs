@@ -352,7 +352,7 @@ impl Subscriber {
         if let Some(ref subgroup_header) = stream_header.subgroup_header {
             if let Some(ref mlog) = self.mlog {
                 if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
+                    let time = mlog_guard.epoch_ms();
                     let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
                     let event = mlog::subgroup_header_parsed(time, stream_id, subgroup_header);
                     let _ = mlog_guard.add_event(event);
@@ -560,7 +560,7 @@ impl Subscriber {
             // Log subgroup object parsed/received
             if let Some(ref mlog) = mlog {
                 if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
+                    let time = mlog_guard.epoch_ms();
                     let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
                     let event = if let Some(obj_ext) = decoded_object {
                         mlog::subgroup_object_ext_parsed(
@@ -651,7 +651,7 @@ impl Subscriber {
 
         if let Some(ref mlog) = self.mlog {
             if let Ok(mut mlog_guard) = mlog.lock() {
-                let time = mlog_guard.elapsed_ms();
+                let time = mlog_guard.epoch_ms();
                 let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
                 let _ =
                     mlog_guard.add_event(mlog::object_datagram_parsed(time, stream_id, &datagram));

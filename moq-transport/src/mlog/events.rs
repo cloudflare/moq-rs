@@ -22,16 +22,27 @@
 // - Need to plumb actual QUIC stream IDs through web_transport abstractions
 // - This would enable correlation between QUIC qlog and MoQ mlog events
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 
+use crate::coding::Encode;
 use crate::{coding, data, message, setup};
+
+/// Hex-encode a byte slice (lowercase).
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
 
 /// MoQ Transport event following qlog patterns
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Event {
-    /// Time in milliseconds since connection start
+    /// Time in milliseconds since Unix epoch (1970-01-01T00:00:00.000Z)
     pub time: f64,
 
     /// Event name in format "moqt:event_name"
@@ -46,7 +57,13 @@ pub struct Event {
 /// Uses serde untagged representation — the event type is conveyed by
 /// the `name` field on the parent Event struct, not repeated in data.
 /// (Per qlog spec, the "name" field is the event type identifier.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Note: `Deserialize` is not derived because structurally identical
+/// variant pairs (e.g. `ControlMessageParsed` / `ControlMessageCreated`)
+/// are ambiguous under untagged deserialization. This enum is
+/// serialization-only. Consumers must use `Event.name` to determine
+/// the event type.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum EventData {
     ControlMessageParsed(ControlMessageParsed),
@@ -63,7 +80,7 @@ pub enum EventData {
 /// Control message parsed event
 /// Per draft-pardue-moq-qlog-moq-events-03 Section 4.2
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ControlMessageParsed {
     pub stream_id: u64,
 
@@ -74,7 +91,7 @@ pub struct ControlMessageParsed {
 /// Control message created event
 /// Per draft-pardue-moq-qlog-moq-events-03 Section 4.1
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ControlMessageCreated {
     pub stream_id: u64,
 
@@ -84,7 +101,7 @@ pub struct ControlMessageCreated {
 
 /// Subgroup header parsed event (data plane)
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SubgroupHeaderParsed {
     pub stream_id: u64,
 
@@ -95,7 +112,7 @@ pub struct SubgroupHeaderParsed {
 
 /// Subgroup header created event (data plane)
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SubgroupHeaderCreated {
     pub stream_id: u64,
 
@@ -106,7 +123,7 @@ pub struct SubgroupHeaderCreated {
 
 /// Subgroup object parsed event (data plane)
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SubgroupObjectParsed {
     pub stream_id: u64,
 
@@ -117,7 +134,7 @@ pub struct SubgroupObjectParsed {
 
 /// Subgroup object created event (data plane)
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SubgroupObjectCreated {
     pub stream_id: u64,
 
@@ -128,7 +145,7 @@ pub struct SubgroupObjectCreated {
 
 /// Object Datagram parsed event (data plane)
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ObjectDatagramParsed {
     pub stream_id: u64,
 
@@ -139,7 +156,7 @@ pub struct ObjectDatagramParsed {
 
 /// Object Datagram created event (data plane)
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ObjectDatagramCreated {
     pub stream_id: u64,
 
@@ -151,16 +168,110 @@ pub struct ObjectDatagramCreated {
 /// LogLevel event for flexible logging (qlog loglevel schema)
 /// See: https://www.ietf.org/archive/id/draft-ietf-quic-qlog-main-schema-12.html#name-loglevel-events
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LogLevelEvent {
     pub message: String,
 }
 
-// Helper functions to create vector of string pairs from KVPs
-fn key_value_pairs_to_vec(kvps: &[coding::KeyValuePair]) -> Vec<(String, String)> {
-    kvps.iter()
-        .map(|kvp| (kvp.key.to_string(), format!("{:?}", kvp.value)))
-        .collect()
+/// Convert a KeyValuePair to a typed MOQTSetupParameter JSON object.
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.2
+fn setup_param_to_qlog(kvp: &coding::KeyValuePair) -> JsonValue {
+    match (kvp.key, &kvp.value) {
+        // PATH (0x01)
+        (0x01, coding::Value::BytesValue(bytes)) => json!({
+            "name": "path",
+            "value": String::from_utf8_lossy(bytes),
+        }),
+        // MAX_REQUEST_ID (0x02)
+        (0x02, coding::Value::IntValue(v)) => json!({
+            "name": "max_request_id",
+            "value": v,
+        }),
+        (key, coding::Value::IntValue(v)) => json!({
+            "name": "unknown",
+            "name_bytes": key,
+            "value": v,
+        }),
+        (key, coding::Value::BytesValue(bytes)) => json!({
+            "name": "unknown",
+            "name_bytes": key,
+            "length": bytes.len(),
+            "value_bytes": hex_encode(bytes),
+        }),
+    }
+}
+
+/// Convert setup parameters to qlog [*MOQTSetupParameter] array.
+fn setup_params_to_qlog(kvps: &[coding::KeyValuePair]) -> JsonValue {
+    json!(kvps.iter().map(setup_param_to_qlog).collect::<Vec<_>>())
+}
+
+/// Convert a KeyValuePair to a typed MOQTParameter JSON object.
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.3
+fn param_to_qlog(kvp: &coding::KeyValuePair) -> JsonValue {
+    match (kvp.key, &kvp.value) {
+        // AUTHORIZATION_TOKEN (0x02) — redact value, log only presence and length
+        (0x02, coding::Value::BytesValue(bytes)) => json!({
+            "name": "authorization_token",
+            "alias_type": kvp.key,
+            "token_length": bytes.len(),
+        }),
+        // DELIVERY_TIMEOUT (0x03)
+        (0x03, coding::Value::IntValue(v)) => json!({
+            "name": "delivery_timeout",
+            "value": v,
+        }),
+        // MAX_CACHE_DURATION (0x04)
+        (0x04, coding::Value::IntValue(v)) => json!({
+            "name": "max_cache_duration",
+            "value": v,
+        }),
+        (key, coding::Value::IntValue(v)) => json!({
+            "name": "unknown",
+            "name_bytes": key,
+            "value": v,
+        }),
+        (key, coding::Value::BytesValue(bytes)) => json!({
+            "name": "unknown",
+            "name_bytes": key,
+            "length": bytes.len(),
+            "value_bytes": hex_encode(bytes),
+        }),
+    }
+}
+
+/// Convert parameters to qlog [*MOQTParameter] array.
+fn params_to_qlog(kvps: &[coding::KeyValuePair]) -> JsonValue {
+    json!(kvps.iter().map(param_to_qlog).collect::<Vec<_>>())
+}
+
+/// Compute the wire byte length of extension headers by encoding to a temp buffer.
+/// This matches the MoQT framing field that precedes extension headers on the wire.
+fn ext_headers_wire_len(headers: &data::ExtensionHeaders) -> u64 {
+    let mut tmp = bytes::BytesMut::new();
+    for kvp in &headers.0 {
+        let _ = kvp.encode(&mut tmp);
+    }
+    tmp.len() as u64
+}
+
+/// Convert extension headers to qlog [*MOQTExtensionHeader] array.
+/// Per draft-pardue-moq-qlog-moq-events-03 Section 5.7
+fn extension_headers_to_qlog(kvps: &[coding::KeyValuePair]) -> JsonValue {
+    json!(kvps
+        .iter()
+        .map(|kvp| match &kvp.value {
+            coding::Value::IntValue(v) => json!({
+                "header_type": kvp.key,
+                "header_value": v,
+            }),
+            coding::Value::BytesValue(bytes) => json!({
+                "header_type": kvp.key,
+                "header_length": bytes.len(),
+                "payload": hex_encode(bytes),
+            }),
+        })
+        .collect::<Vec<_>>())
 }
 
 /// Convert a TrackNamespace to the qlog [*MOQTByteString] format.
@@ -218,7 +329,7 @@ pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Ev
             "number_of_supported_versions": msg.versions.0.len(),
             "supported_versions": versions,
             "number_of_parameters": msg.params.0.len(),
-            "setup_parameters": key_value_pairs_to_vec(&msg.params.0),
+            "setup_parameters": setup_params_to_qlog(&msg.params.0),
         }),
     )
 }
@@ -233,7 +344,7 @@ pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Server) -> E
             "type": "server_setup",
             "selected_version": format!("{:?}", msg.version),
             "number_of_parameters": msg.params.0.len(),
-            "setup_parameters": key_value_pairs_to_vec(&msg.params.0),
+            "setup_parameters": setup_params_to_qlog(&msg.params.0),
         }),
     )
 }
@@ -251,7 +362,7 @@ fn subscribe_to_json(msg: &message::Subscribe) -> JsonValue {
         "forward": msg.forward,
         "filter_type": format!("{:?}", msg.filter_type),
         "number_of_parameters": msg.params.0.len(),
-        "parameters": key_value_pairs_to_vec(&msg.params.0),
+        "parameters": params_to_qlog(&msg.params.0),
     });
 
     // Add optional fields based on filter type
@@ -286,7 +397,7 @@ fn subscribe_ok_to_json(msg: &message::SubscribeOk) -> JsonValue {
         "group_order": format!("{:?}", msg.group_order),
         "content_exists": msg.content_exists,
         "number_of_parameters": msg.params.0.len(),
-        "parameters": key_value_pairs_to_vec(&msg.params.0),
+        "parameters": params_to_qlog(&msg.params.0),
     });
 
     // Add optional largest_location if content exists
@@ -338,7 +449,7 @@ fn publish_namespace_to_json(msg: &message::PublishNamespace) -> JsonValue {
         "request_id": msg.id,
         "track_namespace": namespace_to_qlog(&msg.track_namespace),
         "number_of_parameters": msg.params.0.len(),
-        "parameters": key_value_pairs_to_vec(&msg.params.0),
+        "parameters": params_to_qlog(&msg.params.0),
     })
 }
 
@@ -576,8 +687,8 @@ fn subgroup_object_ext_to_json(
         "group_id": group_id,
         "subgroup_id": subgroup_id,
         "object_id": object_id,
-        "extension_headers_length": object.extension_headers.0.len(),
-        "extension_headers": key_value_pairs_to_vec(&object.extension_headers.0),
+        "extension_headers_length": ext_headers_wire_len(&object.extension_headers),
+        "extension_headers": extension_headers_to_qlog(&object.extension_headers.0),
         // TODO send object_payload itself
         "object_payload_length": object.payload_length,
     });
@@ -640,7 +751,10 @@ fn object_datagram_to_json(datagram: &data::Datagram) -> JsonValue {
     });
 
     if let Some(extension_headers) = &datagram.extension_headers {
-        json["extension_headers"] = json!(key_value_pairs_to_vec(&extension_headers.0));
+        json["extension_headers_length"] = json!(ext_headers_wire_len(extension_headers));
+        json["extension_headers"] = extension_headers_to_qlog(&extension_headers.0);
+    } else {
+        json["extension_headers_length"] = json!(0u64);
     }
 
     if let Some(status) = datagram.status {
