@@ -332,27 +332,34 @@ impl Locals {
         // when different namespaces have the same track_name
         let track_key = format!("{}:{}", namespace, track_name);
 
+        // Check if there's an existing exact-match namespace entry that's stale
+        // and needs to be removed (this happens when publisher disconnects and reconnects)
+        let should_remove_namespace = if let Some(entry) = lookup.get(namespace) {
+            let tracks = entry.tracks.lock().unwrap();
+            if let Some(existing) = tracks.get(&track_key) {
+                // Track exists and is in Publishing state but has no writer = stale
+                existing.state() == TrackState::Publishing
+                    && existing.track_writer.lock().unwrap().is_none()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if should_remove_namespace {
+            log::info!(
+                "removing stale namespace entry {} (track {}/{} was Publishing with no writer)",
+                namespace,
+                namespace,
+                track_name
+            );
+            lookup.remove(namespace);
+        }
+
         // First try to find an existing matching namespace entry
         if let Some(entry) = Self::find_best_match_entry(&lookup, namespace) {
             let mut tracks = entry.tracks.lock().unwrap();
-
-            // Check if there's an existing track in stale Publishing state
-            if let Some(existing) = tracks.get(&track_key) {
-                if existing.state() == TrackState::Publishing {
-                    // Check if the writer was already taken (stale state)
-                    // by trying to see if we can get the writer
-                    let has_writer = existing.track_writer.lock().unwrap().is_some();
-                    if !has_writer {
-                        // Stale state - remove and create fresh TrackInfo
-                        log::info!(
-                            "removing stale TrackInfo for {}/{} (was Publishing, no writer)",
-                            namespace,
-                            track_name
-                        );
-                        tracks.remove(&track_key);
-                    }
-                }
-            }
 
             return tracks
                 .entry(track_key.clone())
