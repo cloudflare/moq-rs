@@ -13,15 +13,26 @@ pub struct PublishReceivedInfo {
     pub track_namespace: TrackNamespace,
     pub track_name: String,
     pub track_alias: u64,
+    /// Forward parameter from PUBLISH (0x10): true = forward immediately, false = paused
+    pub forward: bool,
 }
 
 impl PublishReceivedInfo {
     pub fn new_from_publish(msg: &message::Publish) -> Self {
+        // Forward parameter (0x10): default to true if not present
+        // Value of 0 means paused, 1 (or non-zero) means forward
+        let forward = msg
+            .params
+            .get_intvalue(0x10) // ParameterType::Forward
+            .map(|v| v != 0)
+            .unwrap_or(true);
+
         Self {
             id: msg.id,
             track_namespace: msg.track_namespace.clone(),
             track_name: msg.track_name.clone(),
             track_alias: msg.track_alias,
+            forward,
         }
     }
 }

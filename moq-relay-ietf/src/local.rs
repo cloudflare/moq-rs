@@ -7,6 +7,7 @@ use moq_transport::{
     coding::TrackNamespace,
     serve::{ServeError, Track, TrackReader, TrackWriter, TracksReader, TracksWriter},
 };
+use tokio::sync::watch;
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -39,6 +40,14 @@ pub struct TrackInfo {
     track_writer: Mutex<Option<TrackWriter>>,
     upstream_subscribe_sent: AtomicBool,
     upstream_request_id: Mutex<Option<u64>>,
+
+    /// The PUBLISH request ID (set when publisher sends PUBLISH)
+    publish_request_id: Mutex<Option<u64>>,
+    /// Forward state: true = forwarding, false = paused
+    /// Publisher watches this to know when to start/stop sending
+    forward_state: Mutex<Option<watch::Sender<bool>>>,
+    /// Receiver side for forward state changes
+    forward_receiver: Mutex<Option<watch::Receiver<bool>>>,
 }
 
 impl TrackInfo {
@@ -51,6 +60,9 @@ impl TrackInfo {
             track_writer: Mutex::new(None),
             upstream_subscribe_sent: AtomicBool::new(false),
             upstream_request_id: Mutex::new(None),
+            publish_request_id: Mutex::new(None),
+            forward_state: Mutex::new(None),
+            forward_receiver: Mutex::new(None),
         }
     }
 
@@ -118,6 +130,62 @@ impl TrackInfo {
 
     pub fn is_publishing(&self) -> bool {
         self.state() == TrackState::Publishing
+    }
+
+    /// Set up forward state tracking when PUBLISH is received.
+    /// Returns the initial forward value that was set.
+    pub fn set_publish_info(&self, request_id: u64, initial_forward: bool) {
+        *self.publish_request_id.lock().unwrap() = Some(request_id);
+
+        let (tx, rx) = watch::channel(initial_forward);
+        *self.forward_state.lock().unwrap() = Some(tx);
+        *self.forward_receiver.lock().unwrap() = Some(rx);
+
+        log::debug!(
+            "set_publish_info: track {}/{} request_id={} initial_forward={}",
+            self.namespace,
+            self.name,
+            request_id,
+            initial_forward
+        );
+    }
+
+    /// Get the PUBLISH request ID
+    pub fn publish_request_id(&self) -> Option<u64> {
+        *self.publish_request_id.lock().unwrap()
+    }
+
+    /// Get current forward state
+    pub fn is_forwarding(&self) -> bool {
+        self.forward_receiver
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|rx| *rx.borrow())
+            .unwrap_or(true) // Default to true if not set (legacy behavior)
+    }
+
+    /// Request forwarding to start (called when a subscriber arrives).
+    /// Returns true if the state changed from false to true.
+    pub fn request_forward(&self) -> bool {
+        if let Some(tx) = self.forward_state.lock().unwrap().as_ref() {
+            let current = *tx.borrow();
+            if !current {
+                let _ = tx.send(true);
+                log::info!(
+                    "request_forward: track {}/{} forward state changed 0 -> 1",
+                    self.namespace,
+                    self.name
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get a receiver for forward state changes (for the publisher to watch)
+    pub fn forward_receiver(&self) -> Option<watch::Receiver<bool>> {
+        self.forward_receiver.lock().unwrap().clone()
     }
 
     pub fn take_writer_for_upstream(&self) -> Result<TrackWriter, ServeError> {

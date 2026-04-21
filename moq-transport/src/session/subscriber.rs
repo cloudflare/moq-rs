@@ -98,7 +98,7 @@ impl Subscriber {
     }
 
     /// Get the current next request id to use and increment the value for by 2 for the next request
-    fn get_next_request_id(&self) -> u64 {
+    pub fn get_next_request_id(&self) -> u64 {
         self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed)
     }
 
@@ -146,7 +146,7 @@ impl Subscriber {
     }
 
     /// Send a message to the publisher via the control stream.
-    pub(super) fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
+    pub fn send_message<M: Into<message::Subscriber>>(&mut self, msg: M) {
         let msg = msg.into();
 
         // Remove our entry on terminal state.

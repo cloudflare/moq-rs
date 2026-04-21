@@ -138,12 +138,24 @@ impl Producer {
                 }
             }
 
+            // If the track is in Publishing state and forward=0, request forwarding
+            // This will trigger the consumer to send REQUEST_UPDATE to the publisher
+            if track_info.is_publishing() && !track_info.is_forwarding() {
+                log::info!(
+                    "subscriber arrived for paused track {}/{}, requesting forward",
+                    namespace,
+                    track_name
+                );
+                track_info.request_forward();
+            }
+
             let reader = track_info.get_reader();
             log::info!(
-                "serving subscribe from local: {}/{} (state: {:?})",
+                "serving subscribe from local: {}/{} (state: {:?}, forwarding: {})",
                 namespace,
                 track_name,
-                track_info.state()
+                track_info.state(),
+                track_info.is_forwarding()
             );
             return Ok(subscribed.serve(reader).await?);
         }

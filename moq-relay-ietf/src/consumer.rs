@@ -181,12 +181,19 @@ impl Consumer {
         }
     }
 
-    async fn serve_publish(self, publish: PublishReceived) -> Result<(), anyhow::Error> {
+    async fn serve_publish(mut self, publish: PublishReceived) -> Result<(), anyhow::Error> {
         let namespace = publish.info.track_namespace.clone();
         let track_name = publish.info.track_name.clone();
         let track_alias = publish.info.track_alias;
+        let initial_forward = publish.info.forward;
+        let publish_request_id = publish.info.id;
 
-        log::info!("received PUBLISH for track: {}/{}", namespace, track_name);
+        log::info!(
+            "received PUBLISH for track: {}/{} (forward={})",
+            namespace,
+            track_name,
+            initial_forward
+        );
 
         // Use auto-register variant to support SUBSCRIBE_NAMESPACE flow
         // where PUBLISH can arrive without prior PUBLISH_NAMESPACE
@@ -226,17 +233,25 @@ impl Consumer {
             .insert_track(&namespace, reader)
             .context("failed to insert track into namespace")?;
 
+        // Store publish info for forward state management
+        track_info.set_publish_info(publish_request_id, initial_forward);
+
+        // Include forward=1 in PUBLISH_OK to tell publisher to start sending immediately
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(0x10, 1); // Forward = 1
+
         let msg = PublishOk {
             id: publish.info.id,
-            params: KeyValuePairs::default(),
+            params,
         };
 
         publish.accept(writer, msg)?;
 
         log::info!(
-            "PUBLISH accepted, track {}/{} now in Publishing state",
+            "PUBLISH accepted, track {}/{} now in Publishing state (forward={})",
             namespace,
-            track_name
+            track_name,
+            initial_forward
         );
 
         // Notify subscriber registry of the new PUBLISH
@@ -250,6 +265,50 @@ impl Consumer {
                     namespace,
                     track_name
                 );
+            }
+        }
+
+        // If forward=0 (paused), wait for subscribers to request forwarding
+        // When forward state changes to 1, send REQUEST_UPDATE to publisher
+        if !initial_forward {
+            let forward_rx = track_info.forward_receiver();
+            if let Some(mut rx) = forward_rx {
+                log::info!(
+                    "track {}/{} is paused (forward=0), waiting for subscriber to request forwarding",
+                    namespace,
+                    track_name
+                );
+
+                // Wait for forward state to change to true
+                loop {
+                    rx.changed().await.ok();
+                    if *rx.borrow() {
+                        // Forward state changed to true, send REQUEST_UPDATE
+                        log::info!(
+                            "subscriber arrived for paused track {}/{}, sending REQUEST_UPDATE with forward=1",
+                            namespace,
+                            track_name
+                        );
+
+                        let mut params = KeyValuePairs::default();
+                        params.set_intvalue(0x10, 1); // Forward = 1
+
+                        let request_update = moq_transport::message::SubscribeUpdate {
+                            id: self.subscriber.get_next_request_id(),
+                            existing_request_id: publish_request_id,
+                            params,
+                        };
+
+                        self.subscriber.send_message(request_update);
+                        log::info!(
+                            "sent REQUEST_UPDATE for track {}/{} (existing_request_id={})",
+                            namespace,
+                            track_name,
+                            publish_request_id
+                        );
+                        break;
+                    }
+                }
             }
         }
 
