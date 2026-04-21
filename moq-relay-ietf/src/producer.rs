@@ -208,50 +208,24 @@ impl Producer {
                 (None, None, None)
             };
 
-        // Find existing namespaces that match the prefix
-        let matching_namespaces: Vec<TrackNamespace> = self
-            .locals
-            .matching_namespaces(&namespace_prefix)
-            .into_iter()
-            .collect();
-
         // Accept the subscription (even if no current matches - publisher may arrive later)
         subscribe_ns.ok()?;
 
         log::info!(
-            "accepted SUBSCRIBE_NAMESPACE for prefix {:?}, {} existing matches",
-            namespace_prefix,
-            matching_namespaces.len()
+            "accepted SUBSCRIBE_NAMESPACE for prefix {:?}",
+            namespace_prefix
         );
 
-        // Send PUBLISH_NAMESPACE for existing namespaces
-        // Keep handles alive to prevent PublishNamespaceDone from being sent
-        let mut publish_ns_handles = Vec::new();
-        for namespace in matching_namespaces {
-            log::info!(
-                "sending PUBLISH_NAMESPACE for {:?} (matched prefix {:?})",
-                namespace,
-                namespace_prefix
-            );
-            match self.publisher.publish_namespace(namespace.clone()).await {
-                Ok(publish_ns) => {
-                    log::debug!("sent PUBLISH_NAMESPACE for {:?}", namespace);
-                    publish_ns_handles.push(publish_ns);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "failed to send PUBLISH_NAMESPACE for {:?}: {}",
-                        namespace,
-                        e
-                    );
-                }
-            }
-        }
-        let _publish_ns_handles = publish_ns_handles;
-
-        // Also send PUBLISH for existing tracks in matching namespaces
+        // Send PUBLISH for existing tracks in matching namespaces
         // This triggers the client's onMatch callback for track discovery
+        // Note: We skip PUBLISH_NAMESPACE and send PUBLISH directly - client expects PUBLISH for tracks
         let matching_tracks = self.locals.matching_tracks(&namespace_prefix);
+        log::info!(
+            "found {} existing tracks matching prefix {:?}",
+            matching_tracks.len(),
+            namespace_prefix
+        );
+
         for (ns, track_name, track_info) in matching_tracks {
             log::info!(
                 "sending PUBLISH for existing track {}/{} (matched prefix {:?})",
@@ -371,7 +345,8 @@ impl Producer {
                             }
                         }
                     }
-                    // Wait for PUBLISH_NAMESPACE notifications -> forward as NAMESPACE message
+                    // PUBLISH_NAMESPACE notifications - we don't forward these as NAMESPACE messages
+                    // Client expects PUBLISH for individual tracks, not namespace announcements
                     notification = async {
                         if let Some(ref mut rx) = publish_ns_rx {
                             rx.recv().await
@@ -381,24 +356,9 @@ impl Producer {
                     } => {
                         match notification {
                             Ok(ns_notif) => {
-                                log::info!(
-                                    "received PUBLISH_NAMESPACE notification for {:?} on subscription prefix {:?}",
-                                    ns_notif.namespace,
-                                    namespace_prefix
-                                );
-                                // Forward NAMESPACE message to the subscriber (not PUBLISH_NAMESPACE)
-                                // NAMESPACE (0x08) is the draft-16 message for announcing namespaces
-                                // to SUBSCRIBE_NAMESPACE subscribers
-                                let namespace_msg = message::Namespace {
-                                    id: subscribe_ns.info.request_id,
-                                    track_namespace: ns_notif.namespace.clone(),
-                                    params: KeyValuePairs::new(),
-                                };
-                                self.publisher.forward_namespace(namespace_msg);
                                 log::debug!(
-                                    "forwarded NAMESPACE for {:?} (request_id={})",
-                                    ns_notif.namespace,
-                                    subscribe_ns.info.request_id
+                                    "ignoring PUBLISH_NAMESPACE notification for {:?} (client expects PUBLISH for tracks)",
+                                    ns_notif.namespace
                                 );
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
