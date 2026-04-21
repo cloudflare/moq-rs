@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use moq_transport::{
     coding::TrackNamespace,
+    data::ExtensionHeaders,
     serve::{ServeError, Track, TrackReader, TrackWriter, TracksReader, TracksWriter},
 };
 use tokio::sync::watch;
@@ -48,6 +49,8 @@ pub struct TrackInfo {
     forward_state: Mutex<Option<watch::Sender<bool>>>,
     /// Receiver side for forward state changes
     forward_receiver: Mutex<Option<watch::Receiver<bool>>>,
+    /// Track extensions from the original PUBLISH message
+    track_extensions: Mutex<Option<ExtensionHeaders>>,
 }
 
 impl TrackInfo {
@@ -63,6 +66,7 @@ impl TrackInfo {
             publish_request_id: Mutex::new(None),
             forward_state: Mutex::new(None),
             forward_receiver: Mutex::new(None),
+            track_extensions: Mutex::new(None),
         }
     }
 
@@ -187,6 +191,16 @@ impl TrackInfo {
     /// Get a receiver for forward state changes (for the publisher to watch)
     pub fn forward_receiver(&self) -> Option<watch::Receiver<bool>> {
         self.forward_receiver.lock().unwrap().clone()
+    }
+
+    /// Set track extensions from the original PUBLISH message
+    pub fn set_track_extensions(&self, extensions: ExtensionHeaders) {
+        *self.track_extensions.lock().unwrap() = Some(extensions);
+    }
+
+    /// Get track extensions (cloned)
+    pub fn track_extensions(&self) -> Option<ExtensionHeaders> {
+        self.track_extensions.lock().unwrap().clone()
     }
 
     pub fn take_writer_for_upstream(&self) -> Result<TrackWriter, ServeError> {

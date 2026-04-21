@@ -227,18 +227,20 @@ impl Producer {
         );
 
         for (ns, track_name, track_info) in matching_tracks {
+            let track_extensions = track_info.track_extensions().unwrap_or_default();
             log::info!(
-                "sending PUBLISH for existing track {}/{} (matched prefix {:?})",
+                "sending PUBLISH for existing track {}/{} (matched prefix {:?}, extensions={:?})",
                 ns,
                 track_name,
-                namespace_prefix
+                namespace_prefix,
+                track_extensions
             );
 
             let track_reader = track_info.get_reader();
             let mut publisher = self.publisher.clone();
 
             tokio::spawn(async move {
-                match publisher.publish(track_reader.clone()).await {
+                match publisher.publish_with_extensions(track_reader.clone(), track_extensions).await {
                     Ok(published) => {
                         log::info!(
                             "sent PUBLISH for existing track {}/{}, waiting for PUBLISH_OK",
@@ -295,13 +297,18 @@ impl Producer {
                                     &publish_notif.track_name,
                                 ) {
                                     let track_reader = track_info.get_reader();
+                                    let track_extensions = track_info.track_extensions().unwrap_or_default();
 
                                     // Send PUBLISH and wait for PUBLISH_OK before streaming
                                     let mut publisher = self.publisher.clone();
                                     let ns = publish_notif.namespace.clone();
                                     let name = publish_notif.track_name.clone();
+                                    log::info!(
+                                        "forwarding PUBLISH for {}/{} with extensions {:?}",
+                                        ns, name, track_extensions
+                                    );
                                     tokio::spawn(async move {
-                                        match publisher.publish(track_reader.clone()).await {
+                                        match publisher.publish_with_extensions(track_reader.clone(), track_extensions).await {
                                             Ok(published) => {
                                                 log::info!(
                                                     "sent PUBLISH for {}/{}, waiting for PUBLISH_OK",

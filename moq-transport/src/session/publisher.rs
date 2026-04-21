@@ -247,6 +247,43 @@ impl Publisher {
         Ok(send)
     }
 
+    /// Publish a track with specific track extensions (for relay forwarding)
+    pub async fn publish_with_extensions(
+        &mut self,
+        track: serve::TrackReader,
+        track_extensions: crate::data::ExtensionHeaders,
+    ) -> Result<Published, SessionError> {
+        let request_id = self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed);
+        let track_alias = self
+            .next_track_alias
+            .fetch_add(1, atomic::Ordering::Relaxed);
+
+        let mut params = KeyValuePairs::new();
+        params.set_intvalue(ParameterType::GroupOrder.into(), GroupOrder::Ascending as u64);
+        params.set_intvalue(ParameterType::Forward.into(), 1);
+        if let Some(loc) = track.largest_location() {
+            let mut buf = bytes::BytesMut::new();
+            use crate::coding::Encode;
+            loc.encode(&mut buf).ok();
+            params.set_bytesvalue(ParameterType::LargestObject.into(), buf.to_vec());
+        }
+
+        let msg = message::Publish {
+            id: request_id,
+            track_namespace: track.namespace.clone(),
+            track_name: track.name.clone(),
+            track_alias,
+            params,
+            track_extensions,
+        };
+
+        let (send, recv) = Published::new(self.clone(), msg, self.mlog.clone());
+
+        self.publisheds.lock().unwrap().insert(request_id, recv);
+
+        Ok(send)
+    }
+
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
         let res = match msg {
             message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg),

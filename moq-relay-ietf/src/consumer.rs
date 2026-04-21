@@ -197,12 +197,14 @@ impl Consumer {
         let track_alias = publish.info.track_alias;
         let initial_forward = publish.info.forward;
         let publish_request_id = publish.info.id;
+        let track_extensions = publish.info.track_extensions.clone();
 
         log::info!(
-            "received PUBLISH for track: {}/{} (forward={})",
+            "received PUBLISH for track: {}/{} (forward={}, extensions={:?})",
             namespace,
             track_name,
-            initial_forward
+            initial_forward,
+            track_extensions
         );
 
         // Use auto-register variant to support SUBSCRIBE_NAMESPACE flow
@@ -245,6 +247,9 @@ impl Consumer {
 
         // Store publish info for forward state management
         track_info.set_publish_info(publish_request_id, initial_forward);
+
+        // Store track extensions for forwarding to subscribers
+        track_info.set_track_extensions(track_extensions);
 
         // Include forward=1 in PUBLISH_OK to tell publisher to start sending immediately
         let mut params = KeyValuePairs::default();

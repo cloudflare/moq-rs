@@ -1,6 +1,7 @@
 use std::ops;
 
 use crate::coding::{ReasonPhrase, TrackNamespace};
+use crate::data::ExtensionHeaders;
 use crate::serve::ServeError;
 use crate::watch::State;
 use crate::{data, message, serve};
@@ -15,6 +16,8 @@ pub struct PublishReceivedInfo {
     pub track_alias: u64,
     /// Forward parameter from PUBLISH (0x10): true = forward immediately, false = paused
     pub forward: bool,
+    /// Track extensions from the original PUBLISH message
+    pub track_extensions: ExtensionHeaders,
 }
 
 impl PublishReceivedInfo {
@@ -33,6 +36,7 @@ impl PublishReceivedInfo {
             track_name: msg.track_name.clone(),
             track_alias: msg.track_alias,
             forward,
+            track_extensions: msg.track_extensions.clone(),
         }
     }
 }
