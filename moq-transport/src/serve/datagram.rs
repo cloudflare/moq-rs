@@ -1,8 +1,10 @@
 use std::{fmt, sync::Arc};
 
-use crate::watch::State;
+use tokio::sync::broadcast;
 
 use super::{ServeError, Track};
+
+const DATAGRAM_CHANNEL_SIZE: usize = 1024;
 
 pub struct Datagrams {
     pub track: Arc<Track>,
@@ -10,114 +12,90 @@ pub struct Datagrams {
 
 impl Datagrams {
     pub fn produce(self) -> (DatagramsWriter, DatagramsReader) {
-        let (writer, reader) = State::default().split();
+        let (tx, rx) = broadcast::channel(DATAGRAM_CHANNEL_SIZE);
 
-        let writer = DatagramsWriter::new(writer, self.track.clone());
-        let reader = DatagramsReader::new(reader, self.track);
+        let writer = DatagramsWriter::new(tx, self.track.clone());
+        let reader = DatagramsReader::new(rx, self.track);
 
         (writer, reader)
     }
 }
 
-struct DatagramsState {
-    // The latest datagram
-    latest: Option<Datagram>,
-
-    // Increased each time datagram changes.
-    epoch: u64,
-
-    // Set when the writer or all readers are dropped.
-    closed: Result<(), ServeError>,
-}
-
-impl Default for DatagramsState {
-    fn default() -> Self {
-        Self {
-            latest: None,
-            epoch: 0,
-            closed: Ok(()),
-        }
-    }
-}
-
 pub struct DatagramsWriter {
-    state: State<DatagramsState>,
+    tx: broadcast::Sender<Datagram>,
     pub track: Arc<Track>,
 }
 
 impl DatagramsWriter {
-    fn new(state: State<DatagramsState>, track: Arc<Track>) -> Self {
-        Self { state, track }
+    fn new(tx: broadcast::Sender<Datagram>, track: Arc<Track>) -> Self {
+        Self { tx, track }
     }
 
     pub fn write(&mut self, datagram: Datagram) -> Result<(), ServeError> {
-        let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
-
-        state.latest = Some(datagram);
-        state.epoch += 1;
-
+        // Ignore send errors (no receivers) - datagrams are fire-and-forget
+        let _ = self.tx.send(datagram);
         Ok(())
     }
 
-    pub fn close(self, err: ServeError) -> Result<(), ServeError> {
-        let state = self.state.lock();
-        state.closed.clone()?;
-
-        let mut state = state.into_mut().ok_or(ServeError::Cancel)?;
-        state.closed = Err(err);
-
+    pub fn close(self, _err: ServeError) -> Result<(), ServeError> {
+        // Channel closes when tx is dropped
         Ok(())
     }
 }
 
-#[derive(Clone)]
 pub struct DatagramsReader {
-    state: State<DatagramsState>,
+    rx: broadcast::Receiver<Datagram>,
     pub track: Arc<Track>,
+    latest: Option<(u64, u64)>,
+}
 
-    epoch: u64,
+impl Clone for DatagramsReader {
+    fn clone(&self) -> Self {
+        Self {
+            rx: self.rx.resubscribe(),
+            track: self.track.clone(),
+            latest: self.latest,
+        }
+    }
 }
 
 impl DatagramsReader {
-    fn new(state: State<DatagramsState>, track: Arc<Track>) -> Self {
+    fn new(rx: broadcast::Receiver<Datagram>, track: Arc<Track>) -> Self {
         Self {
-            state,
+            rx,
             track,
-            epoch: 0,
+            latest: None,
         }
     }
 
     pub async fn read(&mut self) -> Result<Option<Datagram>, ServeError> {
         loop {
-            {
-                let state = self.state.lock();
-                if self.epoch < state.epoch {
-                    self.epoch = state.epoch;
-                    return Ok(state.latest.clone());
+            match self.rx.recv().await {
+                Ok(datagram) => {
+                    self.latest = Some((datagram.group_id, datagram.object_id));
+                    return Ok(Some(datagram));
                 }
-
-                state.closed.clone()?;
-                match state.modified() {
-                    Some(notify) => notify,
-                    None => return Ok(None), // No more updates will come
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("[DATAGRAMS] reader lagged by {} datagrams", n);
+                    // Continue reading - we'll get the next available datagram
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Ok(None); // Channel closed
                 }
             }
-            .await;
         }
     }
 
-    // Returns the largest group/sequence
     pub fn latest(&self) -> Option<(u64, u64)> {
-        let state = self.state.lock();
-        state
-            .latest
-            .as_ref()
-            .map(|datagram| (datagram.group_id, datagram.object_id))
+        self.latest
     }
 
     pub fn is_closed(&self) -> bool {
-        let state = self.state.lock();
-        state.closed.is_err() || state.modified().is_none()
+        // Broadcast receiver doesn't have a direct is_closed check.
+        // We return false (not closed) since we can't reliably detect sender drop
+        // without actually trying to receive. The read() method will return None
+        // when the channel is truly closed.
+        false
     }
 }
 
