@@ -9,6 +9,8 @@ use tokio::sync::broadcast;
 pub struct NamespaceSubscription {
     /// The namespace prefix this subscription is for
     pub prefix: TrackNamespace,
+    /// Session ID of the subscriber (for self-exclusion)
+    pub session_id: u64,
     /// Channel to send PUBLISH notifications to this subscriber
     pub publish_tx: broadcast::Sender<PublishNotification>,
     /// Channel to send PUBLISH_NAMESPACE notifications to this subscriber
@@ -60,6 +62,7 @@ impl SubscriberRegistry {
     pub fn register(
         &self,
         prefix: TrackNamespace,
+        session_id: u64,
     ) -> (
         u64,
         broadcast::Receiver<PublishNotification>,
@@ -76,13 +79,18 @@ impl SubscriberRegistry {
 
         let subscription = NamespaceSubscription {
             prefix,
+            session_id,
             publish_tx,
             publish_ns_tx,
         };
 
         inner.subscriptions.insert(id, subscription);
 
-        log::debug!("registered namespace subscription id={}", id);
+        log::debug!(
+            "registered namespace subscription id={} session_id={}",
+            id,
+            session_id
+        );
 
         (id, publish_rx, publish_ns_rx)
     }
@@ -96,12 +104,14 @@ impl SubscriberRegistry {
     }
 
     /// Find all subscriptions that match a given namespace and notify them of a PUBLISH
+    /// Excludes the session that originated the PUBLISH (self-exclusion)
     /// Returns the number of matching subscriptions notified
     pub fn notify_publish(
         &self,
         namespace: &TrackNamespace,
         track_name: &str,
         track_alias: u64,
+        origin_session_id: u64,
     ) -> usize {
         let inner = self.inner.lock().unwrap();
 
@@ -114,6 +124,16 @@ impl SubscriberRegistry {
         let mut notified = 0;
 
         for (id, sub) in inner.subscriptions.iter() {
+            // Skip if this subscription belongs to the same session that sent the PUBLISH
+            if sub.session_id == origin_session_id {
+                log::debug!(
+                    "skipping subscription id={} (same session {})",
+                    id,
+                    origin_session_id
+                );
+                continue;
+            }
+
             // Check if the namespace matches the subscription prefix
             // The subscription prefix should be a prefix of the namespace
             if Self::prefix_matches(&sub.prefix, namespace) {
@@ -135,8 +155,9 @@ impl SubscriberRegistry {
     }
 
     /// Find all subscriptions that match a given namespace and notify them of a PUBLISH_NAMESPACE
+    /// Excludes the session that originated the PUBLISH_NAMESPACE (self-exclusion)
     /// Returns the number of matching subscriptions notified
-    pub fn notify_publish_namespace(&self, namespace: &TrackNamespace) -> usize {
+    pub fn notify_publish_namespace(&self, namespace: &TrackNamespace, origin_session_id: u64) -> usize {
         let inner = self.inner.lock().unwrap();
 
         let notification = PublishNamespaceNotification {
@@ -146,6 +167,16 @@ impl SubscriberRegistry {
         let mut notified = 0;
 
         for (id, sub) in inner.subscriptions.iter() {
+            // Skip if this subscription belongs to the same session that sent the PUBLISH_NAMESPACE
+            if sub.session_id == origin_session_id {
+                log::debug!(
+                    "skipping subscription id={} for PUBLISH_NAMESPACE (same session {})",
+                    id,
+                    origin_session_id
+                );
+                continue;
+            }
+
             // Check if the namespace matches the subscription prefix
             if Self::prefix_matches(&sub.prefix, namespace) {
                 if let Err(e) = sub.publish_ns_tx.send(notification.clone()) {
@@ -245,8 +276,8 @@ mod tests {
     fn test_register_unregister() {
         let registry = SubscriberRegistry::new();
 
-        let (id1, _rx1, _rx1_ns) = registry.register(ns("live"));
-        let (id2, _rx2, _rx2_ns) = registry.register(ns("live/room1"));
+        let (id1, _rx1, _rx1_ns) = registry.register(ns("live"), 100);
+        let (id2, _rx2, _rx2_ns) = registry.register(ns("live/room1"), 101);
 
         assert_eq!(registry.matching_subscriptions(&ns("live/room1/track")).len(), 2);
 
@@ -263,15 +294,32 @@ mod tests {
     async fn test_notify_publish() {
         let registry = SubscriberRegistry::new();
 
-        let (id, mut rx, _rx_ns) = registry.register(ns("live"));
+        // Register with session_id=100
+        let (id, mut rx, _rx_ns) = registry.register(ns("live"), 100);
 
-        let notified = registry.notify_publish(&ns("live/stream1"), "video", 100);
+        // Notify from session 200 (different) - should be delivered
+        let notified = registry.notify_publish(&ns("live/stream1"), "video", 42, 200);
         assert_eq!(notified, 1);
 
         let notification = rx.recv().await.unwrap();
         assert_eq!(notification.track_name, "video");
-        assert_eq!(notification.track_alias, 100);
+        assert_eq!(notification.track_alias, 42);
 
         registry.unregister(id);
+    }
+
+    #[tokio::test]
+    async fn test_self_exclusion() {
+        let registry = SubscriberRegistry::new();
+
+        // Register with session_id=100
+        let (_id, mut rx, _rx_ns) = registry.register(ns("live"), 100);
+
+        // Notify from the same session (100) - should NOT be delivered
+        let notified = registry.notify_publish(&ns("live/stream1"), "video", 42, 100);
+        assert_eq!(notified, 0);
+
+        // Verify nothing was received (use try_recv to avoid blocking)
+        assert!(rx.try_recv().is_err());
     }
 }

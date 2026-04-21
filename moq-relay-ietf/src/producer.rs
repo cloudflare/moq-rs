@@ -18,6 +18,7 @@ pub struct Producer {
     locals: Locals,
     remotes: Option<RemotesConsumer>,
     subscriber_registry: Option<SubscriberRegistry>,
+    session_id: u64,
 }
 
 impl Producer {
@@ -27,6 +28,7 @@ impl Producer {
             locals,
             remotes,
             subscriber_registry: None,
+            session_id: 0,
         }
     }
 
@@ -36,12 +38,14 @@ impl Producer {
         locals: Locals,
         remotes: Option<RemotesConsumer>,
         subscriber_registry: SubscriberRegistry,
+        session_id: u64,
     ) -> Self {
         Self {
             publisher,
             locals,
             remotes,
             subscriber_registry: Some(subscriber_registry),
+            session_id,
         }
     }
 
@@ -191,9 +195,10 @@ impl Producer {
         let namespace_prefix = subscribe_ns.namespace_prefix.clone();
 
         // Register with subscriber registry to receive PUBLISH and PUBLISH_NAMESPACE notifications
+        // Uses session_id so we can exclude PUBLISH messages from the same session (self-exclusion)
         let (_subscription_guard, mut publish_rx, mut publish_ns_rx) =
             if let Some(ref registry) = self.subscriber_registry {
-                let (id, rx, rx_ns) = registry.register(namespace_prefix.clone());
+                let (id, rx, rx_ns) = registry.register(namespace_prefix.clone(), self.session_id);
                 (
                     Some(crate::SubscriptionGuard::new(registry.clone(), id)),
                     Some(rx),

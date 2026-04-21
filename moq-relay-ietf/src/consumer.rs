@@ -19,6 +19,7 @@ pub struct Consumer {
     coordinator: Arc<dyn Coordinator>,
     forward: Option<Producer>, // Forward all announcements to this subscriber
     subscriber_registry: Option<SubscriberRegistry>,
+    session_id: u64,
 }
 
 impl Consumer {
@@ -34,6 +35,7 @@ impl Consumer {
             coordinator,
             forward,
             subscriber_registry: None,
+            session_id: 0,
         }
     }
 
@@ -44,6 +46,7 @@ impl Consumer {
         coordinator: Arc<dyn Coordinator>,
         forward: Option<Producer>,
         subscriber_registry: SubscriberRegistry,
+        session_id: u64,
     ) -> Self {
         Self {
             subscriber,
@@ -51,6 +54,7 @@ impl Consumer {
             coordinator,
             forward,
             subscriber_registry: Some(subscriber_registry),
+            session_id,
         }
     }
 
@@ -121,8 +125,9 @@ impl Consumer {
 
         // Notify subscriber registry of the new PUBLISH_NAMESPACE
         // This will trigger forwarding to matching SUBSCRIBE_NAMESPACE subscriptions
+        // Uses session_id for self-exclusion
         if let Some(ref registry) = self.subscriber_registry {
-            let notified = registry.notify_publish_namespace(&publish_ns.namespace);
+            let notified = registry.notify_publish_namespace(&publish_ns.namespace, self.session_id);
             if notified > 0 {
                 log::info!(
                     "notified {} SUBSCRIBE_NAMESPACE subscriptions of PUBLISH_NAMESPACE {:?}",
@@ -261,8 +266,9 @@ impl Consumer {
 
         // Notify subscriber registry of the new PUBLISH
         // This will trigger forwarding to matching SUBSCRIBE_NAMESPACE subscriptions
+        // Uses session_id for self-exclusion (don't notify the same session that sent the PUBLISH)
         if let Some(ref registry) = self.subscriber_registry {
-            let notified = registry.notify_publish(&namespace, &track_name, track_alias);
+            let notified = registry.notify_publish(&namespace, &track_name, track_alias, self.session_id);
             if notified > 0 {
                 log::info!(
                     "notified {} SUBSCRIBE_NAMESPACE subscriptions of PUBLISH {}/{}",

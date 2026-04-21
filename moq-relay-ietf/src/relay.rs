@@ -239,6 +239,14 @@ impl Relay {
                         };
 
                         // Create our MoQ relay session
+                        // Use connection_id hash as session_id for self-exclusion in pub/sub
+                        use std::hash::{Hash, Hasher};
+                        let session_id = {
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            connection_id.hash(&mut hasher);
+                            hasher.finish()
+                        };
+
                         let moq_session = session;
                         let session = Session {
                             session: moq_session,
@@ -248,6 +256,7 @@ impl Relay {
                                     locals.clone(),
                                     remotes,
                                     subscriber_registry.clone(),
+                                    session_id,
                                 )
                             }),
                             consumer: subscriber.map(|subscriber| {
@@ -257,6 +266,7 @@ impl Relay {
                                     coordinator,
                                     forward,
                                     subscriber_registry,
+                                    session_id,
                                 )
                             }),
                         };
