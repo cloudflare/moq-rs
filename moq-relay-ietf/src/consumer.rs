@@ -98,7 +98,8 @@ impl Consumer {
         mut self,
         mut publish_ns: PublishNamespaceReceived,
     ) -> Result<(), anyhow::Error> {
-        let mut tasks = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<futures::future::BoxFuture<'_, Result<(), anyhow::Error>>> =
+            FuturesUnordered::new();
 
         let (writer, mut request, reader) = Tracks::new(publish_ns.namespace.clone()).produce();
 
@@ -131,27 +132,31 @@ impl Consumer {
             }
         }
 
-        if let Some(mut forward) = self.forward.clone() {
+        // Forward publish_namespace upstream - keep handle alive in this scope
+        let _forwarded_publish_ns = if let Some(mut forward) = self.forward.clone() {
             let reader_clone = reader.clone();
-            tasks.push(
-                async move {
-                    log::info!("forwarding publish_namespace: {:?}", reader_clone.info);
-                    let publish_ns = forward
-                        .publish_namespace(reader_clone)
-                        .await
-                        .context("failed forwarding publish_namespace")?;
-                    publish_ns
-                        .ok()
-                        .await
-                        .context("publish_namespace not accepted")?;
-                    publish_ns
-                        .closed()
-                        .await
-                        .context("publish_namespace closed with error")
+            log::info!("forwarding publish_namespace: {:?}", reader_clone.info);
+            match forward.publish_namespace(reader_clone).await {
+                Ok(publish_ns) => {
+                    if let Err(e) = publish_ns.ok().await {
+                        log::warn!("publish_namespace not accepted: {}", e);
+                        None
+                    } else {
+                        log::info!(
+                            "publish_namespace forwarded and accepted: {:?}",
+                            publish_ns.info.namespace
+                        );
+                        Some(publish_ns)
+                    }
                 }
-                .boxed(),
-            );
-        }
+                Err(e) => {
+                    log::warn!("failed forwarding publish_namespace: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Serve subscribe requests
         loop {

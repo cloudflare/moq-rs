@@ -124,6 +124,7 @@ impl TrackInfo {
             .ok_or(ServeError::Duplicate)
     }
 
+
     pub fn state(&self) -> TrackState {
         TrackState::from_u8(self.state.load(Ordering::SeqCst))
     }
@@ -334,6 +335,25 @@ impl Locals {
         // First try to find an existing matching namespace entry
         if let Some(entry) = Self::find_best_match_entry(&lookup, namespace) {
             let mut tracks = entry.tracks.lock().unwrap();
+
+            // Check if there's an existing track in stale Publishing state
+            if let Some(existing) = tracks.get(&track_key) {
+                if existing.state() == TrackState::Publishing {
+                    // Check if the writer was already taken (stale state)
+                    // by trying to see if we can get the writer
+                    let has_writer = existing.track_writer.lock().unwrap().is_some();
+                    if !has_writer {
+                        // Stale state - remove and create fresh TrackInfo
+                        log::info!(
+                            "removing stale TrackInfo for {}/{} (was Publishing, no writer)",
+                            namespace,
+                            track_name
+                        );
+                        tracks.remove(&track_key);
+                    }
+                }
+            }
+
             return tracks
                 .entry(track_key.clone())
                 .or_insert_with(|| {
