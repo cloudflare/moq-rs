@@ -105,6 +105,27 @@ impl StreamHeaderType {
                 | StreamHeaderType::SubgroupIdExtEndOfGroupNoPriority
         )
     }
+
+    /// Returns the equivalent header type without extensions.
+    /// Used when forwarding streams where objects have empty extension headers.
+    pub fn without_extensions(&self) -> Self {
+        match *self {
+            StreamHeaderType::SubgroupZeroIdExt => StreamHeaderType::SubgroupZeroId,
+            StreamHeaderType::SubgroupFirstObjectIdExt => StreamHeaderType::SubgroupFirstObjectId,
+            StreamHeaderType::SubgroupIdExt => StreamHeaderType::SubgroupId,
+            StreamHeaderType::SubgroupZeroIdExtEndOfGroup => StreamHeaderType::SubgroupZeroIdEndOfGroup,
+            StreamHeaderType::SubgroupFirstObjectIdExtEndOfGroup => StreamHeaderType::SubgroupFirstObjectIdEndOfGroup,
+            StreamHeaderType::SubgroupIdExtEndOfGroup => StreamHeaderType::SubgroupIdEndOfGroup,
+            StreamHeaderType::SubgroupZeroIdExtNoPriority => StreamHeaderType::SubgroupZeroIdNoPriority,
+            StreamHeaderType::SubgroupFirstObjectIdExtNoPriority => StreamHeaderType::SubgroupFirstObjectIdNoPriority,
+            StreamHeaderType::SubgroupIdExtNoPriority => StreamHeaderType::SubgroupIdNoPriority,
+            StreamHeaderType::SubgroupZeroIdExtEndOfGroupNoPriority => StreamHeaderType::SubgroupZeroIdEndOfGroupNoPriority,
+            StreamHeaderType::SubgroupFirstObjectIdExtEndOfGroupNoPriority => StreamHeaderType::SubgroupFirstObjectIdEndOfGroupNoPriority,
+            StreamHeaderType::SubgroupIdExtEndOfGroupNoPriority => StreamHeaderType::SubgroupIdEndOfGroupNoPriority,
+            // Already non-Ext or Fetch
+            other => other,
+        }
+    }
 }
 
 impl Encode for StreamHeaderType {

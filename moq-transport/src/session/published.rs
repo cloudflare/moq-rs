@@ -297,6 +297,18 @@ impl Published {
             }
         });
 
+        // If we're not writing extension headers but the preserved header type has extensions,
+        // convert to the non-Ext variant to avoid mismatch between header and object encoding
+        let header_type = if !has_extension_headers && header_type.has_extension_headers() {
+            log::debug!(
+                "[PUBLISHED] serve_subgroup: converting header_type {:?} to non-Ext variant (objects have no extensions)",
+                header_type
+            );
+            header_type.without_extensions()
+        } else {
+            header_type
+        };
+
         // Set subgroup_id based on header type (ZeroId variants don't include it on wire)
         let subgroup_id = if header_type.has_subgroup_id() {
             Some(subgroup_reader.subgroup_id)
