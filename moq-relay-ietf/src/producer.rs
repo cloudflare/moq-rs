@@ -253,8 +253,8 @@ impl Producer {
                         result?;
                         break;
                     }
-                    // Wait for PUBLISH notifications -> send NAMESPACE message to notify subscriber
-                    // The subscriber will then explicitly SUBSCRIBE to tracks it wants
+                    // Wait for PUBLISH notifications -> forward PUBLISH to subscriber
+                    // Subscriber sends PUBLISH_OK, then relay starts streaming data
                     notification = async {
                         if let Some(ref mut rx) = publish_rx {
                             rx.recv().await
@@ -271,20 +271,52 @@ impl Producer {
                                     namespace_prefix
                                 );
 
-                                // Send NAMESPACE message to notify subscriber about the new track's namespace
-                                // Subscriber will explicitly SUBSCRIBE to tracks it wants
-                                let namespace_msg = message::Namespace {
-                                    id: subscribe_ns.info.request_id,
-                                    track_namespace: publish_notif.namespace.clone(),
-                                    params: KeyValuePairs::new(),
-                                };
-                                self.publisher.forward_namespace(namespace_msg);
-                                log::debug!(
-                                    "sent NAMESPACE for {:?} (track {}) on request_id={}",
-                                    publish_notif.namespace,
-                                    publish_notif.track_name,
-                                    subscribe_ns.info.request_id
-                                );
+                                // Get the TrackReader for this track so we can stream data
+                                if let Some(track_info) = self.locals.get_track_info(
+                                    &publish_notif.namespace,
+                                    &publish_notif.track_name,
+                                ) {
+                                    let track_reader = track_info.get_reader();
+
+                                    // Send PUBLISH and wait for PUBLISH_OK before streaming
+                                    let mut publisher = self.publisher.clone();
+                                    let ns = publish_notif.namespace.clone();
+                                    let name = publish_notif.track_name.clone();
+                                    tokio::spawn(async move {
+                                        match publisher.publish(track_reader.clone()).await {
+                                            Ok(published) => {
+                                                log::info!(
+                                                    "sent PUBLISH for {}/{}, waiting for PUBLISH_OK",
+                                                    ns, name
+                                                );
+                                                // serve() waits for PUBLISH_OK before streaming
+                                                match published.serve(track_reader).await {
+                                                    Ok(()) => {
+                                                        log::info!("track {}/{} serving completed", ns, name);
+                                                    }
+                                                    Err(e) => {
+                                                        log::warn!(
+                                                            "track {}/{} serving ended: {}",
+                                                            ns, name, e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "failed to send PUBLISH for {}/{}: {}",
+                                                    ns, name, e
+                                                );
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    log::warn!(
+                                        "no track info found for {}/{}, cannot forward PUBLISH",
+                                        publish_notif.namespace,
+                                        publish_notif.track_name
+                                    );
+                                }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 log::warn!("subscription lagged by {} messages", n);
