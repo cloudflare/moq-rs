@@ -220,6 +220,8 @@ impl Producer {
         );
 
         // Send PUBLISH_NAMESPACE for existing namespaces
+        // Keep handles alive to prevent PublishNamespaceDone from being sent
+        let mut publish_ns_handles = Vec::new();
         for namespace in matching_namespaces {
             log::info!(
                 "sending PUBLISH_NAMESPACE for {:?} (matched prefix {:?})",
@@ -227,9 +229,9 @@ impl Producer {
                 namespace_prefix
             );
             match self.publisher.publish_namespace(namespace.clone()).await {
-                Ok(_publish_ns) => {
+                Ok(publish_ns) => {
                     log::debug!("sent PUBLISH_NAMESPACE for {:?}", namespace);
-                    // Note: publish_ns is kept alive to maintain the announcement
+                    publish_ns_handles.push(publish_ns);
                 }
                 Err(e) => {
                     log::warn!(
@@ -240,6 +242,7 @@ impl Producer {
                 }
             }
         }
+        let _publish_ns_handles = publish_ns_handles;
 
         // If we have a publish receiver, listen for new PUBLISH and PUBLISH_NAMESPACE notifications
         if publish_rx.is_some() || publish_ns_rx.is_some() {
