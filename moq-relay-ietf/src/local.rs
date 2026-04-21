@@ -493,6 +493,35 @@ impl Locals {
             .cloned()
             .collect()
     }
+
+    /// Get all tracks in namespaces matching a prefix that are in Publishing state.
+    /// Returns (namespace, track_name, TrackInfo) tuples.
+    pub fn matching_tracks(&self, prefix: &TrackNamespace) -> Vec<(TrackNamespace, String, Arc<TrackInfo>)> {
+        let lookup = self.lookup.lock().unwrap();
+
+        let mut result = Vec::new();
+
+        for (ns, entry) in lookup.iter() {
+            // Check if namespace matches prefix
+            if ns.fields.len() >= prefix.fields.len()
+                && prefix
+                    .fields
+                    .iter()
+                    .zip(ns.fields.iter())
+                    .all(|(a, b)| a == b)
+            {
+                // Get all tracks in this namespace that are publishing
+                let tracks = entry.tracks.lock().unwrap();
+                for (key, track_info) in tracks.iter() {
+                    if track_info.is_publishing() {
+                        result.push((ns.clone(), track_info.name.clone(), track_info.clone()));
+                    }
+                }
+            }
+        }
+
+        result
+    }
 }
 
 pub struct Registration {

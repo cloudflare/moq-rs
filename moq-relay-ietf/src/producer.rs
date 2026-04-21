@@ -249,6 +249,45 @@ impl Producer {
         }
         let _publish_ns_handles = publish_ns_handles;
 
+        // Also send PUBLISH for existing tracks in matching namespaces
+        // This triggers the client's onMatch callback for track discovery
+        let matching_tracks = self.locals.matching_tracks(&namespace_prefix);
+        for (ns, track_name, track_info) in matching_tracks {
+            log::info!(
+                "sending PUBLISH for existing track {}/{} (matched prefix {:?})",
+                ns,
+                track_name,
+                namespace_prefix
+            );
+
+            let track_reader = track_info.get_reader();
+            let mut publisher = self.publisher.clone();
+
+            tokio::spawn(async move {
+                match publisher.publish(track_reader.clone()).await {
+                    Ok(published) => {
+                        log::info!(
+                            "sent PUBLISH for existing track {}/{}, waiting for PUBLISH_OK",
+                            ns,
+                            track_name
+                        );
+                        // serve() waits for PUBLISH_OK before streaming
+                        match published.serve(track_reader).await {
+                            Ok(()) => {
+                                log::info!("existing track {}/{} serving completed", ns, track_name);
+                            }
+                            Err(e) => {
+                                log::warn!("existing track {}/{} serving ended: {}", ns, track_name, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("failed to send PUBLISH for existing track {}/{}: {}", ns, track_name, e);
+                    }
+                }
+            });
+        }
+
         // If we have a publish receiver, listen for new PUBLISH and PUBLISH_NAMESPACE notifications
         if publish_rx.is_some() || publish_ns_rx.is_some() {
             loop {
