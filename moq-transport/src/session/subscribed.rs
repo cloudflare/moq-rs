@@ -286,6 +286,7 @@ impl Subscribed {
             }
         }
 
+        let has_extension_headers = header.header_type.has_extension_headers();
         let mut object_count = 0;
         while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
             if state.lock().is_closed() {
@@ -298,45 +299,65 @@ impl Subscribed {
                 return Ok(());
             }
 
-            let subgroup_object = data::SubgroupObjectExt {
-                object_id_delta: 0, // before delta logic, used to be subgroup_object_reader.object_id,
-                extension_headers: subgroup_object_reader.extension_headers.clone(), // Pass through extension headers
-                payload_length: subgroup_object_reader.size,
-                status: if subgroup_object_reader.size == 0 {
-                    // Only set status if payload length is zero
-                    Some(subgroup_object_reader.status)
-                } else {
-                    None
-                },
-            };
+            // Encode object based on header type - must match what receiver expects
+            if has_extension_headers {
+                let subgroup_object = data::SubgroupObjectExt {
+                    object_id_delta: 0,
+                    extension_headers: subgroup_object_reader.extension_headers.clone(),
+                    payload_length: subgroup_object_reader.size,
+                    status: if subgroup_object_reader.size == 0 {
+                        Some(subgroup_object_reader.status)
+                    } else {
+                        None
+                    },
+                };
 
-            log::debug!(
-                "[PUBLISHER] serve_subgroup: sending object #{} - object_id={}, object_id_delta={}, payload_length={}, status={:?}, extension_headers={:?}",
-                object_count + 1,
-                subgroup_object_reader.object_id,
-                subgroup_object.object_id_delta,
-                subgroup_object.payload_length,
-                subgroup_object.status,
-                subgroup_object.extension_headers
-            );
+                log::debug!(
+                    "[PUBLISHER] serve_subgroup: sending object #{} (ext) - object_id={}, payload_length={}, status={:?}, extension_headers={:?}",
+                    object_count + 1,
+                    subgroup_object_reader.object_id,
+                    subgroup_object.payload_length,
+                    subgroup_object.status,
+                    subgroup_object.extension_headers
+                );
 
-            writer.encode(&subgroup_object).await?;
+                writer.encode(&subgroup_object).await?;
 
-            // Log subgroup object created/sent
-            if let Some(ref mlog) = mlog {
-                if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
-                    let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
-                    let event = mlog::subgroup_object_ext_created(
-                        time,
-                        stream_id,
-                        subgroup_reader.group_id,
-                        subgroup_reader.subgroup_id,
-                        subgroup_object_reader.object_id,
-                        &subgroup_object,
-                    );
-                    let _ = mlog_guard.add_event(event);
+                if let Some(ref mlog) = mlog {
+                    if let Ok(mut mlog_guard) = mlog.lock() {
+                        let time = mlog_guard.elapsed_ms();
+                        let stream_id = 0;
+                        let event = mlog::subgroup_object_ext_created(
+                            time,
+                            stream_id,
+                            subgroup_reader.group_id,
+                            subgroup_reader.subgroup_id,
+                            subgroup_object_reader.object_id,
+                            &subgroup_object,
+                        );
+                        let _ = mlog_guard.add_event(event);
+                    }
                 }
+            } else {
+                let subgroup_object = data::SubgroupObject {
+                    object_id_delta: 0,
+                    payload_length: subgroup_object_reader.size,
+                    status: if subgroup_object_reader.size == 0 {
+                        Some(subgroup_object_reader.status)
+                    } else {
+                        None
+                    },
+                };
+
+                log::debug!(
+                    "[PUBLISHER] serve_subgroup: sending object #{} - object_id={}, payload_length={}, status={:?}",
+                    object_count + 1,
+                    subgroup_object_reader.object_id,
+                    subgroup_object.payload_length,
+                    subgroup_object.status
+                );
+
+                writer.encode(&subgroup_object).await?;
             }
 
             state
