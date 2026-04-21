@@ -940,10 +940,15 @@ impl Subscriber {
             }
         }
 
-        if let Some(subscribe_id) = self
-            .get_subscribe_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-            .await
-        {
+        // Fast path: check both maps immediately WITHOUT waiting
+        // This allows datagrams to flow at full rate once alias mapping is established
+        let (subscribe_id_immediate, publish_id_immediate) = {
+            let subscribe_id = self.get_subscribe_id_by_alias(datagram.track_alias, None).await;
+            let publish_id = self.get_publish_id_by_alias(datagram.track_alias, None).await;
+            (subscribe_id, publish_id)
+        };
+
+        if let Some(subscribe_id) = subscribe_id_immediate {
             if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&subscribe_id) {
                 log::trace!(
                     "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
@@ -955,10 +960,7 @@ impl Subscriber {
                     datagram.payload.as_ref().map_or(0, |p| p.len()));
                 subscribe.datagram(datagram)?;
             }
-        } else if let Some(publish_id) = self
-            .get_publish_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-            .await
-        {
+        } else if let Some(publish_id) = publish_id_immediate {
             if let Some(publish_recv) = self.publishes_received.lock().unwrap().get_mut(&publish_id)
             {
                 log::trace!(
@@ -972,14 +974,49 @@ impl Subscriber {
                 publish_recv.datagram(datagram)?;
             }
         } else {
-            log::warn!(
-                "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
-                datagram.track_alias,
-                datagram.group_id,
-                datagram.object_id.unwrap_or(0),
-                datagram.publisher_priority,
-                datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
-                datagram.payload.as_ref().map_or(0, |p| p.len()));
+            // Slow path: alias not found immediately, wait with timeout (only for first datagram)
+            let subscribe_fut = self.get_subscribe_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS));
+            let publish_fut = self.get_publish_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS));
+
+            tokio::select! {
+                Some(subscribe_id) = subscribe_fut => {
+                    if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&subscribe_id) {
+                        log::trace!(
+                            "[SUBSCRIBER] recv_datagram (waited): track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
+                            datagram.track_alias,
+                            datagram.group_id,
+                            datagram.object_id.unwrap_or(0),
+                            datagram.publisher_priority,
+                            datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
+                            datagram.payload.as_ref().map_or(0, |p| p.len()));
+                        subscribe.datagram(datagram)?;
+                    }
+                }
+                Some(publish_id) = publish_fut => {
+                    if let Some(publish_recv) = self.publishes_received.lock().unwrap().get_mut(&publish_id)
+                    {
+                        log::trace!(
+                            "[SUBSCRIBER] recv_datagram from publish (waited): track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
+                            datagram.track_alias,
+                            datagram.group_id,
+                            datagram.object_id.unwrap_or(0),
+                            datagram.publisher_priority,
+                            datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
+                            datagram.payload.as_ref().map_or(0, |p| p.len()));
+                        publish_recv.datagram(datagram)?;
+                    }
+                }
+                else => {
+                    log::warn!(
+                        "[SUBSCRIBER] recv_datagram: discarded due to unknown track_alias: track_alias={}, group_id={}, object_id={}, publisher_priority={:?}, status={}, payload_length={}",
+                        datagram.track_alias,
+                        datagram.group_id,
+                        datagram.object_id.unwrap_or(0),
+                        datagram.publisher_priority,
+                        datagram.status.as_ref().map_or("None".to_string(), |s| format!("{:?}", s)),
+                        datagram.payload.as_ref().map_or(0, |p| p.len()));
+                }
+            }
         }
 
         Ok(())

@@ -4,7 +4,7 @@ use tokio::sync::broadcast;
 
 use super::{ServeError, Track};
 
-const DATAGRAM_CHANNEL_SIZE: usize = 1024;
+const DATAGRAM_CHANNEL_SIZE: usize = 4096;
 
 pub struct Datagrams {
     pub track: Arc<Track>,
@@ -14,8 +14,10 @@ impl Datagrams {
     pub fn produce(self) -> (DatagramsWriter, DatagramsReader) {
         let (tx, rx) = broadcast::channel(DATAGRAM_CHANNEL_SIZE);
 
+        // Keep a reference to the sender in the reader so clones get fresh receivers
+        let tx_for_reader = tx.clone();
         let writer = DatagramsWriter::new(tx, self.track.clone());
-        let reader = DatagramsReader::new(rx, self.track);
+        let reader = DatagramsReader::new(rx, tx_for_reader, self.track);
 
         (writer, reader)
     }
@@ -45,14 +47,18 @@ impl DatagramsWriter {
 
 pub struct DatagramsReader {
     rx: broadcast::Receiver<Datagram>,
+    tx: broadcast::Sender<Datagram>,
     pub track: Arc<Track>,
     latest: Option<(u64, u64)>,
 }
 
 impl Clone for DatagramsReader {
     fn clone(&self) -> Self {
+        // Subscribe to get a NEW receiver that will get all FUTURE datagrams
+        // This is correct for relay: each subscriber gets datagrams from now on
         Self {
-            rx: self.rx.resubscribe(),
+            rx: self.tx.subscribe(),
+            tx: self.tx.clone(),
             track: self.track.clone(),
             latest: self.latest,
         }
@@ -60,9 +66,10 @@ impl Clone for DatagramsReader {
 }
 
 impl DatagramsReader {
-    fn new(rx: broadcast::Receiver<Datagram>, track: Arc<Track>) -> Self {
+    fn new(rx: broadcast::Receiver<Datagram>, tx: broadcast::Sender<Datagram>, track: Arc<Track>) -> Self {
         Self {
             rx,
+            tx,
             track,
             latest: None,
         }
@@ -91,10 +98,8 @@ impl DatagramsReader {
     }
 
     pub fn is_closed(&self) -> bool {
-        // Broadcast receiver doesn't have a direct is_closed check.
-        // We return false (not closed) since we can't reliably detect sender drop
-        // without actually trying to receive. The read() method will return None
-        // when the channel is truly closed.
+        // Check if sender is gone (receiver_count would be 0 or send would fail)
+        // But we can't easily check this, so return false (conservative)
         false
     }
 }
