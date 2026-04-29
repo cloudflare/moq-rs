@@ -9,7 +9,7 @@ use moq_transport::{
 
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
-    Locals, RemotesConsumer,
+    Locals, RemoteManager,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -17,7 +17,7 @@ use crate::{
 pub struct Producer {
     publisher: Publisher,
     locals: Locals,
-    remotes: Option<RemotesConsumer>,
+    remotes: RemoteManager,
     /// The resolved scope identity for this session, if any.
     /// Produced by `Coordinator::resolve_scope()` from the connection path.
     /// Passed to locals/remotes to isolate namespace lookups.
@@ -28,7 +28,7 @@ impl Producer {
     pub fn new(
         publisher: Publisher,
         locals: Locals,
-        remotes: Option<RemotesConsumer>,
+        remotes: RemoteManager,
         scope: Option<String>,
     ) -> Self {
         Self {
@@ -122,39 +122,32 @@ impl Producer {
             }
         }
 
-        if let Some(remotes) = self.remotes {
-            // Check remote tracks second, and serve from remote if possible
-            match remotes.route(self.scope.as_deref(), &namespace).await {
-                Ok(remote) => {
-                    if let Some(remote) = remote {
-                        if let Some(track) = remote.subscribe(&namespace, &track_name)? {
-                            let ns = namespace.to_utf8_path();
-                            tracing::info!(namespace = %ns, track = %track_name, source = "remote", "serving subscribe from remote: {:?}", track.info);
-                            // Update label to indicate remote source, timing recorded on drop
-                            timing_guard.set_label("source", "remote");
-                            // Track active tracks - decrements when serve completes
-                            let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
-                            return Ok(subscribed.serve(track.reader).await?);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Route error = infrastructure failure (couldn't reach coordinator/upstream)
-                    // This is different from "not found" - we don't know if the track exists
+        match self
+            .remotes
+            .subscribe(self.scope.as_deref(), &namespace, &track_name)
+            .await
+        {
+            Ok(track) => {
+                if let Some(track) = track {
                     let ns = namespace.to_utf8_path();
-                    tracing::error!(namespace = %ns, track = %track_name, error = %e, "failed to route to remote: {}", e);
-                    timing_guard.set_label("source", "route_error");
-                    metrics::counter!("moq_relay_subscribe_route_errors_total").increment(1);
-
-                    // Return an internal error rather than "not found" since we couldn't check
-                    // TODO: Consider returning a more specific error to the subscriber
-                    let err = ServeError::internal_ctx(format!(
-                        "route error for namespace '{}': {}",
-                        namespace, e
-                    ));
-                    subscribed.close(err.clone())?;
-                    return Err(err.into());
+                    tracing::info!(namespace = %ns, track = %track_name, source = "remote", "serving subscribe from remote: {:?}", track.info);
+                    timing_guard.set_label("source", "remote");
+                    let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+                    return Ok(subscribed.serve(track).await?);
                 }
+            }
+            Err(e) => {
+                let ns = namespace.to_utf8_path();
+                tracing::error!(namespace = %ns, track = %track_name, error = %e, "failed to route to remote: {}", e);
+                timing_guard.set_label("source", "route_error");
+                metrics::counter!("moq_relay_subscribe_route_errors_total").increment(1);
+
+                let err = ServeError::internal_ctx(format!(
+                    "route error for namespace '{}': {}",
+                    namespace, e
+                ));
+                subscribed.close(err.clone())?;
+                return Err(err.into());
             }
         }
 
