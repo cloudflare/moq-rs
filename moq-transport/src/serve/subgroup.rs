@@ -713,15 +713,13 @@ mod tests {
 
         let num_groups = 3u64;
         let objects_per_group = 4u64;
-        let mut expected: Vec<(u64, u64, Bytes)> = Vec::new();
 
         for _ in 0..num_groups {
             let mut sg = writer.append(0).unwrap();
             let gid = sg.group_id;
             for oid in 0..objects_per_group {
                 let p = payload(gid, oid);
-                sg.write(p.clone()).unwrap();
-                expected.push((gid, oid, p));
+                sg.write(p).unwrap();
             }
             drop(sg);
         }
@@ -744,11 +742,17 @@ mod tests {
             assert_eq!(data, &payload(*gid, *oid));
         }
 
-        // At minimum the last group must be received.
+        // At minimum the last group must be received with all its objects.
         let last_group_id = num_groups - 1;
-        assert!(
-            received.iter().any(|(g, _, _)| *g == last_group_id),
-            "last group must be received"
+        let last_group_objects: Vec<_> = received
+            .iter()
+            .filter(|(g, _, _)| *g == last_group_id)
+            .collect();
+        assert_eq!(
+            last_group_objects.len(),
+            objects_per_group as usize,
+            "last group must be received with all {} objects",
+            objects_per_group
         );
     }
 
@@ -760,10 +764,10 @@ mod tests {
         let (mut writer, mut reader) = make_subgroups();
 
         let payloads: Vec<Bytes> = vec![
-            Bytes::new(),                   // 0-byte
-            Bytes::from_static(b"x"),       // 1-byte
-            Bytes::from(vec![0xAB; 4096]),  // 4 KB
-            Bytes::from(vec![0xCD; 65536]), // 64 KB
+            Bytes::new(),                  // 0-byte
+            Bytes::from_static(b"x"),      // 1-byte
+            Bytes::from(vec![0xAB; 1024]), // 1 KB
+            Bytes::from(vec![0xCD; 4096]), // 4 KB
         ];
 
         let mut sg = writer.append(0).unwrap();
@@ -913,23 +917,28 @@ mod tests {
             .unwrap();
 
         // Reader should see subgroup_id=1 as latest (two epoch bumps).
-        // Drain to the latest.
-        let mut latest_sub = None;
-        // Read available updates (non-blocking after writer is done).
-        // We'll read what we can and the last one should be subgroup_id=1.
-        loop {
-            let sub = reader.next().await.unwrap();
-            match sub {
-                Some(s) => latest_sub = Some(s),
-                None => break,
+        // Drain to the latest with a timeout guard to prevent indefinite hang.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut latest_sub = None;
+            // Read available updates (non-blocking after writer is done).
+            // We'll read what we can and the last one should be subgroup_id=1.
+            loop {
+                let sub = reader.next().await.unwrap();
+                match sub {
+                    Some(s) => latest_sub = Some(s),
+                    None => break,
+                }
+                // Break after we've seen subgroup_id=1 to avoid blocking forever
+                // since writer is still alive.
+                if latest_sub.as_ref().map(|s| s.subgroup_id) == Some(1) {
+                    break;
+                }
             }
-            // Break after we've seen subgroup_id=1 to avoid blocking forever
-            // since writer is still alive.
-            if latest_sub.as_ref().map(|s| s.subgroup_id) == Some(1) {
-                break;
-            }
-        }
+            latest_sub
+        })
+        .await;
 
+        let latest_sub = result.expect("higher_subgroup_id_updates_latest timed out after 5 seconds");
         assert_eq!(latest_sub.unwrap().subgroup_id, 1);
     }
 

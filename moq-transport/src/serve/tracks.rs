@@ -286,21 +286,31 @@ mod tests {
 
     /// Helper: drain all objects from a TrackReader in Subgroups mode.
     async fn drain_subgroups(track_reader: TrackReader) -> Vec<(u64, u64, Bytes)> {
-        let mode = track_reader.mode().await.unwrap();
-        let mut received: Vec<(u64, u64, Bytes)> = Vec::new();
-        if let TrackReaderMode::Subgroups(mut subgroups) = mode {
-            while let Ok(Some(mut subgroup)) = subgroups.next().await {
-                let gid = subgroup.group_id;
-                while let Ok(Some(mut obj)) = subgroup.next().await {
-                    let oid = obj.object_id;
-                    let data: Bytes = obj.read_all().await.unwrap();
-                    received.push((gid, oid, data));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            let mode = track_reader
+                .mode()
+                .await
+                .expect("track_reader.mode() should succeed");
+            let mut received: Vec<(u64, u64, Bytes)> = Vec::new();
+            if let TrackReaderMode::Subgroups(mut subgroups) = mode {
+                while let Ok(Some(mut subgroup)) = subgroups.next().await {
+                    let gid = subgroup.group_id;
+                    while let Ok(Some(mut obj)) = subgroup.next().await {
+                        let oid = obj.object_id;
+                        let data: Bytes = obj
+                            .read_all()
+                            .await
+                            .expect("obj.read_all() should succeed");
+                        received.push((gid, oid, data));
+                    }
                 }
+            } else {
+                panic!("expected Subgroups mode");
             }
-        } else {
-            panic!("expected Subgroups mode");
-        }
-        received
+            received
+        })
+        .await
+        .expect("drain_subgroups timed out after 5 seconds")
     }
 
     /// Regression test for the stale track caching bug.
@@ -567,7 +577,7 @@ mod tests {
         let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
 
         // First subscription
-        let _track_reader_1 = reader
+        let track_reader_1 = reader
             .subscribe(namespace.clone(), track_name)
             .expect("first subscribe");
 
@@ -575,8 +585,12 @@ mod tests {
         let track_writer_1 = request.next().await.expect("first request");
         track_writer_1.close(ServeError::Cancel).unwrap();
 
-        // Wait for close to propagate
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for close to propagate using closed() with timeout
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            track_reader_1.closed(),
+        )
+        .await;
 
         // Second subscription (stale eviction should happen)
         let track_reader_2 = reader
