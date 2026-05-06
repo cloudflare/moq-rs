@@ -263,7 +263,9 @@ impl Session {
         mut subscriber: Option<Subscriber>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
+        log::debug!("[SESSION] run_recv: starting message receive loop");
         loop {
+            log::trace!("[SESSION] run_recv: waiting for next message...");
             let msg: message::Message = recver.decode().await?;
             log::debug!("received message: {:?}", msg);
 

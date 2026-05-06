@@ -63,9 +63,13 @@ impl Consumer {
         let mut tasks: FuturesUnordered<futures::future::BoxFuture<'_, ()>> =
             FuturesUnordered::new();
 
+        log::debug!("[CONSUMER] run: starting main loop");
+
         loop {
             let mut subscriber_ns = self.subscriber.clone();
             let mut subscriber_publish = self.subscriber.clone();
+
+            log::trace!("[CONSUMER] run: waiting on select (tasks={})", tasks.len());
 
             tokio::select! {
                 Some(publish_ns) = subscriber_ns.publish_ns_recvd() => {
@@ -81,6 +85,7 @@ impl Consumer {
                     }.boxed());
                 },
                 Some(publish) = subscriber_publish.publish_received() => {
+                    log::debug!("[CONSUMER] run: received track-level PUBLISH");
                     let this = self.clone();
 
                     tasks.push(async move {
@@ -92,8 +97,13 @@ impl Consumer {
                         }
                     }.boxed());
                 },
-                _ = tasks.next(), if !tasks.is_empty() => {},
-                else => return Ok(()),
+                _ = tasks.next(), if !tasks.is_empty() => {
+                    log::trace!("[CONSUMER] run: a task completed");
+                },
+                else => {
+                    log::debug!("[CONSUMER] run: else branch triggered, returning");
+                    return Ok(());
+                },
             };
         }
     }
@@ -268,6 +278,34 @@ impl Consumer {
             track_name,
             initial_forward
         );
+
+        // Register track with TopN tracker if track_extensions contain property values
+        // This enables top-N filtering for SUBSCRIBE_NAMESPACE with TRACK_FILTER
+        if let Some(ref registry) = self.subscriber_registry {
+            // Check for known property types in track_extensions
+            // AUDIO_LEVEL_EXT = 0x12 (18) - audio level for active speaker detection
+            const AUDIO_LEVEL_EXT: u64 = 0x12;
+
+            if let Some(track_exts) = track_info.track_extensions() {
+                if let Some(kvp) = track_exts.get(AUDIO_LEVEL_EXT) {
+                    if let moq_transport::coding::Value::IntValue(audio_level) = kvp.value {
+                        registry.register_track(
+                            &namespace,
+                            &track_name,
+                            AUDIO_LEVEL_EXT,
+                            audio_level,
+                            self.session_id,
+                        );
+                        log::info!(
+                            "registered track {}/{} with TopN tracker (audio_level={})",
+                            namespace,
+                            track_name,
+                            audio_level
+                        );
+                    }
+                }
+            }
+        }
 
         // Notify subscriber registry of the new PUBLISH
         // This will trigger forwarding to matching SUBSCRIBE_NAMESPACE subscriptions

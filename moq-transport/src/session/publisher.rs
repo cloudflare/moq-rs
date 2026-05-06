@@ -439,7 +439,7 @@ impl Publisher {
         };
 
         let (send, recv) =
-            SubscribeNamespaceReceived::new(self.clone(), msg.id, namespace_prefix);
+            SubscribeNamespaceReceived::new(self.clone(), msg.id, namespace_prefix, msg.params);
 
         if let Err(send) = self.subscribe_namespace_received_queue.push(send) {
             send.reject(0x0, "Internal error")?;
@@ -473,7 +473,13 @@ impl Publisher {
     /// Send a message without waiting for it to be sent.
     pub(super) fn send_message<T: Into<message::Publisher> + Into<Message>>(&mut self, msg: T) {
         let msg = self.act_on_message_to_send(msg);
-        self.outgoing.push(msg.into()).ok();
+        let msg_name = format!("{:?}", msg);
+        let msg: Message = msg.into();
+        log::debug!("[PUBLISHER] send_message: pushing {:?} to outgoing queue", msg_name);
+        match self.outgoing.push(msg) {
+            Ok(()) => log::debug!("[PUBLISHER] send_message: push succeeded"),
+            Err(_) => log::warn!("[PUBLISHER] send_message: push FAILED (queue closed?)"),
+        }
     }
 
     /// Send a message and wait until it is sent (or at least popped off the outgoing control message queue)

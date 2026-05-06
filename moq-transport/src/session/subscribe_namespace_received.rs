@@ -1,6 +1,6 @@
 use std::ops;
 
-use crate::coding::{ReasonPhrase, TrackNamespace};
+use crate::coding::{KeyValuePairs, ReasonPhrase, TrackNamespace};
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
@@ -10,6 +10,7 @@ use super::Publisher;
 pub struct SubscribeNamespaceReceivedInfo {
     pub request_id: u64,
     pub namespace_prefix: TrackNamespace,
+    pub params: KeyValuePairs,
 }
 
 struct SubscribeNamespaceReceivedState {
@@ -35,10 +36,12 @@ impl SubscribeNamespaceReceived {
         publisher: Publisher,
         request_id: u64,
         namespace_prefix: TrackNamespace,
+        params: KeyValuePairs,
     ) -> (Self, SubscribeNamespaceReceivedRecv) {
         let info = SubscribeNamespaceReceivedInfo {
             request_id,
             namespace_prefix: namespace_prefix.clone(),
+            params,
         };
 
         let (send, recv) = State::default().split();

@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::{
     Consumer, Coordinator, Locals, Producer, Remotes, RemotesConsumer, RemotesProducer, Session,
-    SubscriberRegistry,
+    SubscriberRegistry, TieBreakPolicy,
 };
 
 // A type alias for boxed future
@@ -49,6 +49,13 @@ pub struct RelayConfig {
 
     /// The coordinator for namespace/track registration and discovery.
     pub coordinator: Arc<dyn Coordinator>,
+
+    /// Enable TopN event logging for visualization
+    /// Logs JSON events to stdout that can be used to generate timeline SVGs
+    pub topn_log: bool,
+
+    /// Tie-break policy for top-N filtering
+    pub tie_break_policy: TieBreakPolicy,
 }
 
 /// MoQ Relay server.
@@ -110,7 +117,13 @@ impl Relay {
         .produce();
 
         // Create subscriber registry for SUBSCRIBE_NAMESPACE tracking
-        let subscriber_registry = SubscriberRegistry::new();
+        let subscriber_registry = if config.topn_log {
+            log::info!("TopN event logging enabled - JSON events will be written to stdout");
+            log::info!("TopN tie-break policy: {:?}", config.tie_break_policy);
+            SubscriberRegistry::with_config(true, config.tie_break_policy)
+        } else {
+            SubscriberRegistry::with_config(false, config.tie_break_policy)
+        };
 
         Ok(Self {
             quic_endpoints: endpoints,

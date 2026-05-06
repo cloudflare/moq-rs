@@ -47,6 +47,31 @@ impl ExtensionHeaders {
 }
 
 impl ExtensionHeaders {
+    /// Encode extension headers without length prefix (just the delta-encoded KVPs).
+    /// Used for Track Extensions in PUBLISH where the length is implicit from the message.
+    pub fn encode_without_length<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        // Sort by key for delta encoding
+        let mut sorted: Vec<&KeyValuePair> = self.0.iter().collect();
+        sorted.sort_by_key(|kvp| kvp.key);
+
+        let mut prev_key: u64 = 0;
+        for kvp in sorted {
+            let delta = kvp.key.checked_sub(prev_key).ok_or_else(|| {
+                log::error!(
+                    "[ExtHdr] Keys not sortable: prev_key={}, current_key={}",
+                    prev_key,
+                    kvp.key
+                );
+                EncodeError::InvalidValue
+            })?;
+            delta.encode(w)?;
+            kvp.encode_value(w)?;
+            prev_key = kvp.key;
+        }
+
+        Ok(())
+    }
+
     /// Decode extension headers from remaining bytes (no length prefix).
     /// Used for Track Extensions in PUBLISH where the length is implicit from the message.
     pub fn decode_remaining_bytes<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {

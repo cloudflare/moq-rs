@@ -131,6 +131,14 @@ impl Subscriber {
         &mut self,
         namespace_prefix: TrackNamespace,
     ) -> Result<SubscribeNs, ServeError> {
+        self.subscribe_ns_with_params(namespace_prefix, crate::coding::KeyValuePairs::new())
+    }
+
+    pub fn subscribe_ns_with_params(
+        &mut self,
+        namespace_prefix: TrackNamespace,
+        params: crate::coding::KeyValuePairs,
+    ) -> Result<SubscribeNs, ServeError> {
         let request_id = self.get_next_request_id();
 
         let mut subscribe_namespaces = self.subscribe_namespaces.lock().unwrap();
@@ -139,7 +147,7 @@ impl Subscriber {
             hash_map::Entry::Vacant(entry) => entry,
         };
 
-        let (send, recv) = SubscribeNs::new(self.clone(), request_id, namespace_prefix);
+        let (send, recv) = SubscribeNs::new(self.clone(), request_id, namespace_prefix, params);
         entry.insert(recv);
 
         Ok(send)

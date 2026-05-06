@@ -41,17 +41,20 @@ impl SubscribeNs {
         mut subscriber: Subscriber,
         request_id: u64,
         namespace_prefix: TrackNamespace,
+        params: crate::coding::KeyValuePairs,
     ) -> (SubscribeNs, SubscribeNsRecv) {
         let info = SubscribeNsInfo {
             request_id,
             namespace_prefix: namespace_prefix.clone(),
         };
 
-        subscriber.send_message(message::SubscribeNamespace::new(
+        let mut msg = message::SubscribeNamespace::new(
             request_id,
             namespace_prefix,
             1,
-        ));
+        );
+        msg.params = params;
+        subscriber.send_message(msg);
 
         let (send, recv) = State::default().split();
 

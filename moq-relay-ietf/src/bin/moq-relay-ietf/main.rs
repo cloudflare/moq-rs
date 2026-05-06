@@ -9,7 +9,7 @@ use url::Url;
 
 use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
-use moq_relay_ietf::{Coordinator, Relay, RelayConfig, Web, WebConfig};
+use moq_relay_ietf::{Coordinator, Relay, RelayConfig, TieBreakPolicy, Web, WebConfig};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -78,6 +78,19 @@ pub struct Cli {
     /// Only used when --api-url is specified.
     #[arg(long, default_value = "600")]
     pub api_ttl: u64,
+
+    /// Enable TopN event logging for visualization.
+    /// Writes JSON events to stdout that can be parsed to generate timeline SVGs.
+    /// Use with: grep TOPN_EVENT relay.log > events.log
+    /// Then: cargo run -p moq-topn-test --bin topn-log-to-svg -- events.log timeline.svg
+    #[arg(long)]
+    pub topn_log: bool,
+
+    /// Tie-break policy for top-N filtering when values are equal.
+    /// "oldest" = first registered track wins (default)
+    /// "recent" = most recently updated track wins
+    #[arg(long, default_value = "oldest")]
+    pub tie_break: String,
 }
 
 #[tokio::main]
@@ -131,6 +144,13 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(FileCoordinator::new(&cli.coordinator_file, relay_url))
     };
 
+    // Parse tie-break policy
+    let tie_break_policy = match cli.tie_break.as_str() {
+        "oldest" => TieBreakPolicy::OldestWins,
+        "recent" => TieBreakPolicy::MostRecentWins,
+        other => anyhow::bail!("invalid tie-break policy '{}': must be 'oldest' or 'recent'", other),
+    };
+
     // Create a QUIC server for media.
     let relay = Relay::new(RelayConfig {
         tls: tls.clone(),
@@ -141,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
         node: cli.node,
         announce: cli.announce,
         coordinator,
+        topn_log: cli.topn_log,
+        tie_break_policy,
     })?;
 
     if cli.dev {

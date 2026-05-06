@@ -55,7 +55,8 @@ impl Encode for Publish {
         self.track_alias.encode(w)?;
 
         self.params.encode(w)?;
-        self.track_extensions.encode(w)?;
+        // Track Extensions use remaining bytes (no length prefix per draft-16)
+        self.track_extensions.encode_without_length(w)?;
 
         Ok(())
     }
@@ -101,5 +102,32 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = Publish::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn encode_decode_with_track_extensions() {
+        let mut buf = BytesMut::new();
+
+        let mut track_ext = ExtensionHeaders::new();
+        track_ext.set_intvalue(0x12, 50); // AUDIO_LEVEL_EXT = 0x12 (18), value = 50
+
+        let msg = Publish {
+            id: 1,
+            track_namespace: TrackNamespace::from_utf8_path("topn-test/speaker-0"),
+            track_name: "audio".to_string(),
+            track_alias: 0,
+            params: Default::default(),
+            track_extensions: track_ext,
+        };
+        msg.encode(&mut buf).unwrap();
+        let decoded = Publish::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
+        // Verify the track extension was decoded correctly
+        let kvp = decoded.track_extensions.get(0x12).unwrap();
+        assert_eq!(kvp.key, 0x12);
+        match &kvp.value {
+            crate::coding::Value::IntValue(v) => assert_eq!(*v, 50),
+            _ => panic!("Expected int value"),
+        }
     }
 }

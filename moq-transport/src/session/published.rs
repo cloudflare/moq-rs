@@ -5,6 +5,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
 use crate::coding::{Encode, Location, ReasonPhrase, TrackNamespace};
+use crate::data::ExtensionHeaders;
 use crate::message::ParameterType;
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
@@ -12,6 +13,23 @@ use crate::watch::State;
 use crate::{data, message, serve};
 
 use super::{Publisher, SessionError, Writer};
+
+/// Callback for object observation and filtering during streaming.
+/// Called for each object before it's forwarded.
+///
+/// Arguments:
+/// - group_id: The group ID of the object
+/// - object_id: The object ID within the group
+/// - extension_headers: The extension headers on the object
+///
+/// Returns:
+/// - `true` to forward the object
+/// - `false` to skip/drop the object
+///
+/// Use cases:
+/// - Update TopN tracker with audio level metrics from extension headers
+/// - Filter objects based on whether the track is in top-N for the subscriber
+pub type ObjectObserverFn = Box<dyn Fn(u64, u64, &ExtensionHeaders) -> bool + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct PublishInfo {
@@ -148,7 +166,22 @@ impl Published {
     }
 
     pub async fn serve(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
-        let res = self.serve_inner(track).await;
+        let res = self.serve_inner(track, None).await;
+        if let Err(err) = &res {
+            self.close(err.clone().into())?;
+        }
+        res
+    }
+
+    /// Serve with an observer callback that's called for each object.
+    /// The observer receives object extension headers and can update external state (e.g., TopN tracker).
+    /// All objects are forwarded regardless of observer return.
+    pub async fn serve_with_observer(
+        mut self,
+        track: serve::TrackReader,
+        observer: ObjectObserverFn,
+    ) -> Result<(), SessionError> {
+        let res = self.serve_inner(track, Some(Arc::new(observer))).await;
         if let Err(err) = &res {
             self.close(err.clone().into())?;
         }
@@ -177,7 +210,11 @@ impl Published {
         res
     }
 
-    async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
+    async fn serve_inner(
+        &mut self,
+        track: serve::TrackReader,
+        observer: Option<Arc<ObjectObserverFn>>,
+    ) -> Result<(), SessionError> {
         self.ok().await?;
 
         let forward = {
@@ -192,7 +229,9 @@ impl Published {
 
         match track.mode().await? {
             TrackReaderMode::Stream(_stream) => panic!("deprecated"),
-            TrackReaderMode::Subgroups(subgroups) => self.serve_subgroups(subgroups).await,
+            TrackReaderMode::Subgroups(subgroups) => {
+                self.serve_subgroups(subgroups, observer).await
+            }
             TrackReaderMode::Datagrams(datagrams) => self.serve_datagrams(datagrams).await,
         }
     }
@@ -212,7 +251,7 @@ impl Published {
 
         match mode {
             TrackReaderMode::Stream(_stream) => panic!("deprecated"),
-            TrackReaderMode::Subgroups(subgroups) => self.serve_subgroups(subgroups).await,
+            TrackReaderMode::Subgroups(subgroups) => self.serve_subgroups(subgroups, None).await,
             TrackReaderMode::Datagrams(datagrams) => self.serve_datagrams(datagrams).await,
         }
     }
@@ -223,7 +262,7 @@ impl Published {
 
         match track.mode().await? {
             TrackReaderMode::Stream(_stream) => panic!("deprecated"),
-            TrackReaderMode::Subgroups(subgroups) => self.serve_subgroups(subgroups).await,
+            TrackReaderMode::Subgroups(subgroups) => self.serve_subgroups(subgroups, None).await,
             TrackReaderMode::Datagrams(datagrams) => self.serve_datagrams(datagrams).await,
         }
     }
@@ -231,6 +270,7 @@ impl Published {
     async fn serve_subgroups(
         &mut self,
         mut subgroups: serve::SubgroupsReader,
+        observer: Option<Arc<ObjectObserverFn>>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
         let mut done: Option<Result<(), ServeError>> = None;
@@ -245,9 +285,10 @@ impl Published {
                         let state = self.state.clone();
                         let info = subgroup.info.clone();
                         let mlog = self.mlog.clone();
+                        let observer = observer.clone();
 
                         tasks.push(async move {
-                            if let Err(err) = Self::serve_subgroup(track_alias, subgroup, publisher, state, mlog).await {
+                            if let Err(err) = Self::serve_subgroup(track_alias, subgroup, publisher, state, mlog, observer).await {
                                 log::warn!("failed to serve subgroup: {:?}, error: {}", info, err);
                             }
                         });
@@ -268,6 +309,7 @@ impl Published {
         mut publisher: Publisher,
         state: State<PublishedState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        observer: Option<Arc<ObjectObserverFn>>,
     ) -> Result<(), SessionError> {
         log::debug!(
             "[PUBLISHED] serve_subgroup: starting - track_alias={}, group_id={}, subgroup_id={:?}, priority={}",
@@ -284,6 +326,17 @@ impl Published {
                 log::debug!("[PUBLISHED] serve_subgroup: no objects in subgroup, skipping");
                 return Ok(());
             }
+        };
+
+        // Call observer for first object if present (always forward first object to establish stream)
+        let should_forward_first = if let Some(ref obs) = observer {
+            obs(
+                subgroup_reader.group_id,
+                first_object.object_id,
+                &first_object.extension_headers,
+            )
+        } else {
+            true
         };
 
         // Use preserved header type if available, otherwise determine from extension headers
@@ -436,26 +489,13 @@ impl Published {
             Ok(())
         }
 
-        // Write the first object that we already read
+        // Write the first object that we already read (if observer allows)
         let mut object_count = 0;
         let mut first_object = first_object;
-        write_object(
-            &mut writer,
-            &mut first_object,
-            has_extension_headers,
-            object_count,
-            &subgroup_reader,
-            &state,
-            &mlog,
-        )
-        .await?;
-        object_count += 1;
-
-        // Continue with remaining objects
-        while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
+        if should_forward_first {
             write_object(
                 &mut writer,
-                &mut subgroup_object_reader,
+                &mut first_object,
                 has_extension_headers,
                 object_count,
                 &subgroup_reader,
@@ -464,6 +504,50 @@ impl Published {
             )
             .await?;
             object_count += 1;
+        } else {
+            // Consume the object data even if not forwarding
+            while first_object.read().await?.is_some() {}
+            log::debug!(
+                "[PUBLISHED] serve_subgroup: skipped first object (group_id={}, object_id={}) - filtered by observer",
+                subgroup_reader.group_id,
+                first_object.object_id
+            );
+        }
+
+        // Continue with remaining objects
+        while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
+            // Call observer for each object if present - observer returns whether to forward
+            let should_forward = if let Some(ref obs) = observer {
+                obs(
+                    subgroup_reader.group_id,
+                    subgroup_object_reader.object_id,
+                    &subgroup_object_reader.extension_headers,
+                )
+            } else {
+                true
+            };
+
+            if should_forward {
+                write_object(
+                    &mut writer,
+                    &mut subgroup_object_reader,
+                    has_extension_headers,
+                    object_count,
+                    &subgroup_reader,
+                    &state,
+                    &mlog,
+                )
+                .await?;
+                object_count += 1;
+            } else {
+                // Consume the object data even if not forwarding
+                while subgroup_object_reader.read().await?.is_some() {}
+                log::debug!(
+                    "[PUBLISHED] serve_subgroup: skipped object (group_id={}, object_id={}) - filtered by observer",
+                    subgroup_reader.group_id,
+                    subgroup_object_reader.object_id
+                );
+            }
         }
 
         log::info!(

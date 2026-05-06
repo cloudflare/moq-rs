@@ -37,6 +37,7 @@ mod relay;
 mod remote;
 mod session;
 mod subscriber_registry;
+mod top_n_tracker;
 mod web;
 
 pub use api::*;
@@ -48,4 +49,5 @@ pub use relay::*;
 pub use remote::*;
 pub use session::*;
 pub use subscriber_registry::*;
+pub use top_n_tracker::*;
 pub use web::*;

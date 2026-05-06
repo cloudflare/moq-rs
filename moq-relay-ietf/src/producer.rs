@@ -194,11 +194,38 @@ impl Producer {
     ) -> Result<(), anyhow::Error> {
         let namespace_prefix = subscribe_ns.namespace_prefix.clone();
 
+        // Parse TRACK_FILTER from params if present
+        // TRACK_FILTER key is 0x12 (even = int value)
+        // Value format: (property_type << 8) | max_selected packed into u64
+        const TRACK_FILTER_KEY: u64 = 0x12;
+        let track_filter = subscribe_ns.info.params.get(TRACK_FILTER_KEY).and_then(|kvp| {
+            if let moq_transport::coding::Value::IntValue(packed) = &kvp.value {
+                // Unpack: property_type in high byte, max_selected in low byte
+                let property_type = (*packed >> 8) & 0xFF;
+                let max_selected = (*packed & 0xFF) as u8;
+                log::info!(
+                    "parsed TRACK_FILTER: property_type={}, max_selected={}",
+                    property_type,
+                    max_selected
+                );
+                Some(crate::TrackFilter {
+                    property_type,
+                    max_selected,
+                })
+            } else {
+                None
+            }
+        });
+
         // Register with subscriber registry to receive PUBLISH and PUBLISH_NAMESPACE notifications
         // Uses session_id so we can exclude PUBLISH messages from the same session (self-exclusion)
         let (_subscription_guard, mut publish_rx, mut publish_ns_rx) =
             if let Some(ref registry) = self.subscriber_registry {
-                let (id, rx, rx_ns) = registry.register(namespace_prefix.clone(), self.session_id);
+                let (id, rx, rx_ns) = registry.register_with_filter(
+                    namespace_prefix.clone(),
+                    self.session_id,
+                    track_filter,
+                );
                 (
                     Some(crate::SubscriptionGuard::new(registry.clone(), id)),
                     Some(rx),
@@ -238,6 +265,10 @@ impl Producer {
 
             let track_reader = track_info.get_reader();
             let mut publisher = self.publisher.clone();
+            let registry = self.subscriber_registry.clone();
+            let session_id = self.session_id;
+            // For existing tracks, we use track_alias 0 as placeholder (not used in TopN update notifications)
+            let track_alias = 0u64;
 
             tokio::spawn(async move {
                 match publisher.publish_with_extensions(track_reader.clone(), track_extensions).await {
@@ -247,8 +278,62 @@ impl Producer {
                             ns,
                             track_name
                         );
-                        // serve() waits for PUBLISH_OK before streaming
-                        match published.serve(track_reader).await {
+                        // Create observer to update TopN tracker and filter objects
+                        let observer = if let Some(ref reg) = registry {
+                            let reg = reg.clone();
+                            let ns_for_observer = ns.clone();
+                            let name_for_observer = track_name.clone();
+                            let track_filter = reg.get_track_filter_for_session(session_id);
+                            Some(moq_transport::session::ObjectObserverFn::from(
+                                Box::new(move |group_id: u64, object_id: u64, ext_headers: &moq_transport::data::ExtensionHeaders| {
+                                    const AUDIO_LEVEL_EXT: u64 = 0x12;
+                                    if let Some(kvp) = ext_headers.get(AUDIO_LEVEL_EXT) {
+                                        if let moq_transport::coding::Value::IntValue(value) = kvp.value {
+                                            log::debug!(
+                                                "object observer (existing): {}/{} group={} obj={} audio_level={}",
+                                                ns_for_observer, name_for_observer, group_id, object_id, value
+                                            );
+                                            reg.update_track_value(
+                                                &ns_for_observer,
+                                                &name_for_observer,
+                                                AUDIO_LEVEL_EXT,
+                                                value,
+                                                track_alias,
+                                                session_id,
+                                            );
+                                        }
+                                    }
+                                    // Check if this track should be forwarded to this subscriber
+                                    if let Some(ref filter) = track_filter {
+                                        let in_top_n = reg.is_track_in_top_n(
+                                            &ns_for_observer,
+                                            &name_for_observer,
+                                            session_id,
+                                            filter.property_type,
+                                            filter.max_selected,
+                                        );
+                                        log::debug!(
+                                            "object filter (existing): {}/{} group={} obj={} in_top_{}={} for session {}",
+                                            ns_for_observer, name_for_observer, group_id, object_id,
+                                            filter.max_selected, in_top_n, session_id
+                                        );
+                                        in_top_n
+                                    } else {
+                                        true
+                                    }
+                                }) as Box<dyn Fn(u64, u64, &moq_transport::data::ExtensionHeaders) -> bool + Send + Sync>
+                            ))
+                        } else {
+                            None
+                        };
+
+                        let result = if let Some(obs) = observer {
+                            published.serve_with_observer(track_reader, obs).await
+                        } else {
+                            published.serve(track_reader).await
+                        };
+
+                        match result {
                             Ok(()) => {
                                 log::info!("existing track {}/{} serving completed", ns, track_name);
                             }
@@ -303,6 +388,9 @@ impl Producer {
                                     let mut publisher = self.publisher.clone();
                                     let ns = publish_notif.namespace.clone();
                                     let name = publish_notif.track_name.clone();
+                                    let registry = self.subscriber_registry.clone();
+                                    let track_alias = publish_notif.track_alias;
+                                    let session_id = self.session_id;
                                     log::info!(
                                         "forwarding PUBLISH for {}/{} with extensions {:?}",
                                         ns, name, track_extensions
@@ -314,8 +402,70 @@ impl Producer {
                                                     "sent PUBLISH for {}/{}, waiting for PUBLISH_OK",
                                                     ns, name
                                                 );
-                                                // serve() waits for PUBLISH_OK before streaming
-                                                match published.serve(track_reader).await {
+                                                // Create observer to update TopN tracker and filter objects
+                                                // The observer both updates the tracker AND returns whether to forward
+                                                let observer = if let Some(ref reg) = registry {
+                                                    let reg = reg.clone();
+                                                    let ns_for_observer = ns.clone();
+                                                    let name_for_observer = name.clone();
+                                                    // Get subscriber's track filter to check top-N membership
+                                                    let track_filter = reg.get_track_filter_for_session(session_id);
+                                                    Some(moq_transport::session::ObjectObserverFn::from(
+                                                        Box::new(move |group_id: u64, object_id: u64, ext_headers: &moq_transport::data::ExtensionHeaders| {
+                                                            // Extract audio level property (0x12) from extension headers
+                                                            const AUDIO_LEVEL_EXT: u64 = 0x12;
+                                                            if let Some(kvp) = ext_headers.get(AUDIO_LEVEL_EXT) {
+                                                                if let moq_transport::coding::Value::IntValue(value) = kvp.value {
+                                                                    log::debug!(
+                                                                        "object observer: {}/{} group={} obj={} audio_level={}",
+                                                                        ns_for_observer, name_for_observer, group_id, object_id, value
+                                                                    );
+                                                                    // Update tracker with new value (notifies other subscribers if track enters their top-N)
+                                                                    reg.update_track_value(
+                                                                        &ns_for_observer,
+                                                                        &name_for_observer,
+                                                                        AUDIO_LEVEL_EXT,
+                                                                        value,
+                                                                        track_alias,
+                                                                        session_id,
+                                                                    );
+                                                                }
+                                                            }
+
+                                                            // Check if this track should be forwarded to this subscriber
+                                                            // If subscriber has no track_filter, always forward
+                                                            if let Some(ref filter) = track_filter {
+                                                                let in_top_n = reg.is_track_in_top_n(
+                                                                    &ns_for_observer,
+                                                                    &name_for_observer,
+                                                                    session_id,
+                                                                    filter.property_type,
+                                                                    filter.max_selected,
+                                                                );
+                                                                log::debug!(
+                                                                    "object filter: {}/{} group={} obj={} in_top_{}={} for session {}",
+                                                                    ns_for_observer, name_for_observer, group_id, object_id,
+                                                                    filter.max_selected, in_top_n, session_id
+                                                                );
+                                                                in_top_n
+                                                            } else {
+                                                                // No filter = always forward
+                                                                true
+                                                            }
+                                                        }) as Box<dyn Fn(u64, u64, &moq_transport::data::ExtensionHeaders) -> bool + Send + Sync>
+                                                    ))
+                                                } else {
+                                                    None
+                                                };
+
+                                                // serve with observer to update TopN from object extension headers
+                                                let result = if let Some(obs) = observer {
+                                                    published.serve_with_observer(track_reader, obs).await
+                                                } else {
+                                                    published.serve(track_reader).await
+                                                };
+
+                                                match result {
                                                     Ok(()) => {
                                                         log::info!("track {}/{} serving completed", ns, name);
                                                     }
