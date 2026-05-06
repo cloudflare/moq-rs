@@ -19,7 +19,8 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    Announce, AnnounceRecv, Session, SessionError, Subscribed, SubscribedRecv, TrackStatusRequested,
+    PublishNamespace, PublishNamespaceRecv, Session, SessionError, Subscribed, SubscribedRecv,
+    TrackStatusRequested,
 };
 
 // TODO remove Clone.
@@ -27,30 +28,24 @@ use super::{
 pub struct Publisher {
     webtransport: web_transport::Session,
 
-    /// When the announce method is used, a new entry is added to this HashMap to track outbound announcement
-    announces: Arc<Mutex<HashMap<TrackNamespace, AnnounceRecv>>>,
+    /// Active outbound PUBLISH_NAMESPACE requests, keyed by namespace.
+    publish_namespaces: Arc<Mutex<HashMap<TrackNamespace, PublishNamespaceRecv>>>,
 
-    /// When a Subscribe is received and we have a previous announce for the namespace, then a new entry is
-    /// added to this HashMap to track the inbound subscription
+    /// When a Subscribe is received and we have a matching publish_namespace entry, the
+    /// subscription is routed to that PublishNamespaceRecv.  Otherwise it goes here.
     subscribeds: Arc<Mutex<HashMap<u64, SubscribedRecv>>>,
 
-    /// When a Subscribe is received and we DO NOT have a previous announce for the namespace, then a new entry is
-    /// added to this Queue to track the inbound subscription
+    /// Subscriptions for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_subscribed: Queue<Subscribed>,
 
-    /// When a TrackStatus is received and we DO NOT have a previous announce for the namespace, then a new entry is
-    /// added to this Queue to track the inbound track status request
+    /// TRACK_STATUS requests for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_track_status_requested: Queue<TrackStatusRequested>,
 
-    /// The queue we will write any outbound control messages we want to sent, the session run_send task
-    /// will process the queue and send the message on the control stream.
+    /// Queue for outbound control messages; processed by the session run_send task.
     outgoing: Queue<Message>,
 
-    /// When we need a new Request Id for sending a request, we can get it from here.  Note:  The instance
-    /// of AtomicU64 is shared with the Subscriber, so the session uses unique request ids for all requests
-    /// generated.  Note:  If we initiated the QUIC connection then request id's start at 0 and increment by 2
-    /// for each request (even numbers).  If we accepted an inbound QUIC connection then request id's start at 1 and
-    /// increment by 2 for each request (odd numbers).
+    /// Shared with Subscriber so all requests within a session use unique IDs.
+    /// Client connections start at 0 (even), server at 1 (odd); increments by 2.
     next_requestid: Arc<atomic::AtomicU64>,
 
     /// Optional mlog writer for logging transport events
@@ -66,7 +61,7 @@ impl Publisher {
     ) -> Self {
         Self {
             webtransport,
-            announces: Default::default(),
+            publish_namespaces: Default::default(),
             subscribeds: Default::default(),
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
@@ -92,26 +87,22 @@ impl Publisher {
         Ok((session, publisher))
     }
 
-    /// Announce a namespace and serve tracks using the provided [serve::TracksReader].
-    /// The caller uses [serve::TracksWriter] for static tracks and [serve::TracksRequest] for dynamic tracks.
-    pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        // Check if annouce for this namespace already exists or not, and if not, then create a new Announce
-        let announce = match self
-            .announces
+    /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided
+    /// [serve::TracksReader].  Blocks until the namespace is unannounced or an error occurs.
+    pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+        let publish_ns = match self
+            .publish_namespaces
             .lock()
-            .unwrap()
+            .map_err(|_| SessionError::Internal)?
             .entry(tracks.namespace.clone())
         {
-            // Namespace already exists in HashMap (has already been announced) - return Duplicate error
+            // Duplicate PUBLISH_NAMESPACE for the same namespace is a protocol error.
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
 
-            // This is a new announce, send announce message to peer.
             hash_map::Entry::Vacant(entry) => {
-                // Get the current next request id to use and increment the value for by 2 for the next request
                 let request_id = self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed);
-
                 let (send, recv) =
-                    Announce::new(self.clone(), request_id, tracks.namespace.clone());
+                    PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
                 entry.insert(recv);
                 send
             }
@@ -122,49 +113,47 @@ impl Publisher {
         let mut subscribe_done = false;
         let mut status_done = false;
 
-        // The code enters an infinite loop and waits for one of several events:
-        // - A new subscription arrives.
-        // - A new track status request arrives.
-        // - One of the spawned subscription-handling tasks completes.
-        // - One of the spawned status-handling tasks completes.
-        // Exit the loop when all input streams are done (None), and all tasks have completed
         loop {
             tokio::select! {
-                // Get next subscription to this announce
-                res = announce.subscribed(), if !subscribe_done => {
+                res = publish_ns.subscribed(), if !subscribe_done => {
                     match res? {
                         Some(subscribed) => {
                             let tracks = tracks.clone();
-
                             subscribe_tasks.push(async move {
                                 let info = subscribed.info.clone();
                                 if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
-                                    tracing::warn!("failed serving subscribe: {:?}, error: {}", info, err)
+                                    tracing::warn!(
+                                        subscribe_info = ?info,
+                                        error = %err,
+                                        "failed serving subscribe"
+                                    );
                                 }
                             });
-                        },
+                        }
                         None => subscribe_done = true,
                     }
-
                 },
-                res = announce.track_status_requested(), if !status_done => {
+                res = publish_ns.track_status_requested(), if !status_done => {
                     match res? {
                         Some(status) => {
                             let tracks = tracks.clone();
-
                             status_tasks.push(async move {
                                 let request_msg = status.request_msg.clone();
                                 if let Err(err) = Self::serve_track_status(status, tracks).await {
-                                    tracing::warn!("failed serving track status request: {:?}, error: {}", request_msg, err)
+                                    tracing::warn!(
+                                        request = ?request_msg,
+                                        error = %err,
+                                        "failed serving track status request"
+                                    );
                                 }
                             });
-                        },
+                        }
                         None => status_done = true,
                     }
                 },
                 Some(res) = subscribe_tasks.next() => res,
                 Some(res) = status_tasks.next() => res,
-                else => return Ok(())
+                else => return Ok(()),
             }
         }
     }
@@ -212,12 +201,12 @@ impl Publisher {
         Ok(())
     }
 
-    // Returns subscriptions that do not map to an active announce.
+    /// Returns the next subscription that did not match any active PUBLISH_NAMESPACE.
     pub async fn subscribed(&mut self) -> Option<Subscribed> {
         self.unknown_subscribed.pop().await
     }
 
-    // Returns track_status requests that do not map to an active announce.
+    /// Returns the next TRACK_STATUS request that did not match any active PUBLISH_NAMESPACE.
     pub async fn track_status_requested(&mut self) -> Option<TrackStatusRequested> {
         self.unknown_track_status_requested.pop().await
     }
@@ -252,7 +241,7 @@ impl Publisher {
         };
 
         if let Err(err) = res {
-            tracing::warn!("failed to process message: {}", err);
+            tracing::warn!(error = %err, "failed to process subscriber message");
         }
 
         Ok(())
@@ -262,14 +251,14 @@ impl Publisher {
         &mut self,
         msg: message::PublishNamespaceOk,
     ) -> Result<(), SessionError> {
-        // We need to find the announce request using the request id, however the self.announces data structure
-        // is a HashMap indexed by Namespace (which is needed for handling PUBLISH_NAMESPACE_CANCEL).  TODO - make more efficient.
-        // For now iterate through all self.annouces until we find the matching id.
-        let mut announces = self.announces.lock().unwrap();
-        let announce = announces.iter_mut().find(|(_k, v)| v.request_id == msg.id);
-
-        if let Some(announce) = announce {
-            announce.1.recv_ok()?;
+        // The publish_namespaces map is keyed by namespace; we must search by request_id.
+        // TODO: maintain a second index keyed by request_id to make this O(1).
+        let mut namespaces = self
+            .publish_namespaces
+            .lock()
+            .map_err(|_| SessionError::Internal)?;
+        if let Some(entry) = namespaces.iter_mut().find(|(_k, v)| v.request_id == msg.id) {
+            entry.1.recv_ok()?;
         }
 
         Ok(())
@@ -279,21 +268,18 @@ impl Publisher {
         &mut self,
         msg: message::PublishNamespaceError,
     ) -> Result<(), SessionError> {
-        // We need to find the announce request using the request id, however the self.announces data structure
-        // is a HashMap indexed by Namespace (which is needed for handling PUBLISH_NAMESPACE_CANCEL).  TODO - make more efficient.
-        // For now iterate through all self.annouces until we find the matching id.
-        let mut announces = self.announces.lock().unwrap();
+        let mut namespaces = self
+            .publish_namespaces
+            .lock()
+            .map_err(|_| SessionError::Internal)?;
 
-        // Find the key first (immutable borrow only)
-        let key_opt = announces
+        let key = namespaces
             .iter()
             .find(|(_k, v)| v.request_id == msg.id)
             .map(|(k, _)| k.clone());
 
-        // Remove from HashMap and take ownership
-        if let Some(key) = key_opt {
-            if let Some((_ns, v)) = announces.remove_entry(&key) {
-                // Step 3: call recv_error, consuming v
+        if let Some(key) = key {
+            if let Some((_ns, v)) = namespaces.remove_entry(&key) {
                 v.recv_error(ServeError::Closed(msg.error_code))?;
             }
         }
@@ -305,10 +291,13 @@ impl Publisher {
         &mut self,
         msg: message::PublishNamespaceCancel,
     ) -> Result<(), SessionError> {
-        // TODO: If a publisher receives new subscriptions for that namespace after receiving an ANNOUNCE_CANCEL,
-        // it SHOULD close the session as a 'Protocol Violation'.
-        if let Some(announce) = self.announces.lock().unwrap().remove(&msg.track_namespace) {
-            announce.recv_error(ServeError::Cancel)?;
+        if let Some(ns) = self
+            .publish_namespaces
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .remove(&msg.track_namespace)
+        {
+            ns.recv_error(ServeError::Cancel)?;
         }
 
         Ok(())
@@ -318,31 +307,34 @@ impl Publisher {
         let namespace = msg.track_namespace.clone();
 
         let subscribed = {
-            let mut subscribeds = self.subscribeds.lock().unwrap();
+            let mut subscribeds = self
+                .subscribeds
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
 
-            // See if entry exists for this request id already, if so error out
             let entry = match subscribeds.entry(msg.id) {
                 hash_map::Entry::Occupied(_) => return Err(SessionError::Duplicate),
                 hash_map::Entry::Vacant(entry) => entry,
             };
 
-            // Create new Subscribed entry and add to HashMap
             let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone());
             entry.insert(recv);
 
             send
         };
 
-        // If we have an announce, route the subscribe to it.
-        if let Some(announce) = self.announces.lock().unwrap().get_mut(&namespace) {
-            return announce.recv_subscribe(subscribed).map_err(Into::into);
+        // Route to an active PUBLISH_NAMESPACE if present.
+        if let Some(ns) = self
+            .publish_namespaces
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&namespace)
+        {
+            return ns.recv_subscribe(subscribed).map_err(Into::into);
         }
 
-        // Otherwise, put it in the unknown queue.
-        // TODO Have some way to detect if the application is not reading from the unknown queue,
-        // then send SubscribeError.
+        // Otherwise, surface it to the application via the unknown queue.
         if let Err(err) = self.unknown_subscribed.push(subscribed) {
-            // Default to closing with a not found error I guess.
             err.close(ServeError::not_found_ctx(format!(
                 "unknown_subscribed queue full for namespace {:?}",
                 namespace
@@ -356,31 +348,30 @@ impl Publisher {
         &mut self,
         _msg: message::SubscribeUpdate,
     ) -> Result<(), SessionError> {
-        // TODO: Implement updating subscriptions.
+        // TODO: Implement REQUEST_UPDATE for subscriptions.
         Err(SessionError::unimplemented("SUBSCRIBE_UPDATE"))
     }
 
     fn recv_track_status(&mut self, msg: message::TrackStatus) -> Result<(), SessionError> {
         let namespace = msg.track_namespace.clone();
 
-        // Create TrackStatusRequested to track this request
         let track_status_requested = TrackStatusRequested::new(self.clone(), msg);
 
-        // If we have an announce, route the track_status to it.
-        if let Some(announce) = self.announces.lock().unwrap().get_mut(&namespace) {
-            return announce
+        if let Some(ns) = self
+            .publish_namespaces
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&namespace)
+        {
+            return ns
                 .recv_track_status_requested(track_status_requested)
                 .map_err(Into::into);
         }
 
-        // Otherwise, put it in the unknown_track_status queue.
-        // TODO Have some way to detect if the application is not reading from the unknown_track_status queue,
-        // then send TrackStatusError.
         if let Err(mut err) = self
             .unknown_track_status_requested
             .push(track_status_requested)
         {
-            // push only fails if the queue is dropped, send  TrackStatusError, Internal error
             err.respond_error(0, "Internal error")?;
         }
 
@@ -388,14 +379,19 @@ impl Publisher {
     }
 
     fn recv_unsubscribe(&mut self, msg: message::Unsubscribe) -> Result<(), SessionError> {
-        if let Some(subscribed) = self.subscribeds.lock().unwrap().get_mut(&msg.id) {
+        if let Some(subscribed) = self
+            .subscribeds
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&msg.id)
+        {
             subscribed.recv_unsubscribe()?;
         }
 
         Ok(())
     }
 
-    /// Process a message before sending it, performing any necessary internal actions.
+    /// Pre-send hook: clean up internal state when terminal publisher messages are enqueued.
     fn act_on_message_to_send<T: Into<message::Publisher>>(
         &mut self,
         msg: T,
@@ -412,13 +408,13 @@ impl Publisher {
         msg
     }
 
-    /// Send a message without waiting for it to be sent.
+    /// Enqueue a control message for sending (fire-and-forget).
     pub(super) fn send_message<T: Into<message::Publisher> + Into<Message>>(&mut self, msg: T) {
         let msg = self.act_on_message_to_send(msg);
         self.outgoing.push(msg.into()).ok();
     }
 
-    /// Send a message and wait until it is sent (or at least popped off the outgoing control message queue)
+    /// Enqueue a control message and wait until it has been dequeued for sending.
     pub(super) async fn send_message_and_wait<T: Into<message::Publisher> + Into<Message>>(
         &mut self,
         msg: T,
@@ -431,11 +427,15 @@ impl Publisher {
     }
 
     fn drop_subscribe(&mut self, id: u64) {
-        self.subscribeds.lock().unwrap().remove(&id);
+        if let Ok(mut s) = self.subscribeds.lock() {
+            s.remove(&id);
+        }
     }
 
     fn drop_publish_namespace(&mut self, namespace: &TrackNamespace) {
-        self.announces.lock().unwrap().remove(namespace);
+        if let Ok(mut ns) = self.publish_namespaces.lock() {
+            ns.remove(namespace);
+        }
     }
 
     pub(super) async fn open_uni(&mut self) -> Result<web_transport::SendStream, SessionError> {

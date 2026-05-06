@@ -21,7 +21,10 @@ use crate::{
 
 use crate::watch::Queue;
 
-use super::{Announced, AnnouncedRecv, Reader, Session, SessionError, Subscribe, SubscribeRecv};
+use super::{
+    PublishedNamespace, PublishedNamespaceRecv, Reader, Session, SessionError, Subscribe,
+    SubscribeRecv,
+};
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
 const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
@@ -29,11 +32,11 @@ const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
 // TODO remove Clone.
 #[derive(Clone)]
 pub struct Subscriber {
-    /// The currently active inbound announces, keyed by namespace.
-    announced: Arc<Mutex<HashMap<TrackNamespace, AnnouncedRecv>>>,
+    /// Active inbound PUBLISH_NAMESPACE messages, keyed by namespace.
+    published_namespaces: Arc<Mutex<HashMap<TrackNamespace, PublishedNamespaceRecv>>>,
 
-    /// Queue of announced namespaces we have received from the Publisher, waiting to be processed.
-    announced_queue: Queue<Announced>,
+    /// Queue of inbound PUBLISH_NAMESPACE events waiting to be consumed by the application.
+    published_namespace_queue: Queue<PublishedNamespace>,
 
     /// The currently active outbound subscribes, keyed by request id.
     subscribes: Arc<Mutex<HashMap<u64, SubscribeRecv>>>,
@@ -66,8 +69,8 @@ impl Subscriber {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Self {
         Self {
-            announced: Default::default(),
-            announced_queue: Default::default(),
+            published_namespaces: Default::default(),
+            published_namespace_queue: Default::default(),
             subscribes: Default::default(),
             subscribe_alias_map: Default::default(),
             outgoing,
@@ -95,9 +98,9 @@ impl Subscriber {
         Ok((session, subscriber))
     }
 
-    /// Wait for the next announced namespace from the publisher, if any.
-    pub async fn announced(&mut self) -> Option<Announced> {
-        self.announced_queue.pop().await
+    /// Wait for the next inbound PUBLISH_NAMESPACE from the peer, if any.
+    pub async fn published_namespace(&mut self) -> Option<PublishedNamespace> {
+        self.published_namespace_queue.pop().await
     }
 
     /// Get the current next request id to use and increment the value for by 2 for the next request
@@ -125,7 +128,10 @@ impl Subscriber {
     pub async fn subscribe(&mut self, track: serve::TrackWriter) -> Result<(), ServeError> {
         let request_id = self.get_next_request_id();
         let (send, recv) = Subscribe::new(self.clone(), request_id, track);
-        self.subscribes.lock().unwrap().insert(request_id, recv);
+        self.subscribes
+            .lock()
+            .map_err(|_| ServeError::internal_ctx("subscribe lock poisoned"))?
+            .insert(request_id, recv);
 
         send.closed().await
     }
@@ -179,23 +185,26 @@ impl Subscriber {
         res
     }
 
-    /// Handle the reception of a PublishNamespace message from the publisher.
+    /// Handle reception of an inbound PUBLISH_NAMESPACE from the publisher.
     fn recv_publish_namespace(
         &mut self,
         msg: &message::PublishNamespace,
     ) -> Result<(), SessionError> {
-        let mut announces = self.announced.lock().unwrap();
+        let mut published_namespaces = self
+            .published_namespaces
+            .lock()
+            .map_err(|_| SessionError::Internal)?;
 
-        // Check for duplicate namespace announcement
-        let entry = match announces.entry(msg.track_namespace.clone()) {
+        // Duplicate PUBLISH_NAMESPACE for the same namespace within a session is invalid.
+        let entry = match published_namespaces.entry(msg.track_namespace.clone()) {
             hash_map::Entry::Occupied(_) => return Err(SessionError::Duplicate),
             hash_map::Entry::Vacant(entry) => entry,
         };
 
-        // Create the announced namespace and insert it into our map of active announces, and the announced queue.
-        let (announced, recv) = Announced::new(self.clone(), msg.id, msg.track_namespace.clone());
-        if let Err(announced) = self.announced_queue.push(announced) {
-            announced.close(ServeError::Cancel)?;
+        let (published_ns, recv) =
+            PublishedNamespace::new(self.clone(), msg.id, msg.track_namespace.clone());
+        if let Err(published_ns) = self.published_namespace_queue.push(published_ns) {
+            published_ns.close(ServeError::Cancel)?;
             return Ok(());
         }
         entry.insert(recv);
@@ -203,13 +212,18 @@ impl Subscriber {
         Ok(())
     }
 
-    /// Handle the reception of a PublishNamespaceDone message from the publisher.
+    /// Handle reception of PUBLISH_NAMESPACE_DONE from the publisher.
     fn recv_publish_namespace_done(
         &mut self,
         msg: &message::PublishNamespaceDone,
     ) -> Result<(), SessionError> {
-        if let Some(announce) = self.announced.lock().unwrap().remove(&msg.track_namespace) {
-            announce.recv_unannounce()?;
+        if let Some(ns) = self
+            .published_namespaces
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .remove(&msg.track_namespace)
+        {
+            ns.recv_done()?;
         }
 
         Ok(())
@@ -217,11 +231,16 @@ impl Subscriber {
 
     /// Handle the reception of a SubscribeOk message from the publisher.
     fn recv_subscribe_ok(&mut self, msg: &message::SubscribeOk) -> Result<(), SessionError> {
-        if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&msg.id) {
+        if let Some(subscribe) = self
+            .subscribes
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get_mut(&msg.id)
+        {
             // Map track alias to subscription id for quick lookup when receiving streams/datagrams
             self.subscribe_alias_map
                 .lock()
-                .unwrap()
+                .map_err(|_| SessionError::Internal)?
                 .insert(msg.track_alias, msg.id);
 
             // Notify waiting tasks that the alias map has been updated
@@ -236,18 +255,19 @@ impl Subscriber {
 
     /// Remove a subscribe from our map of active subscribes, and the alias map if present.
     fn remove_subscribe(&mut self, id: u64) -> Option<SubscribeRecv> {
-        if let Some(subscribe) = self.subscribes.lock().unwrap().remove(&id) {
-            // Remove from alias map if present
-            if let Some(track_alias) = subscribe.track_alias() {
-                self.subscribe_alias_map
-                    .lock()
-                    .unwrap()
-                    .remove(&track_alias);
-            };
-            Some(subscribe)
-        } else {
-            None
+        let subscribe = self
+            .subscribes
+            .lock()
+            .ok()
+            .and_then(|mut s| s.remove(&id));
+        if let Some(ref sub) = subscribe {
+            if let Some(track_alias) = sub.track_alias() {
+                if let Ok(mut alias_map) = self.subscribe_alias_map.lock() {
+                    alias_map.remove(&track_alias);
+                }
+            }
         }
+        subscribe
     }
 
     /// Handle the reception of a SubscribeError message from the publisher.
@@ -276,9 +296,11 @@ impl Subscriber {
         Ok(())
     }
 
-    /// Remove an announced namespace from our map of active announces.
+    /// Remove a published namespace from the active map (called when sending CANCEL/ERROR).
     fn drop_publish_namespace(&mut self, namespace: &TrackNamespace) {
-        self.announced.lock().unwrap().remove(namespace);
+        if let Ok(mut ns) = self.published_namespaces.lock() {
+            ns.remove(namespace);
+        }
     }
 
     /// Get a subscribe id by track alias, waiting up to the specified timeout if not present.
@@ -412,7 +434,10 @@ impl Subscriber {
                 .await
             {
                 // Look up the subscribe by id
-                let mut subscribes = self.subscribes.lock().unwrap();
+                let mut subscribes = self
+                    .subscribes
+                    .lock()
+                    .map_err(|_| SessionError::Internal)?;
                 let subscribe = subscribes.get_mut(&subscribe_id).ok_or_else(|| {
                     ServeError::not_found_ctx(format!(
                         "subscribe_id={} not found for track_alias={}",
@@ -700,7 +725,13 @@ impl Subscriber {
             .await
         {
             // Look up the subscribe by id
-            if let Some(subscribe) = self.subscribes.lock().unwrap().get_mut(&subscribe_id) {
+            if let Some(subscribe) = self
+                .subscribes
+                .lock()
+                .ok()
+                .as_mut()
+                .and_then(|s| s.get_mut(&subscribe_id))
+            {
                 tracing::trace!(
                     "[SUBSCRIBER] recv_datagram: track_alias={}, group_id={}, object_id={}, publisher_priority={}, status={}, payload_length={}",
                     datagram.track_alias,
