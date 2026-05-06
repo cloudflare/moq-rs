@@ -56,17 +56,15 @@ impl Session {
 
     /// Drain incoming PUBLISH_NAMESPACEs and reject each one.
     ///
-    /// The transport `Subscriber` queues incoming PUBLISH_NAMESPACE messages
-    /// as `Announced` events. Dropping an `Announced` without calling `ok()`
-    /// triggers its `Drop` impl, which sends PUBLISH_NAMESPACE_ERROR back
-    /// to the peer.
+    /// Dropping a `PublishedNamespace` without calling `ok()` triggers its
+    /// `Drop` impl, which sends REQUEST_ERROR back to the peer.
     async fn drain_and_reject_publishes(mut subscriber: Subscriber) -> Result<(), SessionError> {
-        while let Some(announced) = subscriber.announced().await {
+        while let Some(published_ns) = subscriber.published_namespace().await {
             tracing::debug!(
-                namespace = %announced.namespace,
+                namespace = %published_ns.namespace,
                 "rejecting PUBLISH_NAMESPACE: publish not permitted for this session"
             );
-            drop(announced);
+            drop(published_ns);
         }
         Ok(())
     }

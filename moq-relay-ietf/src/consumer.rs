@@ -7,7 +7,7 @@ use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     serve::Tracks,
-    session::{Announced, SessionError, Subscriber},
+    session::{PublishedNamespace, SessionError, Subscriber},
 };
 
 use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer};
@@ -42,27 +42,31 @@ impl Consumer {
         }
     }
 
-    /// Run the consumer to serve announce requests.
+    /// Run the consumer to handle inbound PUBLISH_NAMESPACE requests.
     pub async fn run(mut self) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
 
         loop {
             tokio::select! {
-                // Handle a new announce request
-                Some(announce) = self.subscriber.announced() => {
+                Some(published_ns) = self.subscriber.published_namespace() => {
                     metrics::counter!("moq_relay_publishers_total").increment(1);
 
                     let this = self.clone();
 
                     tasks.push(async move {
-                        let info = announce.clone();
+                        let info = published_ns.clone();
                         let namespace = info.namespace.to_utf8_path();
-                        tracing::info!(namespace = %namespace, "serving announce: {:?}", info);
+                        tracing::info!(
+                            namespace = %namespace,
+                            "serving PUBLISH_NAMESPACE: {:?}", info
+                        );
 
-                        // Serve the announce request
-                        if let Err(err) = this.serve(announce).await {
-                            tracing::warn!(namespace = %namespace, error = %err, "failed serving announce: {:?}, error: {}", info, err);
-                            // Note: phase-specific error counters are incremented in serve()
+                        if let Err(err) = this.serve(published_ns).await {
+                            tracing::warn!(
+                                namespace = %namespace,
+                                error = %err,
+                                "failed serving PUBLISH_NAMESPACE: {:?}", info
+                            );
                         }
                     });
                 },
@@ -72,22 +76,18 @@ impl Consumer {
         }
     }
 
-    /// Serve an announce request.
-    async fn serve(mut self, mut announce: Announced) -> Result<(), anyhow::Error> {
-        // Track active publishers - decrements when this function returns
+    /// Serve an inbound PUBLISH_NAMESPACE.
+    async fn serve(mut self, mut published_ns: PublishedNamespace) -> Result<(), anyhow::Error> {
+        // Track active publishers - decrements when this function returns.
         let _publisher_guard = GaugeGuard::new("moq_relay_active_publishers");
 
         let mut tasks = FuturesUnordered::new();
 
-        // Produce the tracks for this announce and return the reader
-        let (_, mut request, reader) = Tracks::new(announce.namespace.clone()).produce();
-
-        // should we allow the same namespace being served from multiple relays??
-        // Manish: NO.
+        let (_, mut request, reader) = Tracks::new(published_ns.namespace.clone()).produce();
 
         let ns = reader.namespace.to_utf8_path();
 
-        // Register the local tracks, unregister on drop
+        // Register the namespace locally so downstream subscribers can be served.
         tracing::debug!(namespace = %ns, "registering namespace in locals");
         let _register = match self
             .locals
@@ -103,10 +103,7 @@ impl Consumer {
         };
         tracing::debug!(namespace = %ns, "namespace registered in locals");
 
-        // NOTE(mpandit): once the track is pulled from origin, internally it will be relayed
-        // from this metal only, because now coordinator will have entry for the namespace.
-
-        // Register namespace with the coordinator
+        // Register namespace with the coordinator so other relay nodes can route to us.
         tracing::debug!(namespace = %ns, "registering namespace with coordinator");
         let _namespace_registration = match self
             .coordinator
@@ -122,55 +119,60 @@ impl Consumer {
         };
         tracing::debug!(namespace = %ns, "namespace registered with coordinator");
 
-        // Accept the announce with an OK response
-        if let Err(err) = announce.ok() {
-            metrics::counter!("moq_relay_announce_errors_total", "phase" => "send_ok").increment(1);
+        // Accept the PUBLISH_NAMESPACE with REQUEST_OK.
+        if let Err(err) = published_ns.ok() {
+            metrics::counter!("moq_relay_announce_errors_total", "phase" => "send_ok")
+                .increment(1);
             return Err(err.into());
         }
-        tracing::debug!(namespace = %ns, "sent ANNOUNCE_OK");
-
-        // Successfully sent ANNOUNCE_OK
+        tracing::debug!(namespace = %ns, "sent REQUEST_OK for PUBLISH_NAMESPACE");
         metrics::counter!("moq_relay_announce_ok_total").increment(1);
 
-        // Forward the announce, if needed
+        // Forward the namespace upstream, if configured.
         if let Some(mut forward) = self.forward {
             tasks.push(
                 async move {
                     let namespace = reader.namespace.to_utf8_path();
-                    tracing::info!(namespace = %namespace, "forwarding announce: {:?}", reader.info);
+                    tracing::info!(
+                        namespace = %namespace,
+                        "forwarding PUBLISH_NAMESPACE: {:?}", reader.info
+                    );
                     forward
-                        .announce(reader)
+                        .publish_namespace(reader)
                         .await
-                        .context("failed forwarding announce")
+                        .context("failed forwarding PUBLISH_NAMESPACE")
                 }
                 .boxed(),
             );
         }
 
-        // Serve subscribe requests
         loop {
             tokio::select! {
-                // If the announce is closed, return the error
-                Err(err) = announce.closed() => {
-                    let ns = announce.namespace.to_utf8_path();
-                    tracing::info!(namespace = %ns, error = %err, "announce closed");
+                Err(err) = published_ns.closed() => {
+                    let ns = published_ns.namespace.to_utf8_path();
+                    tracing::info!(namespace = %ns, error = %err, "PUBLISH_NAMESPACE closed");
                     return Err(err.into());
                 },
-
-                // Wait for the next subscriber and serve the track.
                 Some(track) = request.next() => {
                     let mut subscriber = self.subscriber.clone();
 
-                    // Spawn a new task to handle the subscribe
                     tasks.push(async move {
                         let info = track.clone();
                         let namespace = info.namespace.to_utf8_path();
                         let track_name = info.name.clone();
-                        tracing::info!(namespace = %namespace, track = %track_name, "forwarding subscribe: {:?}", info);
+                        tracing::info!(
+                            namespace = %namespace,
+                            track = %track_name,
+                            "forwarding subscribe: {:?}", info
+                        );
 
-                        // Forward the subscribe request
                         if let Err(err) = subscriber.subscribe(track).await {
-                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed forwarding subscribe: {:?}, error: {}", info, err)
+                            tracing::warn!(
+                                namespace = %namespace,
+                                track = %track_name,
+                                error = %err,
+                                "failed forwarding subscribe: {:?}", info
+                            )
                         }
 
                         Ok(())

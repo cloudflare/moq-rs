@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         res = run_media(media) => {
             res.context("media error")?
         },
-        res = publisher.announce(reader) => res.context("publisher error")?,
+        res = publisher.publish_namespace(reader) => res.context("publisher error")?,
     }
 
     Ok(())

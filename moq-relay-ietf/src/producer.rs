@@ -39,9 +39,9 @@ impl Producer {
         }
     }
 
-    /// Announce new tracks to the remote server.
-    pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        self.publisher.announce(tracks).await
+    /// Send PUBLISH_NAMESPACE for a set of tracks to the remote peer.
+    pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+        self.publisher.publish_namespace(tracks).await
     }
 
     /// Run the producer to serve subscribe requests.

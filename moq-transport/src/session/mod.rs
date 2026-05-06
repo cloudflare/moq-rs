@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-mod announce;
-mod announced;
 mod error;
+mod publish_namespace;
+mod published_namespace;
 mod publisher;
 mod reader;
 mod subscribe;
@@ -13,9 +13,9 @@ mod subscriber;
 mod track_status_requested;
 mod writer;
 
-pub use announce::*;
-pub use announced::*;
 pub use error::*;
+pub use publish_namespace::*;
+pub use published_namespace::*;
 pub use publisher::*;
 pub use subscribe::*;
 pub use subscribed::*;
