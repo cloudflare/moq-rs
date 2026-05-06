@@ -180,7 +180,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
 async fn connect(args: &Args, relay_url: &Url) -> Result<web_transport::Session> {
     let tls = args.tls.load()?;
-    let quic = quic::Endpoint::new(quic::Config::new("[::]:0".parse()?, None, tls))?;
+    // Use 0.0.0.0:0 for IPv4 relay addresses, [::]:0 for IPv6
+    let bind_addr = if relay_url.host_str().map(|h| h.contains(':')).unwrap_or(false) {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let quic = quic::Endpoint::new(quic::Config::new(bind_addr.parse()?, None, tls))?;
     let (session, _cid) = quic.client.connect(relay_url, None).await?;
     Ok(session)
 }
