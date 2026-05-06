@@ -75,8 +75,20 @@ pub enum DecodeError {
     #[error("key-value-pair length exceeded")]
     KeyValuePairLengthExceeded(),
 
+    /// Delta-encoded KVP type would overflow u64 (draft-16 §1.4.2 PROTOCOL_VIOLATION).
+    #[error("key-value-pair type delta overflow")]
+    KvpTypeOverflow,
+
     #[error("field '{0}' too large")]
     FieldBoundsExceeded(String),
+
+    /// A namespace field had zero length (draft-16 §2.4.1 PROTOCOL_VIOLATION).
+    #[error("namespace field must not be empty")]
+    EmptyNamespaceField,
+
+    /// A full track name exceeded 4096 bytes (draft-16 §2.4.1 PROTOCOL_VIOLATION).
+    #[error("full track name exceeds 4096 bytes")]
+    TrackNameTooLong,
 
     #[error("invalid datagram type")]
     InvalidDatagramType,
