@@ -18,4 +18,6 @@ pub use param_types::*;
 pub use server::*;
 pub use version::*;
 
-pub const ALPN: &[u8] = b"moq-00";
+/// ALPN identifier for draft-ietf-moq-transport-16.
+/// Used for native QUIC connections; WebTransport uses the WT-Available-Protocols header instead.
+pub const ALPN: &[u8] = b"moqt-16";
