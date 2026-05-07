@@ -208,33 +208,29 @@ fn create_control_message_event(
     }
 }
 
-/// Create a control_message_parsed event for CLIENT_SETUP
+/// Create a control_message_parsed event for CLIENT_SETUP.
+/// From draft-16 the setup payload carries only parameters; version is agreed via ALPN.
 pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Event {
-    let versions: Vec<String> = msg.versions.0.iter().map(|v| format!("{:?}", v)).collect();
     create_control_message_event(
         time,
         stream_id,
         true,
         "client_setup",
-        json!(
-        {
-            "number_of_supported_versions": msg.versions.0.len(),
-            "supported_versions": versions,
+        json!({
             "parameters": key_value_pairs_to_vec(&msg.params.0),
         }),
     )
 }
 
-/// Create a control_message_created event for SERVER_SETUP
+/// Create a control_message_created event for SERVER_SETUP.
+/// From draft-16 the setup payload carries only parameters; version is agreed via ALPN.
 pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Server) -> Event {
     create_control_message_event(
         time,
         stream_id,
         false,
         "server_setup",
-        json!(
-        {
-            "selected_version": format!("{:?}", msg.version),
+        json!({
             "parameters": key_value_pairs_to_vec(&msg.params.0),
         }),
     )

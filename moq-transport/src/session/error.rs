@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::{coding, serve, setup};
+use crate::{coding, serve};
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum SessionError {
@@ -14,10 +14,6 @@ pub enum SessionError {
 
     #[error("decode error: {0}")]
     Decode(#[from] coding::DecodeError),
-
-    // TODO move to a ConnectError
-    #[error("unsupported versions: client={0:?} server={1:?}")]
-    Version(setup::Versions, setup::Versions),
 
     /// TODO SLG - eventually remove or morph into error for incorrect control message for publisher/subscriber
     /// The role negiotiated in the handshake was violated. For example, a publisher sent a SUBSCRIBE, or a subscriber sent an OBJECT.
@@ -58,8 +54,6 @@ impl SessionError {
             Self::Encode(_) => 0x1,
             Self::BoundsExceeded(_) => 0x1,
             Self::Internal => 0x1,
-            // VERSION_NEGOTIATION_FAILED (0x15)
-            Self::Version(..) => 0x15,
             // PROTOCOL_VIOLATION (0x3) - Malformed messages
             Self::Decode(_) => 0x3,
             Self::WrongSize => 0x3,

@@ -183,14 +183,6 @@ impl Session {
         self.connection_path.as_deref()
     }
 
-    // Helper for determining the largest supported version
-    fn largest_common<T: Ord + Clone + Eq>(a: &[T], b: &[T]) -> Option<T> {
-        a.iter()
-            .filter(|x| b.contains(x)) // keep only items also in b
-            .cloned() // clone because we return T, not &T
-            .max() // take the largest
-    }
-
     /// Log a control message with structured fields for observability.
     /// Uses target "moq_transport::control" so it can be filtered independently.
     fn log_control_message(msg: &Message, direction: &str) {
@@ -526,93 +518,105 @@ impl Session {
         (session, publisher, subscriber)
     }
 
-    /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for
-    /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
+    /// Create an outbound/client QUIC connection.
     ///
-    /// If the session URL contains a non-trivial path (not empty or "/"), the PATH
-    /// parameter (key 0x1) is automatically sent in CLIENT_SETUP. This propagates
-    /// the connection path (App ID / MoQT scope) to the remote peer, which is needed
-    /// for relay-to-relay connections. To connect without sending PATH, use a URL
-    /// with no path component.
+    /// Opens the bidirectional control stream, sends CLIENT_SETUP with
+    /// parameters only (version is agreed via ALPN), and waits for SERVER_SETUP.
+    ///
+    /// For native `moqt://` connections the PATH and AUTHORITY parameters are
+    /// sent automatically.  For WebTransport the path is carried in the HTTP/3
+    /// CONNECT URL so PATH is not sent.
     pub async fn connect(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
-        // Auto-extract path from the session URL.
-        // This aligns with the unified moqt:// URI scheme direction (IETF PR #1486)
-        // where the path is always part of the URI regardless of transport.
-        let url_path = session.url().path();
+        let url = session.url().clone();
+        let url_path = url.path();
         let path = Self::normalize_connection_path(url_path)?;
-        let mlog = mlog_path.and_then(|path| {
-            mlog::MlogWriter::new(path)
+
+        let mlog = mlog_path.and_then(|p| {
+            mlog::MlogWriter::new(p)
                 .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
                 .ok()
         });
+
         let control = session.open_bi().await?;
         let mut sender = Writer::new(control.0);
         let mut recver = Reader::new(control.1);
 
-        let versions: setup::Versions = [setup::Version::DRAFT_14].into();
-
-        // TODO SLG - make configurable?
         let mut params = KeyValuePairs::default();
+        // TODO: make MAX_REQUEST_ID configurable.
         params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
-        // Only send PATH in CLIENT_SETUP for raw QUIC connections.
-        // For WebTransport, the path is already carried in the HTTP/3 CONNECT URL.
-        if let Some(ref path) = path {
-            if transport == Transport::RawQuic {
-                params.set_bytesvalue(setup::ParameterType::Path.into(), path.as_bytes().to_vec());
+        if transport == Transport::RawQuic {
+            // Draft-16 §9.3.1.1: send AUTHORITY for native QUIC.
+            if let Some(host) = url.host_str() {
+                let authority = if let Some(port) = url.port() {
+                    format!("{}:{}", host, port)
+                } else {
+                    host.to_string()
+                };
+                params.set_bytesvalue(
+                    setup::ParameterType::Authority.into(),
+                    authority.into_bytes(),
+                );
+            }
+
+            // Draft-16 §9.3.1.2: send PATH (path + optional query) for native QUIC.
+            let path_and_query = match url.query() {
+                Some(q) => format!("{}?{}", url_path, q),
+                None => url_path.to_string(),
+            };
+            if !path_and_query.is_empty() && path_and_query != "/" {
+                params.set_bytesvalue(
+                    setup::ParameterType::Path.into(),
+                    path_and_query.into_bytes(),
+                );
             }
         }
 
-        let client = setup::Client {
-            versions: versions.clone(),
-            params,
-        };
+        let client = setup::Client { params };
 
         tracing::debug!(
             target: "moq_transport::control",
             direction = "sent",
             msg_type = "CLIENT_SETUP",
-            versions = ?client.versions,
             ?transport,
             path = path.as_deref(),
             "MoQT control message"
         );
         sender.encode(&client).await?;
 
-        // TODO: emit client_setup_created event when we add that
-
-        let server: setup::Server = recver.decode().await?;
+        let _server: setup::Server = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
             msg_type = "SERVER_SETUP",
-            version = ?server.version,
             "MoQT control message"
         );
 
-        // TODO: emit server_setup_parsed event
-
-        // We are the client, so the first request id is 0
+        // Client uses even request IDs starting at 0.
         let session = Session::new(session, sender, recver, 0, mlog, transport, path);
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
-    /// Accepts an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for
-    /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
+    /// Accept an inbound server connection.
+    ///
+    /// Waits for the bidirectional control stream, decodes CLIENT_SETUP,
+    /// sends SERVER_SETUP with parameters only.  Version is already agreed
+    /// via ALPN before this is called.
     pub async fn accept(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
-        let mut mlog = mlog_path.and_then(|path| {
-            mlog::MlogWriter::new(path)
+        let mut mlog = mlog_path.and_then(|p| {
+            mlog::MlogWriter::new(p)
                 .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
                 .ok()
         });
+
         let control = session.accept_bi().await?;
         let mut sender = Writer::new(control.0);
         let mut recver = Reader::new(control.1);
@@ -622,27 +626,20 @@ impl Session {
             target: "moq_transport::control",
             direction = "recv",
             msg_type = "CLIENT_SETUP",
-            versions = ?client.versions,
             "MoQT control message"
         );
 
-        // Extract WebTransport URL path from the underlying session.
-        // For WebTransport connections, this comes from the HTTP/3 CONNECT :path.
-        // For raw QUIC, this is the placeholder URL ("moqt://localhost") and has no meaningful path.
+        // For WebTransport the path arrives in the HTTP/3 CONNECT :path.
+        // For raw QUIC the PATH setup parameter carries it instead.
         let wt_url_path = session.url().path();
         let wt_path = Self::normalize_connection_path(wt_url_path)?;
 
-        // Extract CLIENT_SETUP PATH parameter (key 0x1, BytesValue).
-        // Used for raw QUIC connections where there's no HTTP CONNECT URL.
         let client_setup_path = if wt_path.is_none() {
             Self::decode_client_setup_path(&client.params)?
         } else {
             None
         };
 
-        // Combine: WebTransport URL path takes precedence over CLIENT_SETUP PATH.
-        // WebTransport connections always have the path in the CONNECT URL.
-        // Raw QUIC connections only have CLIENT_SETUP PATH.
         let connection_path = wt_path.or(client_setup_path);
 
         if connection_path.is_some() {
@@ -652,55 +649,41 @@ impl Session {
             );
         }
 
-        // Emit mlog event for CLIENT_SETUP parsed
         if let Some(ref mut mlog) = mlog {
             let event = mlog::events::client_setup_parsed(mlog.elapsed_ms(), 0, &client);
             let _ = mlog.add_event(event);
         }
 
-        let server_versions = setup::Versions(vec![setup::Version::DRAFT_14]);
+        let mut params = KeyValuePairs::default();
+        // TODO: make MAX_REQUEST_ID configurable.
+        params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
-        if let Some(largest_common_version) =
-            Self::largest_common(&server_versions, &client.versions)
-        {
-            // TODO SLG - make configurable?
-            let mut params = KeyValuePairs::default();
-            params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
+        let server = setup::Server { params };
 
-            let server = setup::Server {
-                version: largest_common_version,
-                params,
-            };
+        tracing::debug!(
+            target: "moq_transport::control",
+            direction = "sent",
+            msg_type = "SERVER_SETUP",
+            "MoQT control message"
+        );
 
-            tracing::debug!(
-                target: "moq_transport::control",
-                direction = "sent",
-                msg_type = "SERVER_SETUP",
-                version = ?server.version,
-                "MoQT control message"
-            );
-
-            // Emit mlog event for SERVER_SETUP created
-            if let Some(ref mut mlog) = mlog {
-                let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
-                let _ = mlog.add_event(event);
-            }
-
-            sender.encode(&server).await?;
-
-            // We are the server, so the first request id is 1
-            Ok(Session::new(
-                session,
-                sender,
-                recver,
-                1,
-                mlog,
-                transport,
-                connection_path,
-            ))
-        } else {
-            Err(SessionError::Version(client.versions, server_versions))
+        if let Some(ref mut mlog) = mlog {
+            let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
+            let _ = mlog.add_event(event);
         }
+
+        sender.encode(&server).await?;
+
+        // Server uses odd request IDs starting at 1.
+        Ok(Session::new(
+            session,
+            sender,
+            recver,
+            1,
+            mlog,
+            transport,
+            connection_path,
+        ))
     }
 
     /// Run Tasks for the session, including sending of control messages, receiving and processing
