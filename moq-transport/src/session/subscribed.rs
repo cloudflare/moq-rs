@@ -307,7 +307,10 @@ impl Subscribed {
         let mut object_count = 0;
         while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
             let subgroup_object = data::SubgroupObjectExt {
-                object_id_delta: 0, // before delta logic, used to be subgroup_object_reader.object_id,
+                // TODO(itzmanish): compute real delta when the receive side uses object IDs
+                // for ordering. Both sender and receiver must agree on the same prev tracking
+                // semantics before this is meaningful.
+                object_id_delta: 0,
                 extension_headers: subgroup_object_reader.extension_headers.clone(), // Pass through extension headers
                 payload_length: subgroup_object_reader.size,
                 status: if subgroup_object_reader.size == 0 {
@@ -543,4 +546,5 @@ mod tests {
             message::PublishDoneCode::InternalError as u64
         );
     }
+
 }
