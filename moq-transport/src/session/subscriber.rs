@@ -5,7 +5,7 @@
 use std::{
     collections::{hash_map, HashMap},
     io,
-    sync::{atomic, Arc, Mutex},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -22,8 +22,8 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    PublishedNamespace, PublishedNamespaceRecv, Reader, Session, SessionError, Subscribe,
-    SubscribeRecv,
+    PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session,
+    SessionError, Subscribe, SubscribeRecv,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -51,12 +51,13 @@ pub struct Subscriber {
     /// will process the queue and send the message on the control stream.
     outgoing: Queue<Message>,
 
-    /// When we need a new Request Id for sending a request, we can get it from here.  Note:  The instance
-    /// of AtomicU64 is shared with the Subscriber, so the session uses unique request ids for all requests
-    /// generated.  Note:  If we initiated the QUIC connection then request id's start at 0 and increment by 2
-    /// for each request (even numbers).  If we accepted an inbound QUIC connection then request id's start at 1 and
-    /// increment by 2 for each request (odd numbers).
-    next_requestid: Arc<atomic::AtomicU64>,
+    /// Shared with Publisher so all requests within a session use unique IDs.
+    /// When we need a new Request Id for sending a request, we can get it from here.
+    /// The manager is shared with the Publisher, so the session uses unique request ids
+    /// for all requests generated.  If we initiated the QUIC connection then request
+    /// IDs start at 0 and increment by 2 (even numbers).  If we accepted an inbound
+    /// QUIC connection then request IDs start at 1 and increment by 2 (odd numbers).
+    request_id: RequestId,
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
@@ -65,8 +66,8 @@ pub struct Subscriber {
 impl Subscriber {
     pub(super) fn new(
         outgoing: Queue<Message>,
-        next_requestid: Arc<atomic::AtomicU64>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        request_id: RequestId,
     ) -> Self {
         Self {
             published_namespaces: Default::default(),
@@ -74,7 +75,7 @@ impl Subscriber {
             subscribes: Default::default(),
             subscribe_alias_map: Default::default(),
             outgoing,
-            next_requestid,
+            request_id,
             mlog,
             subscribe_alias_notify: Arc::new(Notify::new()),
         }
@@ -103,14 +104,32 @@ impl Subscriber {
         self.published_namespace_queue.pop().await
     }
 
-    /// Get the current next request id to use and increment the value for by 2 for the next request
-    fn get_next_request_id(&self) -> u64 {
-        self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed)
+    /// Allocate the next outbound request ID, enforcing the peer-advertised maximum.
+    ///
+    /// Returns `Err(TooManyRequests)` if no budget remains and also sends
+    /// REQUESTS_BLOCKED if not already sent for this limit.
+    fn get_next_request_id(&mut self) -> Result<u64, SessionError> {
+        match self.request_id.allocate()? {
+            RequestIdAllocation::Allocated(id) => Ok(id),
+            blocked @ RequestIdAllocation::Blocked { .. } => {
+                if let Some(msg) = blocked.requests_blocked() {
+                    let _ = self.outgoing.push(msg.into());
+                }
+                Err(SessionError::TooManyRequests)
+            }
+        }
     }
 
     pub fn track_status(&mut self, track_namespace: &TrackNamespace, track_name: &str) {
+        let id = match self.get_next_request_id() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not send TRACK_STATUS: request ID limit reached");
+                return;
+            }
+        };
         self.send_message(message::TrackStatus {
-            id: self.get_next_request_id(),
+            id,
             track_namespace: track_namespace.clone(),
             track_name: track_name.to_string(),
             subscriber_priority: 127, // default to mid value, see: https://github.com/moq-wg/moq-transport/issues/504
@@ -121,7 +140,7 @@ impl Subscriber {
             end_group_id: None,
             params: Default::default(),
         });
-        // TODO make async and wait for response?
+        // TODO(itzmanish): make async and wait for response?
     }
 
     /// Subscribe to a track by creating a new subscribe request to the publisher.  Block until subscription is closed.
@@ -135,7 +154,9 @@ impl Subscriber {
         &mut self,
         track: serve::TrackWriter,
     ) -> Result<Subscribe, ServeError> {
-        let request_id = self.get_next_request_id();
+        let request_id = self
+            .get_next_request_id()
+            .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
         let (send, recv) = Subscribe::new(self.clone(), request_id, track);
         self.subscribes
             .lock()

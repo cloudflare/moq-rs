@@ -167,6 +167,26 @@ macro_rules! message_types {
                     $(Self::$name(_) => stringify!($name),)*
                 }
             }
+
+            /// Return the request ID if this message participates in request ID sequencing.
+            ///
+            /// Responses and cancellation messages reference existing request IDs
+            /// and therefore return `None`. This is used only for request ID
+            /// sequencing validation on receive.
+            pub fn sequenced_request_id(&self) -> Option<u64> {
+                match self {
+                    Self::Subscribe(m) => Some(m.id),
+                    Self::RequestUpdate(m) => Some(m.id),
+                    Self::Fetch(m) => Some(m.id),
+                    Self::TrackStatus(m) => Some(m.id),
+                    Self::SubscribeNamespace(m) => Some(m.id),
+                    Self::Publish(m) => Some(m.id),
+                    Self::PublishNamespace(m) => Some(m.id),
+                    // Legacy pre-draft-16 request update stub.
+                    Self::SubscribeUpdate(m) => Some(m.id),
+                    _ => None,
+                }
+            }
         }
 
         $(impl From<$name> for Message {
@@ -252,4 +272,151 @@ message_types! {
     UnsubscribeNamespace    = 0x108,
     PublishError            = 0x109,
     SubscribeUpdate         = 0x10a,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::{KeyValuePairs, Location, ReasonPhrase, TrackNamespace};
+
+    fn namespace() -> TrackNamespace {
+        TrackNamespace::from_utf8_path("test/ns")
+    }
+
+    fn assert_sequenced(msg: Message, id: u64) {
+        assert_eq!(msg.sequenced_request_id(), Some(id));
+    }
+
+    fn assert_not_sequenced(msg: Message) {
+        assert_eq!(msg.sequenced_request_id(), None);
+    }
+
+    #[test]
+    fn sequenced_request_id_covers_all_request_start_messages() {
+        assert_sequenced(Message::Subscribe(Subscribe {
+            id: 0,
+            track_namespace: namespace(),
+            track_name: "track".to_string(),
+            subscriber_priority: 127,
+            group_order: GroupOrder::Publisher,
+            forward: true,
+            filter_type: FilterType::LargestObject,
+            start_location: None,
+            end_group_id: None,
+            params: KeyValuePairs::default(),
+        }), 0);
+
+        assert_sequenced(Message::RequestUpdate(RequestUpdate {
+            id: 2,
+            existing_request_id: 0,
+            params: KeyValuePairs::default(),
+        }), 2);
+
+        assert_sequenced(Message::Fetch(Fetch {
+            id: 4,
+            subscriber_priority: 127,
+            group_order: GroupOrder::Ascending,
+            fetch_type: FetchType::Standalone,
+            standalone_fetch: Some(StandaloneFetch {
+                track_namespace: namespace(),
+                track_name: "track".to_string(),
+                start_location: Location::new(0, 0),
+                end_location: Location::new(0, 1),
+            }),
+            joining_fetch: None,
+            params: KeyValuePairs::default(),
+        }), 4);
+
+        assert_sequenced(Message::TrackStatus(TrackStatus {
+            id: 6,
+            track_namespace: namespace(),
+            track_name: "track".to_string(),
+            subscriber_priority: 127,
+            group_order: GroupOrder::Publisher,
+            forward: true,
+            filter_type: FilterType::LargestObject,
+            start_location: None,
+            end_group_id: None,
+            params: KeyValuePairs::default(),
+        }), 6);
+
+        assert_sequenced(Message::SubscribeNamespace(SubscribeNamespace {
+            id: 8,
+            track_namespace_prefix: namespace(),
+            params: KeyValuePairs::default(),
+        }), 8);
+
+        assert_sequenced(Message::Publish(Publish {
+            id: 10,
+            track_namespace: namespace(),
+            track_name: "track".to_string(),
+            track_alias: 1,
+            group_order: GroupOrder::Ascending,
+            content_exists: false,
+            largest_location: None,
+            forward: true,
+            params: KeyValuePairs::default(),
+        }), 10);
+
+        assert_sequenced(Message::PublishNamespace(PublishNamespace {
+            id: 12,
+            track_namespace: namespace(),
+            params: KeyValuePairs::default(),
+        }), 12);
+    }
+
+    #[test]
+    fn sequenced_request_id_ignores_messages_that_reference_existing_requests() {
+        assert_not_sequenced(Message::RequestOk(RequestOk {
+            id: 0,
+            params: KeyValuePairs::default(),
+        }));
+
+        assert_not_sequenced(Message::RequestError(RequestError {
+            id: 0,
+            error_code: 0,
+            retry_interval: 0,
+            reason: ReasonPhrase(String::new()),
+        }));
+
+        assert_not_sequenced(Message::SubscribeOk(SubscribeOk {
+            id: 0,
+            track_alias: 1,
+            expires: 0,
+            group_order: GroupOrder::Publisher,
+            content_exists: false,
+            largest_location: None,
+            params: KeyValuePairs::default(),
+        }));
+
+        assert_not_sequenced(Message::Unsubscribe(Unsubscribe { id: 0 }));
+
+        assert_not_sequenced(Message::FetchCancel(FetchCancel { id: 0 }));
+
+        assert_not_sequenced(Message::FetchOk(FetchOk {
+            id: 0,
+            group_order: GroupOrder::Ascending,
+            end_of_track: false,
+            end_location: Location::new(0, 0),
+            params: KeyValuePairs::default(),
+        }));
+
+        assert_not_sequenced(Message::PublishOk(PublishOk {
+            id: 0,
+            forward: true,
+            filter_type: FilterType::LargestObject,
+            start_location: None,
+            end_group_id: None,
+            subscriber_priority: 127,
+            group_order: GroupOrder::Publisher,
+            params: KeyValuePairs::default(),
+        }));
+
+        assert_not_sequenced(Message::PublishDone(PublishDone {
+            id: 0,
+            status_code: 0,
+            stream_count: 0,
+            reason: ReasonPhrase(String::new()),
+        }));
+    }
 }

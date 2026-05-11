@@ -4,7 +4,7 @@
 
 use std::{
     collections::{hash_map, HashMap},
-    sync::{atomic, Arc, Mutex},
+    sync::{Arc, Mutex},
 };
 
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -19,8 +19,8 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    PublishNamespace, PublishNamespaceRecv, Session, SessionError, Subscribed, SubscribedRecv,
-    TrackStatusRequested,
+    PublishNamespace, PublishNamespaceRecv, RequestId, RequestIdAllocation, Session, SessionError,
+    Subscribed, SubscribedRecv, TrackStatusRequested,
 };
 
 // TODO remove Clone.
@@ -45,8 +45,12 @@ pub struct Publisher {
     outgoing: Queue<Message>,
 
     /// Shared with Subscriber so all requests within a session use unique IDs.
-    /// Client connections start at 0 (even), server at 1 (odd); increments by 2.
-    next_requestid: Arc<atomic::AtomicU64>,
+    /// When we need a new Request Id for sending a request, we can get it from here.
+    /// The manager is shared with the Subscriber, so the session uses unique request ids
+    /// for all requests generated.  If we initiated the QUIC connection then request
+    /// IDs start at 0 and increment by 2 (even numbers).  If we accepted an inbound
+    /// QUIC connection then request IDs start at 1 and increment by 2 (odd numbers).
+    request_id: RequestId,
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
@@ -56,8 +60,8 @@ impl Publisher {
     pub(crate) fn new(
         outgoing: Queue<Message>,
         webtransport: web_transport::Session,
-        next_requestid: Arc<atomic::AtomicU64>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        request_id: RequestId,
     ) -> Self {
         Self {
             webtransport,
@@ -66,7 +70,7 @@ impl Publisher {
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
             outgoing,
-            next_requestid,
+            request_id,
             mlog,
         }
     }
@@ -100,7 +104,16 @@ impl Publisher {
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
 
             hash_map::Entry::Vacant(entry) => {
-                let request_id = self.next_requestid.fetch_add(2, atomic::Ordering::Relaxed);
+                // Allocate a request ID, enforcing the peer-advertised maximum.
+                let request_id = match self.request_id.allocate()? {
+                    RequestIdAllocation::Allocated(id) => id,
+                    blocked @ RequestIdAllocation::Blocked { .. } => {
+                        if let Some(msg) = blocked.requests_blocked() {
+                            let _ = self.outgoing.push(msg.into());
+                        }
+                        return Err(SessionError::TooManyRequests);
+                    }
+                };
                 let (send, recv) =
                     PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
                 entry.insert(recv);
