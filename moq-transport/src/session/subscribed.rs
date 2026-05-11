@@ -22,10 +22,18 @@ use super::{Publisher, SessionError, SubscribeInfo, Writer};
 #[derive(Debug)]
 struct SubscribedState {
     largest_location: Option<Location>,
+    stream_count: u64,
+    /// Set to true when UNSUBSCRIBE is received.  When true, Drop skips sending
+    /// PUBLISH_DONE or REQUEST_ERROR because the subscriber already terminated.
+    unsubscribed: bool,
     closed: Result<(), ServeError>,
 }
 
 impl SubscribedState {
+    fn record_stream_opened(&mut self) {
+        self.stream_count = self.stream_count.saturating_add(1);
+    }
+
     fn update_largest_location(&mut self, group_id: u64, object_id: u64) -> Result<(), ServeError> {
         if let Some(current_largest_location) = self.largest_location {
             let update_largest_location = Location::new(group_id, object_id);
@@ -42,6 +50,8 @@ impl Default for SubscribedState {
     fn default() -> Self {
         Self {
             largest_location: None,
+            stream_count: 0,
+            unsubscribed: false,
             closed: Ok(()),
         }
     }
@@ -167,19 +177,21 @@ impl ops::Deref for Subscribed {
 impl Drop for Subscribed {
     fn drop(&mut self) {
         let state = self.state.lock();
-        let err = state
-            .closed
-            .as_ref()
-            .err()
-            .cloned()
-            .unwrap_or(ServeError::Done);
+        let err = state.closed.as_ref().err().cloned().unwrap_or(ServeError::Done);
+        let stream_count = state.stream_count;
+        let unsubscribed = state.unsubscribed;
         drop(state); // Important to avoid a deadlock
+
+        // Subscriber already sent UNSUBSCRIBE — no terminal message needed.
+        if unsubscribed {
+            return;
+        }
 
         if self.ok {
             self.publisher.send_message(message::PublishDone {
                 id: self.info.id,
-                status_code: err.code(),
-                stream_count: 0, // TODO SLG
+                status_code: Self::publish_done_code(&err),
+                stream_count,
                 reason: ReasonPhrase(err.to_string()),
             });
         } else {
@@ -196,6 +208,14 @@ impl Drop for Subscribed {
 }
 
 impl Subscribed {
+    fn publish_done_code(err: &ServeError) -> u64 {
+        match err {
+            ServeError::Done => message::PublishDoneCode::TrackEnded as u64,
+            ServeError::Closed(code) => *code,
+            _ => message::PublishDoneCode::InternalError as u64,
+        }
+    }
+
     async fn serve_subgroups(
         &mut self,
         mut subgroups: serve::SubgroupsReader,
@@ -252,6 +272,11 @@ impl Subscribed {
 
         let mut send_stream = publisher.open_uni().await?;
         tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
+
+        state
+            .lock_mut()
+            .ok_or(ServeError::Done)?
+            .record_stream_opened();
 
         // TODO figure out u32 vs u64 priority
         send_stream.set_priority(subgroup_reader.priority as i32);
@@ -459,9 +484,63 @@ impl SubscribedRecv {
         state.closed.clone()?;
 
         if let Some(mut state) = state.into_mut() {
+            state.unsubscribed = true;
             state.closed = Err(ServeError::Cancel);
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscribed_state_counts_opened_streams() {
+        let mut state = SubscribedState::default();
+        assert_eq!(state.stream_count, 0);
+
+        state.record_stream_opened();
+        assert_eq!(state.stream_count, 1);
+
+        state.record_stream_opened();
+        assert_eq!(state.stream_count, 2);
+    }
+
+    #[test]
+    fn recv_unsubscribe_marks_unsubscribed_and_closes() {
+        let state = State::<SubscribedState>::default();
+        let (_send, recv_state) = state.split();
+        let mut recv = SubscribedRecv { state: recv_state };
+
+        assert!(!recv.state.lock().unsubscribed);
+
+        recv.recv_unsubscribe().unwrap();
+
+        let locked = recv.state.lock();
+        assert!(locked.unsubscribed);
+        assert!(matches!(locked.closed, Err(ServeError::Cancel)));
+    }
+
+    #[test]
+    fn publish_done_code_maps_done_to_track_ended() {
+        assert_eq!(
+            Subscribed::publish_done_code(&ServeError::Done),
+            message::PublishDoneCode::TrackEnded as u64
+        );
+    }
+
+    #[test]
+    fn publish_done_code_passes_through_closed_code() {
+        assert_eq!(Subscribed::publish_done_code(&ServeError::Closed(0x12)), 0x12);
+    }
+
+    #[test]
+    fn publish_done_code_maps_other_errors_to_internal() {
+        assert_eq!(
+            Subscribed::publish_done_code(&ServeError::internal_ctx("test")),
+            message::PublishDoneCode::InternalError as u64
+        );
     }
 }
