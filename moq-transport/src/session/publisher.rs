@@ -393,7 +393,7 @@ impl Publisher {
             .unknown_track_status_requested
             .push(track_status_requested)
         {
-            err.respond_error(0, "Internal error")?;
+            err.respond_error(RequestErrorCode::InternalError as u64, "internal error")?;
         }
 
         Ok(())

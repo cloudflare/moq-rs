@@ -210,7 +210,10 @@ impl Producer {
             }
         }*/
 
-        track_status_requested.respond_error(4, "Track not found")?;
+        track_status_requested.respond_error(
+            moq_transport::message::RequestErrorCode::DoesNotExist as u64,
+            "track not found",
+        )?;
 
         Err(ServeError::not_found_ctx(format!(
             "track '{}/{}' not found for track_status",
