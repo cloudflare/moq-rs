@@ -400,11 +400,11 @@ impl Publisher {
     }
 
     fn recv_unsubscribe(&mut self, msg: message::Unsubscribe) -> Result<(), SessionError> {
-        if let Some(subscribed) = self
+        if let Some(mut subscribed) = self
             .subscribeds
             .lock()
             .map_err(|_| SessionError::Internal)?
-            .get_mut(&msg.id)
+            .remove(&msg.id)
         {
             subscribed.recv_unsubscribe()?;
         }
