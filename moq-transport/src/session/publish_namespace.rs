@@ -174,8 +174,10 @@ impl Drop for PublishNamespace {
             return;
         }
 
+        // Draft-16 §9.22: PUBLISH_NAMESPACE_DONE carries the Request ID,
+        // not the namespace.
         self.publisher.send_message(message::PublishNamespaceDone {
-            track_namespace: self.namespace.clone(),
+            id: self.info.request_id,
         });
     }
 }

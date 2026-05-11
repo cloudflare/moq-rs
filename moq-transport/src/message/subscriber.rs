@@ -49,10 +49,14 @@ macro_rules! subscriber_msgs {
 }
 
 // Defines messages that a SUBSCRIBER would send, or that a PUBLISHER would handle.
-// RequestUpdate is the draft-16 replacement for SubscribeUpdate (Part 7).
+// RequestUpdate is the draft-16 replacement for SubscribeUpdate.
+// RequestOk and RequestError are now sent by the subscriber for PUBLISH_NAMESPACE
+// acceptance/rejection (draft-16 §9.7/§9.8).
 subscriber_msgs! {
     Subscribe,
     RequestUpdate,
+    RequestOk,
+    RequestError,
     Unsubscribe,
     Fetch,
     FetchCancel,

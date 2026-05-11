@@ -282,7 +282,7 @@ impl Session {
                     target: "moq_transport::control",
                     direction,
                     msg_type = "PUBLISH_NAMESPACE_DONE",
-                    namespace = %m.track_namespace,
+                    request_id = m.id,
                     "MoQT control message"
                 );
             }
@@ -291,7 +291,7 @@ impl Session {
                     target: "moq_transport::control",
                     direction,
                     msg_type = "PUBLISH_NAMESPACE_CANCEL",
-                    namespace = %m.track_namespace,
+                    request_id = m.id,
                     error_code = m.error_code,
                     reason = %m.reason_phrase.0,
                     "MoQT control message"
