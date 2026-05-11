@@ -53,7 +53,7 @@ pub enum Transport {
     /// ALPN: "h3". Path carried in HTTP/3 CONNECT :path pseudo-header.
     WebTransport,
     /// Raw QUIC with MoQT framing directly on QUIC streams.
-    /// ALPN: "moq-00". Path carried in CLIENT_SETUP PATH parameter.
+    /// ALPN: "moqt-16". Path carried in CLIENT_SETUP PATH parameter.
     RawQuic,
 }
 
