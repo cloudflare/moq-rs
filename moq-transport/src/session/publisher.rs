@@ -227,10 +227,14 @@ impl Publisher {
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
         let res = match msg {
             message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg),
-            // REQUEST_UPDATE: draft-16 replacement for SubscribeUpdate (Part 7).
+            // REQUEST_UPDATE: draft-16 replacement for SubscribeUpdate (TODO itzmanish).
             message::Subscriber::RequestUpdate(_msg) => {
                 Err(SessionError::unimplemented("REQUEST_UPDATE"))
             }
+            // Draft-16: REQUEST_OK from subscriber is the acceptance of PUBLISH_NAMESPACE.
+            message::Subscriber::RequestOk(msg) => self.recv_publish_namespace_ok(msg),
+            // Draft-16: REQUEST_ERROR from subscriber is the rejection of PUBLISH_NAMESPACE.
+            message::Subscriber::RequestError(msg) => self.recv_publish_namespace_error(msg),
             // Legacy stub retained for dispatch (pre-draft-16 peers only).
             message::Subscriber::SubscribeUpdate(msg) => self.recv_subscribe_update(msg),
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg),
@@ -248,10 +252,10 @@ impl Publisher {
             message::Subscriber::PublishNamespaceCancel(msg) => {
                 self.recv_publish_namespace_cancel(msg)
             }
-            message::Subscriber::PublishNamespaceOk(msg) => self.recv_publish_namespace_ok(msg),
-            message::Subscriber::PublishNamespaceError(msg) => {
-                self.recv_publish_namespace_error(msg)
-            }
+            // Legacy stub types — stub IDs (0x100+) are never decoded from the wire;
+            // these arms exist only so the exhaustive match compiles.
+            message::Subscriber::PublishNamespaceOk(_) => Ok(()),
+            message::Subscriber::PublishNamespaceError(_) => Ok(()),
             message::Subscriber::PublishOk(_msg) => Err(SessionError::unimplemented("PUBLISH_OK")),
             message::Subscriber::PublishError(_msg) => {
                 Err(SessionError::unimplemented("PUBLISH_ERROR"))
@@ -265,12 +269,13 @@ impl Publisher {
         Ok(())
     }
 
+    /// Handle REQUEST_OK from subscriber — acceptance of our PUBLISH_NAMESPACE (draft-16 §9.7).
     fn recv_publish_namespace_ok(
         &mut self,
-        msg: message::PublishNamespaceOk,
+        msg: message::RequestOk,
     ) -> Result<(), SessionError> {
         // The publish_namespaces map is keyed by namespace; we must search by request_id.
-        // TODO: maintain a second index keyed by request_id to make this O(1).
+        // TODO(itzmanish): maintain a second index keyed by request_id to make this O(1).
         let mut namespaces = self
             .publish_namespaces
             .lock()
@@ -282,42 +287,27 @@ impl Publisher {
         Ok(())
     }
 
+    /// Handle REQUEST_ERROR from subscriber — rejection of our PUBLISH_NAMESPACE (draft-16 §9.8).
     fn recv_publish_namespace_error(
         &mut self,
-        msg: message::PublishNamespaceError,
+        msg: message::RequestError,
     ) -> Result<(), SessionError> {
-        let mut namespaces = self
-            .publish_namespaces
-            .lock()
-            .map_err(|_| SessionError::Internal)?;
-
-        let key = namespaces
-            .iter()
-            .find(|(_k, v)| v.request_id == msg.id)
-            .map(|(k, _)| k.clone());
-
-        if let Some(key) = key {
-            if let Some((_ns, v)) = namespaces.remove_entry(&key) {
-                v.recv_error(ServeError::Closed(msg.error_code))?;
-            }
+        if let Some(recv) = self.drop_publish_namespace(msg.id) {
+            recv.recv_error(ServeError::Closed(msg.error_code))?;
         }
-
         Ok(())
     }
+
+
 
     fn recv_publish_namespace_cancel(
         &mut self,
         msg: message::PublishNamespaceCancel,
     ) -> Result<(), SessionError> {
-        if let Some(ns) = self
-            .publish_namespaces
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .remove(&msg.track_namespace)
-        {
-            ns.recv_error(ServeError::Cancel)?;
+        // Draft-16 §9.24: PUBLISH_NAMESPACE_CANCEL now carries Request ID.
+        if let Some(recv) = self.drop_publish_namespace(msg.id) {
+            recv.recv_error(ServeError::Cancel)?;
         }
-
         Ok(())
     }
 
@@ -418,8 +408,10 @@ impl Publisher {
         match &msg {
             message::Publisher::PublishDone(m) => self.drop_subscribe(m.id),
             message::Publisher::SubscribeError(m) => self.drop_subscribe(m.id),
+            // Draft-16: PUBLISH_NAMESPACE_DONE carries Request ID, not namespace.
+            // Dropping the recv state signals that the namespace is done.
             message::Publisher::PublishNamespaceDone(m) => {
-                self.drop_publish_namespace(&m.track_namespace);
+                let _ = self.drop_publish_namespace(m.id);
             }
             _ => {}
         }
@@ -450,10 +442,17 @@ impl Publisher {
         }
     }
 
-    fn drop_publish_namespace(&mut self, namespace: &TrackNamespace) {
+    fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishNamespaceRecv> {
         if let Ok(mut ns) = self.publish_namespaces.lock() {
-            ns.remove(namespace);
+            let key = ns
+                .iter()
+                .find(|(_k, v)| v.request_id == id)
+                .map(|(k, _)| k.clone());
+            if let Some(key) = key {
+                return ns.remove(&key);
+            }
         }
+        None
     }
 
     pub(super) async fn open_uni(&mut self) -> Result<web_transport::SendStream, SessionError> {

@@ -171,12 +171,17 @@ impl Subscriber {
         let msg = msg.into();
 
         // Remove our entry on terminal state.
+        // Draft-16: PUBLISH_NAMESPACE_CANCEL carries Request ID, so look up
+        // the namespace by iterating the map.
         match &msg {
+            // Dropping the returned recv signals the PublishedNamespace that
+            // the cancel has been sent.
             message::Subscriber::PublishNamespaceCancel(msg) => {
-                self.drop_publish_namespace(&msg.track_namespace)
+                let _ = self.drop_publish_namespace(msg.id);
             }
-            // TODO SLG - there is no longer a namespace in the error, need to map via request id
-            message::Subscriber::PublishNamespaceError(_msg) => {} // Not implemented yet - need request id mapping
+            // PublishNamespaceError is the legacy stub (internal only; not sent on wire).
+            // REQUEST_ERROR is now used for rejections.
+            message::Subscriber::PublishNamespaceError(_msg) => {}
             _ => {}
         }
 
@@ -251,15 +256,10 @@ impl Subscriber {
         &mut self,
         msg: &message::PublishNamespaceDone,
     ) -> Result<(), SessionError> {
-        if let Some(ns) = self
-            .published_namespaces
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .remove(&msg.track_namespace)
-        {
-            ns.recv_done()?;
+        // Draft-16 §9.22: PUBLISH_NAMESPACE_DONE carries Request ID, not namespace.
+        if let Some(recv) = self.drop_publish_namespace(msg.id) {
+            recv.recv_done()?;
         }
-
         Ok(())
     }
 
@@ -367,11 +367,17 @@ impl Subscriber {
         Ok(())
     }
 
-    /// Remove a published namespace from the active map (called when sending CANCEL/ERROR).
-    fn drop_publish_namespace(&mut self, namespace: &TrackNamespace) {
+    fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishedNamespaceRecv> {
         if let Ok(mut ns) = self.published_namespaces.lock() {
-            ns.remove(namespace);
+            let key = ns
+                .iter()
+                .find(|(_k, v)| v.request_id == id)
+                .map(|(k, _)| k.clone());
+            if let Some(key) = key {
+                return ns.remove(&key);
+            }
         }
+        None
     }
 
     /// Get a subscribe id by track alias, waiting up to the specified timeout if not present.

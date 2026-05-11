@@ -5,6 +5,7 @@
 use std::ops;
 
 use crate::coding::{ReasonPhrase, TrackNamespace};
+use crate::message::RequestErrorCode;
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
@@ -47,19 +48,25 @@ impl PublishedNamespace {
             error: None,
             state: send,
         };
-        let recv = PublishedNamespaceRecv { _state: recv };
+        let recv = PublishedNamespaceRecv {
+            _state: recv,
+            request_id,
+        };
 
         (send, recv)
     }
 
-    /// Accept the PUBLISH_NAMESPACE by sending REQUEST_OK.
+    /// Accept the PUBLISH_NAMESPACE by sending REQUEST_OK (draft-16 §9.7).
     pub fn ok(&mut self) -> Result<(), ServeError> {
         if self.ok {
             return Err(ServeError::Duplicate);
         }
 
-        self.session.send_message(message::PublishNamespaceOk {
+        // Draft-16 §6.2: acceptance is signalled with REQUEST_OK, not the
+        // legacy PUBLISH_NAMESPACE_OK.
+        self.session.send_message(message::RequestOk {
             id: self.info.request_id,
+            params: Default::default(),
         });
 
         self.ok = true;
@@ -98,18 +105,20 @@ impl Drop for PublishedNamespace {
         let err = self.error.clone().unwrap_or(ServeError::Done);
 
         if self.ok {
-            // Accepted: send PUBLISH_NAMESPACE_CANCEL to revoke acceptance.
+            // Accepted: send PUBLISH_NAMESPACE_CANCEL to revoke acceptance
+            // (draft-16 §9.24).  Carries Request ID, not the namespace.
             self.session.send_message(message::PublishNamespaceCancel {
-                track_namespace: self.namespace.clone(),
+                id: self.info.request_id,
                 error_code: err.code(),
                 reason_phrase: ReasonPhrase(err.to_string()),
             });
         } else {
-            // Never accepted: send REQUEST_ERROR.
-            self.session.send_message(message::PublishNamespaceError {
+            // Never accepted: send REQUEST_ERROR (draft-16 §9.8).
+            self.session.send_message(message::RequestError {
                 id: self.info.request_id,
-                error_code: err.code(),
-                reason_phrase: ReasonPhrase(err.to_string()),
+                error_code: RequestErrorCode::Uninterested as u64,
+                retry_interval: 0,
+                reason: ReasonPhrase(err.to_string()),
             });
         }
     }
@@ -117,6 +126,9 @@ impl Drop for PublishedNamespace {
 
 pub(super) struct PublishedNamespaceRecv {
     _state: State<PublishedNamespaceState>,
+    /// Request ID of the corresponding PUBLISH_NAMESPACE, used for O(1) lookup
+    /// when PUBLISH_NAMESPACE_DONE or PUBLISH_NAMESPACE_CANCEL arrives.
+    pub request_id: u64,
 }
 
 impl PublishedNamespaceRecv {
