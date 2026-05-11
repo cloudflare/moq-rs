@@ -226,48 +226,91 @@ impl Publisher {
     }
 
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
-        let res = match msg {
-            message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg),
-            // REQUEST_UPDATE: draft-16 replacement for SubscribeUpdate (TODO itzmanish).
-            message::Subscriber::RequestUpdate(_msg) => {
-                Err(SessionError::unimplemented("REQUEST_UPDATE"))
+        match msg {
+            message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg)?,
+            // REQUEST_UPDATE: not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
+            message::Subscriber::RequestUpdate(msg) => {
+                self.send_not_supported(msg.id);
             }
-            // Draft-16: REQUEST_OK from subscriber is the acceptance of PUBLISH_NAMESPACE.
-            message::Subscriber::RequestOk(msg) => self.recv_publish_namespace_ok(msg),
-            // Draft-16: REQUEST_ERROR from subscriber is the rejection of PUBLISH_NAMESPACE.
-            message::Subscriber::RequestError(msg) => self.recv_publish_namespace_error(msg),
+            // Draft-16: REQUEST_OK from subscriber is acceptance of PUBLISH_NAMESPACE.
+            message::Subscriber::RequestOk(msg) => self.recv_publish_namespace_ok(msg)?,
+            // Draft-16: REQUEST_ERROR from subscriber is rejection of PUBLISH_NAMESPACE.
+            message::Subscriber::RequestError(msg) => self.recv_publish_namespace_error(msg)?,
             // Legacy stub retained for dispatch (pre-draft-16 peers only).
-            message::Subscriber::SubscribeUpdate(msg) => self.recv_subscribe_update(msg),
-            message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg),
-            message::Subscriber::Fetch(_msg) => Err(SessionError::unimplemented("FETCH")),
-            message::Subscriber::FetchCancel(_msg) => {
-                Err(SessionError::unimplemented("FETCH_CANCEL"))
+            message::Subscriber::SubscribeUpdate(msg) => self.recv_subscribe_update(msg)?,
+            message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg)?,
+            // FETCH not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
+            message::Subscriber::Fetch(msg) => {
+                self.send_not_supported(msg.id);
             }
-            message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg),
-            message::Subscriber::SubscribeNamespace(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE"))
+            // FETCH_CANCEL references an existing request; log and ignore.
+            message::Subscriber::FetchCancel(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received FETCH_CANCEL for unsupported FETCH — ignoring"
+                );
             }
-            message::Subscriber::UnsubscribeNamespace(_msg) => {
-                Err(SessionError::unimplemented("UNSUBSCRIBE_NAMESPACE"))
+            message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg)?,
+            // SUBSCRIBE_NAMESPACE not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
+            message::Subscriber::SubscribeNamespace(msg) => {
+                self.send_not_supported(msg.id);
+            }
+            // UNSUBSCRIBE_NAMESPACE references an existing subscription; log and ignore.
+            message::Subscriber::UnsubscribeNamespace(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    namespace_prefix = %msg.track_namespace_prefix,
+                    "received UNSUBSCRIBE_NAMESPACE for unsupported SUBSCRIBE_NAMESPACE — ignoring"
+                );
             }
             message::Subscriber::PublishNamespaceCancel(msg) => {
-                self.recv_publish_namespace_cancel(msg)
+                self.recv_publish_namespace_cancel(msg)?;
             }
             // Legacy stub types — stub IDs (0x100+) are never decoded from the wire;
             // these arms exist only so the exhaustive match compiles.
-            message::Subscriber::PublishNamespaceOk(_) => Ok(()),
-            message::Subscriber::PublishNamespaceError(_) => Ok(()),
-            message::Subscriber::PublishOk(_msg) => Err(SessionError::unimplemented("PUBLISH_OK")),
-            message::Subscriber::PublishError(_msg) => {
-                Err(SessionError::unimplemented("PUBLISH_ERROR"))
+            message::Subscriber::PublishNamespaceOk(_) => {}
+            message::Subscriber::PublishNamespaceError(_) => {}
+            // PUBLISH_OK and PUBLISH_ERROR are for publisher-initiated subscriptions
+            // which are not yet implemented — log and ignore.
+            message::Subscriber::PublishOk(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received PUBLISH_OK for unsupported PUBLISH — ignoring"
+                );
             }
-        };
-
-        if let Err(err) = res {
-            tracing::warn!(error = %err, "failed to process subscriber message");
+            message::Subscriber::PublishError(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received PUBLISH_ERROR for unsupported PUBLISH — ignoring"
+                );
+            }
         }
 
         Ok(())
+    }
+
+    /// Send REQUEST_ERROR NOT_SUPPORTED for an incoming request we do not implement.
+    ///
+    /// Draft-16 §4: limited endpoints SHOULD respond with NOT_SUPPORTED rather
+    /// than ignoring unsupported request types.
+    fn send_not_supported(&mut self, request_id: u64) {
+        tracing::debug!(
+            target: "moq_transport::control",
+            request_id,
+            "sending REQUEST_ERROR NOT_SUPPORTED for unimplemented request"
+        );
+        let _ = self.outgoing.push(
+            message::RequestError {
+                id: request_id,
+                error_code: RequestErrorCode::NotSupported as u64,
+                retry_interval: 0,
+                reason: crate::coding::ReasonPhrase("not supported".to_string()),
+            }
+            .into(),
+        );
     }
 
     /// Handle REQUEST_OK from subscriber — acceptance of our PUBLISH_NAMESPACE (draft-16 §9.7).
