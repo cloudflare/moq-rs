@@ -214,6 +214,11 @@ impl Publisher {
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
         let res = match msg {
             message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg),
+            // REQUEST_UPDATE: draft-16 replacement for SubscribeUpdate (Part 7).
+            message::Subscriber::RequestUpdate(_msg) => {
+                Err(SessionError::unimplemented("REQUEST_UPDATE"))
+            }
+            // Legacy stub retained for dispatch (pre-draft-16 peers only).
             message::Subscriber::SubscribeUpdate(msg) => self.recv_subscribe_update(msg),
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg),
             message::Subscriber::Fetch(_msg) => Err(SessionError::unimplemented("FETCH")),

@@ -48,13 +48,18 @@ macro_rules! publisher_msgs {
     }
 }
 
-// Defines messages that a PUBLISHER would send, or that a SUBSCRIBER would handle
+// Defines messages that a PUBLISHER would send, or that a SUBSCRIBER would handle.
+// RequestOk and RequestError are shared responses (draft-16 §9.7 / §9.8).
 publisher_msgs! {
     PublishNamespace,
     PublishNamespaceDone,
     Publish,
     PublishDone,
     SubscribeOk,
+    // Shared request responses
+    RequestOk,
+    RequestError,
+    // Legacy stubs retained for session dispatch (TODO itzmanish: replace with REQUEST_OK/ERROR routing)
     SubscribeError,
     TrackStatusOk,
     TrackStatusError,

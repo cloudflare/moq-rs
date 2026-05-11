@@ -473,6 +473,36 @@ impl Session {
                     "MoQT control message"
                 );
             }
+            Message::RequestOk(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "REQUEST_OK",
+                    request_id = m.id,
+                    "MoQT control message"
+                );
+            }
+            Message::RequestError(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "REQUEST_ERROR",
+                    request_id = m.id,
+                    error_code = m.error_code,
+                    retry_interval = m.retry_interval,
+                    "MoQT control message"
+                );
+            }
+            Message::RequestUpdate(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "REQUEST_UPDATE",
+                    request_id = m.id,
+                    existing_request_id = m.existing_request_id,
+                    "MoQT control message"
+                );
+            }
         }
     }
 

@@ -29,7 +29,7 @@ impl Decode for Client {
         }
 
         let _len = u16::decode(r)?;
-        // TODO: enforce message length (Part 4).
+        // TODO(itzmanish): enforce message length.
 
         let params = KeyValuePairs::decode(r)?;
 

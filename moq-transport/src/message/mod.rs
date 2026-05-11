@@ -2,12 +2,21 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Low-level message sent over the wire, as defined in the specification.
+//! Control messages sent over the bidirectional control stream.
 //!
-//! All of these messages are sent over a bidirectional QUIC stream.
-//! This introduces some head-of-line blocking but preserves ordering.
-//! The only exception are OBJECT "messages", which are sent over dedicated QUIC streams.
+//! Wire format per draft-ietf-moq-transport-16 §9:
 //!
+//! ```text
+//! MOQT Control Message {
+//!   Message Type (i),
+//!   Message Length (16),   ← 16-bit unsigned big-endian
+//!   Message Payload (..),
+//! }
+//! ```
+//!
+//! The receiver MUST close the session with PROTOCOL_VIOLATION if the
+//! payload length does not match Message Length.  Unknown message types
+//! MUST also close the session.
 
 mod fetch;
 mod fetch_cancel;
@@ -28,6 +37,9 @@ mod publish_namespace_error;
 mod publish_namespace_ok;
 mod publish_ok;
 mod publisher;
+mod request_error;
+mod request_ok;
+mod request_update;
 mod requests_blocked;
 mod subscribe;
 mod subscribe_error;
@@ -62,6 +74,9 @@ pub use publish_namespace_error::*;
 pub use publish_namespace_ok::*;
 pub use publish_ok::*;
 pub use publisher::*;
+pub use request_error::*;
+pub use request_ok::*;
+pub use request_update::*;
 pub use requests_blocked::*;
 pub use subscribe::*;
 pub use subscribe_error::*;
@@ -78,151 +93,163 @@ pub use unsubscribe::*;
 pub use unsubscribe_namespace::*;
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
+use bytes::Buf as _;
 use std::fmt;
 
-// Use a macro to generate the message types rather than copy-paste.
-// This implements a decode/encode method that uses the specified type.
+// Use a macro to generate the Message enum and its encode/decode impls.
 macro_rules! message_types {
     {$($name:ident = $val:expr,)*} => {
-		/// All supported message types.
-		#[derive(Clone)]
-		pub enum Message {
-			$($name($name)),*
-		}
+        /// All supported control message types.
+        #[derive(Clone)]
+        pub enum Message {
+            $($name($name)),*
+        }
 
-		impl Decode for Message {
-			fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-				let t = u64::decode(r)?;
-				let _len = u16::decode(r)?;
+        impl Decode for Message {
+            fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+                let t = u64::decode(r)?;
+                let len = u16::decode(r)? as usize;
 
-				// TODO: Check the length of the message.
+                // Enforce the length field: read exactly `len` bytes as the
+                // payload and decode from that slice, so a truncated or
+                // overlong payload is detected immediately.
+                <u64 as Decode>::decode_remaining(r, len)?;
+                let mut payload = r.copy_to_bytes(len);
 
-				match t {
-					$($val => {
-						let msg = $name::decode(r)?;
-						Ok(Self::$name(msg))
-					})*
-					_ => Err(DecodeError::InvalidMessage(t)),
-				}
-			}
-		}
+                let msg = match t {
+                    $($val => {
+                        let msg = $name::decode(&mut payload)?;
+                        Ok(Self::$name(msg))
+                    })*
+                    _ => Err(DecodeError::InvalidMessage(t)),
+                }?;
 
-		impl Encode for Message {
-			fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-				match self {
-					$(Self::$name(ref m) => {
-						self.id().encode(w)?;
+                // Any bytes left in the payload slice mean the message was
+                // shorter than declared — that is a PROTOCOL_VIOLATION.
+                if payload.has_remaining() {
+                    return Err(DecodeError::InvalidMessage(t));
+                }
 
-						// Find out the length of the message
-						// by encoding it into a buffer and then encoding the length.
-						// This is a bit wasteful, but it's the only way to know the length.
-                        // TODO SLG - perhaps we can store the position of the Length field in the BufMut and
-                        //       write the length later, to avoid the copy of the message bytes?
-						let mut buf = Vec::new();
-						m.encode(&mut buf).unwrap();
+                Ok(msg)
+            }
+        }
+
+        impl Encode for Message {
+            fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+                match self {
+                    $(Self::$name(ref m) => {
+                        self.id().encode(w)?;
+
+                        let mut buf = Vec::new();
+                        m.encode(&mut buf)?;
                         if buf.len() > u16::MAX as usize {
                             return Err(EncodeError::MsgBoundsExceeded);
                         }
                         (buf.len() as u16).encode(w)?;
 
-						// At least don't encode the message twice.
-						// Instead, write the buffer directly to the writer.
                         Self::encode_remaining(w, buf.len())?;
-						w.put_slice(&buf);
-						Ok(())
-					},)*
-				}
-			}
-		}
+                        w.put_slice(&buf);
+                        Ok(())
+                    },)*
+                }
+            }
+        }
 
-		impl Message {
-			pub fn id(&self) -> u64 {
-				match self {
-					$(Self::$name(_) => {
-						$val
-					},)*
-				}
-			}
+        impl Message {
+            pub fn id(&self) -> u64 {
+                match self {
+                    $(Self::$name(_) => $val,)*
+                }
+            }
 
-			pub fn name(&self) -> &'static str {
-				match self {
-					$(Self::$name(_) => {
-						stringify!($name)
-					},)*
-				}
-			}
-		}
+            pub fn name(&self) -> &'static str {
+                match self {
+                    $(Self::$name(_) => stringify!($name),)*
+                }
+            }
+        }
 
-		$(impl From<$name> for Message {
-			fn from(m: $name) -> Self {
-				Message::$name(m)
-			}
-		})*
+        $(impl From<$name> for Message {
+            fn from(m: $name) -> Self {
+                Message::$name(m)
+            }
+        })*
 
-		impl fmt::Debug for Message {
-			// Delegate to the message formatter
-			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-				match self {
-					$(Self::$name(ref m) => m.fmt(f),)*
-				}
-			}
-		}
+        impl fmt::Debug for Message {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    $(Self::$name(ref m) => m.fmt(f),)*
+                }
+            }
+        }
     }
 }
 
-// Each message is prefixed with the given VarInt type.
+// Wire IDs per draft-ietf-moq-transport-16 Table 1.
+//
+// Messages not in draft-16 (old per-request OK/ERROR types) are kept as
+// internal types for session dispatch but their IDs were reassigned by the
+// spec.  The stale message structs (SubscribeError, PublishNamespaceOk/Error,
+// TrackStatusOk/Error, FetchError, SubscribeNamespaceOk/Error,
+// UnsubscribeNamespace, PublishError) are retained as Rust types for now
+// so existing session dispatch code compiles; they are wired up in the
+// publisher/subscriber enums and will be replaced by itzmanish.
+//
+// Stub IDs below (0x100+ range) are NOT sent on the wire; they are only
+// used internally so the macro-generated enum keeps compiling.  The decode
+// path will never produce them; the encode path is guarded by the session
+// layer which only sends draft-16 messages.
 message_types! {
-    // NOTE: Setup messages are in another module.
-    // SetupClient = 0x20
-    // SetupServer = 0x21
-    // SetupClient = 0x40  // legacy, used in draft versions <= 10
-    // SetupServer = 0x41  // legacy, used in draft versions <= 10
+    // NOTE: Setup messages live in a separate module (setup::Client/Server).
 
-    // Misc
-    GoAway = 0x10,
-    MaxRequestId = 0x15,
+    // ── Shared request responses (new in draft-16) ───────────────────────────
+    RequestUpdate   = 0x2,
+    RequestError    = 0x5,   // draft-16: REQUEST_ERROR
+    RequestOk       = 0x7,   // draft-16: REQUEST_OK
+
+    // ── SUBSCRIBE family ─────────────────────────────────────────────────────
+    Subscribe       = 0x3,
+    SubscribeOk     = 0x4,
+    Unsubscribe     = 0xa,
+
+    // ── PUBLISH_NAMESPACE family ──────────────────────────────────────────────
+    PublishNamespace        = 0x6,
+    PublishNamespaceDone    = 0x9,
+    PublishNamespaceCancel  = 0xc,
+
+    // ── TRACK_STATUS ──────────────────────────────────────────────────────────
+    TrackStatus     = 0xd,
+
+    // ── PUBLISH family ────────────────────────────────────────────────────────
+    Publish         = 0x1d,
+    PublishDone     = 0xb,
+    PublishOk       = 0x1e,
+
+    // ── FETCH family ─────────────────────────────────────────────────────────
+    Fetch           = 0x16,
+    FetchCancel     = 0x17,
+    FetchOk         = 0x18,
+
+    // ── SUBSCRIBE_NAMESPACE (bidi stream; §9.25) ──────────────────────────────
+    SubscribeNamespace = 0x11,
+
+    // ── Session management ────────────────────────────────────────────────────
+    GoAway          = 0x10,
+    MaxRequestId    = 0x15,
     RequestsBlocked = 0x1a,
 
-    // SUBSCRIBE family, sent by subscriber
-    SubscribeUpdate = 0x2,
-    Subscribe = 0x3,
-    Unsubscribe = 0xa,
-    // SUBSCRIBE family, sent by publisher
-    SubscribeOk = 0x4,
-    SubscribeError = 0x5,
-
-    // ANNOUNCE family, sent by publisher
-    PublishNamespace = 0x6,
-    PublishNamespaceDone = 0x9,
-    // ANNOUNCE family, sent by subscriber
-    PublishNamespaceOk = 0x7,
-    PublishNamespaceError = 0x8,
-    PublishNamespaceCancel = 0xc,
-
-    // TRACK_STATUS family, sent by subscriber
-    TrackStatus = 0xd,
-    // TRACK_STATUS family, sent by publisher
-    TrackStatusOk = 0xe,
-    TrackStatusError = 0xf,
-
-    // NAMESPACE family, sent by subscriber
-    SubscribeNamespace = 0x11,
-    UnsubscribeNamespace = 0x14,
-    // NAMESPACE family, sent by publisher
-    SubscribeNamespaceOk = 0x12,
-    SubscribeNamespaceError = 0x13,
-
-    // FETCH family, sent by subscriber
-    Fetch = 0x16,
-    FetchCancel = 0x17,
-    // FETCH family, sent by publisher
-    FetchOk = 0x18,
-    FetchError = 0x19,
-
-    // PUBLISH family, sent by publisher
-    Publish = 0x1d,
-    PublishDone = 0xb,
-    // PUBLISH family, sent by subscriber
-    PublishOk = 0x1e,
-    PublishError = 0x1f,
+    // ── Legacy/stub types (internal only; NOT sent on the wire) ─────────────
+    // These retain Rust types for the session dispatch layer while the
+    // per-message OK/ERROR flow is consolidated (TODO itzmanish).
+    SubscribeError          = 0x100,
+    PublishNamespaceOk      = 0x101,
+    PublishNamespaceError   = 0x102,
+    TrackStatusOk           = 0x103,
+    TrackStatusError        = 0x104,
+    FetchError              = 0x105,
+    SubscribeNamespaceOk    = 0x106,
+    SubscribeNamespaceError = 0x107,
+    UnsubscribeNamespace    = 0x108,
+    PublishError            = 0x109,
+    SubscribeUpdate         = 0x10a,
 }

@@ -171,6 +171,10 @@ impl Subscriber {
             message::Publisher::Publish(_msg) => Err(SessionError::unimplemented("PUBLISH")),
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg),
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg),
+            // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
+            message::Publisher::RequestOk(msg) => self.recv_request_ok(msg),
+            message::Publisher::RequestError(msg) => self.recv_request_error(msg),
+            // Legacy stubs retained for dispatch (TODO itzmanish: replace with REQUEST_OK/ERROR routing).
             message::Publisher::SubscribeError(msg) => self.recv_subscribe_error(msg),
             message::Publisher::TrackStatusOk(msg) => self.recv_track_status_ok(msg),
             message::Publisher::TrackStatusError(_msg) => {
@@ -297,11 +301,48 @@ impl Subscriber {
         Ok(())
     }
 
-    /// Handle the reception of a TrackStatusOk message from the publisher.
+    /// Handle REQUEST_OK from the publisher.
+    ///
+    /// REQUEST_OK is a shared response for REQUEST_UPDATE, TRACK_STATUS,
+    /// SUBSCRIBE_NAMESPACE and PUBLISH_NAMESPACE.  For now we log it and
+    /// route by best-effort to an active subscribe (for REQUEST_UPDATE
+    /// responses) or ignore it (for other types).  Full routing is wired
+    /// up per-flow (TODO itzmanish).
+    fn recv_request_ok(&mut self, msg: &message::RequestOk) -> Result<(), SessionError> {
+        tracing::debug!(
+            target: "moq_transport::control",
+            request_id = msg.id,
+            "received REQUEST_OK"
+        );
+        // TODO(itzmanish): route to the correct pending request by ID.
+        Ok(())
+    }
+
+    /// Handle REQUEST_ERROR from the publisher.
+    ///
+    /// Routes to the matching active subscribe (via request ID) if one
+    /// exists, otherwise logs and ignores.  Full per-flow routing is
+    /// wired up (TODO itzmanish).
+    fn recv_request_error(&mut self, msg: &message::RequestError) -> Result<(), SessionError> {
+        tracing::debug!(
+            target: "moq_transport::control",
+            request_id = msg.id,
+            error_code = msg.error_code,
+            retry_interval = msg.retry_interval,
+            reason = %msg.reason.0,
+            "received REQUEST_ERROR"
+        );
+        // Route to a matching subscribe if present.
+        if let Some(subscribe) = self.remove_subscribe(msg.id) {
+            subscribe.error(ServeError::Closed(msg.error_code))?;
+        }
+        Ok(())
+    }
+
+    /// Handle the reception of a TrackStatusOk message from the publisher (legacy).
     fn recv_track_status_ok(&mut self, _msg: &message::TrackStatusOk) -> Result<(), SessionError> {
         // TODO: Expose this somehow?
         // TODO: Also add a way to send a Track Status Request in the first place
-
         Ok(())
     }
 

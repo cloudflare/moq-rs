@@ -48,19 +48,22 @@ macro_rules! subscriber_msgs {
     }
 }
 
-// Defines messages that a SUBSCRIBER would send, or that a PUBLISHER would handle
+// Defines messages that a SUBSCRIBER would send, or that a PUBLISHER would handle.
+// RequestUpdate is the draft-16 replacement for SubscribeUpdate (Part 7).
 subscriber_msgs! {
     Subscribe,
-    SubscribeUpdate,
+    RequestUpdate,
     Unsubscribe,
     Fetch,
     FetchCancel,
     TrackStatus,
     SubscribeNamespace,
-    UnsubscribeNamespace,
     PublishNamespaceCancel,
+    PublishOk,
+    // Legacy stubs retained for session dispatch (TODO itzmanish: replace with REQUEST_OK/ERROR routing)
+    SubscribeUpdate,
+    UnsubscribeNamespace,
     PublishNamespaceOk,
     PublishNamespaceError,
-    PublishOk,
     PublishError,
 }
