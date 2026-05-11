@@ -295,7 +295,10 @@ impl Subscriber {
         subscribe
     }
 
-    /// Handle the reception of a SubscribeError message from the publisher.
+    /// Handle SubscribeError from the publisher (legacy stub; never decoded from
+    /// draft-16 wire — stub ID 0x100 is never produced by the decoder).
+    /// Draft-16 subscription rejections arrive as REQUEST_ERROR and are handled
+    /// by recv_request_error.
     fn recv_subscribe_error(&mut self, msg: &message::SubscribeError) -> Result<(), SessionError> {
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
             subscribe.error(ServeError::Closed(msg.error_code))?;
@@ -315,18 +318,17 @@ impl Subscriber {
 
     /// Handle REQUEST_OK from the publisher.
     ///
-    /// REQUEST_OK is a shared response for REQUEST_UPDATE, TRACK_STATUS,
-    /// SUBSCRIBE_NAMESPACE and PUBLISH_NAMESPACE.  For now we log it and
-    /// route by best-effort to an active subscribe (for REQUEST_UPDATE
-    /// responses) or ignore it (for other types).  Full routing is wired
-    /// up per-flow (TODO itzmanish).
+    /// REQUEST_OK is the shared positive response for REQUEST_UPDATE, TRACK_STATUS,
+    /// SUBSCRIBE_NAMESPACE, and PUBLISH_NAMESPACE.  SUBSCRIBE uses its own dedicated
+    /// SUBSCRIBE_OK message (§9.10) and does not come through this handler.
+    /// Full routing for the other request types is wired up (TODO itzmanish).
     fn recv_request_ok(&mut self, msg: &message::RequestOk) -> Result<(), SessionError> {
         tracing::debug!(
             target: "moq_transport::control",
             request_id = msg.id,
             "received REQUEST_OK"
         );
-        // TODO(itzmanish): route to the correct pending request by ID.
+        // TODO(itzmanish): route to the correct pending request type by ID.
         Ok(())
     }
 
