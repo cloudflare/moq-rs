@@ -9,6 +9,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
 use crate::coding::{Encode, Location, ReasonPhrase};
+use crate::message::RequestErrorCode;
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
@@ -182,10 +183,13 @@ impl Drop for Subscribed {
                 reason: ReasonPhrase(err.to_string()),
             });
         } else {
-            self.publisher.send_message(message::SubscribeError {
+            // Draft-16 §9.8: subscription rejection uses REQUEST_ERROR, not the
+            // legacy SUBSCRIBE_ERROR.
+            self.publisher.send_message(message::RequestError {
                 id: self.info.id,
-                error_code: err.code(),
-                reason_phrase: ReasonPhrase(err.to_string()),
+                error_code: RequestErrorCode::InternalError as u64,
+                retry_interval: 0,
+                reason: ReasonPhrase(err.to_string()),
             });
         };
     }

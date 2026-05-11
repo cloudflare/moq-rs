@@ -246,4 +246,48 @@ mod tests {
         let encoded = msg.encode(&mut buf);
         assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
     }
+
+    #[test]
+    fn default_params_roundtrip() {
+        // Verify a minimal SUBSCRIBE with no params still round-trips cleanly.
+        let mut buf = BytesMut::new();
+        let msg = Subscribe {
+            id: 0,
+            track_namespace: TrackNamespace::from_utf8_path("a/b"),
+            track_name: "t".to_string(),
+            subscriber_priority: 128,
+            group_order: GroupOrder::Ascending,
+            forward: true,
+            filter_type: FilterType::LargestObject,
+            start_location: None,
+            end_group_id: None,
+            params: KeyValuePairs::default(),
+        };
+        msg.encode(&mut buf).unwrap();
+        let decoded = Subscribe::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn absolute_range_end_group_gte_start_group() {
+        // End group must be >= start group per draft-16 §5.1.2.
+        let mut buf = BytesMut::new();
+        let msg = Subscribe {
+            id: 2,
+            track_namespace: TrackNamespace::from_utf8_path("ns/v"),
+            track_name: "track".to_string(),
+            subscriber_priority: 127,
+            group_order: GroupOrder::Ascending,
+            forward: true,
+            filter_type: FilterType::AbsoluteRange,
+            start_location: Some(Location::new(5, 0)),
+            end_group_id: Some(10),
+            params: KeyValuePairs::default(),
+        };
+        msg.encode(&mut buf).unwrap();
+        let decoded = Subscribe::decode(&mut buf).unwrap();
+        assert_eq!(decoded.filter_type, FilterType::AbsoluteRange);
+        assert_eq!(decoded.start_location.unwrap().group_id, 5);
+        assert_eq!(decoded.end_group_id.unwrap(), 10);
+    }
 }

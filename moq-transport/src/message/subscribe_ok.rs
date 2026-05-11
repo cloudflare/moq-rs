@@ -117,4 +117,42 @@ mod tests {
         let encoded = msg.encode(&mut buf);
         assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
     }
+
+    #[test]
+    fn track_alias_independent_of_request_id() {
+        // track_alias can differ from the request id — it is chosen by the publisher.
+        let mut buf = BytesMut::new();
+        let msg = SubscribeOk {
+            id: 10,
+            track_alias: 42,
+            expires: 0,
+            group_order: GroupOrder::Ascending,
+            content_exists: false,
+            largest_location: None,
+            params: KeyValuePairs::default(),
+        };
+        msg.encode(&mut buf).unwrap();
+        let decoded = SubscribeOk::decode(&mut buf).unwrap();
+        assert_eq!(decoded.id, 10);
+        assert_eq!(decoded.track_alias, 42);
+    }
+
+    #[test]
+    fn encode_decode_no_content() {
+        let mut buf = BytesMut::new();
+        let msg = SubscribeOk {
+            id: 0,
+            track_alias: 0,
+            expires: 0,
+            group_order: GroupOrder::Descending,
+            content_exists: false,
+            largest_location: None,
+            params: KeyValuePairs::default(),
+        };
+        msg.encode(&mut buf).unwrap();
+        let decoded = SubscribeOk::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert!(!decoded.content_exists);
+        assert!(decoded.largest_location.is_none());
+    }
 }

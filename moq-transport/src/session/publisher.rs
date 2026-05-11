@@ -22,6 +22,7 @@ use super::{
     PublishNamespace, PublishNamespaceRecv, RequestId, RequestIdAllocation, Session, SessionError,
     Subscribed, SubscribedRecv, TrackStatusRequested,
 };
+use crate::message::RequestErrorCode;
 
 // TODO remove Clone.
 #[derive(Clone)]
@@ -321,7 +322,19 @@ impl Publisher {
                 .map_err(|_| SessionError::Internal)?;
 
             let entry = match subscribeds.entry(msg.id) {
-                hash_map::Entry::Occupied(_) => return Err(SessionError::Duplicate),
+                hash_map::Entry::Occupied(_) => {
+                    // Draft-16 §5.1: duplicate SUBSCRIBE for the same request ID
+                    // MUST be rejected with DUPLICATE_SUBSCRIPTION, not a session close.
+                    self.outgoing.push(message::RequestError {
+                        id: msg.id,
+                        error_code: RequestErrorCode::DuplicateSubscription as u64,
+                        retry_interval: 0,
+                        reason: crate::coding::ReasonPhrase(
+                            "duplicate subscription".to_string(),
+                        ),
+                    }.into()).ok();
+                    return Ok(());
+                }
                 hash_map::Entry::Vacant(entry) => entry,
             };
 
