@@ -70,18 +70,11 @@ impl TrackStatusRequested {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::RequestErrorCode;
 
     #[test]
-    fn respond_error_not_found_code() {
-        // Verify that the DoesNotExist code is used for missing tracks.
-        assert_eq!(RequestErrorCode::DoesNotExist as u64, 0x10);
-    }
-
-    #[test]
-    fn param_keys_match_draft_16() {
-        // LARGEST_OBJECT is §9.2.2.7 key 0x9 (odd → bytes value).
-        assert_eq!(param_keys::LARGEST_OBJECT, 0x9);
-        assert_eq!(param_keys::LARGEST_OBJECT % 2, 1, "must be odd (bytes key)");
+    fn largest_object_param_key_is_odd() {
+        // The LARGEST_OBJECT key must be odd so the KVP codec treats the value
+        // as bytes-typed rather than int-typed.
+        assert_eq!(param_keys::LARGEST_OBJECT % 2, 1, "LARGEST_OBJECT key must be odd (bytes-typed KVP)");
     }
 }

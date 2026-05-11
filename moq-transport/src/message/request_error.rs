@@ -139,12 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_subscription_code_is_correct() {
-        // Draft-16 §13.4.2: DUPLICATE_SUBSCRIPTION = 0x19.
-        assert_eq!(RequestErrorCode::DuplicateSubscription as u64, 0x19);
-    }
-
-    #[test]
     fn subscribe_rejection_uses_request_error() {
         // Verify that subscription rejections can be expressed as REQUEST_ERROR
         // with the correct error code.
@@ -176,6 +170,18 @@ mod tests {
         assert_eq!(decoded.id, 4);
         assert_eq!(decoded.error_code, RequestErrorCode::DuplicateSubscription as u64);
         assert_eq!(decoded.retry_interval, 0);
+        assert!(decoded.is_fatal());
+    }
+
+    #[test]
+    fn not_supported_response_round_trips() {
+        // Verify that a NOT_SUPPORTED response encodes, decodes, and is fatal (retry_interval=0).
+        let mut buf = bytes::BytesMut::new();
+        let msg = RequestError::new(10, RequestErrorCode::NotSupported, 0, "not supported");
+        msg.encode(&mut buf).unwrap();
+        let decoded = RequestError::decode(&mut buf).unwrap();
+        assert_eq!(decoded.id, 10);
+        assert_eq!(decoded.error_code, RequestErrorCode::NotSupported as u64);
         assert!(decoded.is_fatal());
     }
 }

@@ -182,37 +182,85 @@ impl Subscriber {
 
     /// Receive a message from the publisher via the control stream.
     pub(super) fn recv_message(&mut self, msg: message::Publisher) -> Result<(), SessionError> {
-        let res = match &msg {
-            message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg),
-            message::Publisher::PublishNamespaceDone(msg) => self.recv_publish_namespace_done(msg),
-            message::Publisher::Publish(_msg) => Err(SessionError::unimplemented("PUBLISH")),
-            message::Publisher::PublishDone(msg) => self.recv_publish_done(msg),
-            message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg),
+        match &msg {
+            message::Publisher::PublishNamespace(msg) => self.recv_publish_namespace(msg)?,
+            message::Publisher::PublishNamespaceDone(msg) => {
+                self.recv_publish_namespace_done(msg)?;
+            }
+            // PUBLISH (publisher-initiated subscription) not yet implemented.
+            // Send REQUEST_ERROR NOT_SUPPORTED so the publisher knows we cannot accept it.
+            message::Publisher::Publish(msg) => {
+                self.send_not_supported(msg.id);
+            }
+            message::Publisher::PublishDone(msg) => self.recv_publish_done(msg)?,
+            message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg)?,
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
-            message::Publisher::RequestOk(msg) => self.recv_request_ok(msg),
-            message::Publisher::RequestError(msg) => self.recv_request_error(msg),
-            // Legacy stubs retained for dispatch (TODO itzmanish: replace with REQUEST_OK/ERROR routing).
-            message::Publisher::SubscribeError(msg) => self.recv_subscribe_error(msg),
-            message::Publisher::TrackStatusOk(msg) => self.recv_track_status_ok(msg),
-            message::Publisher::TrackStatusError(_msg) => {
-                Err(SessionError::unimplemented("TRACK_STATUS_ERROR"))
+            message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
+            message::Publisher::RequestError(msg) => self.recv_request_error(msg)?,
+            // Legacy stubs — stub IDs (0x100+) are never decoded from the wire;
+            // these arms exist only so the exhaustive match compiles.
+            message::Publisher::SubscribeError(msg) => self.recv_subscribe_error(msg)?,
+            message::Publisher::TrackStatusOk(msg) => self.recv_track_status_ok(msg)?,
+            // These legacy response stubs are never decoded from the wire; log and ignore.
+            message::Publisher::TrackStatusError(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received legacy TRACK_STATUS_ERROR — ignoring (draft-16 uses REQUEST_ERROR)"
+                );
             }
-            message::Publisher::FetchOk(_msg) => Err(SessionError::unimplemented("FETCH_OK")),
-            message::Publisher::FetchError(_msg) => Err(SessionError::unimplemented("FETCH_ERROR")),
-            message::Publisher::SubscribeNamespaceOk(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE_OK"))
+            message::Publisher::FetchOk(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received FETCH_OK for unsupported FETCH — ignoring"
+                );
             }
-            message::Publisher::SubscribeNamespaceError(_msg) => {
-                Err(SessionError::unimplemented("SUBSCRIBE_NAMESPACE_ERROR"))
+            message::Publisher::FetchError(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received FETCH_ERROR for unsupported FETCH — ignoring"
+                );
             }
-        };
-
-        if let Err(SessionError::Serve(err)) = res {
-            tracing::debug!("failed to process message: {:?} {}", msg, err);
-            return Ok(());
+            message::Publisher::SubscribeNamespaceOk(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received legacy SUBSCRIBE_NAMESPACE_OK — ignoring"
+                );
+            }
+            message::Publisher::SubscribeNamespaceError(msg) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received legacy SUBSCRIBE_NAMESPACE_ERROR — ignoring"
+                );
+            }
         }
 
-        res
+        Ok(())
+    }
+
+    /// Send REQUEST_ERROR NOT_SUPPORTED for an incoming request we do not implement.
+    ///
+    /// Draft-16 §4: limited endpoints SHOULD respond with NOT_SUPPORTED rather
+    /// than ignoring unsupported request types.
+    fn send_not_supported(&mut self, request_id: u64) {
+        tracing::debug!(
+            target: "moq_transport::control",
+            request_id,
+            "sending REQUEST_ERROR NOT_SUPPORTED for unimplemented request"
+        );
+        let _ = self.outgoing.push(
+            message::RequestError {
+                id: request_id,
+                error_code: crate::message::RequestErrorCode::NotSupported as u64,
+                retry_interval: 0,
+                reason: crate::coding::ReasonPhrase("not supported".to_string()),
+            }
+            .into(),
+        );
     }
 
     /// Handle reception of an inbound PUBLISH_NAMESPACE from the publisher.

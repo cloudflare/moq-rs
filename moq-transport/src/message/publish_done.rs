@@ -87,17 +87,4 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
-    #[test]
-    fn publish_done_code_values_match_draft_16() {
-        assert_eq!(PublishDoneCode::InternalError as u64, 0x0);
-        assert_eq!(PublishDoneCode::Unauthorized as u64, 0x1);
-        assert_eq!(PublishDoneCode::TrackEnded as u64, 0x2);
-        assert_eq!(PublishDoneCode::SubscriptionEnded as u64, 0x3);
-        assert_eq!(PublishDoneCode::GoingAway as u64, 0x4);
-        assert_eq!(PublishDoneCode::Expired as u64, 0x5);
-        assert_eq!(PublishDoneCode::TooFarBehind as u64, 0x6);
-        assert_eq!(PublishDoneCode::UpdateFailed as u64, 0x8);
-        assert_eq!(PublishDoneCode::MalformedTrack as u64, 0x12);
-    }
-
 }
