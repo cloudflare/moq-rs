@@ -121,6 +121,7 @@ impl Producer {
             }
         }
 
+        // Check remote tracks second, and serve from remote if possible
         match self
             .remotes
             .subscribe(self.scope.as_deref(), &namespace, &track_name)
@@ -130,17 +131,23 @@ impl Producer {
                 if let Some(track) = track {
                     let ns = namespace.to_utf8_path();
                     tracing::info!(namespace = %ns, track = %track_name, source = "remote", "serving subscribe from remote: {:?}", track.info);
+                    // Update label to indicate remote source, timing recorded on drop
                     timing_guard.set_label("source", "remote");
+                    // Track active tracks - decrements when serve completes
                     let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
                     return Ok(subscribed.serve(track).await?);
                 }
             }
             Err(e) => {
+                // Route error = infrastructure failure (couldn't reach coordinator/upstream)
+                // This is different from "not found" - we don't know if the track exists
                 let ns = namespace.to_utf8_path();
                 tracing::error!(namespace = %ns, track = %track_name, error = %e, "failed to route to remote: {}", e);
                 timing_guard.set_label("source", "route_error");
                 metrics::counter!("moq_relay_subscribe_route_errors_total").increment(1);
 
+                // Return an internal error rather than "not found" since we couldn't check
+                // TODO: Consider returning a more specific error to the subscriber
                 let err = ServeError::internal_ctx(format!(
                     "route error for namespace '{}': {}",
                     namespace, e
