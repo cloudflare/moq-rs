@@ -143,12 +143,7 @@ mod tests {
         // Verify that subscription rejections can be expressed as REQUEST_ERROR
         // with the correct error code.
         let mut buf = bytes::BytesMut::new();
-        let msg = RequestError::new(
-            0,
-            RequestErrorCode::DoesNotExist,
-            0,
-            "track not found",
-        );
+        let msg = RequestError::new(0, RequestErrorCode::DoesNotExist, 0, "track not found");
         msg.encode(&mut buf).unwrap();
         let decoded = RequestError::decode(&mut buf).unwrap();
         assert_eq!(decoded.error_code, RequestErrorCode::DoesNotExist as u64);
@@ -168,7 +163,10 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = RequestError::decode(&mut buf).unwrap();
         assert_eq!(decoded.id, 4);
-        assert_eq!(decoded.error_code, RequestErrorCode::DuplicateSubscription as u64);
+        assert_eq!(
+            decoded.error_code,
+            RequestErrorCode::DuplicateSubscription as u64
+        );
         assert_eq!(decoded.retry_interval, 0);
         assert!(decoded.is_fatal());
     }

@@ -15,6 +15,9 @@ use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePair};
 use bytes::Buf;
 use std::fmt;
 
+/// Smallest possible encoded extension KVP: one-byte delta plus one-byte value.
+const MIN_EXTENSION_KVP_WIRE_LEN: usize = 2;
+
 /// A length-prefixed sequence of delta-encoded Key-Value-Pairs used for
 /// data-plane object extension headers.
 ///
@@ -69,12 +72,10 @@ impl Decode for ExtensionHeaders {
             return Ok(ExtensionHeaders::new());
         }
 
-        // Copy the exact byte slice and decode KVPs from it with a shared prev.
-        let mut buf = vec![0u8; length];
-        r.copy_to_slice(&mut buf);
-        let mut kvps_bytes = bytes::Bytes::from(buf);
+        // Decode KVPs from the exact byte slice with a shared prev.
+        let mut kvps_bytes = r.copy_to_bytes(length);
 
-        let mut kvps = Vec::new();
+        let mut kvps = Vec::with_capacity(length / MIN_EXTENSION_KVP_WIRE_LEN);
         let mut prev = 0u64;
 
         while kvps_bytes.has_remaining() {
@@ -89,16 +90,25 @@ impl Decode for ExtensionHeaders {
 
 impl Encode for ExtensionHeaders {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        // Sort by ascending key so deltas are always non-negative.
-        let mut sorted: Vec<&KeyValuePair> = self.0.iter().collect();
-        sorted.sort_by_key(|k| k.key);
+        if self.0.is_empty() {
+            0usize.encode(w)?;
+            return Ok(());
+        }
 
         // Encode into a temporary buffer to measure the byte length before writing
         // the length prefix.
         let mut tmp = bytes::BytesMut::new();
-        let mut prev = 0u64;
-        for kvp in &sorted {
-            prev = kvp.encode_with_prev(&mut tmp, prev)?;
+
+        if self.0.len() == 1 {
+            self.0[0].encode_with_prev(&mut tmp, 0)?;
+        } else {
+            // Sort by ascending key so deltas are always non-negative.
+            let mut sorted: Vec<&KeyValuePair> = self.0.iter().collect();
+            sorted.sort_by_key(|k| k.key);
+            let mut prev = 0u64;
+            for kvp in &sorted {
+                prev = kvp.encode_with_prev(&mut tmp, prev)?;
+            }
         }
 
         // Write the byte-length prefix followed by the encoded pairs.
@@ -178,8 +188,14 @@ mod tests {
         // Decode and verify all three pairs survive
         let decoded = ExtensionHeaders::decode(&mut buf).unwrap();
         assert_eq!(decoded.0.len(), 3);
-        assert_eq!(decoded.get(0).unwrap().value, crate::coding::Value::IntValue(0));
-        assert_eq!(decoded.get(100).unwrap().value, crate::coding::Value::IntValue(100));
+        assert_eq!(
+            decoded.get(0).unwrap().value,
+            crate::coding::Value::IntValue(0)
+        );
+        assert_eq!(
+            decoded.get(100).unwrap().value,
+            crate::coding::Value::IntValue(100)
+        );
         assert_eq!(
             decoded.get(1).unwrap().value,
             crate::coding::Value::BytesValue(vec![0x01, 0x02, 0x03, 0x04, 0x05])
@@ -199,8 +215,14 @@ mod tests {
         ext.encode(&mut buf).unwrap();
         let decoded = ExtensionHeaders::decode(&mut buf).unwrap();
 
-        assert_eq!(decoded.get(0).unwrap().value, crate::coding::Value::IntValue(1));
-        assert_eq!(decoded.get(100).unwrap().value, crate::coding::Value::IntValue(99));
+        assert_eq!(
+            decoded.get(0).unwrap().value,
+            crate::coding::Value::IntValue(1)
+        );
+        assert_eq!(
+            decoded.get(100).unwrap().value,
+            crate::coding::Value::IntValue(99)
+        );
     }
 
     // ── empty ─────────────────────────────────────────────────────────────────

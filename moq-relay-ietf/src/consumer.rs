@@ -121,8 +121,7 @@ impl Consumer {
 
         // Accept the PUBLISH_NAMESPACE with REQUEST_OK.
         if let Err(err) = published_ns.ok() {
-            metrics::counter!("moq_relay_announce_errors_total", "phase" => "send_ok")
-                .increment(1);
+            metrics::counter!("moq_relay_announce_errors_total", "phase" => "send_ok").increment(1);
             return Err(err.into());
         }
         tracing::debug!(namespace = %ns, "sent REQUEST_OK for PUBLISH_NAMESPACE");

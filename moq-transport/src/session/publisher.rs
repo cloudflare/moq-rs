@@ -314,10 +314,7 @@ impl Publisher {
     }
 
     /// Handle REQUEST_OK from subscriber — acceptance of our PUBLISH_NAMESPACE (draft-16 §9.7).
-    fn recv_publish_namespace_ok(
-        &mut self,
-        msg: message::RequestOk,
-    ) -> Result<(), SessionError> {
+    fn recv_publish_namespace_ok(&mut self, msg: message::RequestOk) -> Result<(), SessionError> {
         // The publish_namespaces map is keyed by namespace; we must search by request_id.
         // TODO(itzmanish): maintain a second index keyed by request_id to make this O(1).
         let mut namespaces = self
@@ -341,8 +338,6 @@ impl Publisher {
         }
         Ok(())
     }
-
-
 
     fn recv_publish_namespace_cancel(
         &mut self,
@@ -368,14 +363,19 @@ impl Publisher {
                 hash_map::Entry::Occupied(_) => {
                     // Draft-16 §5.1: duplicate SUBSCRIBE for the same request ID
                     // MUST be rejected with DUPLICATE_SUBSCRIPTION, not a session close.
-                    self.outgoing.push(message::RequestError {
-                        id: msg.id,
-                        error_code: RequestErrorCode::DuplicateSubscription as u64,
-                        retry_interval: 0,
-                        reason: crate::coding::ReasonPhrase(
-                            "duplicate subscription".to_string(),
-                        ),
-                    }.into()).ok();
+                    self.outgoing
+                        .push(
+                            message::RequestError {
+                                id: msg.id,
+                                error_code: RequestErrorCode::DuplicateSubscription as u64,
+                                retry_interval: 0,
+                                reason: crate::coding::ReasonPhrase(
+                                    "duplicate subscription".to_string(),
+                                ),
+                            }
+                            .into(),
+                        )
+                        .ok();
                     return Ok(());
                 }
                 hash_map::Entry::Vacant(entry) => entry,

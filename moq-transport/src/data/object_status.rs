@@ -48,7 +48,11 @@ mod tests {
     fn encode_decode_valid_statuses() {
         let mut buf = BytesMut::new();
 
-        for status in [ObjectStatus::NormalObject, ObjectStatus::EndOfGroup, ObjectStatus::EndOfTrack] {
+        for status in [
+            ObjectStatus::NormalObject,
+            ObjectStatus::EndOfGroup,
+            ObjectStatus::EndOfTrack,
+        ] {
             status.encode(&mut buf).unwrap();
             let decoded = ObjectStatus::decode(&mut buf).unwrap();
             assert_eq!(decoded, status);

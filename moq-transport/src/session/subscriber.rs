@@ -337,11 +337,7 @@ impl Subscriber {
 
     /// Remove a subscribe from our map of active subscribes, and the alias map if present.
     pub(super) fn remove_subscribe(&mut self, id: u64) -> Option<SubscribeRecv> {
-        let subscribe = self
-            .subscribes
-            .lock()
-            .ok()
-            .and_then(|mut s| s.remove(&id));
+        let subscribe = self.subscribes.lock().ok().and_then(|mut s| s.remove(&id));
         if let Some(ref sub) = subscribe {
             if let Some(track_alias) = sub.track_alias() {
                 if let Ok(mut alias_map) = self.subscribe_alias_map.lock() {
@@ -436,18 +432,23 @@ impl Subscriber {
         &self,
         track_alias: u64,
         timeout_ms: Option<u64>,
-    ) -> Option<u64> {
+    ) -> Result<Option<u64>, SessionError> {
         // If no timeout specified, don't wait
         let timeout_ms = match timeout_ms {
             Some(ms) => ms,
             None => {
                 // Just check once
-                return self
-                    .subscribe_alias_map
-                    .lock()
-                    .unwrap()
-                    .get(&track_alias)
-                    .cloned();
+                return match self.subscribe_alias_map.lock() {
+                    Ok(aliases) => Ok(aliases.get(&track_alias).cloned()),
+                    Err(_) => {
+                        tracing::error!(
+                            target: "moq_transport::control",
+                            track_alias,
+                            "subscribe alias map lock poisoned"
+                        );
+                        Err(SessionError::Internal)
+                    }
+                };
             }
         };
 
@@ -459,14 +460,20 @@ impl Subscriber {
                 let notified = self.subscribe_alias_notify.notified();
 
                 // Check Map for alias
-                if let Some(id) = self
-                    .subscribe_alias_map
-                    .lock()
-                    .unwrap()
-                    .get(&track_alias)
-                    .cloned()
-                {
-                    return id;
+                let id = match self.subscribe_alias_map.lock() {
+                    Ok(aliases) => aliases.get(&track_alias).cloned(),
+                    Err(_) => {
+                        tracing::error!(
+                            target: "moq_transport::control",
+                            track_alias,
+                            "subscribe alias map lock poisoned"
+                        );
+                        return Err(SessionError::Internal);
+                    }
+                };
+
+                if let Some(id) = id {
+                    return Ok(Some(id));
                 }
 
                 // Alias not present yet, wait for notification
@@ -474,7 +481,7 @@ impl Subscriber {
             }
         })
         .await
-        .ok()
+        .unwrap_or(Ok(None))
     }
 
     /// Handle reception of a new stream from the QUIC session.
@@ -525,7 +532,7 @@ impl Subscriber {
             );
             // The writer is closed, so we should terminate.
             // TODO it would be nice to do this immediately when the Writer is closed.
-            if let Some(subscribe_id) = self.get_subscribe_id_by_alias(track_alias, None).await {
+            if let Some(subscribe_id) = self.get_subscribe_id_by_alias(track_alias, None).await? {
                 if let Some(subscribe) = self.remove_subscribe(subscribe_id) {
                     subscribe.error(err.clone())?;
                 }
@@ -558,13 +565,10 @@ impl Subscriber {
             // Look up the subscribe id for this track alias
             if let Some(subscribe_id) = self
                 .get_subscribe_id_by_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-                .await
+                .await?
             {
                 // Look up the subscribe by id
-                let mut subscribes = self
-                    .subscribes
-                    .lock()
-                    .map_err(|_| SessionError::Internal)?;
+                let mut subscribes = self.subscribes.lock().map_err(|_| SessionError::Internal)?;
                 let subscribe = subscribes.get_mut(&subscribe_id).ok_or_else(|| {
                     ServeError::not_found_ctx(format!(
                         "subscribe_id={} not found for track_alias={}",
@@ -849,7 +853,7 @@ impl Subscriber {
         // Look up the subscribe id for this track alias
         if let Some(subscribe_id) = self
             .get_subscribe_id_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-            .await
+            .await?
         {
             // Look up the subscribe by id
             if let Some(subscribe) = self

@@ -9,8 +9,8 @@
 //! - A **prefix** `TrackNamespacePrefix` (used in `SUBSCRIBE_NAMESPACE`) may have
 //!   0–32 fields; each non-empty field must also be ≥ 1 byte.
 //! - The total length of a Full Track Name (sum of all namespace field lengths +
-//!   track name length) MUST NOT exceed 4096 bytes.  Validated by callers via
-//!   [`full_track_name_len`].
+//!   track name length) MUST NOT exceed 4096 bytes.  Validated by message
+//!   decoders via [`validate_full_track_name`].
 //! - Track names are arbitrary bytes and may be empty.
 
 use super::{Decode, DecodeError, Encode, EncodeError, TupleField};
@@ -89,6 +89,14 @@ impl TrackNamespace {
     pub fn namespace_byte_len(&self) -> usize {
         self.fields.iter().map(|f| f.value.len()).sum()
     }
+
+    fn validate_namespace_byte_len(&self) -> Result<(), DecodeError> {
+        if self.namespace_byte_len() > MAX_FULL_TRACK_NAME_LEN {
+            return Err(DecodeError::TrackNameTooLong);
+        }
+
+        Ok(())
+    }
 }
 
 impl Hash for TrackNamespace {
@@ -119,7 +127,9 @@ impl Decode for TrackNamespace {
             }
             fields.push(field);
         }
-        Ok(Self { fields })
+        let namespace = Self { fields };
+        namespace.validate_namespace_byte_len()?;
+        Ok(namespace)
     }
 }
 
@@ -130,6 +140,11 @@ impl Encode for TrackNamespace {
                 "TrackNamespace must have 1–{} fields",
                 Self::MAX_FIELDS
             )));
+        }
+        if self.namespace_byte_len() > MAX_FULL_TRACK_NAME_LEN {
+            return Err(EncodeError::FieldBoundsExceeded(
+                "TrackNamespace".to_string(),
+            ));
         }
         self.fields.len().encode(w)?;
         for field in &self.fields {
@@ -330,6 +345,18 @@ pub fn full_track_name_len(namespace: &TrackNamespace, track_name: &[u8]) -> usi
     namespace.namespace_byte_len() + track_name.len()
 }
 
+/// Validate that a Full Track Name is within the draft-16 4096-byte limit.
+pub fn validate_full_track_name(
+    namespace: &TrackNamespace,
+    track_name: &[u8],
+) -> Result<(), DecodeError> {
+    if full_track_name_len(namespace, track_name) > MAX_FULL_TRACK_NAME_LEN {
+        return Err(DecodeError::TrackNameTooLong);
+    }
+
+    Ok(())
+}
+
 // ─── Add missing EncodeError variant ─────────────────────────────────────────
 // (defined here to keep it adjacent to the validation logic)
 
@@ -370,10 +397,7 @@ mod tests {
         let mut t = TrackNamespace::new();
         t.add(TupleField::from_utf8("test"));
         t.encode(&mut buf).unwrap();
-        assert_eq!(
-            buf.to_vec(),
-            vec![0x01, 0x04, 0x74, 0x65, 0x73, 0x74]
-        );
+        assert_eq!(buf.to_vec(), vec![0x01, 0x04, 0x74, 0x65, 0x73, 0x74]);
         let decoded = TrackNamespace::decode(&mut buf).unwrap();
         assert_eq!(decoded, t);
     }
@@ -498,7 +522,10 @@ mod tests {
     fn try_from_empty_vec_is_error() {
         let fields: Vec<TupleField> = vec![];
         let result: Result<TrackNamespace, _> = fields.try_into();
-        assert!(matches!(result.unwrap_err(), TrackNamespaceError::TooFewFields));
+        assert!(matches!(
+            result.unwrap_err(),
+            TrackNamespaceError::TooFewFields
+        ));
     }
 
     #[test]
@@ -530,7 +557,10 @@ mod tests {
     fn try_from_empty_field_is_error() {
         let fields = vec![TupleField { value: vec![] }];
         let result: Result<TrackNamespace, _> = fields.try_into();
-        assert!(matches!(result.unwrap_err(), TrackNamespaceError::EmptyField));
+        assert!(matches!(
+            result.unwrap_err(),
+            TrackNamespaceError::EmptyField
+        ));
     }
 
     // ── TrackNamespacePrefix ──────────────────────────────────────────────────
@@ -559,7 +589,9 @@ mod tests {
     fn prefix_rejects_too_many_fields() {
         let mut prefix = TrackNamespacePrefix::new();
         for i in 0..=TrackNamespacePrefix::MAX_FIELDS {
-            prefix.fields.push(TupleField::from_utf8(&format!("f{}", i)));
+            prefix
+                .fields
+                .push(TupleField::from_utf8(&format!("f{}", i)));
         }
         let mut buf = BytesMut::new();
         assert!(matches!(
@@ -600,6 +632,20 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_namespace_over_full_track_name_limit() {
+        let mut buf = BytesMut::new();
+        (2usize).encode(&mut buf).unwrap();
+        let field = vec![b'x'; 2049];
+        field.len().encode(&mut buf).unwrap();
+        buf.extend_from_slice(&field);
+        field.len().encode(&mut buf).unwrap();
+        buf.extend_from_slice(&field);
+
+        let err = TrackNamespace::decode(&mut buf).unwrap_err();
+        assert!(matches!(err, DecodeError::TrackNameTooLong));
+    }
+
+    #[test]
     fn full_track_name_len_over_limit() {
         // 4092 (namespace) + 5 (track name "hello") = 4097 > 4096
         let big_field = vec![b'x'; 4092];
@@ -607,5 +653,16 @@ mod tests {
             fields: vec![TupleField { value: big_field }],
         };
         assert!(full_track_name_len(&ns, b"hello") > MAX_FULL_TRACK_NAME_LEN);
+    }
+
+    #[test]
+    fn validate_full_track_name_rejects_over_limit() {
+        let big_field = vec![b'a'; MAX_FULL_TRACK_NAME_LEN];
+        let ns = TrackNamespace {
+            fields: vec![TupleField { value: big_field }],
+        };
+
+        let err = validate_full_track_name(&ns, b"x").unwrap_err();
+        assert!(matches!(err, DecodeError::TrackNameTooLong));
     }
 }

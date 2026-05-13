@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::coding::{
-    Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location, TrackNamespace,
+    validate_full_track_name, Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location,
+    TrackNamespace,
 };
 use crate::message::{FetchType, GroupOrder};
 
@@ -18,6 +19,7 @@ impl Decode for StandaloneFetch {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let track_namespace = TrackNamespace::decode(r)?;
         let track_name = String::decode(r)?;
+        validate_full_track_name(&track_namespace, track_name.as_bytes())?;
         let start_location = Location::decode(r)?;
         let end_location = Location::decode(r)?;
 

@@ -97,11 +97,7 @@ impl RequestId {
     /// If the peer-advertised budget is exhausted, returns `Blocked` with
     /// `should_send_requests_blocked=true` once per max value.
     pub fn allocate(&self) -> Result<RequestIdAllocation, SessionError> {
-        let mut send = self
-            .inner
-            .send
-            .lock()
-            .map_err(|_| SessionError::Internal)?;
+        let mut send = self.inner.send.lock().map_err(|_| SessionError::Internal)?;
 
         if send.next >= send.peer_max {
             let should_send_requests_blocked = if send.blocked_sent_for == Some(send.peer_max) {
@@ -128,11 +124,7 @@ impl RequestId {
 
     /// Apply a peer MAX_REQUEST_ID update to the outbound allocator.
     pub fn apply_max_request_id(&self, msg: &MaxRequestId) -> Result<(), SessionError> {
-        let mut send = self
-            .inner
-            .send
-            .lock()
-            .map_err(|_| SessionError::Internal)?;
+        let mut send = self.inner.send.lock().map_err(|_| SessionError::Internal)?;
 
         if msg.request_id <= send.peer_max {
             return Err(SessionError::ProtocolViolation(
@@ -147,11 +139,7 @@ impl RequestId {
 
     /// Validate an incoming new request ID from the peer.
     pub fn validate_incoming(&self, id: u64) -> Result<(), SessionError> {
-        let mut recv = self
-            .inner
-            .recv
-            .lock()
-            .map_err(|_| SessionError::Internal)?;
+        let mut recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
 
         if id != recv.next_expected {
             return Err(SessionError::InvalidRequestId);
@@ -177,11 +165,7 @@ impl RequestId {
         msg: &RequestsBlocked,
         outgoing: &mut Queue<Message>,
     ) -> Result<(), SessionError> {
-        let mut recv = self
-            .inner
-            .recv
-            .lock()
-            .map_err(|_| SessionError::Internal)?;
+        let mut recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
 
         if msg.max_request_id >= recv.our_max {
             // TODO(itzmanish): make increment configurable.
@@ -372,9 +356,15 @@ mod tests {
         let send_ids = ids.clone();
         let recv_ids = ids.clone();
 
-        assert_eq!(send_ids.allocate().unwrap(), RequestIdAllocation::Allocated(0));
+        assert_eq!(
+            send_ids.allocate().unwrap(),
+            RequestIdAllocation::Allocated(0)
+        );
         recv_ids.validate_incoming(1).unwrap();
-        assert_eq!(send_ids.allocate().unwrap(), RequestIdAllocation::Allocated(2));
+        assert_eq!(
+            send_ids.allocate().unwrap(),
+            RequestIdAllocation::Allocated(2)
+        );
         recv_ids.validate_incoming(3).unwrap();
     }
 
@@ -383,11 +373,8 @@ mod tests {
         let ids = server_ids(10, 10);
         let mut outgoing = Queue::default().split().0;
 
-        ids.handle_requests_blocked(
-            &RequestsBlocked { max_request_id: 10 },
-            &mut outgoing,
-        )
-        .unwrap();
+        ids.handle_requests_blocked(&RequestsBlocked { max_request_id: 10 }, &mut outgoing)
+            .unwrap();
 
         // The peer can now send IDs beyond the original 10.
         ids.validate_incoming(0).unwrap();

@@ -293,76 +293,97 @@ mod tests {
 
     #[test]
     fn sequenced_request_id_covers_all_request_start_messages() {
-        assert_sequenced(Message::Subscribe(Subscribe {
-            id: 0,
-            track_namespace: namespace(),
-            track_name: "track".to_string(),
-            subscriber_priority: 127,
-            group_order: GroupOrder::Publisher,
-            forward: true,
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
-            params: KeyValuePairs::default(),
-        }), 0);
-
-        assert_sequenced(Message::RequestUpdate(RequestUpdate {
-            id: 2,
-            existing_request_id: 0,
-            params: KeyValuePairs::default(),
-        }), 2);
-
-        assert_sequenced(Message::Fetch(Fetch {
-            id: 4,
-            subscriber_priority: 127,
-            group_order: GroupOrder::Ascending,
-            fetch_type: FetchType::Standalone,
-            standalone_fetch: Some(StandaloneFetch {
+        assert_sequenced(
+            Message::Subscribe(Subscribe {
+                id: 0,
                 track_namespace: namespace(),
                 track_name: "track".to_string(),
-                start_location: Location::new(0, 0),
-                end_location: Location::new(0, 1),
+                subscriber_priority: 127,
+                group_order: GroupOrder::Publisher,
+                forward: true,
+                filter_type: FilterType::LargestObject,
+                start_location: None,
+                end_group_id: None,
+                params: KeyValuePairs::default(),
             }),
-            joining_fetch: None,
-            params: KeyValuePairs::default(),
-        }), 4);
+            0,
+        );
 
-        assert_sequenced(Message::TrackStatus(TrackStatus {
-            id: 6,
-            track_namespace: namespace(),
-            track_name: "track".to_string(),
-            subscriber_priority: 127,
-            group_order: GroupOrder::Publisher,
-            forward: true,
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
-            params: KeyValuePairs::default(),
-        }), 6);
+        assert_sequenced(
+            Message::RequestUpdate(RequestUpdate {
+                id: 2,
+                existing_request_id: 0,
+                params: KeyValuePairs::default(),
+            }),
+            2,
+        );
 
-        assert_sequenced(Message::SubscribeNamespace(SubscribeNamespace {
-            id: 8,
-            track_namespace_prefix: namespace(),
-            params: KeyValuePairs::default(),
-        }), 8);
+        assert_sequenced(
+            Message::Fetch(Fetch {
+                id: 4,
+                subscriber_priority: 127,
+                group_order: GroupOrder::Ascending,
+                fetch_type: FetchType::Standalone,
+                standalone_fetch: Some(StandaloneFetch {
+                    track_namespace: namespace(),
+                    track_name: "track".to_string(),
+                    start_location: Location::new(0, 0),
+                    end_location: Location::new(0, 1),
+                }),
+                joining_fetch: None,
+                params: KeyValuePairs::default(),
+            }),
+            4,
+        );
 
-        assert_sequenced(Message::Publish(Publish {
-            id: 10,
-            track_namespace: namespace(),
-            track_name: "track".to_string(),
-            track_alias: 1,
-            group_order: GroupOrder::Ascending,
-            content_exists: false,
-            largest_location: None,
-            forward: true,
-            params: KeyValuePairs::default(),
-        }), 10);
+        assert_sequenced(
+            Message::TrackStatus(TrackStatus {
+                id: 6,
+                track_namespace: namespace(),
+                track_name: "track".to_string(),
+                subscriber_priority: 127,
+                group_order: GroupOrder::Publisher,
+                forward: true,
+                filter_type: FilterType::LargestObject,
+                start_location: None,
+                end_group_id: None,
+                params: KeyValuePairs::default(),
+            }),
+            6,
+        );
 
-        assert_sequenced(Message::PublishNamespace(PublishNamespace {
-            id: 12,
-            track_namespace: namespace(),
-            params: KeyValuePairs::default(),
-        }), 12);
+        assert_sequenced(
+            Message::SubscribeNamespace(SubscribeNamespace {
+                id: 8,
+                track_namespace_prefix: namespace(),
+                params: KeyValuePairs::default(),
+            }),
+            8,
+        );
+
+        assert_sequenced(
+            Message::Publish(Publish {
+                id: 10,
+                track_namespace: namespace(),
+                track_name: "track".to_string(),
+                track_alias: 1,
+                group_order: GroupOrder::Ascending,
+                content_exists: false,
+                largest_location: None,
+                forward: true,
+                params: KeyValuePairs::default(),
+            }),
+            10,
+        );
+
+        assert_sequenced(
+            Message::PublishNamespace(PublishNamespace {
+                id: 12,
+                track_namespace: namespace(),
+                params: KeyValuePairs::default(),
+            }),
+            12,
+        );
     }
 
     #[test]

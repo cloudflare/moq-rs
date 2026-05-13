@@ -177,7 +177,12 @@ impl ops::Deref for Subscribed {
 impl Drop for Subscribed {
     fn drop(&mut self) {
         let state = self.state.lock();
-        let err = state.closed.as_ref().err().cloned().unwrap_or(ServeError::Done);
+        let err = state
+            .closed
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or(ServeError::Done);
         let stream_count = state.stream_count;
         let unsubscribed = state.unsubscribed;
         drop(state); // Important to avoid a deadlock
@@ -199,7 +204,7 @@ impl Drop for Subscribed {
             // legacy SUBSCRIBE_ERROR.
             self.publisher.send_message(message::RequestError {
                 id: self.info.id,
-                error_code: RequestErrorCode::InternalError as u64,
+                error_code: Self::request_error_code(&err),
                 retry_interval: 0,
                 reason: ReasonPhrase(err.to_string()),
             });
@@ -213,6 +218,24 @@ impl Subscribed {
             ServeError::Done => message::PublishDoneCode::TrackEnded as u64,
             ServeError::Closed(code) => *code,
             _ => message::PublishDoneCode::InternalError as u64,
+        }
+    }
+
+    fn request_error_code(err: &ServeError) -> u64 {
+        match err {
+            ServeError::Closed(code) => *code,
+            ServeError::NotFound | ServeError::NotFoundWithId(_, _) => {
+                RequestErrorCode::DoesNotExist as u64
+            }
+            ServeError::Duplicate => RequestErrorCode::DuplicateSubscription as u64,
+            ServeError::Cancel | ServeError::Done => RequestErrorCode::Uninterested as u64,
+            ServeError::Mode
+            | ServeError::Size
+            | ServeError::NotImplemented(_)
+            | ServeError::NotImplementedWithId(_, _) => RequestErrorCode::NotSupported as u64,
+            ServeError::Internal(_) | ServeError::InternalWithId(_, _) => {
+                RequestErrorCode::InternalError as u64
+            }
         }
     }
 
@@ -536,7 +559,10 @@ mod tests {
 
     #[test]
     fn publish_done_code_passes_through_closed_code() {
-        assert_eq!(Subscribed::publish_done_code(&ServeError::Closed(0x12)), 0x12);
+        assert_eq!(
+            Subscribed::publish_done_code(&ServeError::Closed(0x12)),
+            0x12
+        );
     }
 
     #[test]
@@ -547,4 +573,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_error_code_maps_rejection_reasons() {
+        assert_eq!(
+            Subscribed::request_error_code(&ServeError::NotFound),
+            RequestErrorCode::DoesNotExist as u64
+        );
+        assert_eq!(
+            Subscribed::request_error_code(&ServeError::Duplicate),
+            RequestErrorCode::DuplicateSubscription as u64
+        );
+        assert_eq!(
+            Subscribed::request_error_code(&ServeError::NotImplemented("fetch".to_string())),
+            RequestErrorCode::NotSupported as u64
+        );
+        assert_eq!(
+            Subscribed::request_error_code(&ServeError::Cancel),
+            RequestErrorCode::Uninterested as u64
+        );
+        assert_eq!(
+            Subscribed::request_error_code(&ServeError::Closed(0x42)),
+            0x42
+        );
+    }
 }
