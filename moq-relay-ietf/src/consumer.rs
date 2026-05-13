@@ -147,10 +147,18 @@ impl Consumer {
 
         loop {
             tokio::select! {
-                Err(err) = published_ns.closed() => {
+                res = published_ns.closed() => {
                     let ns = published_ns.namespace.to_utf8_path();
-                    tracing::info!(namespace = %ns, error = %err, "PUBLISH_NAMESPACE closed");
-                    return Err(err.into());
+                    match res {
+                        Ok(()) => {
+                            tracing::info!(namespace = %ns, "PUBLISH_NAMESPACE closed");
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            tracing::warn!(namespace = %ns, error = %err, "PUBLISH_NAMESPACE closed with cancel");
+                            return Err(err.into());
+                        }
+                    }
                 },
                 Some(track) = request.next() => {
                     let mut subscriber = self.subscriber.clone();
