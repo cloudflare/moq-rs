@@ -583,8 +583,6 @@ impl Session {
         let mut recver = Reader::new(control.1);
 
         let mut params = KeyValuePairs::default();
-        // TODO: make MAX_REQUEST_ID configurable.
-        params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
         if transport == Transport::RawQuic {
             // Draft-16 §9.3.1.1: send AUTHORITY for native QUIC.
@@ -616,7 +614,10 @@ impl Session {
         // The MAX_REQUEST_ID we advertise to the server.
         // TODO(itzmanish): make configurable.
         let our_max_request_id: u64 = 100;
-        params.set_intvalue(setup::ParameterType::MaxRequestId.into(), our_max_request_id);
+        params.set_intvalue(
+            setup::ParameterType::MaxRequestId.into(),
+            our_max_request_id,
+        );
 
         let client = setup::Client { params };
 
@@ -641,9 +642,7 @@ impl Session {
         let peer_max = max_request_id_from_params(&server.params);
         // Client sends even IDs (0); peer server sends odd IDs (1).
         let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
-        let session = Session::new(
-            session, sender, recver, mlog, transport, path, request_id,
-        );
+        let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
@@ -706,7 +705,10 @@ impl Session {
         // TODO(itzmanish): make configurable.
         let our_max_request_id: u64 = 100;
         let mut params = KeyValuePairs::default();
-        params.set_intvalue(setup::ParameterType::MaxRequestId.into(), our_max_request_id);
+        params.set_intvalue(
+            setup::ParameterType::MaxRequestId.into(),
+            our_max_request_id,
+        );
 
         let server = setup::Server { params };
 
@@ -727,7 +729,13 @@ impl Session {
         // Server sends odd IDs (1); peer client sends even IDs (0).
         let request_id = RequestId::new(1, peer_max, our_max_request_id, 0);
         Ok(Session::new(
-            session, sender, recver, mlog, transport, connection_path, request_id,
+            session,
+            sender,
+            recver,
+            mlog,
+            transport,
+            connection_path,
+            request_id,
         ))
     }
 
@@ -924,10 +932,7 @@ impl Session {
                     request_id.handle_requests_blocked(m, &mut outgoing)?;
                 }
                 other => {
-                    tracing::warn!(
-                        msg_type = other.name(),
-                        "received unhandled message type"
-                    );
+                    tracing::warn!(msg_type = other.name(), "received unhandled message type");
                     return Err(SessionError::unimplemented(&format!(
                         "message type {}",
                         other.name()

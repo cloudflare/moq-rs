@@ -86,5 +86,4 @@ mod tests {
         let decoded = PublishDone::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
     }
-
 }

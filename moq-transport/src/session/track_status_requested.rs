@@ -54,7 +54,9 @@ impl TrackStatusRequested {
             // and store as the LARGEST_OBJECT bytes parameter (odd key → bytes).
             let mut encoded = bytes::BytesMut::new();
             use crate::coding::Encode as _;
-            largest.encode(&mut encoded).map_err(|_| SessionError::Internal)?;
+            largest
+                .encode(&mut encoded)
+                .map_err(|_| SessionError::Internal)?;
             params.set_bytesvalue(param_keys::LARGEST_OBJECT, encoded.to_vec());
         }
 
@@ -75,6 +77,10 @@ mod tests {
     fn largest_object_param_key_is_odd() {
         // The LARGEST_OBJECT key must be odd so the KVP codec treats the value
         // as bytes-typed rather than int-typed.
-        assert_eq!(param_keys::LARGEST_OBJECT % 2, 1, "LARGEST_OBJECT key must be odd (bytes-typed KVP)");
+        assert_eq!(
+            param_keys::LARGEST_OBJECT % 2,
+            1,
+            "LARGEST_OBJECT key must be odd (bytes-typed KVP)"
+        );
     }
 }

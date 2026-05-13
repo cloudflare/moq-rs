@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::coding::{
-    Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location, TrackNamespace,
+    validate_full_track_name, Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location,
+    TrackNamespace,
 };
 use crate::message::FilterType;
 use crate::message::GroupOrder;
@@ -45,6 +46,7 @@ impl Decode for Subscribe {
 
         let track_namespace = TrackNamespace::decode(r)?;
         let track_name = String::decode(r)?;
+        validate_full_track_name(&track_namespace, track_name.as_bytes())?;
 
         let subscriber_priority = u8::decode(r)?;
         let group_order = GroupOrder::decode(r)?;
@@ -266,6 +268,31 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = Subscribe::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn decode_rejects_full_track_name_over_limit() {
+        let mut buf = BytesMut::new();
+        let msg = Subscribe {
+            id: 0,
+            track_namespace: TrackNamespace {
+                fields: vec![crate::coding::TupleField {
+                    value: vec![b'a'; crate::coding::MAX_FULL_TRACK_NAME_LEN],
+                }],
+            },
+            track_name: "x".to_string(),
+            subscriber_priority: 128,
+            group_order: GroupOrder::Ascending,
+            forward: true,
+            filter_type: FilterType::LargestObject,
+            start_location: None,
+            end_group_id: None,
+            params: KeyValuePairs::default(),
+        };
+
+        msg.encode(&mut buf).unwrap();
+        let err = Subscribe::decode(&mut buf).unwrap_err();
+        assert!(matches!(err, DecodeError::TrackNameTooLong));
     }
 
     #[test]

@@ -77,11 +77,11 @@ impl PublishedNamespace {
     /// Wait until the peer closes the namespace publish (PUBLISH_NAMESPACE_DONE).
     pub async fn closed(&self) -> Result<(), ServeError> {
         loop {
-            self.state
-                .lock()
-                .modified()
-                .ok_or(ServeError::Cancel)?
-                .await;
+            let Some(modified) = self.state.lock().modified() else {
+                return Ok(());
+            };
+
+            modified.await;
         }
     }
 

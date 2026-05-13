@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::coding::{
-    Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location, TrackNamespace,
+    validate_full_track_name, Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location,
+    TrackNamespace,
 };
 use crate::message::FilterType;
 use crate::message::GroupOrder;
@@ -43,6 +44,7 @@ impl Decode for TrackStatus {
 
         let track_namespace = TrackNamespace::decode(r)?;
         let track_name = String::decode(r)?;
+        validate_full_track_name(&track_namespace, track_name.as_bytes())?;
 
         let subscriber_priority = u8::decode(r)?;
         let group_order = GroupOrder::decode(r)?;

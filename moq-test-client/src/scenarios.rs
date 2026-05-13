@@ -157,9 +157,7 @@ pub async fn test_subscribe_error(args: &Args) -> Result<TestConnectionIds> {
 
         match subscribe_result {
             Ok(()) => {
-                anyhow::bail!(
-                    "subscribe succeeded but should have failed (track doesn't exist)"
-                );
+                anyhow::bail!("subscribe succeeded but should have failed (track doesn't exist)");
             }
             Err(e) => {
                 let err_str = e.to_string().to_lowercase();
@@ -198,28 +196,24 @@ pub async fn test_publish_namespace_subscribe(args: &Args) -> Result<TestConnect
         let (pub_session, pub_cid, pub_transport) =
             connect(args).await.context("publisher failed to connect")?;
         cids.add(pub_cid);
-        let (pub_session, mut publisher, _) =
-            Session::connect(pub_session, None, pub_transport)
-                .await
-                .context("publisher SETUP failed")?;
+        let (pub_session, mut publisher, _) = Session::connect(pub_session, None, pub_transport)
+            .await
+            .context("publisher SETUP failed")?;
 
-        let (sub_session, sub_cid, sub_transport) =
-            connect(args).await.context("subscriber failed to connect")?;
+        let (sub_session, sub_cid, sub_transport) = connect(args)
+            .await
+            .context("subscriber failed to connect")?;
         cids.add(sub_cid);
-        let (sub_session, _, mut subscriber) =
-            Session::connect(sub_session, None, sub_transport)
-                .await
-                .context("subscriber SETUP failed")?;
+        let (sub_session, _, mut subscriber) = Session::connect(sub_session, None, sub_transport)
+            .await
+            .context("subscriber SETUP failed")?;
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
 
         let (mut pub_writer, _, pub_reader) = Tracks::new(namespace.clone()).produce();
         let _track_writer = pub_writer.create(TEST_TRACK);
 
-        tracing::info!(
-            "Publisher sending PUBLISH_NAMESPACE: {}",
-            TEST_NAMESPACE
-        );
+        tracing::info!("Publisher sending PUBLISH_NAMESPACE: {}", TEST_NAMESPACE);
 
         let (mut sub_writer, _, _sub_reader) = Tracks::new(namespace.clone()).produce();
         let sub_track = sub_writer
@@ -315,13 +309,13 @@ pub async fn test_subscribe_before_publish_namespace(args: &Args) -> Result<Test
         let mut cids = TestConnectionIds::default();
 
         // Subscriber connects first.
-        let (sub_session, sub_cid, sub_transport) =
-            connect(args).await.context("subscriber failed to connect")?;
+        let (sub_session, sub_cid, sub_transport) = connect(args)
+            .await
+            .context("subscriber failed to connect")?;
         cids.add(sub_cid);
-        let (sub_session, _, mut subscriber) =
-            Session::connect(sub_session, None, sub_transport)
-                .await
-                .context("subscriber SETUP failed")?;
+        let (sub_session, _, mut subscriber) = Session::connect(sub_session, None, sub_transport)
+            .await
+            .context("subscriber SETUP failed")?;
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
 
@@ -354,10 +348,9 @@ pub async fn test_subscribe_before_publish_namespace(args: &Args) -> Result<Test
         let (pub_session, pub_cid, pub_transport) =
             connect(args).await.context("publisher failed to connect")?;
         cids.add(pub_cid);
-        let (pub_session, mut publisher, _) =
-            Session::connect(pub_session, None, pub_transport)
-                .await
-                .context("publisher SETUP failed")?;
+        let (pub_session, mut publisher, _) = Session::connect(pub_session, None, pub_transport)
+            .await
+            .context("publisher SETUP failed")?;
 
         let (mut pub_writer, _, pub_reader) = Tracks::new(namespace.clone()).produce();
         let _track_writer = pub_writer.create(TEST_TRACK);

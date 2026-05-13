@@ -25,6 +25,9 @@ use std::fmt;
 /// Maximum byte-value length for a bytes-typed KVP (2^16 − 1).
 const MAX_BYTES_VALUE_LEN: usize = u16::MAX as usize;
 
+/// Smallest possible encoded KVP: a one-byte delta plus a one-byte varint value.
+const MIN_KVP_WIRE_LEN: usize = 2;
+
 // ─── Value ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Eq, PartialEq)]
@@ -38,8 +41,11 @@ impl fmt::Debug for Value {
         match self {
             Value::IntValue(v) => write!(f, "{}", v),
             Value::BytesValue(bytes) => {
-                let preview: Vec<String> =
-                    bytes.iter().take(16).map(|b| format!("{:02X}", b)).collect();
+                let preview: Vec<String> = bytes
+                    .iter()
+                    .take(16)
+                    .map(|b| format!("{:02X}", b))
+                    .collect();
                 write!(f, "[{}]", preview.join(" "))
             }
         }
@@ -88,7 +94,9 @@ impl KeyValuePair {
         let delta = u64::decode(r)?;
 
         // Draft-16 §1.4.2: prev + delta MUST NOT overflow u64.
-        let abs_type = prev.checked_add(delta).ok_or(DecodeError::KvpTypeOverflow)?;
+        let abs_type = prev
+            .checked_add(delta)
+            .ok_or(DecodeError::KvpTypeOverflow)?;
 
         let pair = if abs_type % 2 == 0 {
             // Even type → varint value.
@@ -206,7 +214,14 @@ impl KeyValuePairs {
 impl Decode for KeyValuePairs {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let count = u64::decode(r)?;
-        let mut kvps = Vec::with_capacity(count as usize);
+
+        // `count` is peer-controlled, so do not allocate directly from it.
+        // This is only a capacity hint: with the bytes currently buffered, at
+        // most `remaining / MIN_KVP_WIRE_LEN` pairs can be decoded before the
+        // normal decode loop asks for more bytes via `DecodeError::More`.
+        let count_capacity = usize::try_from(count).unwrap_or(usize::MAX);
+        let payload_capacity = r.remaining() / MIN_KVP_WIRE_LEN;
+        let mut kvps = Vec::with_capacity(count_capacity.min(payload_capacity));
         let mut prev = 0u64;
 
         for _ in 0..count {
@@ -438,6 +453,15 @@ mod tests {
             "expected KeyValuePairLengthExceeded, got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn decode_large_count_does_not_allocate_count_capacity() {
+        let mut buf = BytesMut::new();
+        ((1u64 << 62) - 1).encode(&mut buf).unwrap();
+
+        let err = KeyValuePairs::decode(&mut buf).unwrap_err();
+        assert!(matches!(err, DecodeError::More(_)));
     }
 
     // ── duplicate key detection ───────────────────────────────────────────────
