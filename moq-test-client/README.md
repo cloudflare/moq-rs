@@ -49,7 +49,7 @@ moq-test-client --relay https://localhost:4443 --tls-disable-verify
 | `subscribe-error` | Subscribe to non-existent track, expect error |
 | `publish-namespace-subscribe` | Publisher sends PUBLISH_NAMESPACE, subscriber subscribes, verify handshake |
 | `subscribe-before-publish-namespace` | Subscriber subscribes before publisher sends PUBLISH_NAMESPACE |
-| `publish-namespace-done` | Announce namespace, send PUBLISH_NAMESPACE_DONE |
+| `publish-namespace-done` | Send PUBLISH_NAMESPACE, then send PUBLISH_NAMESPACE_DONE |
 
 ## Running with moq-relay
 

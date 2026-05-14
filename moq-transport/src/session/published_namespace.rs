@@ -11,14 +11,16 @@ use crate::{message, serve::ServeError};
 
 use super::{PublishNamespaceInfo, Subscriber};
 
-// There is currently no subscriber feedback beyond an OK or error, so the
-// shared state carries no data.
+// Tracks whether the publisher has cleanly completed this namespace publish.
 #[derive(Default)]
-struct PublishedNamespaceState {}
+struct PublishedNamespaceState {
+    done: bool,
+}
 
 /// Represents an inbound PUBLISH_NAMESPACE received by a subscriber.
 ///
-/// On drop, sends REQUEST_OK if accepted, or REQUEST_ERROR if rejected.
+/// On drop, revokes an accepted namespace with PUBLISH_NAMESPACE_CANCEL, or
+/// rejects an unaccepted namespace with REQUEST_ERROR.
 pub struct PublishedNamespace {
     session: Subscriber,
     state: State<PublishedNamespaceState>,
@@ -49,7 +51,7 @@ impl PublishedNamespace {
             state: send,
         };
         let recv = PublishedNamespaceRecv {
-            _state: recv,
+            state: recv,
             request_id,
         };
 
@@ -104,6 +106,10 @@ impl Drop for PublishedNamespace {
     fn drop(&mut self) {
         let err = self.error.clone().unwrap_or(ServeError::Done);
 
+        if self.state.lock().done {
+            return;
+        }
+
         if self.ok {
             // Accepted: send PUBLISH_NAMESPACE_CANCEL to revoke acceptance
             // (draft-16 §9.24).  Carries Request ID, not the namespace.
@@ -125,7 +131,7 @@ impl Drop for PublishedNamespace {
 }
 
 pub(super) struct PublishedNamespaceRecv {
-    _state: State<PublishedNamespaceState>,
+    state: State<PublishedNamespaceState>,
     /// Request ID of the corresponding PUBLISH_NAMESPACE, used for O(1) lookup
     /// when PUBLISH_NAMESPACE_DONE or PUBLISH_NAMESPACE_CANCEL arrives.
     pub request_id: u64,
@@ -133,7 +139,33 @@ pub(super) struct PublishedNamespaceRecv {
 
 impl PublishedNamespaceRecv {
     pub fn recv_done(self) -> Result<(), ServeError> {
+        if let Some(mut state) = self.state.lock_mut() {
+            state.done = true;
+        }
+
         // Dropping the state signals the PublishedNamespace that the peer is done.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recv_done_marks_namespace_done_before_drop() {
+        let state = State::<PublishedNamespaceState>::default();
+        let (send_state, recv_state) = state.split();
+        let recv = PublishedNamespaceRecv {
+            state: recv_state,
+            request_id: 0,
+        };
+
+        assert!(!send_state.lock().done);
+
+        recv.recv_done().unwrap();
+
+        assert!(send_state.lock().done);
+        assert!(send_state.lock().modified().is_none());
     }
 }
