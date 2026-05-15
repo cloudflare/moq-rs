@@ -68,7 +68,7 @@ pub struct Subscribed {
     state: State<SubscribedState>,
 
     /// Tracks if SubscribeOk has been sent yet or not. Used to send
-    /// SubscribeDone vs SubscribeError on drop.
+    /// PUBLISH_DONE vs REQUEST_ERROR on drop.
     ok: bool,
 
     /// Optional mlog writer for logging transport events
@@ -202,12 +202,15 @@ impl Drop for Subscribed {
         } else {
             // Draft-16 §9.8: subscription rejection uses REQUEST_ERROR, not the
             // legacy SUBSCRIBE_ERROR.
-            self.publisher.send_message(message::RequestError {
-                id: self.info.id,
-                error_code: Self::request_error_code(&err),
-                retry_interval: 0,
-                reason: ReasonPhrase(err.to_string()),
-            });
+            self.publisher.send_request_error(
+                "subscribe",
+                message::RequestError {
+                    id: self.info.id,
+                    error_code: Self::request_error_code(&err),
+                    retry_interval: 0,
+                    reason: ReasonPhrase(err.to_string()),
+                },
+            );
         };
     }
 }

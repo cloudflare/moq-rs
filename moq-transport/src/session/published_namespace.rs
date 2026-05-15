@@ -66,10 +66,13 @@ impl PublishedNamespace {
 
         // Draft-16 §6.2: acceptance is signalled with REQUEST_OK, not the
         // legacy PUBLISH_NAMESPACE_OK.
-        self.session.send_message(message::RequestOk {
-            id: self.info.request_id,
-            params: Default::default(),
-        });
+        self.session.send_request_ok(
+            "publish_namespace",
+            message::RequestOk {
+                id: self.info.request_id,
+                params: Default::default(),
+            },
+        );
 
         self.ok = true;
 
@@ -120,12 +123,15 @@ impl Drop for PublishedNamespace {
             });
         } else {
             // Never accepted: send REQUEST_ERROR (draft-16 §9.8).
-            self.session.send_message(message::RequestError {
-                id: self.info.request_id,
-                error_code: RequestErrorCode::Uninterested as u64,
-                retry_interval: 0,
-                reason: ReasonPhrase(err.to_string()),
-            });
+            self.session.send_request_error(
+                "publish_namespace",
+                message::RequestError {
+                    id: self.info.request_id,
+                    error_code: RequestErrorCode::Uninterested as u64,
+                    retry_interval: 0,
+                    reason: ReasonPhrase(err.to_string()),
+                },
+            );
         }
     }
 }

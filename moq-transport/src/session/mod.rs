@@ -217,27 +217,6 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::SubscribeError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "SUBSCRIBE_ERROR",
-                    subscribe_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
-                    "MoQT control message"
-                );
-            }
-            Message::SubscribeUpdate(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "SUBSCRIBE_UPDATE",
-                    request_id = m.id,
-                    subscription_request_id = m.subscription_request_id,
-                    "MoQT control message"
-                );
-            }
             Message::Unsubscribe(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
@@ -254,26 +233,6 @@ impl Session {
                     msg_type = "PUBLISH_NAMESPACE",
                     request_id = m.id,
                     namespace = %m.track_namespace,
-                    "MoQT control message"
-                );
-            }
-            Message::PublishNamespaceOk(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "PUBLISH_NAMESPACE_OK",
-                    request_id = m.id,
-                    "MoQT control message"
-                );
-            }
-            Message::PublishNamespaceError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "PUBLISH_NAMESPACE_ERROR",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
                     "MoQT control message"
                 );
             }
@@ -308,63 +267,12 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::TrackStatusOk(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "TRACK_STATUS_OK",
-                    request_id = m.id,
-                    track_alias = m.track_alias,
-                    content_exists = m.content_exists,
-                    "MoQT control message"
-                );
-            }
-            Message::TrackStatusError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "TRACK_STATUS_ERROR",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
-                    "MoQT control message"
-                );
-            }
             Message::SubscribeNamespace(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     direction,
                     msg_type = "SUBSCRIBE_NAMESPACE",
                     request_id = m.id,
-                    namespace_prefix = %m.track_namespace_prefix,
-                    "MoQT control message"
-                );
-            }
-            Message::SubscribeNamespaceOk(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "SUBSCRIBE_NAMESPACE_OK",
-                    request_id = m.id,
-                    "MoQT control message"
-                );
-            }
-            Message::SubscribeNamespaceError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "SUBSCRIBE_NAMESPACE_ERROR",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
-                    "MoQT control message"
-                );
-            }
-            Message::UnsubscribeNamespace(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "UNSUBSCRIBE_NAMESPACE",
                     namespace_prefix = %m.track_namespace_prefix,
                     "MoQT control message"
                 );
@@ -386,17 +294,6 @@ impl Session {
                     msg_type = "FETCH_OK",
                     request_id = m.id,
                     end_of_track = m.end_of_track,
-                    "MoQT control message"
-                );
-            }
-            Message::FetchError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "FETCH_ERROR",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
                     "MoQT control message"
                 );
             }
@@ -428,17 +325,6 @@ impl Session {
                     msg_type = "PUBLISH_OK",
                     request_id = m.id,
                     filter_type = ?m.filter_type,
-                    "MoQT control message"
-                );
-            }
-            Message::PublishError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "PUBLISH_ERROR",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
                     "MoQT control message"
                 );
             }
@@ -775,21 +661,12 @@ impl Session {
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_created(time, stream_id, m))
                         }
-                        Message::SubscribeError(m) => {
-                            Some(mlog::events::subscribe_error_created(time, stream_id, m))
-                        }
                         Message::Unsubscribe(m) => {
                             Some(mlog::events::unsubscribe_created(time, stream_id, m))
                         }
                         Message::PublishNamespace(m) => {
                             Some(mlog::events::publish_namespace_created(time, stream_id, m))
                         }
-                        Message::PublishNamespaceOk(m) => Some(
-                            mlog::events::publish_namespace_ok_created(time, stream_id, m),
-                        ),
-                        Message::PublishNamespaceError(m) => Some(
-                            mlog::events::publish_namespace_error_created(time, stream_id, m),
-                        ),
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_created(time, stream_id, m))
                         }
@@ -844,21 +721,12 @@ impl Session {
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_parsed(time, stream_id, m))
                         }
-                        Message::SubscribeError(m) => {
-                            Some(mlog::events::subscribe_error_parsed(time, stream_id, m))
-                        }
                         Message::Unsubscribe(m) => {
                             Some(mlog::events::unsubscribe_parsed(time, stream_id, m))
                         }
                         Message::PublishNamespace(m) => {
                             Some(mlog::events::publish_namespace_parsed(time, stream_id, m))
                         }
-                        Message::PublishNamespaceOk(m) => Some(
-                            mlog::events::publish_namespace_ok_parsed(time, stream_id, m),
-                        ),
-                        Message::PublishNamespaceError(m) => Some(
-                            mlog::events::publish_namespace_error_parsed(time, stream_id, m),
-                        ),
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_parsed(time, stream_id, m))
                         }

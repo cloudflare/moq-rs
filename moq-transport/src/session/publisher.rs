@@ -225,23 +225,79 @@ impl Publisher {
         self.unknown_track_status_requested.pop().await
     }
 
+    fn add_mlog_event(&self, event: mlog::Event) {
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mut mlog) = mlog.lock() {
+                let _ = mlog.add_event(event);
+            }
+        }
+    }
+
+    fn log_request_ok_parsed(&self, request_kind: &str, msg: &message::RequestOk) {
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mlog) = mlog.lock() {
+                let event =
+                    mlog::events::request_ok_parsed(mlog.elapsed_ms(), 0, request_kind, msg);
+                drop(mlog);
+                self.add_mlog_event(event);
+            }
+        }
+    }
+
+    fn log_request_error_parsed(&self, request_kind: &str, msg: &message::RequestError) {
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mlog) = mlog.lock() {
+                let event =
+                    mlog::events::request_error_parsed(mlog.elapsed_ms(), 0, request_kind, msg);
+                drop(mlog);
+                self.add_mlog_event(event);
+            }
+        }
+    }
+
+    fn log_request_error_created(&self, request_kind: &str, msg: &message::RequestError) {
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mlog) = mlog.lock() {
+                let event =
+                    mlog::events::request_error_created(mlog.elapsed_ms(), 0, request_kind, msg);
+                drop(mlog);
+                self.add_mlog_event(event);
+            }
+        }
+    }
+
+    pub(super) fn send_request_ok(&mut self, request_kind: &str, msg: message::RequestOk) {
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mlog) = mlog.lock() {
+                let event =
+                    mlog::events::request_ok_created(mlog.elapsed_ms(), 0, request_kind, &msg);
+                drop(mlog);
+                self.add_mlog_event(event);
+            }
+        }
+        self.send_message(msg);
+    }
+
+    pub(super) fn send_request_error(&mut self, request_kind: &str, msg: message::RequestError) {
+        self.log_request_error_created(request_kind, &msg);
+        self.send_message(msg);
+    }
+
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {
         match msg {
             message::Subscriber::Subscribe(msg) => self.recv_subscribe(msg)?,
             // REQUEST_UPDATE: not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
             message::Subscriber::RequestUpdate(msg) => {
-                self.send_not_supported(msg.id);
+                self.send_not_supported(msg.id, "request_update");
             }
             // Draft-16: REQUEST_OK from subscriber is acceptance of PUBLISH_NAMESPACE.
             message::Subscriber::RequestOk(msg) => self.recv_publish_namespace_ok(msg)?,
             // Draft-16: REQUEST_ERROR from subscriber is rejection of PUBLISH_NAMESPACE.
             message::Subscriber::RequestError(msg) => self.recv_publish_namespace_error(msg)?,
-            // Legacy stub retained for dispatch (pre-draft-16 peers only).
-            message::Subscriber::SubscribeUpdate(msg) => self.recv_subscribe_update(msg)?,
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg)?,
             // FETCH not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
             message::Subscriber::Fetch(msg) => {
-                self.send_not_supported(msg.id);
+                self.send_not_supported(msg.id, "fetch");
             }
             // FETCH_CANCEL references an existing request; log and ignore.
             message::Subscriber::FetchCancel(msg) => {
@@ -254,37 +310,18 @@ impl Publisher {
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg)?,
             // SUBSCRIBE_NAMESPACE not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
             message::Subscriber::SubscribeNamespace(msg) => {
-                self.send_not_supported(msg.id);
-            }
-            // UNSUBSCRIBE_NAMESPACE references an existing subscription; log and ignore.
-            message::Subscriber::UnsubscribeNamespace(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    namespace_prefix = %msg.track_namespace_prefix,
-                    "received UNSUBSCRIBE_NAMESPACE for unsupported SUBSCRIBE_NAMESPACE — ignoring"
-                );
+                self.send_not_supported(msg.id, "subscribe_namespace");
             }
             message::Subscriber::PublishNamespaceCancel(msg) => {
                 self.recv_publish_namespace_cancel(msg)?;
             }
-            // Legacy stub types — stub IDs (0x100+) are never decoded from the wire;
-            // these arms exist only so the exhaustive match compiles.
-            message::Subscriber::PublishNamespaceOk(_) => {}
-            message::Subscriber::PublishNamespaceError(_) => {}
-            // PUBLISH_OK and PUBLISH_ERROR are for publisher-initiated subscriptions
-            // which are not yet implemented — log and ignore.
+            // PUBLISH_OK is for publisher-initiated subscriptions, which are not
+            // yet implemented — log and ignore.
             message::Subscriber::PublishOk(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     request_id = msg.id,
                     "received PUBLISH_OK for unsupported PUBLISH — ignoring"
-                );
-            }
-            message::Subscriber::PublishError(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received PUBLISH_ERROR for unsupported PUBLISH — ignoring"
                 );
             }
         }
@@ -296,25 +333,26 @@ impl Publisher {
     ///
     /// Draft-16 §4: limited endpoints SHOULD respond with NOT_SUPPORTED rather
     /// than ignoring unsupported request types.
-    fn send_not_supported(&mut self, request_id: u64) {
+    fn send_not_supported(&mut self, request_id: u64, request_kind: &str) {
         tracing::debug!(
             target: "moq_transport::control",
             request_id,
             "sending REQUEST_ERROR NOT_SUPPORTED for unimplemented request"
         );
-        let _ = self.outgoing.push(
+        self.send_request_error(
+            request_kind,
             message::RequestError {
                 id: request_id,
                 error_code: RequestErrorCode::NotSupported as u64,
                 retry_interval: 0,
                 reason: crate::coding::ReasonPhrase("not supported".to_string()),
-            }
-            .into(),
+            },
         );
     }
 
     /// Handle REQUEST_OK from subscriber — acceptance of our PUBLISH_NAMESPACE (draft-16 §9.7).
     fn recv_publish_namespace_ok(&mut self, msg: message::RequestOk) -> Result<(), SessionError> {
+        self.log_request_ok_parsed("publish_namespace", &msg);
         // The publish_namespaces map is keyed by namespace; we must search by request_id.
         // TODO(itzmanish): maintain a second index keyed by request_id to make this O(1).
         let mut namespaces = self
@@ -333,6 +371,7 @@ impl Publisher {
         &mut self,
         msg: message::RequestError,
     ) -> Result<(), SessionError> {
+        self.log_request_error_parsed("publish_namespace", &msg);
         if let Some(recv) = self.drop_publish_namespace(msg.id) {
             recv.recv_error(ServeError::Closed(msg.error_code))?;
         }
@@ -359,30 +398,25 @@ impl Publisher {
                 .lock()
                 .map_err(|_| SessionError::Internal)?;
 
-            let entry = match subscribeds.entry(msg.id) {
-                hash_map::Entry::Occupied(_) => {
-                    // Draft-16 §5.1: duplicate SUBSCRIBE for the same request ID
-                    // MUST be rejected with DUPLICATE_SUBSCRIPTION, not a session close.
-                    self.outgoing
-                        .push(
-                            message::RequestError {
-                                id: msg.id,
-                                error_code: RequestErrorCode::DuplicateSubscription as u64,
-                                retry_interval: 0,
-                                reason: crate::coding::ReasonPhrase(
-                                    "duplicate subscription".to_string(),
-                                ),
-                            }
-                            .into(),
-                        )
-                        .ok();
-                    return Ok(());
-                }
-                hash_map::Entry::Vacant(entry) => entry,
-            };
+            if subscribeds.contains_key(&msg.id) {
+                let id = msg.id;
+                drop(subscribeds);
+                // Draft-16 §5.1: duplicate SUBSCRIBE for the same request ID
+                // MUST be rejected with DUPLICATE_SUBSCRIPTION, not a session close.
+                self.send_request_error(
+                    "subscribe",
+                    message::RequestError {
+                        id,
+                        error_code: RequestErrorCode::DuplicateSubscription as u64,
+                        retry_interval: 0,
+                        reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
+                    },
+                );
+                return Ok(());
+            }
 
             let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone());
-            entry.insert(recv);
+            subscribeds.insert(send.info.id, recv);
 
             send
         };
@@ -406,14 +440,6 @@ impl Publisher {
         }
 
         Ok(())
-    }
-
-    fn recv_subscribe_update(
-        &mut self,
-        _msg: message::SubscribeUpdate,
-    ) -> Result<(), SessionError> {
-        // TODO: Implement REQUEST_UPDATE for subscriptions.
-        Err(SessionError::unimplemented("SUBSCRIBE_UPDATE"))
     }
 
     fn recv_track_status(&mut self, msg: message::TrackStatus) -> Result<(), SessionError> {
@@ -463,7 +489,6 @@ impl Publisher {
         let msg = msg.into();
         match &msg {
             message::Publisher::PublishDone(m) => self.drop_subscribe(m.id),
-            message::Publisher::SubscribeError(m) => self.drop_subscribe(m.id),
             // Draft-16: PUBLISH_NAMESPACE_DONE carries Request ID, not namespace.
             // Dropping the recv state signals that the namespace is done.
             message::Publisher::PublishNamespaceDone(m) => {

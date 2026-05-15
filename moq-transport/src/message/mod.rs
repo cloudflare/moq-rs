@@ -20,7 +20,6 @@
 
 mod fetch;
 mod fetch_cancel;
-mod fetch_error;
 mod fetch_ok;
 mod fetch_type;
 mod filter_type;
@@ -30,11 +29,8 @@ mod max_request_id;
 mod pubilsh_namespace_done;
 mod publish;
 mod publish_done;
-mod publish_error;
 mod publish_namespace;
 mod publish_namespace_cancel;
-mod publish_namespace_error;
-mod publish_namespace_ok;
 mod publish_ok;
 mod publisher;
 mod request_error;
@@ -42,22 +38,14 @@ mod request_ok;
 mod request_update;
 mod requests_blocked;
 mod subscribe;
-mod subscribe_error;
 mod subscribe_namespace;
-mod subscribe_namespace_error;
-mod subscribe_namespace_ok;
 mod subscribe_ok;
-mod subscribe_update;
 mod subscriber;
 mod track_status;
-mod track_status_error;
-mod track_status_ok;
 mod unsubscribe;
-mod unsubscribe_namespace;
 
 pub use fetch::*;
 pub use fetch_cancel::*;
-pub use fetch_error::*;
 pub use fetch_ok::*;
 pub use fetch_type::*;
 pub use filter_type::*;
@@ -67,11 +55,8 @@ pub use max_request_id::*;
 pub use pubilsh_namespace_done::*;
 pub use publish::*;
 pub use publish_done::*;
-pub use publish_error::*;
 pub use publish_namespace::*;
 pub use publish_namespace_cancel::*;
-pub use publish_namespace_error::*;
-pub use publish_namespace_ok::*;
 pub use publish_ok::*;
 pub use publisher::*;
 pub use request_error::*;
@@ -79,18 +64,11 @@ pub use request_ok::*;
 pub use request_update::*;
 pub use requests_blocked::*;
 pub use subscribe::*;
-pub use subscribe_error::*;
 pub use subscribe_namespace::*;
-pub use subscribe_namespace_error::*;
-pub use subscribe_namespace_ok::*;
 pub use subscribe_ok::*;
-pub use subscribe_update::*;
 pub use subscriber::*;
 pub use track_status::*;
-pub use track_status_error::*;
-pub use track_status_ok::*;
 pub use unsubscribe::*;
-pub use unsubscribe_namespace::*;
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use bytes::Buf as _;
@@ -182,8 +160,6 @@ macro_rules! message_types {
                     Self::SubscribeNamespace(m) => Some(m.id),
                     Self::Publish(m) => Some(m.id),
                     Self::PublishNamespace(m) => Some(m.id),
-                    // Legacy pre-draft-16 request update stub.
-                    Self::SubscribeUpdate(m) => Some(m.id),
                     _ => None,
                 }
             }
@@ -206,19 +182,6 @@ macro_rules! message_types {
 }
 
 // Wire IDs per draft-ietf-moq-transport-16 Table 1.
-//
-// Messages not in draft-16 (old per-request OK/ERROR types) are kept as
-// internal types for session dispatch but their IDs were reassigned by the
-// spec.  The stale message structs (SubscribeError, PublishNamespaceOk/Error,
-// TrackStatusOk/Error, FetchError, SubscribeNamespaceOk/Error,
-// UnsubscribeNamespace, PublishError) are retained as Rust types for now
-// so existing session dispatch code compiles; they are wired up in the
-// publisher/subscriber enums and will be replaced by itzmanish.
-//
-// Stub IDs below (0x100+ range) are NOT sent on the wire; they are only
-// used internally so the macro-generated enum keeps compiling.  The decode
-// path will never produce them; the encode path is guarded by the session
-// layer which only sends draft-16 messages.
 message_types! {
     // NOTE: Setup messages live in a separate module (setup::Client/Server).
 
@@ -257,21 +220,6 @@ message_types! {
     GoAway          = 0x10,
     MaxRequestId    = 0x15,
     RequestsBlocked = 0x1a,
-
-    // ── Legacy/stub types (internal only; NOT sent on the wire) ─────────────
-    // These retain Rust types for the session dispatch layer while the
-    // per-message OK/ERROR flow is consolidated (TODO itzmanish).
-    SubscribeError          = 0x100,
-    PublishNamespaceOk      = 0x101,
-    PublishNamespaceError   = 0x102,
-    TrackStatusOk           = 0x103,
-    TrackStatusError        = 0x104,
-    FetchError              = 0x105,
-    SubscribeNamespaceOk    = 0x106,
-    SubscribeNamespaceError = 0x107,
-    UnsubscribeNamespace    = 0x108,
-    PublishError            = 0x109,
-    SubscribeUpdate         = 0x10a,
 }
 
 #[cfg(test)]
@@ -439,5 +387,15 @@ mod tests {
             stream_count: 0,
             reason: ReasonPhrase(String::new()),
         }));
+    }
+
+    #[test]
+    fn decode_rejects_legacy_stub_message_type() {
+        let mut buf = bytes::BytesMut::new();
+        0x100u64.encode(&mut buf).unwrap();
+        0u16.encode(&mut buf).unwrap();
+
+        let err = Message::decode(&mut buf).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidMessage(0x100)));
     }
 }

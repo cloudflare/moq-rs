@@ -32,12 +32,15 @@ impl TrackStatusRequested {
         error_code: u64,
         error_message: &str,
     ) -> Result<(), SessionError> {
-        self.publisher.send_message(message::RequestError {
-            id: self.request_msg.id,
-            error_code,
-            retry_interval: 0,
-            reason: ReasonPhrase(error_message.to_string()),
-        });
+        self.publisher.send_request_error(
+            "track_status",
+            message::RequestError {
+                id: self.request_msg.id,
+                error_code,
+                retry_interval: 0,
+                reason: ReasonPhrase(error_message.to_string()),
+            },
+        );
         Ok(())
     }
 
@@ -60,10 +63,13 @@ impl TrackStatusRequested {
             params.set_bytesvalue(param_keys::LARGEST_OBJECT, encoded.to_vec());
         }
 
-        self.publisher.send_message(RequestOk {
-            id: self.request_msg.id,
-            params,
-        });
+        self.publisher.send_request_ok(
+            "track_status",
+            RequestOk {
+                id: self.request_msg.id,
+                params,
+            },
+        );
 
         Ok(())
     }

@@ -104,6 +104,64 @@ impl Subscriber {
         self.published_namespace_queue.pop().await
     }
 
+    fn add_mlog_event(&self, event: mlog::Event) {
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mut mlog) = mlog.lock() {
+                let _ = mlog.add_event(event);
+            }
+        }
+    }
+
+    fn log_request_ok_parsed(&self, request_kind: &str, msg: &message::RequestOk) {
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mlog) = mlog.lock() {
+                let event =
+                    mlog::events::request_ok_parsed(mlog.elapsed_ms(), 0, request_kind, msg);
+                drop(mlog);
+                self.add_mlog_event(event);
+            }
+        }
+    }
+
+    fn log_request_error_parsed(&self, request_kind: &str, msg: &message::RequestError) {
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mlog) = mlog.lock() {
+                let event =
+                    mlog::events::request_error_parsed(mlog.elapsed_ms(), 0, request_kind, msg);
+                drop(mlog);
+                self.add_mlog_event(event);
+            }
+        }
+    }
+
+    fn log_request_error_created(&self, request_kind: &str, msg: &message::RequestError) {
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mlog) = mlog.lock() {
+                let event =
+                    mlog::events::request_error_created(mlog.elapsed_ms(), 0, request_kind, msg);
+                drop(mlog);
+                self.add_mlog_event(event);
+            }
+        }
+    }
+
+    pub(super) fn send_request_ok(&mut self, request_kind: &str, msg: message::RequestOk) {
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mlog) = mlog.lock() {
+                let event =
+                    mlog::events::request_ok_created(mlog.elapsed_ms(), 0, request_kind, &msg);
+                drop(mlog);
+                self.add_mlog_event(event);
+            }
+        }
+        self.send_message(msg);
+    }
+
+    pub(super) fn send_request_error(&mut self, request_kind: &str, msg: message::RequestError) {
+        self.log_request_error_created(request_kind, &msg);
+        self.send_message(msg);
+    }
+
     /// Allocate the next outbound request ID, enforcing the peer-advertised maximum.
     ///
     /// Returns `Err(TooManyRequests)` if no budget remains and also sends
@@ -173,16 +231,8 @@ impl Subscriber {
         // Remove our entry on terminal state.
         // Draft-16: PUBLISH_NAMESPACE_CANCEL carries Request ID, so look up
         // the namespace by iterating the map.
-        match &msg {
-            // Dropping the returned recv signals the PublishedNamespace that
-            // the cancel has been sent.
-            message::Subscriber::PublishNamespaceCancel(msg) => {
-                let _ = self.drop_publish_namespace(msg.id);
-            }
-            // PublishNamespaceError is the legacy stub (internal only; not sent on wire).
-            // REQUEST_ERROR is now used for rejections.
-            message::Subscriber::PublishNamespaceError(_msg) => {}
-            _ => {}
+        if let message::Subscriber::PublishNamespaceCancel(msg) = &msg {
+            let _ = self.drop_publish_namespace(msg.id);
         }
 
         // TODO report dropped messages?
@@ -199,51 +249,19 @@ impl Subscriber {
             // PUBLISH (publisher-initiated subscription) not yet implemented.
             // Send REQUEST_ERROR NOT_SUPPORTED so the publisher knows we cannot accept it.
             message::Publisher::Publish(msg) => {
-                self.send_not_supported(msg.id);
+                self.send_not_supported(msg.id, "publish");
             }
             message::Publisher::PublishDone(msg) => self.recv_publish_done(msg)?,
             message::Publisher::SubscribeOk(msg) => self.recv_subscribe_ok(msg)?,
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
             message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
             message::Publisher::RequestError(msg) => self.recv_request_error(msg)?,
-            // Legacy stubs — stub IDs (0x100+) are never decoded from the wire;
-            // these arms exist only so the exhaustive match compiles.
-            message::Publisher::SubscribeError(msg) => self.recv_subscribe_error(msg)?,
-            message::Publisher::TrackStatusOk(msg) => self.recv_track_status_ok(msg)?,
-            // These legacy response stubs are never decoded from the wire; log and ignore.
-            message::Publisher::TrackStatusError(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received legacy TRACK_STATUS_ERROR — ignoring (draft-16 uses REQUEST_ERROR)"
-                );
-            }
+            // FETCH_OK is part of draft-16, but FETCH is not implemented here yet.
             message::Publisher::FetchOk(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     request_id = msg.id,
                     "received FETCH_OK for unsupported FETCH — ignoring"
-                );
-            }
-            message::Publisher::FetchError(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received FETCH_ERROR for unsupported FETCH — ignoring"
-                );
-            }
-            message::Publisher::SubscribeNamespaceOk(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received legacy SUBSCRIBE_NAMESPACE_OK — ignoring"
-                );
-            }
-            message::Publisher::SubscribeNamespaceError(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received legacy SUBSCRIBE_NAMESPACE_ERROR — ignoring"
                 );
             }
         }
@@ -255,20 +273,20 @@ impl Subscriber {
     ///
     /// Draft-16 §4: limited endpoints SHOULD respond with NOT_SUPPORTED rather
     /// than ignoring unsupported request types.
-    fn send_not_supported(&mut self, request_id: u64) {
+    fn send_not_supported(&mut self, request_id: u64, request_kind: &str) {
         tracing::debug!(
             target: "moq_transport::control",
             request_id,
             "sending REQUEST_ERROR NOT_SUPPORTED for unimplemented request"
         );
-        let _ = self.outgoing.push(
+        self.send_request_error(
+            request_kind,
             message::RequestError {
                 id: request_id,
                 error_code: crate::message::RequestErrorCode::NotSupported as u64,
                 retry_interval: 0,
                 reason: crate::coding::ReasonPhrase("not supported".to_string()),
-            }
-            .into(),
+            },
         );
     }
 
@@ -348,18 +366,6 @@ impl Subscriber {
         subscribe
     }
 
-    /// Handle SubscribeError from the publisher (legacy stub; never decoded from
-    /// draft-16 wire — stub ID 0x100 is never produced by the decoder).
-    /// Draft-16 subscription rejections arrive as REQUEST_ERROR and are handled
-    /// by recv_request_error.
-    fn recv_subscribe_error(&mut self, msg: &message::SubscribeError) -> Result<(), SessionError> {
-        if let Some(subscribe) = self.remove_subscribe(msg.id) {
-            subscribe.error(ServeError::Closed(msg.error_code))?;
-        }
-
-        Ok(())
-    }
-
     /// Handle the reception of a PublishDone message from the publisher.
     fn recv_publish_done(&mut self, msg: &message::PublishDone) -> Result<(), SessionError> {
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
@@ -376,6 +382,7 @@ impl Subscriber {
     /// SUBSCRIBE_OK message (§9.10) and does not come through this handler.
     /// Full routing for the other request types is wired up (TODO itzmanish).
     fn recv_request_ok(&mut self, msg: &message::RequestOk) -> Result<(), SessionError> {
+        self.log_request_ok_parsed("unknown", msg);
         tracing::debug!(
             target: "moq_transport::control",
             request_id = msg.id,
@@ -391,6 +398,14 @@ impl Subscriber {
     /// exists, otherwise logs and ignores.  Full per-flow routing is
     /// wired up (TODO itzmanish).
     fn recv_request_error(&mut self, msg: &message::RequestError) -> Result<(), SessionError> {
+        // Route to a matching subscribe if present.
+        if let Some(subscribe) = self.remove_subscribe(msg.id) {
+            self.log_request_error_parsed("subscribe", msg);
+            subscribe.error(ServeError::Closed(msg.error_code))?;
+        } else {
+            self.log_request_error_parsed("unknown", msg);
+        }
+
         tracing::debug!(
             target: "moq_transport::control",
             request_id = msg.id,
@@ -399,17 +414,6 @@ impl Subscriber {
             reason = %msg.reason.0,
             "received REQUEST_ERROR"
         );
-        // Route to a matching subscribe if present.
-        if let Some(subscribe) = self.remove_subscribe(msg.id) {
-            subscribe.error(ServeError::Closed(msg.error_code))?;
-        }
-        Ok(())
-    }
-
-    /// Handle the reception of a TrackStatusOk message from the publisher (legacy).
-    fn recv_track_status_ok(&mut self, _msg: &message::TrackStatusOk) -> Result<(), SessionError> {
-        // TODO: Expose this somehow?
-        // TODO: Also add a way to send a Track Status Request in the first place
         Ok(())
     }
 
