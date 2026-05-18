@@ -158,8 +158,9 @@ impl RequestId {
 
     /// Handle REQUESTS_BLOCKED from the peer.
     ///
-    /// If the peer is blocked at or above our current advertised maximum, this
-    /// increases our advertised max and queues MAX_REQUEST_ID.
+    /// If the peer has consumed our current advertised maximum and reports that
+    /// same maximum as blocked, this increases our advertised max and queues
+    /// MAX_REQUEST_ID.
     pub fn handle_requests_blocked(
         &self,
         msg: &RequestsBlocked,
@@ -167,7 +168,7 @@ impl RequestId {
     ) -> Result<(), SessionError> {
         let mut recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
 
-        if msg.max_request_id >= recv.our_max {
+        if msg.max_request_id == recv.our_max && recv.next_expected >= recv.our_max {
             // TODO(itzmanish): make increment configurable.
             recv.our_max = recv.our_max.saturating_add(100);
             let _ = outgoing.push(
@@ -371,17 +372,59 @@ mod tests {
     #[test]
     fn requests_blocked_increases_our_max() {
         let ids = server_ids(10, 10);
-        let mut outgoing = Queue::default().split().0;
+        let (mut outgoing, _recv) = Queue::default().split();
 
-        ids.handle_requests_blocked(&RequestsBlocked { max_request_id: 10 }, &mut outgoing)
-            .unwrap();
-
-        // The peer can now send IDs beyond the original 10.
+        // The peer must consume the advertised range before REQUESTS_BLOCKED can
+        // expand it.
         ids.validate_incoming(0).unwrap();
         ids.validate_incoming(2).unwrap();
         ids.validate_incoming(4).unwrap();
         ids.validate_incoming(6).unwrap();
         ids.validate_incoming(8).unwrap();
+
+        ids.handle_requests_blocked(&RequestsBlocked { max_request_id: 10 }, &mut outgoing)
+            .unwrap();
+
+        // The peer can now send IDs beyond the original 10.
         ids.validate_incoming(10).unwrap();
+    }
+
+    #[test]
+    fn requests_blocked_before_budget_consumed_does_not_increase_our_max() {
+        let ids = server_ids(10, 10);
+        let (mut outgoing, _recv) = Queue::default().split();
+
+        ids.handle_requests_blocked(&RequestsBlocked { max_request_id: 10 }, &mut outgoing)
+            .unwrap();
+
+        assert!(outgoing.close().is_empty());
+        ids.validate_incoming(0).unwrap();
+        ids.validate_incoming(2).unwrap();
+        ids.validate_incoming(4).unwrap();
+        ids.validate_incoming(6).unwrap();
+        ids.validate_incoming(8).unwrap();
+        assert!(matches!(
+            ids.validate_incoming(10).unwrap_err(),
+            SessionError::TooManyRequests
+        ));
+    }
+
+    #[test]
+    fn requests_blocked_only_increases_once_per_advertised_max() {
+        let ids = server_ids(10, 10);
+        let (mut outgoing, _recv) = Queue::default().split();
+
+        ids.validate_incoming(0).unwrap();
+        ids.validate_incoming(2).unwrap();
+        ids.validate_incoming(4).unwrap();
+        ids.validate_incoming(6).unwrap();
+        ids.validate_incoming(8).unwrap();
+
+        ids.handle_requests_blocked(&RequestsBlocked { max_request_id: 10 }, &mut outgoing)
+            .unwrap();
+        ids.handle_requests_blocked(&RequestsBlocked { max_request_id: 10 }, &mut outgoing)
+            .unwrap();
+
+        assert_eq!(outgoing.close().len(), 1);
     }
 }

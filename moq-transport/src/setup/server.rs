@@ -9,6 +9,7 @@
 //! the selected version.
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
+use bytes::Buf as _;
 
 /// Sent by the server in response to CLIENT_SETUP.
 ///
@@ -28,10 +29,14 @@ impl Decode for Server {
             return Err(DecodeError::InvalidMessage(typ));
         }
 
-        let _len = u16::decode(r)?;
-        // TODO(itzmanish): enforce message length.
+        let len = u16::decode(r)? as usize;
+        <u64 as Decode>::decode_remaining(r, len)?;
+        let mut payload = r.copy_to_bytes(len);
 
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode(&mut payload)?;
+        if payload.has_remaining() {
+            return Err(DecodeError::InvalidMessage(typ));
+        }
 
         Ok(Self { params })
     }
@@ -102,5 +107,21 @@ mod tests {
 
         let decoded = Server::decode(&mut buf).unwrap();
         assert!(decoded.params.0.is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_overlong_payload() {
+        let mut buf = BytesMut::new();
+        let server = Server {
+            params: KeyValuePairs::default(),
+        };
+        server.encode(&mut buf).unwrap();
+        buf[2] += 1;
+        buf.extend_from_slice(&[0x00]);
+
+        assert!(matches!(
+            Server::decode(&mut buf).unwrap_err(),
+            DecodeError::InvalidMessage(0x21)
+        ));
     }
 }

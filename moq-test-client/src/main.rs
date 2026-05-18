@@ -77,7 +77,7 @@ pub enum TestCase {
     PublishNamespaceSubscribe,
     /// T0.5: Subscriber subscribes before publisher sends PUBLISH_NAMESPACE
     SubscribeBeforePublishNamespace,
-    /// T0.6: Announce namespace, receive OK, send PUBLISH_NAMESPACE_DONE
+    /// T0.6: Send PUBLISH_NAMESPACE, receive REQUEST_OK, send PUBLISH_NAMESPACE_DONE
     PublishNamespaceDone,
 }
 
