@@ -9,6 +9,7 @@
 //! they no longer contain a version list.
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
+use bytes::Buf as _;
 
 /// Sent by the client to set up the session.
 ///
@@ -28,10 +29,14 @@ impl Decode for Client {
             return Err(DecodeError::InvalidMessage(typ));
         }
 
-        let _len = u16::decode(r)?;
-        // TODO(itzmanish): enforce message length.
+        let len = u16::decode(r)? as usize;
+        <u64 as Decode>::decode_remaining(r, len)?;
+        let mut payload = r.copy_to_bytes(len);
 
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode(&mut payload)?;
+        if payload.has_remaining() {
+            return Err(DecodeError::InvalidMessage(typ));
+        }
 
         Ok(Self { params })
     }
@@ -108,6 +113,22 @@ mod tests {
 
         let decoded = Client::decode(&mut buf).unwrap();
         assert!(decoded.params.0.is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_overlong_payload() {
+        let mut buf = BytesMut::new();
+        let client = Client {
+            params: KeyValuePairs::default(),
+        };
+        client.encode(&mut buf).unwrap();
+        buf[2] += 1;
+        buf.extend_from_slice(&[0x00]);
+
+        assert!(matches!(
+            Client::decode(&mut buf).unwrap_err(),
+            DecodeError::InvalidMessage(0x20)
+        ));
     }
 
     /// Confirm DRAFT_16 version constant is defined and has the right value.
