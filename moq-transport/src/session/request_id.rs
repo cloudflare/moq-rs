@@ -163,7 +163,7 @@ impl RequestId {
     pub fn handle_requests_blocked(&self, msg: &RequestsBlocked) -> Result<(), SessionError> {
         let recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
         tracing::warn!(
-            "got requests blocked, peer max: {}, configured limit: {}, limit hit: {}",
+            "got requests blocked, peer max: {}, configured limit: {}, limit hit: {}, ignoring it",
             msg.max_request_id,
             recv.our_max,
             msg.max_request_id == recv.our_max
@@ -184,7 +184,7 @@ pub fn max_request_id_from_params(params: &KeyValuePairs) -> u64 {
             Value::IntValue(v) => Some(*v),
             _ => None,
         })
-        .unwrap_or(u64::MAX)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
