@@ -104,56 +104,32 @@ impl Subscriber {
         self.published_namespace_queue.pop().await
     }
 
-    fn add_mlog_event(&self, event: mlog::Event) {
+    fn add_mlog_event<F>(&self, make_event: F)
+    where
+        F: FnOnce(f64) -> mlog::Event,
+    {
         if let Some(ref mlog) = self.mlog {
             if let Ok(mut mlog) = mlog.lock() {
+                let event = make_event(mlog.elapsed_ms());
                 let _ = mlog.add_event(event);
             }
         }
     }
 
     fn log_request_ok_parsed(&self, request_kind: &str, msg: &message::RequestOk) {
-        if let Some(ref mlog) = self.mlog {
-            if let Ok(mlog) = mlog.lock() {
-                let event =
-                    mlog::events::request_ok_parsed(mlog.elapsed_ms(), 0, request_kind, msg);
-                drop(mlog);
-                self.add_mlog_event(event);
-            }
-        }
+        self.add_mlog_event(|time| mlog::events::request_ok_parsed(time, 0, request_kind, msg));
     }
 
     fn log_request_error_parsed(&self, request_kind: &str, msg: &message::RequestError) {
-        if let Some(ref mlog) = self.mlog {
-            if let Ok(mlog) = mlog.lock() {
-                let event =
-                    mlog::events::request_error_parsed(mlog.elapsed_ms(), 0, request_kind, msg);
-                drop(mlog);
-                self.add_mlog_event(event);
-            }
-        }
+        self.add_mlog_event(|time| mlog::events::request_error_parsed(time, 0, request_kind, msg));
     }
 
     fn log_request_error_created(&self, request_kind: &str, msg: &message::RequestError) {
-        if let Some(ref mlog) = self.mlog {
-            if let Ok(mlog) = mlog.lock() {
-                let event =
-                    mlog::events::request_error_created(mlog.elapsed_ms(), 0, request_kind, msg);
-                drop(mlog);
-                self.add_mlog_event(event);
-            }
-        }
+        self.add_mlog_event(|time| mlog::events::request_error_created(time, 0, request_kind, msg));
     }
 
     pub(super) fn send_request_ok(&mut self, request_kind: &str, msg: message::RequestOk) {
-        if let Some(ref mlog) = self.mlog {
-            if let Ok(mlog) = mlog.lock() {
-                let event =
-                    mlog::events::request_ok_created(mlog.elapsed_ms(), 0, request_kind, &msg);
-                drop(mlog);
-                self.add_mlog_event(event);
-            }
-        }
+        self.add_mlog_event(|time| mlog::events::request_ok_created(time, 0, request_kind, &msg));
         self.send_message(msg);
     }
 

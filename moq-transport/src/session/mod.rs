@@ -697,7 +697,7 @@ impl Session {
         mut subscriber: Option<Subscriber>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
-        mut outgoing: Queue<Message>,
+        _outgoing: Queue<Message>,
     ) -> Result<(), SessionError> {
         let mut goaway_received = false;
 
@@ -794,10 +794,10 @@ impl Session {
                     tracing::debug!(
                         target: "moq_transport::control",
                         max_request_id = m.max_request_id,
-                        "received REQUESTS_BLOCKED — increasing our advertised max"
+                        "received REQUESTS_BLOCKED"
                     );
                     // REQUESTS_BLOCKED tells us the peer's send budget is exhausted.
-                    request_id.handle_requests_blocked(m, &mut outgoing)?;
+                    request_id.handle_requests_blocked(m)?;
                 }
                 other => {
                     tracing::warn!(msg_type = other.name(), "received unhandled message type");
