@@ -20,6 +20,6 @@ ADDR="${ADDR:-$HOST:$PORT}"
 NAME="${NAME:-bbb}"
 
 # Combine the host and name into a URL.
-URL="${URL:-"https://$ADDR/$NAME"}"
+URL="${URL:-"https://$ADDR"}"
 
 cargo run --bin moq-sub -- --name "$NAME" "$URL" "$@" | ffplay -
