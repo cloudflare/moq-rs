@@ -304,6 +304,7 @@ mod tests {
             Message::SubscribeNamespace(SubscribeNamespace {
                 id: 8,
                 track_namespace_prefix: namespace(),
+                subscribe_options: SubscribeOptions::Both,
                 params: KeyValuePairs::default(),
             }),
             8,
