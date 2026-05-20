@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8](https://github.com/cloudflare/moq-rs/compare/moq-sub-v0.4.7...moq-sub-v0.4.8) - 2026-05-20
+
+### Fixed
+
+- subscribe cleaning on drop
+
 ## [0.4.7](https://github.com/cloudflare/moq-rs/compare/moq-sub-v0.4.6...moq-sub-v0.4.7) - 2026-04-10
 
 ### Fixed

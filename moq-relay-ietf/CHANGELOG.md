@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.18](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.17...moq-relay-ietf-v0.7.18) - 2026-05-20
+
+### Fixed
+
+- tokio utils use default features
+- suggestions from opencode reviewers
+- apply suggestions from opencode review
+
+### Other
+
+- check for cancelled of cancellation token when waiting for subscribe open
+- keep the comments for readability purpose
+- Merge branch 'main' of github.com:itzmanish/moq-rs into feat/remote-manager-rewrite
+
 ## [0.7.17](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.16...moq-relay-ietf-v0.7.17) - 2026-04-13
 
 ### Fixed

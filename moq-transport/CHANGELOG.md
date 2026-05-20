@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.14.1...moq-transport-v0.14.2) - 2026-05-20
+
+### Fixed
+
+- subscribe cleaning on drop
+- apply suggestions from opencode review
+
 ## [0.14.1](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.14.0...moq-transport-v0.14.1) - 2026-03-31
 
 ### Other
