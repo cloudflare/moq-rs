@@ -268,7 +268,7 @@ impl Subscribed {
         // Log subgroup header created/sent
         if let Some(ref mlog) = mlog {
             if let Ok(mut mlog_guard) = mlog.lock() {
-                let time = mlog_guard.elapsed_ms();
+                let time = mlog_guard.epoch_ms();
                 let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
                 let event = mlog::subgroup_header_created(time, stream_id, &header);
                 let _ = mlog_guard.add_event(event);
@@ -304,7 +304,7 @@ impl Subscribed {
             // Log subgroup object created/sent
             if let Some(ref mlog) = mlog {
                 if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
+                    let time = mlog_guard.epoch_ms();
                     let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
                     let event = mlog::subgroup_object_ext_created(
                         time,
@@ -413,7 +413,7 @@ impl Subscribed {
             // Create mlog event for datagram created
             if let Some(ref mlog) = self.mlog {
                 if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
+                    let time = mlog_guard.epoch_ms();
                     let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
                     let _ = mlog_guard.add_event(mlog::object_datagram_created(
                         time,

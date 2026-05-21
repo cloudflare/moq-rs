@@ -654,7 +654,7 @@ impl Session {
 
         // Emit mlog event for CLIENT_SETUP parsed
         if let Some(ref mut mlog) = mlog {
-            let event = mlog::events::client_setup_parsed(mlog.elapsed_ms(), 0, &client);
+            let event = mlog::events::client_setup_parsed(mlog.epoch_ms(), 0, &client);
             let _ = mlog.add_event(event);
         }
 
@@ -682,7 +682,7 @@ impl Session {
 
             // Emit mlog event for SERVER_SETUP created
             if let Some(ref mut mlog) = mlog {
-                let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
+                let event = mlog::events::server_setup_created(mlog.epoch_ms(), 0, &server);
                 let _ = mlog.add_event(event);
             }
 
@@ -728,7 +728,7 @@ impl Session {
             // Emit mlog event for sent control messages
             if let Some(ref mlog) = mlog {
                 if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
+                    let time = mlog_guard.epoch_ms();
                     let stream_id = 0; // Control stream is always stream 0
 
                     // Emit events based on message type
@@ -792,7 +792,7 @@ impl Session {
             // Emit mlog event for received control messages
             if let Some(ref mlog) = mlog {
                 if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
+                    let time = mlog_guard.epoch_ms();
                     let stream_id = 0; // Control stream is always stream 0
 
                     // Emit events based on message type

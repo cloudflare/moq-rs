@@ -40,15 +40,15 @@ curl https://interop-relay.cloudflare.mediaoverquic.com:443/mlog/22c73802597dcd9
 The output is JSON-SEQ: each record starts with ASCII Record Separator (`0x1e`) and contains a JSON object. The first record is a header; subsequent records are events:
 
 ```json
-{"time":0.179,"name":"moqt:control_message_parsed","data":{"message_type":"client_setup","supported_versions":["DRAFT_14"],...}}
-{"time":0.216,"name":"moqt:control_message_created","data":{"message_type":"server_setup","selected_version":"DRAFT_14",...}}
+{"time":1744243200179.0,"name":"moqt:control_message_parsed","data":{"stream_id":0,"message":{"type":"client_setup","supported_versions":["DRAFT_14"],...}}}
+{"time":1744243200216.0,"name":"moqt:control_message_created","data":{"stream_id":0,"message":{"type":"server_setup","selected_version":"DRAFT_14",...}}}
 ```
 
-- `control_message_parsed` = the relay **received** a message from your client
+- `control_message_parsed` = the relay **received** a message from your client (the `message.type` field identifies which control message)
 - `control_message_created` = the relay **sent** a message to your client
-- `time` = milliseconds since connection start
+- `time` = milliseconds since Unix epoch (absolute timestamp)
 
-If you see `client_setup` parsed and `server_setup` created, your client is speaking valid MoQ Transport and the relay understood it.
+If you see `client_setup` parsed and `server_setup` created (check `message.type`), your client is speaking valid MoQ Transport and the relay understood it.
 
 ## Worked Examples
 
@@ -67,30 +67,34 @@ cargo run --bin moq-test-client -- \
 
 ```json
 {
-  "time": 0.179,
+  "time": 1744243200179.0,
   "name": "moqt:control_message_parsed",
   "data": {
-    "event_type": "control_message_parsed",
     "stream_id": 0,
-    "message_type": "client_setup",
-    "number_of_supported_versions": 1,
-    "supported_versions": ["DRAFT_14"],
-    "parameters": [["2", "100"]]
+    "message": {
+      "type": "client_setup",
+      "number_of_supported_versions": 1,
+      "supported_versions": ["DRAFT_14"],
+      "number_of_parameters": 1,
+      "setup_parameters": [{"name": "path", "value": "/"}]
+    }
   }
 }
 ```
-The relay parsed your CLIENT_SETUP. It offered version DRAFT_14. The `parameters` array contains SETUP parameters as `[id, value]` pairs (here, PATH with max length 100).
+The relay parsed your CLIENT_SETUP. It offered version DRAFT_14. The `setup_parameters` array contains typed parameter objects (here, a PATH parameter).
 
 ```json
 {
-  "time": 0.216,
+  "time": 1744243200216.0,
   "name": "moqt:control_message_created",
   "data": {
-    "event_type": "control_message_created",
     "stream_id": 0,
-    "message_type": "server_setup",
-    "selected_version": "DRAFT_14",
-    "parameters": [["2", "100"]]
+    "message": {
+      "type": "server_setup",
+      "selected_version": "DRAFT_14",
+      "number_of_parameters": 1,
+      "setup_parameters": [{"name": "max_request_id", "value": 100}]
+    }
   }
 }
 ```
@@ -115,29 +119,32 @@ cargo run --bin moq-test-client -- \
 
 ```json
 {
-  "time": 64.779,
+  "time": 1744243264779.0,
   "name": "moqt:control_message_parsed",
   "data": {
-    "event_type": "control_message_parsed",
     "stream_id": 0,
-    "message_type": "publish_namespace",
-    "request_id": 0,
-    "track_namespace": "/moq-test/interop",
-    "parameters": []
+    "message": {
+      "type": "publish_namespace",
+      "request_id": 0,
+      "track_namespace": [{"value": "moq-test"}, {"value": "interop"}],
+      "number_of_parameters": 0,
+      "parameters": []
+    }
   }
 }
 ```
-The relay received your PUBLISH_NAMESPACE for `/moq-test/interop`.
+The relay received your PUBLISH_NAMESPACE for `moq-test/interop`.
 
 ```json
 {
-  "time": 65.526,
+  "time": 1744243265526.0,
   "name": "moqt:control_message_created",
   "data": {
-    "event_type": "control_message_created",
     "stream_id": 0,
-    "message_type": "publish_namespace_ok",
-    "request_id": 0
+    "message": {
+      "type": "publish_namespace_ok",
+      "request_id": 0
+    }
   }
 }
 ```
@@ -183,33 +190,33 @@ curl https://interop-relay.cloudflare.mediaoverquic.com:443/mlog/08d0b03ede133f0
 **Publisher mlog** (after SETUP):
 
 ```json
-{"time":231.481,"name":"moqt:control_message_parsed","data":{"message_type":"publish_namespace","request_id":0,"track_namespace":"/moq-test/interop",...}}
-{"time":233.084,"name":"moqt:control_message_created","data":{"message_type":"publish_namespace_ok","request_id":0}}
+{"time":1744243431481.0,"name":"moqt:control_message_parsed","data":{"stream_id":0,"message":{"type":"publish_namespace","request_id":0,"track_namespace":[{"value":"moq-test"},{"value":"interop"}],...}}}
+{"time":1744243433084.0,"name":"moqt:control_message_created","data":{"stream_id":0,"message":{"type":"publish_namespace_ok","request_id":0}}}
 ```
 
-The publisher announced `/moq-test/interop` and the relay accepted it.
+The publisher announced `moq-test/interop` and the relay accepted it.
 
 **Subscriber mlog** (after SETUP):
 
 ```json
-{"time":47.169,"name":"moqt:control_message_parsed","data":{"message_type":"subscribe","subscribe_id":0,"track_namespace":"/moq-test/interop","track_name":"test-track",...}}
-{"time":48.622,"name":"moqt:control_message_created","data":{"message_type":"subscribe_ok","subscribe_id":0,"track_alias":0,...}}
+{"time":1744243247169.0,"name":"moqt:control_message_parsed","data":{"stream_id":0,"message":{"type":"subscribe","request_id":0,"track_namespace":[{"value":"moq-test"},{"value":"interop"}],"track_name":{"value":"test-track"},...}}}
+{"time":1744243248622.0,"name":"moqt:control_message_created","data":{"stream_id":0,"message":{"type":"subscribe_ok","request_id":0,"track_alias":0,...}}}
 ```
 
-The subscriber sent a SUBSCRIBE for track `test-track` under namespace `/moq-test/interop`, and the relay responded with SUBSCRIBE_OK. This confirms the relay successfully routed the subscription to the publisher's namespace.
+The subscriber sent a SUBSCRIBE for track `test-track` under namespace `moq-test/interop`, and the relay responded with SUBSCRIBE_OK. This confirms the relay successfully routed the subscription to the publisher's namespace.
 
 **When data flows**, you'll also see data plane events in the mlog. In the publisher's mlog, `*_parsed` events show data the relay received:
 
 ```json
-{"time":395.872,"name":"moqt:subgroup_header_parsed","data":{"header_type":"SubgroupIdExt","track_alias":0,"group_id":1,"publisher_priority":128}}
-{"time":397.166,"name":"moqt:subgroup_object_parsed","data":{"group_id":1,"subgroup_id":0,"object_id":0,"object_payload_length":1024}}
+{"time":1744243595872.0,"name":"moqt:subgroup_header_parsed","data":{"stream_id":0,"track_alias":0,"group_id":1,"publisher_priority":128}}
+{"time":1744243597166.0,"name":"moqt:subgroup_object_parsed","data":{"stream_id":0,"group_id":1,"subgroup_id":0,"object_id":0,"extension_headers_length":0,"object_payload_length":1024}}
 ```
 
 In the subscriber's mlog, `*_created` events show data the relay forwarded:
 
 ```json
-{"time":395.872,"name":"moqt:subgroup_header_created","data":{"header_type":"SubgroupIdExt","track_alias":0,"group_id":1,"publisher_priority":128,"subgroup_id":0}}
-{"time":397.166,"name":"moqt:subgroup_object_created","data":{"group_id":1,"subgroup_id":0,"object_id":0,"object_payload_length":1024}}
+{"time":1744243595872.0,"name":"moqt:subgroup_header_created","data":{"stream_id":0,"track_alias":0,"group_id":1,"publisher_priority":128,"subgroup_id":0}}
+{"time":1744243597166.0,"name":"moqt:subgroup_object_created","data":{"stream_id":0,"group_id":1,"subgroup_id":0,"object_id":0,"extension_headers_length":0,"object_payload_length":1024}}
 ```
 
 - `object_payload_length` tells you the size of the payload the relay handled
@@ -224,15 +231,21 @@ mlog uses [JSON-SEQ (RFC 7464)](https://www.rfc-editor.org/rfc/rfc7464): each re
 
 ```json
 {
-  "qlog_version": "0.3",
-  "qlog_format": "JSON-SEQ",
+  "file_schema": "urn:ietf:params:qlog:file:sequential",
+  "serialization_format": "JSON-SEQ",
   "title": "moq-relay",
   "description": "MoQ Transport events",
   "trace": {
     "vantage_point": { "type": "server" },
+    "common_fields": {
+      "time_format": "relative_to_epoch",
+      "reference_time": {
+        "clock_type": "system",
+        "epoch": "1970-01-01T00:00:00.000Z"
+      }
+    },
     "event_schemas": [
-      "urn:ietf:params:qlog:events:loglevel",
-      "urn:ietf:params:qlog:events:moqt"
+      "urn:ietf:params:qlog:events:moqt-03"
     ]
   }
 }
@@ -242,7 +255,7 @@ mlog uses [JSON-SEQ (RFC 7464)](https://www.rfc-editor.org/rfc/rfc7464): each re
 
 ```json
 {
-  "time": <milliseconds since connection start>,
+  "time": <milliseconds since Unix epoch>,
   "name": "<event_name>",
   "data": { ... }
 }
@@ -265,7 +278,7 @@ mlog uses [JSON-SEQ (RFC 7464)](https://www.rfc-editor.org/rfc/rfc7464): each re
 
 ### Control message types
 
-These appear in the `message_type` field of control message events:
+These appear in the `message.type` field of control message events:
 
 | Message Type | Protocol Reference |
 |-------------|-------------------|
