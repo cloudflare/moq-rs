@@ -426,9 +426,18 @@ impl Server {
                 .await
                 .context("failed to receive WebTransport request")?;
 
+            let moqt_protocol = std::str::from_utf8(moq_transport::setup::ALPN)
+                .context("invalid MoQT ALPN")?
+                .to_string();
+            let response = if request.protocols.contains(&moqt_protocol) {
+                web_transport_quinn::proto::ConnectResponse::OK.with_protocol(moqt_protocol)
+            } else {
+                web_transport_quinn::proto::ConnectResponse::OK
+            };
+
             // Accept the CONNECT request.
             let session = request
-                .ok()
+                .respond(response)
                 .await
                 .context("failed to respond to WebTransport request")?;
             (session, Transport::WebTransport)
@@ -552,10 +561,17 @@ impl Client {
             .to_string();
 
         let (session, transport) = match url.scheme() {
-            "https" => (
-                web_transport_quinn::Session::connect(connection, url.clone()).await?,
-                Transport::WebTransport,
-            ),
+            "https" => {
+                let moqt_protocol = std::str::from_utf8(moq_transport::setup::ALPN)
+                    .context("invalid MoQT ALPN")?
+                    .to_string();
+                let request = web_transport_quinn::proto::ConnectRequest::new(url.clone())
+                    .with_protocol(moqt_protocol);
+                (
+                    web_transport_quinn::Session::connect(connection, request).await?,
+                    Transport::WebTransport,
+                )
+            }
             "moqt" => (
                 web_transport_quinn::Session::raw(
                     connection,

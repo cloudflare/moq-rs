@@ -22,7 +22,7 @@ use super::{
     Datagrams, DatagramsReader, DatagramsWriter, ObjectsWriter, ServeError, Stream, StreamReader,
     StreamWriter, Subgroups, SubgroupsReader, SubgroupsWriter,
 };
-use crate::coding::{Location, TrackNamespace};
+use crate::coding::{Location, TrackName, TrackNamespace};
 use paste::paste;
 use std::{ops::Deref, sync::Arc};
 
@@ -30,12 +30,15 @@ use std::{ops::Deref, sync::Arc};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
     pub namespace: TrackNamespace,
-    pub name: String,
+    pub name: TrackName,
 }
 
 impl Track {
-    pub fn new(namespace: TrackNamespace, name: String) -> Self {
-        Self { namespace, name }
+    pub fn new(namespace: TrackNamespace, name: impl Into<TrackName>) -> Self {
+        Self {
+            namespace,
+            name: name.into(),
+        }
     }
 
     pub fn produce(self) -> (TrackWriter, TrackReader) {
@@ -212,9 +215,10 @@ impl TrackReader {
 
     // Returns the largest group/sequence
     pub fn largest_location(&self) -> Option<Location> {
-        // We don't even know the mode yet.
-        // TODO populate from SUBSCRIBE_OK
-        None
+        let mode = self.state.lock().reader_mode.clone();
+        mode.as_ref()
+            .and_then(|mode| mode.latest())
+            .map(|(group_id, object_id)| Location::new(group_id, object_id))
     }
 
     /// Wait until the track is closed, returning the closing error.

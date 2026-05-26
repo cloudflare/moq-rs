@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs, TrackNamespace};
+use crate::coding::{
+    Decode, DecodeError, Encode, EncodeError, KeyValuePairs, TrackNamespacePrefix,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
@@ -40,7 +42,7 @@ pub struct SubscribeNamespace {
     pub id: u64,
 
     /// The track namespace prefix
-    pub track_namespace_prefix: TrackNamespace,
+    pub track_namespace_prefix: TrackNamespacePrefix,
 
     pub subscribe_options: SubscribeOptions,
 
@@ -51,7 +53,7 @@ pub struct SubscribeNamespace {
 impl Decode for SubscribeNamespace {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
-        let track_namespace_prefix = TrackNamespace::decode(r)?;
+        let track_namespace_prefix = TrackNamespacePrefix::decode(r)?;
         let subscribe_options = SubscribeOptions::decode(r)?;
         let params = KeyValuePairs::decode(r)?;
 
@@ -90,7 +92,7 @@ mod tests {
 
         let msg = SubscribeNamespace {
             id: 12345,
-            track_namespace_prefix: TrackNamespace::from_utf8_path("path/prefix"),
+            track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("path/prefix"),
             subscribe_options: SubscribeOptions::Publish,
             params: kvps,
         };

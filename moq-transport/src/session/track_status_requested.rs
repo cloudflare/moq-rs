@@ -7,12 +7,6 @@ use crate::message;
 use crate::message::RequestOk;
 use crate::serve;
 
-/// Draft-16 §9.19: TRACK_STATUS parameters (key types).
-mod param_keys {
-    /// LARGEST_OBJECT parameter type (§9.2.2.7) — bytes-typed (odd key).
-    pub const LARGEST_OBJECT: u64 = 0x9;
-}
-
 pub struct TrackStatusRequested {
     publisher: Publisher,
     pub request_msg: message::TrackStatus,
@@ -53,14 +47,9 @@ impl TrackStatusRequested {
         let mut params = KeyValuePairs::default();
 
         if let Some(largest) = track.largest_location() {
-            // Encode the Location as two consecutive varints (group_id, object_id)
-            // and store as the LARGEST_OBJECT bytes parameter (odd key → bytes).
-            let mut encoded = bytes::BytesMut::new();
-            use crate::coding::Encode as _;
-            largest
-                .encode(&mut encoded)
+            params
+                .set_largest_object(largest)
                 .map_err(|_| SessionError::Internal)?;
-            params.set_bytesvalue(param_keys::LARGEST_OBJECT, encoded.to_vec());
         }
 
         self.publisher.send_request_ok(
@@ -72,21 +61,5 @@ impl TrackStatusRequested {
         );
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn largest_object_param_key_is_odd() {
-        // The LARGEST_OBJECT key must be odd so the KVP codec treats the value
-        // as bytes-typed rather than int-typed.
-        assert_eq!(
-            param_keys::LARGEST_OBJECT % 2,
-            1,
-            "LARGEST_OBJECT key must be odd (bytes-typed KVP)"
-        );
     }
 }

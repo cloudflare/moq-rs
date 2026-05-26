@@ -15,12 +15,201 @@
 
 use super::{Decode, DecodeError, Encode, EncodeError, TupleField};
 use core::hash::{Hash, Hasher};
+use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fmt;
 use thiserror::Error;
 
 /// Maximum total length of a Full Track Name (namespace fields + track name).
 pub const MAX_FULL_TRACK_NAME_LEN: usize = 4096;
+
+fn namespace_fields_byte_len(fields: &[TupleField]) -> usize {
+    fields.iter().map(|f| f.value.len()).sum()
+}
+
+fn namespace_path(fields: &[TupleField]) -> String {
+    let mut path = String::new();
+    for field in fields {
+        path.push('/');
+        path.push_str(&String::from_utf8_lossy(&field.value));
+    }
+    path
+}
+
+fn decode_namespace_fields<R: bytes::Buf>(
+    r: &mut R,
+    min_fields: usize,
+    max_fields: usize,
+    kind: &str,
+) -> Result<Vec<TupleField>, DecodeError> {
+    let count = usize::decode(r)?;
+    if count < min_fields || count > max_fields {
+        return Err(DecodeError::FieldBoundsExceeded(format!(
+            "{kind} must have {min_fields}-{max_fields} fields, got {count}"
+        )));
+    }
+
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        let field = TupleField::decode(r)?;
+        if field.value.is_empty() {
+            return Err(DecodeError::EmptyNamespaceField);
+        }
+        fields.push(field);
+    }
+
+    Ok(fields)
+}
+
+fn encode_namespace_fields<W: bytes::BufMut>(
+    fields: &[TupleField],
+    min_fields: usize,
+    max_fields: usize,
+    kind: &str,
+    w: &mut W,
+) -> Result<(), EncodeError> {
+    if fields.len() < min_fields || fields.len() > max_fields {
+        return Err(EncodeError::FieldBoundsExceeded(format!(
+            "{kind} must have {min_fields}-{max_fields} fields"
+        )));
+    }
+
+    fields.len().encode(w)?;
+    for field in fields {
+        if field.value.is_empty() {
+            return Err(EncodeError::EmptyNamespaceField);
+        }
+        field.encode(w)?;
+    }
+
+    Ok(())
+}
+
+fn validate_track_namespace_fields(
+    fields: &[TupleField],
+    min_fields: usize,
+    max_fields: usize,
+) -> Result<(), TrackNamespaceError> {
+    if fields.len() < min_fields {
+        return Err(TrackNamespaceError::TooFewFields);
+    }
+    if fields.len() > max_fields {
+        return Err(TrackNamespaceError::TooManyFields(fields.len(), max_fields));
+    }
+    for field in fields {
+        if field.value.is_empty() {
+            return Err(TrackNamespaceError::EmptyField);
+        }
+        if field.value.len() > TupleField::MAX_VALUE_SIZE {
+            return Err(TrackNamespaceError::FieldTooLarge(
+                field.value.len(),
+                TupleField::MAX_VALUE_SIZE,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// A Track Name is arbitrary bytes and may be empty.
+#[derive(Clone, Default, Eq, Hash, PartialEq)]
+pub struct TrackName {
+    value: Vec<u8>,
+}
+
+impl TrackName {
+    pub fn new(value: Vec<u8>) -> Self {
+        Self { value }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.value
+    }
+
+    pub fn to_string_lossy(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.value)
+    }
+}
+
+impl AsRef<[u8]> for TrackName {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl From<Vec<u8>> for TrackName {
+    fn from(value: Vec<u8>) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&[u8]> for TrackName {
+    fn from(value: &[u8]) -> Self {
+        Self::new(value.to_vec())
+    }
+}
+
+impl From<String> for TrackName {
+    fn from(value: String) -> Self {
+        Self::new(value.into_bytes())
+    }
+}
+
+impl From<&str> for TrackName {
+    fn from(value: &str) -> Self {
+        Self::new(value.as_bytes().to_vec())
+    }
+}
+
+impl From<&String> for TrackName {
+    fn from(value: &String) -> Self {
+        Self::from(value.as_str())
+    }
+}
+
+impl From<&TrackName> for TrackName {
+    fn from(value: &TrackName) -> Self {
+        value.clone()
+    }
+}
+
+impl Decode for TrackName {
+    fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+        let size = usize::decode(r)?;
+        if size > MAX_FULL_TRACK_NAME_LEN {
+            return Err(DecodeError::TrackNameTooLong);
+        }
+        Self::decode_remaining(r, size)?;
+
+        let mut value = vec![0; size];
+        r.copy_to_slice(&mut value);
+        Ok(Self { value })
+    }
+}
+
+impl Encode for TrackName {
+    fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        if self.value.len() > MAX_FULL_TRACK_NAME_LEN {
+            return Err(EncodeError::FieldBoundsExceeded("TrackName".to_string()));
+        }
+        self.value.len().encode(w)?;
+        Self::encode_remaining(w, self.value.len())?;
+        w.put_slice(&self.value);
+        Ok(())
+    }
+}
+
+impl fmt::Debug for TrackName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+impl fmt::Display for TrackName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_string_lossy())
+    }
+}
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
@@ -77,17 +266,12 @@ impl TrackNamespace {
     }
 
     pub fn to_utf8_path(&self) -> String {
-        let mut path = String::new();
-        for field in &self.fields {
-            path.push('/');
-            path.push_str(&String::from_utf8_lossy(&field.value));
-        }
-        path
+        namespace_path(&self.fields)
     }
 
     /// Sum of all field lengths. Used for full-track-name limit calculation.
     pub fn namespace_byte_len(&self) -> usize {
-        self.fields.iter().map(|f| f.value.len()).sum()
+        namespace_fields_byte_len(&self.fields)
     }
 
     fn validate_namespace_byte_len(&self) -> Result<(), DecodeError> {
@@ -107,26 +291,8 @@ impl Hash for TrackNamespace {
 
 impl Decode for TrackNamespace {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        let count = usize::decode(r)?;
-
-        // Draft-16 §2.4.1: 0 or >32 fields → PROTOCOL_VIOLATION.
-        if count == 0 || count > Self::MAX_FIELDS {
-            return Err(DecodeError::FieldBoundsExceeded(format!(
-                "TrackNamespace must have 1–{} fields, got {}",
-                Self::MAX_FIELDS,
-                count
-            )));
-        }
-
-        let mut fields = Vec::with_capacity(count);
-        for _ in 0..count {
-            let field = TupleField::decode(r)?;
-            // Draft-16 §2.4.1: each field must be ≥ 1 byte.
-            if field.value.is_empty() {
-                return Err(DecodeError::EmptyNamespaceField);
-            }
-            fields.push(field);
-        }
+        // Draft-16 §2.4.1: full namespaces have 1-32 non-empty fields.
+        let fields = decode_namespace_fields(r, 1, Self::MAX_FIELDS, "TrackNamespace")?;
         let namespace = Self { fields };
         namespace.validate_namespace_byte_len()?;
         Ok(namespace)
@@ -135,25 +301,12 @@ impl Decode for TrackNamespace {
 
 impl Encode for TrackNamespace {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        if self.fields.is_empty() || self.fields.len() > Self::MAX_FIELDS {
-            return Err(EncodeError::FieldBoundsExceeded(format!(
-                "TrackNamespace must have 1–{} fields",
-                Self::MAX_FIELDS
-            )));
-        }
         if self.namespace_byte_len() > MAX_FULL_TRACK_NAME_LEN {
             return Err(EncodeError::FieldBoundsExceeded(
                 "TrackNamespace".to_string(),
             ));
         }
-        self.fields.len().encode(w)?;
-        for field in &self.fields {
-            if field.value.is_empty() {
-                return Err(EncodeError::EmptyNamespaceField);
-            }
-            field.encode(w)?;
-        }
-        Ok(())
+        encode_namespace_fields(&self.fields, 1, Self::MAX_FIELDS, "TrackNamespace", w)
     }
 }
 
@@ -165,7 +318,7 @@ impl fmt::Debug for TrackNamespace {
 
 impl fmt::Display for TrackNamespace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{0}", self.to_utf8_path())
+        write!(f, "{0}", namespace_path(&self.fields))
     }
 }
 
@@ -173,26 +326,7 @@ impl TryFrom<Vec<TupleField>> for TrackNamespace {
     type Error = TrackNamespaceError;
 
     fn try_from(fields: Vec<TupleField>) -> Result<Self, Self::Error> {
-        if fields.is_empty() {
-            return Err(TrackNamespaceError::TooFewFields);
-        }
-        if fields.len() > Self::MAX_FIELDS {
-            return Err(TrackNamespaceError::TooManyFields(
-                fields.len(),
-                Self::MAX_FIELDS,
-            ));
-        }
-        for field in &fields {
-            if field.value.is_empty() {
-                return Err(TrackNamespaceError::EmptyField);
-            }
-            if field.value.len() > TupleField::MAX_VALUE_SIZE {
-                return Err(TrackNamespaceError::FieldTooLarge(
-                    field.value.len(),
-                    TupleField::MAX_VALUE_SIZE,
-                ));
-            }
-        }
+        validate_track_namespace_fields(&fields, 1, Self::MAX_FIELDS)?;
         Ok(Self { fields })
     }
 }
@@ -263,12 +397,7 @@ impl TrackNamespacePrefix {
     }
 
     pub fn to_utf8_path(&self) -> String {
-        let mut path = String::new();
-        for field in &self.fields {
-            path.push('/');
-            path.push_str(&String::from_utf8_lossy(&field.value));
-        }
-        path
+        namespace_path(&self.fields)
     }
 }
 
@@ -280,45 +409,15 @@ impl Hash for TrackNamespacePrefix {
 
 impl Decode for TrackNamespacePrefix {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        let count = usize::decode(r)?;
-
-        // Draft-16 §9.25: 0–32 fields allowed for prefix.
-        if count > Self::MAX_FIELDS {
-            return Err(DecodeError::FieldBoundsExceeded(format!(
-                "TrackNamespacePrefix must have 0–{} fields, got {}",
-                Self::MAX_FIELDS,
-                count
-            )));
-        }
-
-        let mut fields = Vec::with_capacity(count);
-        for _ in 0..count {
-            let field = TupleField::decode(r)?;
-            if field.value.is_empty() {
-                return Err(DecodeError::EmptyNamespaceField);
-            }
-            fields.push(field);
-        }
+        // Draft-16 §9.25: prefixes have 0-32 non-empty fields.
+        let fields = decode_namespace_fields(r, 0, Self::MAX_FIELDS, "TrackNamespacePrefix")?;
         Ok(Self { fields })
     }
 }
 
 impl Encode for TrackNamespacePrefix {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        if self.fields.len() > Self::MAX_FIELDS {
-            return Err(EncodeError::FieldBoundsExceeded(format!(
-                "TrackNamespacePrefix must have 0–{} fields",
-                Self::MAX_FIELDS
-            )));
-        }
-        self.fields.len().encode(w)?;
-        for field in &self.fields {
-            if field.value.is_empty() {
-                return Err(EncodeError::EmptyNamespaceField);
-            }
-            field.encode(w)?;
-        }
-        Ok(())
+        encode_namespace_fields(&self.fields, 0, Self::MAX_FIELDS, "TrackNamespacePrefix", w)
     }
 }
 
@@ -330,7 +429,7 @@ impl fmt::Debug for TrackNamespacePrefix {
 
 impl fmt::Display for TrackNamespacePrefix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{0}", self.to_utf8_path())
+        write!(f, "{0}", namespace_path(&self.fields))
     }
 }
 
@@ -389,6 +488,17 @@ mod tests {
         );
         let decoded = TrackNamespace::decode(&mut buf).unwrap();
         assert_eq!(decoded, t);
+    }
+
+    #[test]
+    fn track_name_allows_non_utf8_bytes() {
+        let name = TrackName::from(vec![0xff, 0x00, b'a']);
+        let mut buf = BytesMut::new();
+
+        name.encode(&mut buf).unwrap();
+        let decoded = TrackName::decode(&mut buf).unwrap();
+
+        assert_eq!(decoded.as_bytes(), &[0xff, 0x00, b'a']);
     }
 
     #[test]

@@ -17,14 +17,14 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use super::{ServeError, Track, TrackReader, TrackWriter};
-use crate::coding::TrackNamespace;
+use crate::coding::{TrackName, TrackNamespace};
 use crate::watch::{Queue, State};
 
 /// Full track identifier: namespace + track name
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub struct FullTrackName {
     pub namespace: TrackNamespace,
-    pub name: String,
+    pub name: TrackName,
 }
 
 /// Static information about a broadcast.
@@ -70,17 +70,18 @@ impl TracksWriter {
     /// Create a new track with the given name, inserting it into the broadcast.
     /// The track will use this writer's namespace.
     /// None is returned if all [TracksReader]s have been dropped.
-    pub fn create(&mut self, track: &str) -> Option<TrackWriter> {
+    pub fn create(&mut self, track: impl Into<TrackName>) -> Option<TrackWriter> {
+        let track = track.into();
         let (writer, reader) = Track {
             namespace: self.namespace.clone(),
-            name: track.to_owned(),
+            name: track.clone(),
         }
         .produce();
 
         // NOTE: We overwrite the track if it already exists.
         let full_name = FullTrackName {
             namespace: self.namespace.clone(),
-            name: track.to_owned(),
+            name: track,
         };
         self.state.lock_mut()?.tracks.insert(full_name, reader);
 
@@ -88,10 +89,14 @@ impl TracksWriter {
     }
 
     /// Remove a track from the broadcast by full name.
-    pub fn remove(&mut self, namespace: &TrackNamespace, track_name: &str) -> Option<TrackReader> {
+    pub fn remove(
+        &mut self,
+        namespace: &TrackNamespace,
+        track_name: impl Into<TrackName>,
+    ) -> Option<TrackReader> {
         let full_name = FullTrackName {
             namespace: namespace.clone(),
-            name: track_name.to_owned(),
+            name: track_name.into(),
         };
         self.state.lock_mut()?.tracks.remove(&full_name)
     }
@@ -176,12 +181,13 @@ impl TracksReader {
     pub fn get_track_reader(
         &mut self,
         namespace: &TrackNamespace,
-        track_name: &str,
+        track_name: impl Into<TrackName>,
     ) -> Option<TrackReader> {
+        let track_name = track_name.into();
         let state = self.state.lock();
         let full_name = FullTrackName {
             namespace: namespace.clone(),
-            name: track_name.to_owned(),
+            name: track_name.clone(),
         };
 
         if let Some(track_reader) = state.tracks.get(&full_name) {
@@ -199,12 +205,13 @@ impl TracksReader {
     pub fn subscribe(
         &mut self,
         namespace: TrackNamespace,
-        track_name: &str,
+        track_name: impl Into<TrackName>,
     ) -> Option<TrackReader> {
+        let track_name = track_name.into();
         let state = self.state.lock();
         let full_name = FullTrackName {
             namespace: namespace.clone(),
-            name: track_name.to_owned(),
+            name: track_name.clone(),
         };
 
         // Check if we have a cached track that is still alive
@@ -235,7 +242,7 @@ impl TracksReader {
         // Use the full requested namespace, not self.namespace
         let track_writer_reader = Track {
             namespace: namespace.clone(),
-            name: track_name.to_owned(),
+            name: track_name.clone(),
         }
         .produce();
 
@@ -307,7 +314,7 @@ mod tests {
             .await
             .expect("publisher should receive first track request");
 
-        assert_eq!(track_writer_1.name, track_name);
+        assert_eq!(track_writer_1.name, TrackName::from(track_name));
 
         // Publisher closes the track with an error (simulates connection failure)
         track_writer_1
@@ -346,7 +353,7 @@ mod tests {
             .unwrap()
             .expect("publisher should receive second track request");
 
-        assert_eq!(track_writer_2.name, track_name);
+        assert_eq!(track_writer_2.name, TrackName::from(track_name));
 
         // Verify that track_reader_2 is NOT already closed
         // (It should be a fresh, working track)

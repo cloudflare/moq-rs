@@ -26,6 +26,8 @@ mod filter_type;
 mod go_away;
 mod group_order;
 mod max_request_id;
+mod namespace;
+mod params;
 mod pubilsh_namespace_done;
 mod publish;
 mod publish_done;
@@ -52,6 +54,8 @@ pub use filter_type::*;
 pub use go_away::*;
 pub use group_order::*;
 pub use max_request_id::*;
+pub use namespace::*;
+pub use params::*;
 pub use pubilsh_namespace_done::*;
 pub use publish::*;
 pub use publish_done::*;
@@ -197,7 +201,9 @@ message_types! {
 
     // ── PUBLISH_NAMESPACE family ──────────────────────────────────────────────
     PublishNamespace        = 0x6,
+    Namespace               = 0x8,
     PublishNamespaceDone    = 0x9,
+    NamespaceDone           = 0xe,
     PublishNamespaceCancel  = 0xc,
 
     // ── TRACK_STATUS ──────────────────────────────────────────────────────────
@@ -225,7 +231,9 @@ message_types! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::{KeyValuePairs, Location, ReasonPhrase, TrackNamespace};
+    use crate::coding::{
+        KeyValuePairs, Location, ReasonPhrase, TrackNamespace, TrackNamespacePrefix,
+    };
 
     fn namespace() -> TrackNamespace {
         TrackNamespace::from_utf8_path("test/ns")
@@ -245,13 +253,7 @@ mod tests {
             Message::Subscribe(Subscribe {
                 id: 0,
                 track_namespace: namespace(),
-                track_name: "track".to_string(),
-                subscriber_priority: 127,
-                group_order: GroupOrder::Publisher,
-                forward: true,
-                filter_type: FilterType::LargestObject,
-                start_location: None,
-                end_group_id: None,
+                track_name: "track".into(),
                 params: KeyValuePairs::default(),
             }),
             0,
@@ -269,12 +271,10 @@ mod tests {
         assert_sequenced(
             Message::Fetch(Fetch {
                 id: 4,
-                subscriber_priority: 127,
-                group_order: GroupOrder::Ascending,
                 fetch_type: FetchType::Standalone,
                 standalone_fetch: Some(StandaloneFetch {
                     track_namespace: namespace(),
-                    track_name: "track".to_string(),
+                    track_name: "track".into(),
                     start_location: Location::new(0, 0),
                     end_location: Location::new(0, 1),
                 }),
@@ -288,13 +288,7 @@ mod tests {
             Message::TrackStatus(TrackStatus {
                 id: 6,
                 track_namespace: namespace(),
-                track_name: "track".to_string(),
-                subscriber_priority: 127,
-                group_order: GroupOrder::Publisher,
-                forward: true,
-                filter_type: FilterType::LargestObject,
-                start_location: None,
-                end_group_id: None,
+                track_name: "track".into(),
                 params: KeyValuePairs::default(),
             }),
             6,
@@ -303,7 +297,7 @@ mod tests {
         assert_sequenced(
             Message::SubscribeNamespace(SubscribeNamespace {
                 id: 8,
-                track_namespace_prefix: namespace(),
+                track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("test/ns"),
                 subscribe_options: SubscribeOptions::Both,
                 params: KeyValuePairs::default(),
             }),
@@ -314,13 +308,10 @@ mod tests {
             Message::Publish(Publish {
                 id: 10,
                 track_namespace: namespace(),
-                track_name: "track".to_string(),
+                track_name: "track".into(),
                 track_alias: 1,
-                group_order: GroupOrder::Ascending,
-                content_exists: false,
-                largest_location: None,
-                forward: true,
                 params: KeyValuePairs::default(),
+                track_extensions: TrackExtensions::default(),
             }),
             10,
         );
@@ -352,11 +343,8 @@ mod tests {
         assert_not_sequenced(Message::SubscribeOk(SubscribeOk {
             id: 0,
             track_alias: 1,
-            expires: 0,
-            group_order: GroupOrder::Publisher,
-            content_exists: false,
-            largest_location: None,
             params: KeyValuePairs::default(),
+            track_extensions: TrackExtensions::default(),
         }));
 
         assert_not_sequenced(Message::Unsubscribe(Unsubscribe { id: 0 }));
@@ -365,20 +353,14 @@ mod tests {
 
         assert_not_sequenced(Message::FetchOk(FetchOk {
             id: 0,
-            group_order: GroupOrder::Ascending,
             end_of_track: false,
             end_location: Location::new(0, 0),
             params: KeyValuePairs::default(),
+            track_extensions: TrackExtensions::default(),
         }));
 
         assert_not_sequenced(Message::PublishOk(PublishOk {
             id: 0,
-            forward: true,
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
-            subscriber_priority: 127,
-            group_order: GroupOrder::Publisher,
             params: KeyValuePairs::default(),
         }));
 
@@ -398,5 +380,107 @@ mod tests {
 
         let err = Message::decode(&mut buf).unwrap_err();
         assert!(matches!(err, DecodeError::InvalidMessage(0x100)));
+    }
+
+    #[test]
+    fn draft16_wire_layouts_for_changed_control_messages() {
+        fn encoded(msg: Message) -> Vec<u8> {
+            let mut buf = bytes::BytesMut::new();
+            msg.encode(&mut buf).unwrap();
+            buf.to_vec()
+        }
+
+        let ns = TrackNamespace::from_utf8_path("ns");
+        let prefix = TrackNamespacePrefix::new();
+
+        assert_eq!(
+            encoded(Message::Subscribe(Subscribe {
+                id: 0,
+                track_namespace: ns.clone(),
+                track_name: "t".into(),
+                params: KeyValuePairs::default(),
+            })),
+            vec![0x03, 0x00, 0x08, 0x00, 0x01, 0x02, b'n', b's', 0x01, b't', 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::SubscribeOk(SubscribeOk {
+                id: 0,
+                track_alias: 1,
+                params: KeyValuePairs::default(),
+                track_extensions: TrackExtensions::default(),
+            })),
+            vec![0x04, 0x00, 0x03, 0x00, 0x01, 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::TrackStatus(TrackStatus {
+                id: 0,
+                track_namespace: ns.clone(),
+                track_name: "t".into(),
+                params: KeyValuePairs::default(),
+            })),
+            vec![0x0d, 0x00, 0x08, 0x00, 0x01, 0x02, b'n', b's', 0x01, b't', 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::Publish(Publish {
+                id: 0,
+                track_namespace: ns.clone(),
+                track_name: "t".into(),
+                track_alias: 5,
+                params: KeyValuePairs::default(),
+                track_extensions: TrackExtensions::default(),
+            })),
+            vec![0x1d, 0x00, 0x09, 0x00, 0x01, 0x02, b'n', b's', 0x01, b't', 0x05, 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::PublishOk(PublishOk {
+                id: 0,
+                params: KeyValuePairs::default(),
+            })),
+            vec![0x1e, 0x00, 0x02, 0x00, 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::Fetch(Fetch {
+                id: 0,
+                fetch_type: FetchType::Standalone,
+                standalone_fetch: Some(StandaloneFetch {
+                    track_namespace: ns,
+                    track_name: "t".into(),
+                    start_location: Location::new(0, 0),
+                    end_location: Location::new(0, 1),
+                }),
+                joining_fetch: None,
+                params: KeyValuePairs::default(),
+            })),
+            vec![
+                0x16, 0x00, 0x0d, 0x00, 0x01, 0x01, 0x02, b'n', b's', 0x01, b't', 0x00, 0x00, 0x00,
+                0x01, 0x00
+            ]
+        );
+
+        assert_eq!(
+            encoded(Message::FetchOk(FetchOk {
+                id: 0,
+                end_of_track: false,
+                end_location: Location::new(0, 1),
+                params: KeyValuePairs::default(),
+                track_extensions: TrackExtensions::default(),
+            })),
+            vec![0x18, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::SubscribeNamespace(SubscribeNamespace {
+                id: 0,
+                track_namespace_prefix: prefix,
+                subscribe_options: SubscribeOptions::Both,
+                params: KeyValuePairs::default(),
+            })),
+            vec![0x11, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00]
+        );
     }
 }

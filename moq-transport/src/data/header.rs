@@ -57,6 +57,16 @@ impl StreamHeaderType {
                 | StreamHeaderType::SubgroupIdExtEndOfGroup
         )
     }
+
+    pub fn uses_first_object_id_as_subgroup_id(&self) -> bool {
+        matches!(
+            *self,
+            StreamHeaderType::SubgroupFirstObjectId
+                | StreamHeaderType::SubgroupFirstObjectIdExt
+                | StreamHeaderType::SubgroupFirstObjectIdEndOfGroup
+                | StreamHeaderType::SubgroupFirstObjectIdExtEndOfGroup
+        )
+    }
 }
 
 impl Encode for StreamHeaderType {
@@ -258,6 +268,12 @@ mod tests {
         assert!(ht.is_subgroup());
         assert!(!ht.is_fetch());
         assert!(!ht.has_subgroup_id());
+
+        let ht = StreamHeaderType::SubgroupFirstObjectId;
+        assert!(ht.uses_first_object_id_as_subgroup_id());
+
+        let ht = StreamHeaderType::SubgroupId;
+        assert!(!ht.uses_first_object_id_as_subgroup_id());
     }
 
     #[test]

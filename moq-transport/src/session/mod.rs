@@ -202,7 +202,6 @@ impl Session {
                     subscribe_id = m.id,
                     namespace = %m.track_namespace,
                     track_name = %m.track_name,
-                    filter_type = ?m.filter_type,
                     "MoQT control message"
                 );
             }
@@ -213,7 +212,6 @@ impl Session {
                     msg_type = "SUBSCRIBE_OK",
                     subscribe_id = m.id,
                     track_alias = m.track_alias,
-                    content_exists = m.content_exists,
                     "MoQT control message"
                 );
             }
@@ -242,6 +240,24 @@ impl Session {
                     direction,
                     msg_type = "PUBLISH_NAMESPACE_DONE",
                     request_id = m.id,
+                    "MoQT control message"
+                );
+            }
+            Message::Namespace(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "NAMESPACE",
+                    namespace_suffix = %m.track_namespace_suffix,
+                    "MoQT control message"
+                );
+            }
+            Message::NamespaceDone(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "NAMESPACE_DONE",
+                    namespace_suffix = %m.track_namespace_suffix,
                     "MoQT control message"
                 );
             }
@@ -324,7 +340,6 @@ impl Session {
                     direction,
                     msg_type = "PUBLISH_OK",
                     request_id = m.id,
-                    filter_type = ?m.filter_type,
                     "MoQT control message"
                 );
             }

@@ -13,7 +13,7 @@ use crate::{
     coding::TrackNamespace,
     message::{self, Message},
     mlog,
-    serve::{ServeError, TracksReader},
+    serve::{FullTrackName, ServeError, TracksReader},
 };
 
 use crate::watch::Queue;
@@ -35,6 +35,9 @@ pub struct Publisher {
     /// When a Subscribe is received and we have a matching publish_namespace entry, the
     /// subscription is routed to that PublishNamespaceRecv.  Otherwise it goes here.
     subscribeds: Arc<Mutex<HashMap<u64, SubscribedRecv>>>,
+
+    /// Active inbound SUBSCRIBEs keyed by Full Track Name.
+    subscribed_names: Arc<Mutex<HashMap<FullTrackName, u64>>>,
 
     /// Subscriptions for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_subscribed: Queue<Subscribed>,
@@ -68,6 +71,7 @@ impl Publisher {
             webtransport,
             publish_namespaces: Default::default(),
             subscribeds: Default::default(),
+            subscribed_names: Default::default(),
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
             outgoing,
@@ -367,6 +371,10 @@ impl Publisher {
 
     fn recv_subscribe(&mut self, msg: message::Subscribe) -> Result<(), SessionError> {
         let namespace = msg.track_namespace.clone();
+        let full_name = FullTrackName {
+            namespace: msg.track_namespace.clone(),
+            name: msg.track_name.clone(),
+        };
 
         let subscribed = {
             let mut subscribeds = self
@@ -391,7 +399,28 @@ impl Publisher {
                 return Ok(());
             }
 
-            let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone());
+            let mut subscribed_names = self
+                .subscribed_names
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if subscribed_names.contains_key(&full_name) {
+                let id = msg.id;
+                drop(subscribed_names);
+                drop(subscribeds);
+                self.send_request_error(
+                    "subscribe",
+                    message::RequestError {
+                        id,
+                        error_code: RequestErrorCode::DuplicateSubscription as u64,
+                        retry_interval: 0,
+                        reason: crate::coding::ReasonPhrase("duplicate subscription".to_string()),
+                    },
+                );
+                return Ok(());
+            }
+
+            let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
+            subscribed_names.insert(full_name, send.info.id);
             subscribeds.insert(send.info.id, recv);
 
             send
@@ -493,9 +522,12 @@ impl Publisher {
             .ok();
     }
 
-    fn drop_subscribe(&mut self, id: u64) {
+    pub(super) fn drop_subscribe(&mut self, id: u64) {
         if let Ok(mut s) = self.subscribeds.lock() {
             s.remove(&id);
+        }
+        if let Ok(mut names) = self.subscribed_names.lock() {
+            names.retain(|_, request_id| *request_id != id);
         }
     }
 

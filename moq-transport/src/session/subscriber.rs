@@ -12,9 +12,9 @@ use std::{
 use tokio::sync::Notify;
 
 use crate::{
-    coding::{Decode, TrackNamespace},
+    coding::{Decode, TrackName, TrackNamespace},
     data,
-    message::{self, FilterType, GroupOrder, Message},
+    message::{self, Message},
     mlog,
     serve::{self, ServeError},
 };
@@ -154,7 +154,11 @@ impl Subscriber {
         }
     }
 
-    pub fn track_status(&mut self, track_namespace: &TrackNamespace, track_name: &str) {
+    pub fn track_status(
+        &mut self,
+        track_namespace: &TrackNamespace,
+        track_name: impl Into<TrackName>,
+    ) {
         let id = match self.get_next_request_id() {
             Ok(id) => id,
             Err(e) => {
@@ -165,13 +169,7 @@ impl Subscriber {
         self.send_message(message::TrackStatus {
             id,
             track_namespace: track_namespace.clone(),
-            track_name: track_name.to_string(),
-            subscriber_priority: 127, // default to mid value, see: https://github.com/moq-wg/moq-transport/issues/504
-            group_order: GroupOrder::Publisher, // defer to publisher send order
-            forward: true,            // default to forwarding objects
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
+            track_name: track_name.into(),
             params: Default::default(),
         });
         // TODO(itzmanish): make async and wait for response?
@@ -535,54 +533,25 @@ impl Subscriber {
             track_alias
         );
 
-        // This is super silly, but I couldn't figure out a way to avoid the mutex guard across awaits.
-        enum Writer {
-            //Fetch(serve::FetchWriter),
-            Subgroup(serve::SubgroupWriter),
-        }
-
-        let writer = {
-            // Look up the subscribe id for this track alias
-            if let Some(subscribe_id) = self
-                .get_subscribe_id_by_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-                .await?
-            {
-                // Look up the subscribe by id
-                let mut subscribes = self.subscribes.lock().map_err(|_| SessionError::Internal)?;
-                let subscribe = subscribes.get_mut(&subscribe_id).ok_or_else(|| {
-                    ServeError::not_found_ctx(format!(
-                        "subscribe_id={} not found for track_alias={}",
-                        subscribe_id, track_alias
-                    ))
-                })?;
-
-                // Create the appropriate writer based on the stream header type
-                if stream_header.header_type.is_subgroup() {
-                    tracing::trace!("[SUBSCRIBER] recv_stream_inner: creating subgroup writer");
-                    Writer::Subgroup(subscribe.subgroup(stream_header.subgroup_header.unwrap())?)
-                } else {
-                    return Err(SessionError::Serve(ServeError::internal_ctx(format!(
-                        "unsupported stream header type={}",
-                        stream_header.header_type
-                    ))));
-                }
-            } else {
-                return Err(SessionError::Serve(ServeError::not_found_ctx(format!(
-                    "subscription track_alias={} not found",
-                    track_alias
-                ))));
-            }
+        let Some(subscribe_id) = self
+            .get_subscribe_id_by_alias(track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+            .await?
+        else {
+            return Err(SessionError::Serve(ServeError::not_found_ctx(format!(
+                "subscription track_alias={} not found",
+                track_alias
+            ))));
         };
 
-        // Handle the stream based on the writer type
-        match writer {
-            //Writer::Fetch(fetch) => Self::recv_fetch(fetch, reader).await?,
-            Writer::Subgroup(subgroup_writer) => {
-                tracing::trace!("[SUBSCRIBER] recv_stream_inner: receiving subgroup data");
-                Self::recv_subgroup(stream_header.header_type, subgroup_writer, reader, mlog)
-                    .await?
-            }
-        };
+        tracing::trace!("[SUBSCRIBER] recv_stream_inner: receiving subgroup data");
+        self.recv_subgroup(
+            stream_header.header_type,
+            stream_header.subgroup_header.unwrap(),
+            subscribe_id,
+            reader,
+            mlog,
+        )
+        .await?;
 
         tracing::debug!(
             "[SUBSCRIBER] recv_stream_inner: completed processing stream for track_alias={}",
@@ -593,20 +562,23 @@ impl Subscriber {
 
     /// If new stream is a Subgroup stream, handle reception of subgroup objects and payloads.
     async fn recv_subgroup(
+        &mut self,
         stream_header_type: data::StreamHeaderType,
-        mut subgroup_writer: serve::SubgroupWriter,
+        mut subgroup_header: data::SubgroupHeader,
+        subscribe_id: u64,
         mut reader: Reader,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         tracing::debug!(
-            "[SUBSCRIBER] recv_subgroup: starting - group_id={}, subgroup_id={}, priority={}",
-            subgroup_writer.info.group_id,
-            subgroup_writer.info.subgroup_id,
-            subgroup_writer.info.priority
+            "[SUBSCRIBER] recv_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
+            subgroup_header.group_id,
+            subgroup_header.subgroup_id,
+            subgroup_header.publisher_priority
         );
 
         let mut object_count = 0;
-        let mut current_object_id = 0u64;
+        let mut previous_object_id: Option<u64> = None;
+        let mut subgroup_writer: Option<serve::SubgroupWriter> = None;
         while !reader.done().await? {
             tracing::trace!(
                 "[SUBSCRIBER] recv_subgroup: reading object #{} (has_ext_headers={})",
@@ -685,13 +657,47 @@ impl Subscriber {
                     }
                 };
 
-            // Calculate absolute object_id from delta
-            current_object_id += object_id_delta;
+            let current_object_id = match previous_object_id {
+                Some(previous) => previous
+                    .checked_add(object_id_delta)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| {
+                        SessionError::ProtocolViolation("subgroup object id overflow".to_string())
+                    })?,
+                None => object_id_delta,
+            };
+            previous_object_id = Some(current_object_id);
 
             // Extract extension headers if present
             let extension_headers = decoded_object
                 .as_ref()
                 .map(|obj| obj.extension_headers.clone());
+
+            if status.is_some_and(|status| status != data::ObjectStatus::NormalObject)
+                && extension_headers
+                    .as_ref()
+                    .is_some_and(|headers| !headers.is_empty())
+            {
+                return Err(SessionError::ProtocolViolation(
+                    "non-normal object status with extension headers".to_string(),
+                ));
+            }
+
+            if subgroup_writer.is_none() {
+                if stream_header_type.uses_first_object_id_as_subgroup_id() {
+                    subgroup_header.subgroup_id = Some(current_object_id);
+                }
+
+                let mut subscribes = self.subscribes.lock().map_err(|_| SessionError::Internal)?;
+                let subscribe = subscribes.get_mut(&subscribe_id).ok_or_else(|| {
+                    ServeError::not_found_ctx(format!(
+                        "subscribe_id={} not found for track_alias={}",
+                        subscribe_id, subgroup_header.track_alias
+                    ))
+                })?;
+
+                subgroup_writer = Some(subscribe.subgroup(subgroup_header.clone())?);
+            }
 
             // Log subgroup object parsed/received
             if let Some(ref mlog) = mlog {
@@ -702,8 +708,8 @@ impl Subscriber {
                         mlog::subgroup_object_ext_parsed(
                             time,
                             stream_id,
-                            subgroup_writer.info.group_id,
-                            subgroup_writer.info.subgroup_id,
+                            subgroup_header.group_id,
+                            subgroup_header.subgroup_id.unwrap_or(0),
                             current_object_id,
                             &obj_ext,
                         )
@@ -717,8 +723,8 @@ impl Subscriber {
                         mlog::subgroup_object_parsed(
                             time,
                             stream_id,
-                            subgroup_writer.info.group_id,
-                            subgroup_writer.info.subgroup_id,
+                            subgroup_header.group_id,
+                            subgroup_header.subgroup_id.unwrap_or(0),
                             current_object_id,
                             &temp_obj,
                         )
@@ -730,6 +736,7 @@ impl Subscriber {
             // Pass extension headers through to the serve layer
             // TODO SLG - object_id_delta and object status are still being ignored
 
+            let subgroup_writer = subgroup_writer.as_mut().ok_or(SessionError::Internal)?;
             let mut object_writer = subgroup_writer.create(remaining_bytes, extension_headers)?;
             tracing::trace!(
                 "[SUBSCRIBER] recv_subgroup: reading payload for object #{} ({} bytes)",
@@ -772,8 +779,8 @@ impl Subscriber {
 
         tracing::info!(
             "[SUBSCRIBER] recv_subgroup: completed subgroup (group_id={}, subgroup_id={}, {} objects received)",
-            subgroup_writer.info.group_id,
-            subgroup_writer.info.subgroup_id,
+            subgroup_header.group_id,
+            subgroup_header.subgroup_id.unwrap_or(0),
             object_count
         );
 
@@ -873,10 +880,7 @@ mod tests {
     use std::{sync::atomic, task::Poll};
 
     use super::*;
-    use crate::{
-        message::{self, GroupOrder},
-        serve::Track,
-    };
+    use crate::{message, serve::Track};
 
     fn subscriber() -> Subscriber {
         Subscriber::new(Queue::default(), Arc::new(atomic::AtomicU64::new(0)), None)
@@ -887,7 +891,7 @@ mod tests {
         let mut subscriber = subscriber();
         let observer = subscriber.clone();
         let (writer, _reader) =
-            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4").produce();
 
         {
             let subscribe = subscriber.subscribe_open(writer);
@@ -906,7 +910,7 @@ mod tests {
         let mut subscriber = subscriber();
         let observer = subscriber.clone();
         let (writer, _reader) =
-            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4".into()).produce();
+            Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4").produce();
 
         let subscribe = subscriber.subscribe_open(writer);
         futures::pin_mut!(subscribe);
@@ -919,11 +923,8 @@ mod tests {
             .recv_subscribe_ok(&message::SubscribeOk {
                 id: 0,
                 track_alias: 10,
-                expires: 0,
-                group_order: GroupOrder::Publisher,
-                content_exists: false,
-                largest_location: None,
                 params: Default::default(),
+                track_extensions: Default::default(),
             })
             .unwrap();
 

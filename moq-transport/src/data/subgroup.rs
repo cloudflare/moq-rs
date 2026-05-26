@@ -290,6 +290,12 @@ impl Decode for SubgroupObjectExt {
             }
         };
 
+        if status.is_some_and(|status| status != ObjectStatus::NormalObject)
+            && !extension_headers.is_empty()
+        {
+            return Err(DecodeError::InvalidValue);
+        }
+
         //Self::decode_remaining(r, payload_length);
         //let payload = r.copy_to_bytes(payload_length);
 
@@ -338,6 +344,9 @@ impl Encode for SubgroupObjectExt {
 
         if self.payload_length == 0 {
             if let Some(status) = self.status {
+                if status != ObjectStatus::NormalObject && !self.extension_headers.is_empty() {
+                    return Err(EncodeError::InvalidValue);
+                }
                 status.encode(w)?;
                 tracing::trace!("[ENCODE] SubgroupObjectExt: encoded status={:?}", status);
             } else {
@@ -358,6 +367,7 @@ impl Encode for SubgroupObjectExt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use bytes::BytesMut;
 
     #[test]
@@ -391,5 +401,41 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = SubgroupObjectExt::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn decode_rejects_non_normal_status_with_extension_headers() {
+        let data = vec![
+            0x00, // object id delta
+            0x02, // extension headers byte length
+            0x00, // extension delta type
+            0x01, // extension value
+            0x00, // payload length
+            0x04, // EndOfTrack
+        ];
+        let mut buf: Bytes = data.into();
+
+        assert!(matches!(
+            SubgroupObjectExt::decode(&mut buf).unwrap_err(),
+            DecodeError::InvalidValue
+        ));
+    }
+
+    #[test]
+    fn encode_rejects_non_normal_status_with_extension_headers() {
+        let mut ext_hdrs = ExtensionHeaders::new();
+        ext_hdrs.set_intvalue(0, 1);
+        let msg = SubgroupObjectExt {
+            object_id_delta: 0,
+            extension_headers: ext_hdrs,
+            payload_length: 0,
+            status: Some(ObjectStatus::EndOfTrack),
+        };
+        let mut buf = BytesMut::new();
+
+        assert!(matches!(
+            msg.encode(&mut buf).unwrap_err(),
+            EncodeError::InvalidValue
+        ));
     }
 }
