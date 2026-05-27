@@ -253,6 +253,13 @@ impl Subscribed {
         }
     }
 
+    fn is_expected_serve_shutdown(err: &SessionError) -> bool {
+        matches!(
+            err,
+            SessionError::Serve(ServeError::Cancel | ServeError::Done)
+        )
+    }
+
     async fn serve_subgroups(
         &mut self,
         mut subgroups: serve::SubgroupsReader,
@@ -280,7 +287,11 @@ impl Subscribed {
 
                         tasks.push(async move {
                             if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await {
-                                tracing::warn!("failed to serve subgroup: {:?}, error: {}", info, err);
+                                if Self::is_expected_serve_shutdown(&err) {
+                                    tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
+                                } else {
+                                    tracing::warn!(subgroup_info = ?info, error = %err, "failed to serve subgroup");
+                                }
                             }
                         });
                     },
@@ -636,5 +647,21 @@ mod tests {
             Subscribed::request_error_code(&ServeError::Closed(0x42)),
             0x42
         );
+    }
+
+    #[test]
+    fn expected_serve_shutdown_is_only_cancel_or_done() {
+        assert!(Subscribed::is_expected_serve_shutdown(
+            &SessionError::Serve(ServeError::Cancel)
+        ));
+        assert!(Subscribed::is_expected_serve_shutdown(
+            &SessionError::Serve(ServeError::Done)
+        ));
+        assert!(!Subscribed::is_expected_serve_shutdown(
+            &SessionError::Serve(ServeError::NotFound)
+        ));
+        assert!(!Subscribed::is_expected_serve_shutdown(
+            &SessionError::Internal
+        ));
     }
 }

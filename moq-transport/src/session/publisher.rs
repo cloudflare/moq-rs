@@ -474,14 +474,22 @@ impl Publisher {
     }
 
     fn recv_unsubscribe(&mut self, msg: message::Unsubscribe) -> Result<(), SessionError> {
-        if let Some(mut subscribed) = self
-            .subscribeds
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .remove(&msg.id)
         {
+            let mut subscribeds = self
+                .subscribeds
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            let subscribed = subscribeds.get_mut(&msg.id).ok_or_else(|| {
+                SessionError::ProtocolViolation(format!(
+                    "UNSUBSCRIBE for unknown subscribe ID {}",
+                    msg.id
+                ))
+            })?;
+
             subscribed.recv_unsubscribe()?;
         }
+
+        self.remove_subscribe(msg.id)?;
 
         Ok(())
     }
@@ -523,12 +531,27 @@ impl Publisher {
     }
 
     pub(super) fn drop_subscribe(&mut self, id: u64) {
-        if let Ok(mut s) = self.subscribeds.lock() {
-            s.remove(&id);
-        }
-        if let Ok(mut names) = self.subscribed_names.lock() {
-            names.retain(|_, request_id| *request_id != id);
-        }
+        let _ = self.remove_subscribe(id);
+    }
+
+    fn remove_subscribe(&mut self, id: u64) -> Result<(), SessionError> {
+        self.subscribeds
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .remove(&id);
+        Self::drop_subscribed_name(&self.subscribed_names, id)
+    }
+
+    fn drop_subscribed_name(
+        subscribed_names: &Arc<Mutex<HashMap<FullTrackName, u64>>>,
+        id: u64,
+    ) -> Result<(), SessionError> {
+        subscribed_names
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .retain(|_, request_id| *request_id != id);
+
+        Ok(())
     }
 
     fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishNamespaceRecv> {
@@ -550,5 +573,46 @@ impl Publisher {
 
     pub(super) async fn send_datagram(&mut self, data: bytes::Bytes) -> Result<(), SessionError> {
         Ok(self.webtransport.send_datagram(data).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    use crate::{
+        coding::{TrackName, TrackNamespace},
+        serve::FullTrackName,
+    };
+
+    use super::Publisher;
+
+    fn full_track_name(namespace: &str, name: &str) -> FullTrackName {
+        FullTrackName {
+            namespace: TrackNamespace::from_utf8_path(namespace),
+            name: TrackName::from(name),
+        }
+    }
+
+    #[test]
+    fn drop_subscribed_name_removes_only_matching_request_id() {
+        let subscribed_names = Arc::new(Mutex::new(HashMap::new()));
+        let unsubscribed_track = full_track_name("bb1", "video.m4s");
+        let active_track = full_track_name("bb1", "audio.m4s");
+
+        {
+            let mut names = subscribed_names.lock().unwrap();
+            names.insert(unsubscribed_track.clone(), 6);
+            names.insert(active_track.clone(), 8);
+        }
+
+        Publisher::drop_subscribed_name(&subscribed_names, 6).unwrap();
+
+        let names = subscribed_names.lock().unwrap();
+        assert!(!names.contains_key(&unsubscribed_track));
+        assert_eq!(names.get(&active_track), Some(&8));
     }
 }
