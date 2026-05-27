@@ -313,7 +313,7 @@ impl Subscribed {
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
     ) -> Result<(), SessionError> {
-        tracing::debug!(
+        tracing::trace!(
             "[PUBLISHER] serve_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
             subgroup_reader.group_id,
             subgroup_reader.subgroup_id,
@@ -346,7 +346,7 @@ impl Subscribed {
 
                 let mut new_writer = Writer::new(send_stream);
 
-                tracing::debug!(
+                tracing::trace!(
                     "[PUBLISHER] serve_subgroup: sending header - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
                     header.track_alias,
                     header.group_id,
@@ -386,7 +386,7 @@ impl Subscribed {
                 },
             };
 
-            tracing::debug!(
+            tracing::trace!(
                 "[PUBLISHER] serve_subgroup: sending object #{} - object_id={}, object_id_delta={}, payload_length={}, status={:?}, extension_headers={:?}",
                 object_count + 1,
                 subgroup_object_reader.object_id,
@@ -446,7 +446,7 @@ impl Subscribed {
             object_count += 1;
         }
 
-        tracing::info!(
+        tracing::trace!(
             "[PUBLISHER] serve_subgroup: completed subgroup (group_id={}, subgroup_id={:?}, {} objects sent)",
             subgroup_reader.group_id,
             subgroup_reader.subgroup_id,
@@ -505,7 +505,7 @@ impl Subscribed {
             let mut buffer = bytes::BytesMut::with_capacity(payload_len + 100);
             encoded_datagram.encode(&mut buffer)?;
 
-            tracing::debug!(
+            tracing::trace!(
                 "[PUBLISHER] serve_datagrams: sending datagram #{} - track_alias={}, group_id={}, object_id={}, priority={}, payload_len={}, extension_headers={:?}, total_encoded_len={}",
                 datagram_count + 1,
                 encoded_datagram.track_alias,
@@ -543,7 +543,7 @@ impl Subscribed {
             datagram_count += 1;
         }
 
-        tracing::info!(
+        tracing::trace!(
             "[PUBLISHER] serve_datagrams: completed ({} datagrams sent)",
             datagram_count
         );

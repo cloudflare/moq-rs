@@ -70,7 +70,7 @@ impl SubgroupHeader {
             publisher_priority,
         };
 
-        tracing::debug!(
+        tracing::trace!(
             "[DECODE] SubgroupHeader complete: track_alias={}, group_id={}, subgroup_id={:?}, priority={}",
             result.track_alias,
             result.group_id,
@@ -135,7 +135,7 @@ impl Encode for SubgroupHeader {
         );
 
         let bytes_written = start_pos - w.remaining_mut();
-        tracing::debug!(
+        tracing::trace!(
             "[ENCODE] SubgroupHeader complete: wrote {} bytes",
             bytes_written
         );
@@ -184,7 +184,7 @@ impl Decode for SubgroupObject {
         //Self::decode_remaining(r, payload_length);
         //let payload = r.copy_to_bytes(payload_length);
 
-        tracing::debug!(
+        tracing::trace!(
             "[DECODE] SubgroupObject complete: object_id_delta={}, payload_length={}, status={:?}, buffer_remaining={} bytes",
             object_id_delta,
             payload_length,
@@ -234,7 +234,7 @@ impl Encode for SubgroupObject {
         //Self::encode_remaining(w, self.payload.len())?;
         //w.put_slice(&self.payload);
 
-        tracing::debug!("[ENCODE] SubgroupObject complete");
+        tracing::trace!("[ENCODE] SubgroupObject complete");
 
         Ok(())
     }
@@ -299,7 +299,7 @@ impl Decode for SubgroupObjectExt {
         //Self::decode_remaining(r, payload_length);
         //let payload = r.copy_to_bytes(payload_length);
 
-        tracing::debug!(
+        tracing::trace!(
             "[DECODE] SubgroupObjectExt complete: object_id_delta={}, payload_length={}, status={:?}, buffer_remaining={} bytes",
             object_id_delta,
             payload_length,
@@ -357,7 +357,7 @@ impl Encode for SubgroupObjectExt {
         //Self::encode_remaining(w, self.payload.len())?;
         //w.put_slice(&self.payload);
 
-        tracing::debug!("[ENCODE] SubgroupObjectExt complete");
+        tracing::trace!("[ENCODE] SubgroupObjectExt complete");
 
         Ok(())
     }

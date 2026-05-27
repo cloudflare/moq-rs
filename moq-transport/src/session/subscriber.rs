@@ -472,7 +472,7 @@ impl Subscriber {
 
         // Decode the stream header
         let stream_header: data::StreamHeader = reader.decode().await?;
-        tracing::debug!(
+        tracing::trace!(
             "[SUBSCRIBER] recv_stream: decoded stream header type={:?}",
             stream_header.header_type
         );
@@ -553,7 +553,7 @@ impl Subscriber {
         )
         .await?;
 
-        tracing::debug!(
+        tracing::trace!(
             "[SUBSCRIBER] recv_stream_inner: completed processing stream for track_alias={}",
             track_alias
         );
@@ -569,7 +569,7 @@ impl Subscriber {
         mut reader: Reader,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
-        tracing::debug!(
+        tracing::trace!(
             "[SUBSCRIBER] recv_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
             subgroup_header.group_id,
             subgroup_header.subgroup_id,
@@ -592,7 +592,7 @@ impl Subscriber {
                 match stream_header_type.has_extension_headers() {
                     true => {
                         let object = reader.decode::<data::SubgroupObjectExt>().await?;
-                        tracing::debug!(
+                        tracing::trace!(
                         "[SUBSCRIBER] recv_subgroup: object #{} with extension headers - object_id_delta={}, payload_length={}, status={:?}, extension_headers={:?}",
                         object_count + 1,
                         object.object_id_delta,
@@ -605,12 +605,12 @@ impl Subscriber {
 
                         // Check for Immutable Extensions (type 0xB = 11)
                         if object.extension_headers.has(0xB) {
-                            tracing::info!(
+                            tracing::trace!(
                                 "[SUBSCRIBER] recv_subgroup: object #{} contains IMMUTABLE EXTENSIONS (type 0xB) - will be forwarded",
                                 object_count + 1
                             );
                             if let Some(immutable_ext) = object.extension_headers.get(0xB) {
-                                tracing::debug!(
+                                tracing::trace!(
                                     "[SUBSCRIBER] recv_subgroup: immutable extension details: {:?}",
                                     immutable_ext
                                 );
@@ -619,12 +619,12 @@ impl Subscriber {
 
                         // Check for Prior Group ID Gap (type 0x3C = 60)
                         if object.extension_headers.has(0x3C) {
-                            tracing::info!(
+                            tracing::trace!(
                                 "[SUBSCRIBER] recv_subgroup: object #{} contains PRIOR GROUP ID GAP (type 0x3C)",
                                 object_count + 1
                             );
                             if let Some(gap_ext) = object.extension_headers.get(0x3C) {
-                                tracing::debug!(
+                                tracing::trace!(
                                     "[SUBSCRIBER] recv_subgroup: prior group id gap details: {:?}",
                                     gap_ext
                                 );
@@ -641,7 +641,7 @@ impl Subscriber {
                     }
                     false => {
                         let object = reader.decode::<data::SubgroupObject>().await?;
-                        tracing::debug!(
+                        tracing::trace!(
                         "[SUBSCRIBER] recv_subgroup: object #{} - object_id_delta={}, payload_length={}, status={:?}",
                         object_count + 1,
                         object.object_id_delta,
@@ -777,7 +777,7 @@ impl Subscriber {
             object_count += 1;
         }
 
-        tracing::info!(
+        tracing::trace!(
             "[SUBSCRIBER] recv_subgroup: completed subgroup (group_id={}, subgroup_id={}, {} objects received)",
             subgroup_header.group_id,
             subgroup_header.subgroup_id.unwrap_or(0),
@@ -803,7 +803,7 @@ impl Subscriber {
 
         // Check for extension headers in the datagram
         if let Some(ref ext_headers) = datagram.extension_headers {
-            tracing::debug!(
+            tracing::trace!(
                 "[SUBSCRIBER] recv_datagram: datagram contains extension headers: {:?}",
                 ext_headers
             );
@@ -812,11 +812,11 @@ impl Subscriber {
 
             // Check for Immutable Extensions (type 0xB = 11)
             if ext_headers.has(0xB) {
-                tracing::info!(
+                tracing::trace!(
                     "[SUBSCRIBER] recv_datagram: datagram contains IMMUTABLE EXTENSIONS (type 0xB)"
                 );
                 if let Some(immutable_ext) = ext_headers.get(0xB) {
-                    tracing::debug!(
+                    tracing::trace!(
                         "[SUBSCRIBER] recv_datagram: immutable extension details: {:?}",
                         immutable_ext
                     );
@@ -825,11 +825,11 @@ impl Subscriber {
 
             // Check for Prior Group ID Gap (type 0x3C = 60)
             if ext_headers.has(0x3C) {
-                tracing::info!(
+                tracing::trace!(
                     "[SUBSCRIBER] recv_datagram: datagram contains PRIOR GROUP ID GAP (type 0x3C)"
                 );
                 if let Some(gap_ext) = ext_headers.get(0x3C) {
-                    tracing::debug!(
+                    tracing::trace!(
                         "[SUBSCRIBER] recv_datagram: prior group id gap details: {:?}",
                         gap_ext
                     );
