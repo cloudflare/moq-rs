@@ -40,8 +40,8 @@ curl https://interop-relay.cloudflare.mediaoverquic.com:443/mlog/22c73802597dcd9
 The output is JSON-SEQ: each record starts with ASCII Record Separator (`0x1e`) and contains a JSON object. The first record is a header; subsequent records are events:
 
 ```json
-{"time":0.179,"name":"moqt:control_message_parsed","data":{"message_type":"client_setup","supported_versions":["DRAFT_14"],...}}
-{"time":0.216,"name":"moqt:control_message_created","data":{"message_type":"server_setup","selected_version":"DRAFT_14",...}}
+{"time":0.179,"name":"moqt:control_message_parsed","data":{"message_type":"client_setup","supported_versions":["DRAFT_16"],...}}
+{"time":0.216,"name":"moqt:control_message_created","data":{"message_type":"server_setup","selected_version":"DRAFT_16",...}}
 ```
 
 - `control_message_parsed` = the relay **received** a message from your client
@@ -74,12 +74,12 @@ cargo run --bin moq-test-client -- \
     "stream_id": 0,
     "message_type": "client_setup",
     "number_of_supported_versions": 1,
-    "supported_versions": ["DRAFT_14"],
+    "supported_versions": ["DRAFT_16"],
     "parameters": [["2", "100"]]
   }
 }
 ```
-The relay parsed your CLIENT_SETUP. It offered version DRAFT_14. The `parameters` array contains SETUP parameters as `[id, value]` pairs (here, PATH with max length 100).
+The relay parsed your CLIENT_SETUP. It offered version DRAFT_16. The `parameters` array contains SETUP parameters as `[id, value]` pairs (here, PATH with max length 100).
 
 ```json
 {
@@ -89,18 +89,18 @@ The relay parsed your CLIENT_SETUP. It offered version DRAFT_14. The `parameters
     "event_type": "control_message_created",
     "stream_id": 0,
     "message_type": "server_setup",
-    "selected_version": "DRAFT_14",
+    "selected_version": "DRAFT_16",
     "parameters": [["2", "100"]]
   }
 }
 ```
-The relay responded with SERVER_SETUP, selecting DRAFT_14. The handshake is complete.
+The relay responded with SERVER_SETUP, selecting DRAFT_16. The handshake is complete.
 
 **What to look for:**
 - If you see `client_setup` parsed but no `server_setup` created, the relay rejected your version or parameters
 - If you see nothing at all, your connection didn't reach the MoQ layer (check QUIC connectivity)
 
-### Example 2: Publishing a namespace (`announce-only`)
+### Example 2: Publishing a namespace (`publish-namespace-only`)
 
 After SETUP, announce a namespace and verify the relay accepts it.
 
@@ -108,7 +108,7 @@ After SETUP, announce a namespace and verify the relay accepts it.
 cargo run --bin moq-test-client -- \
   --relay https://interop-relay.cloudflare.mediaoverquic.com:443 \
   --tls-disable-verify \
-  --test announce-only
+  --test publish-namespace-only
 ```
 
 **mlog output** (after the SETUP exchange):
@@ -148,7 +148,7 @@ The relay accepted the namespace with PUBLISH_NAMESPACE_OK. Your client is now r
 - `publish_namespace_ok` created confirms it was accepted
 - The `request_id` ties the response to the request
 
-### Example 3: Full publish-subscribe flow (`announce-subscribe`)
+### Example 3: Full publish-subscribe flow (`publish-namespace-subscribe`)
 
 This test uses two connections: a publisher and a subscriber. The test client reports both Connection IDs:
 
@@ -156,13 +156,13 @@ This test uses two connections: a publisher and a subscriber. The test client re
 cargo run --bin moq-test-client -- \
   --relay https://interop-relay.cloudflare.mediaoverquic.com:443 \
   --tls-disable-verify \
-  --test announce-subscribe
+  --test publish-namespace-subscribe
 ```
 
 **TAP output:**
 
 ```
-ok 1 - announce-subscribe
+ok 1 - publish-namespace-subscribe
   ---
   duration_ms: 3436
   publisher_connection_id: 71d4b5eb1a807779af03331c330d5fa9

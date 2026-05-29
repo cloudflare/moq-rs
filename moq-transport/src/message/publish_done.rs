@@ -3,7 +3,26 @@
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, ReasonPhrase};
 
-// TODO SLG - add an enum for status_codes
+/// Draft-16 §13.4.3 PUBLISH_DONE codes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum PublishDoneCode {
+    InternalError = 0x0,
+    Unauthorized = 0x1,
+    TrackEnded = 0x2,
+    SubscriptionEnded = 0x3,
+    GoingAway = 0x4,
+    Expired = 0x5,
+    TooFarBehind = 0x6,
+    UpdateFailed = 0x8,
+    MalformedTrack = 0x12,
+}
+
+impl From<PublishDoneCode> for u64 {
+    fn from(value: PublishDoneCode) -> Self {
+        value as u64
+    }
+}
 
 /// Sent by the publisher to cleanly terminate a Subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]

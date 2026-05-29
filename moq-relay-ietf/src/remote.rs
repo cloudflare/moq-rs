@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use moq_native_ietf::quic;
-use moq_transport::coding::TrackNamespace;
+use moq_transport::coding::{TrackName, TrackNamespace};
 use moq_transport::serve::{Track, TrackReader};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -21,7 +21,7 @@ use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
 /// only when both match.
 type RemoteCacheKey = (Url, Option<SocketAddr>);
 type RemoteSlot = Arc<Mutex<Option<Remote>>>;
-type TrackCacheKey = (TrackNamespace, String);
+type TrackCacheKey = (TrackNamespace, TrackName);
 type TrackSlot = Arc<Mutex<Option<TrackReader>>>;
 
 /// Manages connections to remote relays.
@@ -56,8 +56,9 @@ impl RemoteManager {
         &self,
         scope: Option<&str>,
         namespace: &TrackNamespace,
-        track_name: &str,
+        track_name: impl Into<TrackName>,
     ) -> anyhow::Result<Option<TrackReader>> {
+        let track_name = track_name.into();
         let (origin, client) = match self.coordinator.lookup(scope, namespace).await {
             Ok(result) => result,
             Err(CoordinatorError::NamespaceNotFound) => return Ok(None),
@@ -78,10 +79,7 @@ impl RemoteManager {
             }
         };
 
-        match remote
-            .subscribe(namespace.clone(), track_name.to_string())
-            .await
-        {
+        match remote.subscribe(namespace.clone(), track_name).await {
             Ok(reader) => Ok(reader),
             Err(err) => {
                 tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
@@ -350,7 +348,7 @@ impl Remote {
     async fn subscribe(
         &self,
         namespace: TrackNamespace,
-        track_name: String,
+        track_name: TrackName,
     ) -> anyhow::Result<Option<TrackReader>> {
         let key = (namespace.clone(), track_name.clone());
 

@@ -44,7 +44,7 @@ pub struct RelayConfig {
     /// Directory to write mlog files (one per connection)
     pub mlog_dir: Option<PathBuf>,
 
-    /// Forward all announcements to the (optional) URL.
+    /// Forward all PUBLISH_NAMESPACE messages to the (optional) upstream URL.
     pub announce: Option<Url>,
 
     /// Our hostname which we advertise to other origins.
@@ -137,7 +137,7 @@ impl Relay {
 
             // Start the forwarder, if any
             let forward_producer = if let Some(url) = &announce_url {
-                tracing::info!("forwarding announces to {}", url);
+                tracing::info!("forwarding PUBLISH_NAMESPACE messages to {}", url);
 
                 // Establish a QUIC connection to the forward URL
                 let (session, _quic_client_initial_cid, transport) = quic_endpoints[0]

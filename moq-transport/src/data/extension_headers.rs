@@ -1,23 +1,37 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! Extension headers for MoQT data-plane objects (§2.5, §10.2.1.2).
+//!
+//! On the wire, extension headers are encoded as a **byte-length prefix**
+//! followed by a sequence of delta-encoded Key-Value-Pairs (same KVP format
+//! as control-plane parameters).  The byte-length prefix distinguishes this
+//! from [`KeyValuePairs`] which uses a count prefix.
+//!
+//! Because the pairs share a single running `prev` counter across the whole
+//! sequence, the encoder sorts them by ascending key before writing.
+
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePair};
 use bytes::Buf;
 use std::fmt;
 
-/// A collection of KeyValuePair entries, where the length in bytes of key-value-pairs are encoded/decoded first.
-/// This structure is appropriate for Data plane extension headers.
-/// Since duplicate parameters are allowed for unknown extension headers, we don't do duplicate checking here.
+/// Smallest possible encoded extension KVP: one-byte delta plus one-byte value.
+const MIN_EXTENSION_KVP_WIRE_LEN: usize = 2;
+
+/// A length-prefixed sequence of delta-encoded Key-Value-Pairs used for
+/// data-plane object extension headers.
+///
+/// Keys are stored internally as absolute values; delta encoding is applied
+/// only on the wire.
 #[derive(Default, Clone, Eq, PartialEq)]
 pub struct ExtensionHeaders(pub Vec<KeyValuePair>);
 
-// TODO: These set/get API's all assume no duplicate keys. We can add API's to support duplicates if needed.
 impl ExtensionHeaders {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Insert or replace a KeyValuePair with the same key.
+    /// Insert or replace the entry with matching key.
     pub fn set(&mut self, kvp: KeyValuePair) {
         if let Some(existing) = self.0.iter_mut().find(|k| k.key == kvp.key) {
             *existing = kvp;
@@ -49,28 +63,25 @@ impl ExtensionHeaders {
 
 impl Decode for ExtensionHeaders {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        // Read total byte length of the encoded kvps
-        // Note: this is the difference between KeyValuePairs and ExtensionHeaders.
-        // KeyValuePairs encodes the count of kvps, whereas ExtensionHeaders encodes the total byte length.
+        // Extension headers are byte-length prefixed (unlike KeyValuePairs which
+        // are count-prefixed).
         let length = usize::decode(r)?;
-
-        // Ensure we have that many bytes available in the input
         Self::decode_remaining(r, length)?;
 
-        // If zero length, return empty map
         if length == 0 {
             return Ok(ExtensionHeaders::new());
         }
 
-        // Copy the exact slice that contains the encoded kvps and decode from it
-        let mut buf = vec![0u8; length];
-        r.copy_to_slice(&mut buf);
-        let mut kvps_bytes = bytes::Bytes::from(buf);
+        // Decode KVPs from the exact byte slice with a shared prev.
+        let mut kvps_bytes = r.copy_to_bytes(length);
 
-        let mut kvps = Vec::new();
+        let mut kvps = Vec::with_capacity(length / MIN_EXTENSION_KVP_WIRE_LEN);
+        let mut prev = 0u64;
+
         while kvps_bytes.has_remaining() {
-            let kvp = KeyValuePair::decode(&mut kvps_bytes)?;
-            kvps.push(kvp);
+            let (pair, new_prev) = KeyValuePair::decode_with_prev(&mut kvps_bytes, prev)?;
+            prev = new_prev;
+            kvps.push(pair);
         }
 
         Ok(ExtensionHeaders(kvps))
@@ -79,14 +90,29 @@ impl Decode for ExtensionHeaders {
 
 impl Encode for ExtensionHeaders {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        // Encode all KeyValuePair entries into a temporary buffer to compute total byte length
-        let mut tmp = bytes::BytesMut::new();
-        for kvp in &self.0 {
-            kvp.encode(&mut tmp)?;
+        if self.0.is_empty() {
+            0usize.encode(w)?;
+            return Ok(());
         }
 
-        // Write total byte length (u64) followed by the encoded bytes
-        (tmp.len() as u64).encode(w)?;
+        // Encode into a temporary buffer to measure the byte length before writing
+        // the length prefix.
+        let mut tmp = bytes::BytesMut::new();
+
+        if self.0.len() == 1 {
+            self.0[0].encode_with_prev(&mut tmp, 0)?;
+        } else {
+            // Sort by ascending key so deltas are always non-negative.
+            let mut sorted: Vec<&KeyValuePair> = self.0.iter().collect();
+            sorted.sort_by_key(|k| k.key);
+            let mut prev = 0u64;
+            for kvp in &sorted {
+                prev = kvp.encode_with_prev(&mut tmp, prev)?;
+            }
+        }
+
+        // Write the byte-length prefix followed by the encoded pairs.
+        tmp.len().encode(w)?;
         w.put_slice(&tmp);
 
         Ok(())
@@ -106,38 +132,108 @@ impl fmt::Debug for ExtensionHeaders {
     }
 }
 
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::BytesMut;
 
-    #[test]
-    fn encode_decode_extension_headers() {
-        let mut buf = BytesMut::new();
+    // ── single pair ───────────────────────────────────────────────────────────
 
-        let mut ext_hdrs = ExtensionHeaders::new();
-        ext_hdrs.set_bytesvalue(1, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
-        ext_hdrs.encode(&mut buf).unwrap();
+    #[test]
+    fn single_bytes_pair_roundtrip() {
+        // key=1 (odd, bytes), value=[0x01..0x05]
+        // Wire: length=7, delta=1 (prev=0→abs=1), length_of_value=5, bytes
+        let mut buf = BytesMut::new();
+        let mut ext = ExtensionHeaders::new();
+        ext.set_bytesvalue(1, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+        ext.encode(&mut buf).unwrap();
         assert_eq!(
             buf.to_vec(),
             vec![
-                0x07, // 7 bytes total length
-                0x01, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05, // Key=1, Value=[1,2,3,4,5]
+                0x07, // 7 bytes of KVP data
+                0x01, // delta=1 → abs_type=1 (odd, bytes)
+                0x05, 0x01, 0x02, 0x03, 0x04, 0x05, // length=5, value
             ]
         );
         let decoded = ExtensionHeaders::decode(&mut buf).unwrap();
-        assert_eq!(decoded, ext_hdrs);
+        assert_eq!(decoded, ext);
+    }
 
-        let mut ext_hdrs = ExtensionHeaders::new();
-        ext_hdrs.set_intvalue(0, 0); // 2 bytes
-        ext_hdrs.set_intvalue(100, 100); // 4 bytes
-        ext_hdrs.set_bytesvalue(1, vec![0x01, 0x02, 0x03, 0x04, 0x05]); // 1 byte key, 1 byte length, 5 bytes data = 7 bytes
-        ext_hdrs.encode(&mut buf).unwrap();
+    // ── multiple pairs with correct delta encoding ────────────────────────────
+
+    #[test]
+    fn multi_pair_delta_encoding() {
+        // Three pairs: key=0 (int=0), key=1 (bytes=[1..5]), key=100 (int=100)
+        // Sorted order on wire: key=0, key=1, key=100
+        // Deltas: 0→0=0 (even, int), 0→1=1 (odd, bytes), 1→100=99 (even, int)
+        let mut ext = ExtensionHeaders::new();
+        ext.set_intvalue(0, 0);
+        ext.set_intvalue(100, 100);
+        ext.set_bytesvalue(1, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+
+        let mut buf = BytesMut::new();
+        ext.encode(&mut buf).unwrap();
+
+        // Manually compute expected bytes (QUIC varints ≥64 take 2 bytes):
+        // key=0 (even,int): delta=0 (1B), value=0 (1B) = 2B
+        // key=1 (odd,bytes): delta=1 (1B), length=5 (1B), 5 bytes = 7B
+        // key=100 (even,int): delta=99 (2B, since 99≥64), value=100 (2B, since 100≥64) = 4B
+        // total KVP bytes = 13; length prefix = 1B (13 < 64 so 1B varint)
         let buf_vec = buf.to_vec();
-        // Validate the encoded length and the KeyValuePair's length.
-        assert_eq!(14, buf_vec.len()); // 14 bytes total (length + 3 kvps)
-        assert_eq!(13, buf_vec[0]); // 13 bytes for the 3 KeyValuePairs data
+        assert_eq!(buf_vec[0], 13); // 13 bytes of KVP data
+        assert_eq!(buf_vec.len(), 14); // 1 (length prefix) + 13
+
+        // Decode and verify all three pairs survive
         let decoded = ExtensionHeaders::decode(&mut buf).unwrap();
-        assert_eq!(decoded, ext_hdrs);
+        assert_eq!(decoded.0.len(), 3);
+        assert_eq!(
+            decoded.get(0).unwrap().value,
+            crate::coding::Value::IntValue(0)
+        );
+        assert_eq!(
+            decoded.get(100).unwrap().value,
+            crate::coding::Value::IntValue(100)
+        );
+        assert_eq!(
+            decoded.get(1).unwrap().value,
+            crate::coding::Value::BytesValue(vec![0x01, 0x02, 0x03, 0x04, 0x05])
+        );
+    }
+
+    // ── round-trip with out-of-order insertion ────────────────────────────────
+
+    #[test]
+    fn encode_sorts_before_delta() {
+        // Insert in reverse order; encode must produce correct ascending deltas.
+        let mut ext = ExtensionHeaders::new();
+        ext.set_intvalue(100, 99);
+        ext.set_intvalue(0, 1);
+
+        let mut buf = BytesMut::new();
+        ext.encode(&mut buf).unwrap();
+        let decoded = ExtensionHeaders::decode(&mut buf).unwrap();
+
+        assert_eq!(
+            decoded.get(0).unwrap().value,
+            crate::coding::Value::IntValue(1)
+        );
+        assert_eq!(
+            decoded.get(100).unwrap().value,
+            crate::coding::Value::IntValue(99)
+        );
+    }
+
+    // ── empty ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_roundtrip() {
+        let ext = ExtensionHeaders::new();
+        let mut buf = BytesMut::new();
+        ext.encode(&mut buf).unwrap();
+        assert_eq!(buf.to_vec(), vec![0x00]); // length=0
+        let decoded = ExtensionHeaders::decode(&mut buf).unwrap();
+        assert_eq!(decoded, ext);
     }
 }

@@ -174,7 +174,7 @@ impl Media {
             let mut selection_params = moq_catalog::SelectionParam::default();
 
             let mut track = moq_catalog::Track {
-                init_track: Some(self.init.name.clone()),
+                init_track: Some(self.init.name.to_string()),
                 name: name.clone(),
                 namespace: Some(self.broadcast.namespace.to_utf8_path()),
                 packaging: Some(moq_catalog::TrackPackaging::Cmaf),
