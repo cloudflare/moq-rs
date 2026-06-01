@@ -42,11 +42,11 @@ pub struct Cli {
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
 
-    /// C4M auth token string to include in CLIENT_SETUP.
+    /// Auth token string to include in CLIENT_SETUP AUTHORIZATION TOKEN parameter.
     #[arg(long)]
     pub auth_token: Option<String>,
 
-    /// Token type for the auth token (default: C4M 0x63346d).
+    /// Token type identifier for the auth token (e.g. C4M=6501485, PrivacyPass=0, shared-secret).
     #[arg(long, default_value = "6501485")]
     pub auth_token_type: u64,
 }
