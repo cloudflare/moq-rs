@@ -81,6 +81,11 @@ pub struct Session {
     /// (takes precedence) or the CLIENT_SETUP PATH parameter (key 0x1).
     /// For outgoing connections: auto-extracted from the session URL in connect().
     connection_path: Option<String>,
+
+    /// Raw AUTHORIZATION TOKEN parameter value from CLIENT_SETUP (key 0x3).
+    /// Contains the uninterpreted bytes of the token parameter for the relay's
+    /// auth hook to parse. Empty if no token was present.
+    auth_token_raw: Vec<u8>,
 }
 
 impl Session {
@@ -181,6 +186,14 @@ impl Session {
     /// Returns `None` if no path was present or if the path was just "/".
     pub fn connection_path(&self) -> Option<&str> {
         self.connection_path.as_deref()
+    }
+
+    /// Returns the raw AUTHORIZATION TOKEN parameter value from CLIENT_SETUP.
+    ///
+    /// This is the uninterpreted bytes from setup parameter key 0x3.
+    /// Returns an empty slice if no token was present.
+    pub fn auth_token_raw(&self) -> &[u8] {
+        &self.auth_token_raw
     }
 
     // Helper for determining the largest supported version
@@ -492,6 +505,7 @@ impl Session {
         mlog: Option<mlog::MlogWriter>,
         transport: Transport,
         connection_path: Option<String>,
+        auth_token_raw: Vec<u8>,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let next_requestid = Arc::new(atomic::AtomicU64::new(first_requestid));
         let outgoing = Queue::default().split();
@@ -521,6 +535,7 @@ impl Session {
             mlog: mlog_shared,
             transport,
             connection_path,
+            auth_token_raw,
         };
 
         (session, publisher, subscriber)
@@ -597,7 +612,7 @@ impl Session {
         // TODO: emit server_setup_parsed event
 
         // We are the client, so the first request id is 0
-        let session = Session::new(session, sender, recver, 0, mlog, transport, path);
+        let session = Session::new(session, sender, recver, 0, mlog, transport, path, vec![]);
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
@@ -644,6 +659,16 @@ impl Session {
         // WebTransport connections always have the path in the CONNECT URL.
         // Raw QUIC connections only have CLIENT_SETUP PATH.
         let connection_path = wt_path.or(client_setup_path);
+
+        // Extract AUTHORIZATION TOKEN parameter (key 0x3, BytesValue).
+        let auth_token_raw = client
+            .params
+            .get(setup::ParameterType::AuthorizationToken.into())
+            .and_then(|kvp| match &kvp.value {
+                crate::coding::Value::BytesValue(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
 
         if connection_path.is_some() {
             tracing::debug!(
@@ -697,6 +722,7 @@ impl Session {
                 mlog,
                 transport,
                 connection_path,
+                auth_token_raw,
             ))
         } else {
             Err(SessionError::Version(client.versions, server_versions))
