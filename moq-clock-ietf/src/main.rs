@@ -14,7 +14,7 @@ use cli::Cli;
 use moq_transport::{
     coding::TrackNamespace,
     serve,
-    session::{Publisher, Subscriber},
+    session::{Publisher, Subscriber, encode_auth_token},
 };
 
 /// The main entry point for the MoQ Clock IETF example.
@@ -45,10 +45,15 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
+    let auth_raw = match &config.auth_token {
+        Some(token) => encode_auth_token(config.auth_token_type, token.as_bytes()),
+        None => vec![],
+    };
+
     // Depending on whether we are publishing or subscribing, create the appropriate session
     if config.publish {
         // Create the publisher session
-        let (session, mut publisher) = Publisher::connect(session, transport)
+        let (session, mut publisher) = Publisher::connect_with_auth(session, transport, auth_raw)
             .await
             .context("failed to create MoQ Transport session")?;
 
@@ -87,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         // Create the subscriber session
-        let (session, mut subscriber) = Subscriber::connect(session, transport)
+        let (session, mut subscriber) = Subscriber::connect_with_auth(session, transport, auth_raw)
             .await
             .context("failed to create MoQ Transport session")?;
 
