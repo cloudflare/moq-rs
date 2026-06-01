@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc. and contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "moq-auth"
+description = "Pluggable authorization hook trait for MoQ relay"
+authors = ["moq-rs contributors"]
+repository = "https://github.com/cloudflare/moq-rs"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+edition = "2021"
+
+keywords = ["quic", "moq", "auth", "authorization"]
+categories = ["authentication", "network-programming"]
+
+[dependencies]
+async-trait = "0.1"
+anyhow = "1"
+bytes = "1"
+thiserror = "2"
+tracing = { workspace = true }
+moq-transport = { path = "../moq-transport", version = "0.14" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
