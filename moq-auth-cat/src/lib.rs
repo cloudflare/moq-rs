@@ -67,17 +67,17 @@ impl C4MAuthHook {
             .map_err(|_| DenyReason::TokenMalformed)?;
 
         let token = decode_token(token_str, self.algorithm.as_ref())
-            .map_err(|e| map_cat_error(e))?;
+            .map_err(map_cat_error)?;
 
         // Step 2: Validate standard CWT claims (exp, nbf, iss, aud).
         self.token_validator
             .validate(&token)
-            .map_err(|e| map_cat_error(e))?;
+            .map_err(map_cat_error)?;
 
         // Step 3: Validate MOQT-specific claims.
         self.moqt_validator
             .validate_moqt_claims(&token)
-            .map_err(|e| map_cat_error(e))?;
+            .map_err(map_cat_error)?;
 
         // Step 4: Authorize the specific action against the token's scopes.
         let request = MoqtAuthRequest::new(action, namespace, track);
