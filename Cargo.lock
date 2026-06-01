@@ -334,8 +334,6 @@ checksum = "514de17de45fdb8dc022b1a7975556c53c86f9f0aa5f534b98977b171857c2c9"
 [[package]]
 name = "cat-token"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a98b94faced9f91de2471a16a5e0d684b816e32af33775713a285a395e0499d6"
 dependencies = [
  "base64",
  "chrono",
@@ -1563,7 +1561,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "cat-token",
- "chrono",
  "moq-auth",
  "moq-transport",
  "tokio",
@@ -1655,7 +1652,6 @@ dependencies = [
  "moq-auth-cat",
  "moq-native-ietf",
  "moq-transport",
- "p256",
  "serde",
  "serde_json",
  "thiserror 2.0.17",

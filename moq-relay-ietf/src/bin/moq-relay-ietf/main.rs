@@ -18,7 +18,6 @@ use moq_relay_ietf::{Coordinator, Relay, RelayConfig, Web, WebConfig};
 use {
     anyhow::Context,
     moq_auth_cat::{C4MAuthHook, C4MConfig, Es256Algorithm},
-    p256::{ecdsa::VerifyingKey, pkcs8::DecodePublicKey},
 };
 
 #[derive(Parser, Clone)]
@@ -247,10 +246,8 @@ fn build_auth_hook(cli: &Cli) -> anyhow::Result<Option<Arc<dyn moq_auth::AuthHoo
     let pem_data = std::fs::read_to_string(key_path)
         .with_context(|| format!("reading C4M public key from {}", key_path.display()))?;
 
-    let verifying_key = VerifyingKey::from_public_key_pem(&pem_data)
+    let algorithm = Es256Algorithm::from_public_key_pem(&pem_data)
         .map_err(|e| anyhow::anyhow!("invalid ES256 public key: {e}"))?;
-
-    let algorithm = Es256Algorithm::new_verifier(verifying_key);
 
     let mut config = C4MConfig::new(algorithm)
         .with_clock_skew_tolerance(cli.auth_cat_clock_skew);

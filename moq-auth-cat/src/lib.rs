@@ -21,16 +21,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cat_token::{
     CatTokenValidator, CryptographicAlgorithm, MoqtAction, MoqtAuthRequest, MoqtValidator,
-    decode_token,
+    decode_token_bytes,
 };
 use moq_auth::{AuthBlob, AuthDecision, AuthHook, DenyReason, RequestContext, SessionContext};
 
 use crate::error::map_cat_error;
 use crate::mapping::map_operation;
 
-/// IANA-registered token type for C4M.
-/// TODO: Replace with actual IANA value once assigned.
-pub const C4M_TOKEN_TYPE: u64 = 0x63346d; // "c4m" in hex as placeholder
+pub use cat_token::C4M_TOKEN_TYPE;
 
 /// C4M authentication hook implementing the CAT for MoQ auth scheme.
 ///
@@ -62,11 +60,8 @@ impl C4MAuthHook {
         namespace: Vec<Vec<u8>>,
         track: Vec<u8>,
     ) -> Result<AuthDecision, DenyReason> {
-        // Step 1: Decode token string from bytes and verify cryptographic signature.
-        let token_str = std::str::from_utf8(&blob.token_value)
-            .map_err(|_| DenyReason::TokenMalformed)?;
-
-        let token = decode_token(token_str, self.algorithm.as_ref())
+        // Step 1: Decode token from raw bytes and verify cryptographic signature.
+        let token = decode_token_bytes(&blob.token_value, self.algorithm.as_ref())
             .map_err(map_cat_error)?;
 
         // Step 2: Validate standard CWT claims (exp, nbf, iss, aud).

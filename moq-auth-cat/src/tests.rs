@@ -7,7 +7,6 @@ use bytes::Bytes;
 use cat_token::{
     CatTokenBuilder, Es256Algorithm, MoqtAction, MoqtScopeBuilder, encode_token,
 };
-use chrono::{Duration, Utc};
 use moq_auth::{
     AuthBlob, AuthHook, AuthzOperation, RequestContext, SessionContext,
 };
@@ -50,9 +49,9 @@ fn make_publisher_token(signing_key: &Es256Algorithm, namespace_parts: &[&[u8]])
 
     let token = CatTokenBuilder::new()
         .issuer("test-issuer")
-        .audience(vec!["test-relay".to_string()])
+        .single_audience("test-relay")
         .subject("publisher-1")
-        .expires_at(Utc::now() + Duration::seconds(3600))
+        .expires_in(3600)
         .moqt_scope(scope)
         .moqt_scope(setup_scope)
         .build();
@@ -73,9 +72,9 @@ fn make_subscriber_token(signing_key: &Es256Algorithm, namespace_parts: &[&[u8]]
 
     let token = CatTokenBuilder::new()
         .issuer("test-issuer")
-        .audience(vec!["test-relay".to_string()])
+        .single_audience("test-relay")
         .subject("subscriber-1")
-        .expires_at(Utc::now() + Duration::seconds(3600))
+        .expires_in(3600)
         .moqt_scope(scope)
         .moqt_scope(setup_scope)
         .build();
@@ -254,8 +253,8 @@ async fn wrong_issuer_denies() {
 
     let token = CatTokenBuilder::new()
         .issuer("wrong-issuer")
-        .audience(vec!["test-relay".to_string()])
-        .expires_at(Utc::now() + Duration::seconds(3600))
+        .single_audience("test-relay")
+        .expires_in(3600)
         .moqt_scope(scope)
         .build();
 
@@ -286,8 +285,8 @@ async fn wrong_audience_denies() {
 
     let token = CatTokenBuilder::new()
         .issuer("test-issuer")
-        .audience(vec!["wrong-relay".to_string()])
-        .expires_at(Utc::now() + Duration::seconds(3600))
+        .single_audience("wrong-relay")
+        .expires_in(3600)
         .moqt_scope(scope)
         .build();
 
@@ -311,8 +310,8 @@ async fn token_without_client_setup_scope_denies_setup() {
 
     let token = CatTokenBuilder::new()
         .issuer("test-issuer")
-        .audience(vec!["test-relay".to_string()])
-        .expires_at(Utc::now() + Duration::seconds(3600))
+        .single_audience("test-relay")
+        .expires_in(3600)
         .moqt_scope(scope)
         .build();
 
@@ -344,8 +343,8 @@ async fn invalid_signature_denies() {
 
     let token = CatTokenBuilder::new()
         .issuer("test-issuer")
-        .audience(vec!["test-relay".to_string()])
-        .expires_at(Utc::now() + Duration::seconds(3600))
+        .single_audience("test-relay")
+        .expires_in(3600)
         .moqt_scope(scope)
         .build();
 
