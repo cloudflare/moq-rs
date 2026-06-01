@@ -14,6 +14,7 @@ mod mapping;
 mod tests;
 
 pub use config::C4MConfig;
+pub use cat_token::Es256Algorithm;
 
 use std::sync::Arc;
 

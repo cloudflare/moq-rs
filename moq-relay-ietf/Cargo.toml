@@ -26,6 +26,8 @@ path = "src/bin/moq-relay-ietf/main.rs"
 moq-transport = { path = "../moq-transport", version = "0.14" }
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.8" }
 moq-auth = { path = "../moq-auth", version = "0.1" }
+moq-auth-cat = { path = "../moq-auth-cat", version = "0.1", optional = true }
+p256 = { version = "0.13", features = ["ecdsa", "pem"], optional = true }
 moq-api = { path = "../moq-api", version = "0.2" }
 web-transport = { workspace = true }
 bytes = "1"
@@ -75,3 +77,4 @@ metrics-exporter-prometheus = { version = "0.16", optional = true }
 [features]
 default = []
 metrics-prometheus = ["dep:metrics-exporter-prometheus"]
+auth-cat = ["dep:moq-auth-cat", "dep:p256"]

@@ -14,6 +14,13 @@ use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
 use file_coordinator::FileCoordinator;
 use moq_relay_ietf::{Coordinator, Relay, RelayConfig, Web, WebConfig};
 
+#[cfg(feature = "auth-cat")]
+use {
+    anyhow::Context,
+    moq_auth_cat::{C4MAuthHook, C4MConfig, Es256Algorithm},
+    p256::{ecdsa::VerifyingKey, pkcs8::DecodePublicKey},
+};
+
 #[derive(Parser, Clone)]
 pub struct Cli {
     /// Listen on this address
@@ -87,6 +94,23 @@ pub struct Cli {
     /// When set, serves metrics at http://<addr>/metrics
     #[arg(long)]
     pub metrics_addr: Option<net::SocketAddr>,
+
+    /// Path to PEM-encoded ES256 public key for C4M token verification.
+    /// Requires the `auth-cat` feature.
+    #[arg(long)]
+    pub auth_cat_public_key: Option<PathBuf>,
+
+    /// Expected token issuer for C4M auth (repeatable).
+    #[arg(long)]
+    pub auth_cat_issuer: Vec<String>,
+
+    /// Expected token audience for C4M auth (repeatable).
+    #[arg(long)]
+    pub auth_cat_audience: Vec<String>,
+
+    /// Clock skew tolerance in seconds for C4M token validation.
+    #[arg(long, default_value = "60")]
+    pub auth_cat_clock_skew: i64,
 }
 
 #[tokio::main]
@@ -180,6 +204,9 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(FileCoordinator::new(&cli.coordinator_file, relay_url))
     };
 
+    // Build the auth hook if C4M is configured
+    let auth_hook = build_auth_hook(&cli)?;
+
     // Create a QUIC server for media.
     let relay = Relay::new(RelayConfig {
         tls: tls.clone(),
@@ -190,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
         node: cli.node,
         announce: cli.announce,
         coordinator,
-        auth_hook: None,
+        auth_hook,
     })?;
 
     if cli.dev {
@@ -209,4 +236,47 @@ async fn main() -> anyhow::Result<()> {
     }
 
     relay.run().await
+}
+
+#[cfg(feature = "auth-cat")]
+fn build_auth_hook(cli: &Cli) -> anyhow::Result<Option<Arc<dyn moq_auth::AuthHook>>> {
+    let Some(key_path) = &cli.auth_cat_public_key else {
+        return Ok(None);
+    };
+
+    let pem_data = std::fs::read_to_string(key_path)
+        .with_context(|| format!("reading C4M public key from {}", key_path.display()))?;
+
+    let verifying_key = VerifyingKey::from_public_key_pem(&pem_data)
+        .map_err(|e| anyhow::anyhow!("invalid ES256 public key: {e}"))?;
+
+    let algorithm = Es256Algorithm::new_verifier(verifying_key);
+
+    let mut config = C4MConfig::new(algorithm)
+        .with_clock_skew_tolerance(cli.auth_cat_clock_skew);
+
+    if !cli.auth_cat_issuer.is_empty() {
+        config = config.with_expected_issuers(cli.auth_cat_issuer.clone());
+    }
+    if !cli.auth_cat_audience.is_empty() {
+        config = config.with_expected_audiences(cli.auth_cat_audience.clone());
+    }
+
+    tracing::info!(
+        "C4M auth enabled with key {}",
+        key_path.display()
+    );
+
+    Ok(Some(Arc::new(C4MAuthHook::new(config))))
+}
+
+#[cfg(not(feature = "auth-cat"))]
+fn build_auth_hook(cli: &Cli) -> anyhow::Result<Option<Arc<dyn moq_auth::AuthHook>>> {
+    if cli.auth_cat_public_key.is_some() {
+        anyhow::bail!(
+            "--auth-cat-public-key requires the `auth-cat` feature. \
+             Rebuild with --features auth-cat"
+        );
+    }
+    Ok(None)
 }
