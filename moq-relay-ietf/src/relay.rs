@@ -308,12 +308,10 @@ impl Relay {
                             // Invoke auth hook at SETUP time.
                             match auth_hook.on_setup(&session_ctx, &auth_tokens).await {
                                 Ok(decision) if decision.is_allowed() => {
-                                    if let Some(ref principal) = decision.principal {
-                                        tracing::debug!(
-                                            principal = principal.as_str(),
-                                            "auth on_setup: allowed"
-                                        );
-                                    }
+                                    tracing::debug!(
+                                        principal = ?decision.principal,
+                                        "auth on_setup: allowed"
+                                    );
                                 }
                                 Ok(decision) => {
                                     tracing::info!(

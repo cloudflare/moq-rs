@@ -60,28 +60,41 @@ impl C4MAuthHook {
         namespace: Vec<Vec<u8>>,
         track: Vec<u8>,
     ) -> Result<AuthDecision, DenyReason> {
-        // Step 1: Decode token from raw bytes and verify cryptographic signature.
-        let token = decode_token_bytes(&blob.token_value, self.algorithm.as_ref())
-            .map_err(map_cat_error)?;
+        let token = decode_token_bytes(&blob.token_value, self.algorithm.as_ref()).map_err(
+            |e| {
+                tracing::debug!(error = %e, "C4M token decode/signature failed");
+                map_cat_error(e)
+            },
+        )?;
 
-        // Step 2: Validate standard CWT claims (exp, nbf, iss, aud).
-        self.token_validator
-            .validate(&token)
-            .map_err(map_cat_error)?;
+        self.token_validator.validate(&token).map_err(|e| {
+            tracing::debug!(error = %e, sub = ?token.informational.sub, "C4M claims validation failed");
+            map_cat_error(e)
+        })?;
 
-        // Step 3: Validate MOQT-specific claims.
-        self.moqt_validator
-            .validate_moqt_claims(&token)
-            .map_err(map_cat_error)?;
+        self.moqt_validator.validate_moqt_claims(&token).map_err(|e| {
+            tracing::debug!(error = %e, sub = ?token.informational.sub, "C4M MOQT claims invalid");
+            map_cat_error(e)
+        })?;
 
-        // Step 4: Authorize the specific action against the token's scopes.
-        let request = MoqtAuthRequest::new(action, namespace, track);
+        let request = MoqtAuthRequest::new(action.clone(), namespace.clone(), track.clone());
         let result = self.moqt_validator.authorize(&token, &request);
 
         if result.authorized {
             let principal = token.informational.sub.clone();
+            tracing::debug!(
+                sub = ?principal,
+                action = ?action,
+                "C4M auth: allowed"
+            );
             Ok(AuthDecision::allow().with_principal(principal))
         } else {
+            tracing::debug!(
+                sub = ?token.informational.sub,
+                action = ?action,
+                namespace = ?namespace.iter().map(|n| String::from_utf8_lossy(n).to_string()).collect::<Vec<_>>(),
+                "C4M auth: denied (scope mismatch)"
+            );
             Err(DenyReason::ScopeMismatch)
         }
     }
