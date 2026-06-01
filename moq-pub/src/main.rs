@@ -12,7 +12,7 @@ use tokio::io::AsyncReadExt;
 
 use moq_native_ietf::quic;
 use moq_pub::Media;
-use moq_transport::{coding::TrackNamespace, serve, session::Publisher};
+use moq_transport::{coding::TrackNamespace, serve, session::{Publisher, encode_auth_token}};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -41,6 +41,14 @@ pub struct Cli {
     /// The TLS configuration.
     #[command(flatten)]
     pub tls: moq_native_ietf::tls::Args,
+
+    /// Auth token string to include in CLIENT_SETUP AUTHORIZATION TOKEN parameter.
+    #[arg(long)]
+    pub auth_token: Option<String>,
+
+    /// Token type identifier for the auth token (e.g. C4M=6501485, PrivacyPass=0, shared-secret).
+    #[arg(long, default_value = "6501485")]
+    pub auth_token_type: u64,
 }
 
 #[tokio::main]
@@ -76,7 +84,12 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let (session, mut publisher) = Publisher::connect(session, transport)
+    let auth_raw = match &cli.auth_token {
+        Some(token) => encode_auth_token(cli.auth_token_type, token.as_bytes()),
+        None => vec![],
+    };
+
+    let (session, mut publisher) = Publisher::connect_with_auth(session, transport, auth_raw)
         .await
         .context("failed to create MoQ Transport publisher")?;
 

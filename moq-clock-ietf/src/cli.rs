@@ -39,4 +39,12 @@ pub struct Cli {
     /// Use datagrams instead of streams for the clock publisher.
     #[arg(long)]
     pub datagrams: bool,
+
+    /// Auth token string to include in CLIENT_SETUP AUTHORIZATION TOKEN parameter.
+    #[arg(long)]
+    pub auth_token: Option<String>,
+
+    /// Token type identifier for the auth token (e.g. C4M=6501485, PrivacyPass=0, shared-secret).
+    #[arg(long, default_value = "6501485")]
+    pub auth_token_type: u64,
 }

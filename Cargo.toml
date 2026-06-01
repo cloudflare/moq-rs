@@ -13,6 +13,8 @@ members = [
 	"moq-native-ietf",
 	"moq-catalog",
 	"moq-test-client",
+	"moq-auth",
+	"moq-auth-cat",
 ]
 resolver = "2"
 

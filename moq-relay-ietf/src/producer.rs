@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::sync::Arc;
+
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use moq_auth::{AuthBlob, AuthHook, AuthzOperation, RequestContext, SessionContext};
 use moq_transport::{
     serve::{ServeError, TracksReader},
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
@@ -22,6 +25,9 @@ pub struct Producer {
     /// Produced by `Coordinator::resolve_scope()` from the connection path.
     /// Passed to locals/remotes to isolate namespace lookups.
     scope: Option<String>,
+    auth_hook: Arc<dyn AuthHook>,
+    session_ctx: SessionContext,
+    auth_tokens: Vec<AuthBlob>,
 }
 
 impl Producer {
@@ -30,12 +36,18 @@ impl Producer {
         locals: Locals,
         remotes: RemoteManager,
         scope: Option<String>,
+        auth_hook: Arc<dyn AuthHook>,
+        session_ctx: SessionContext,
+        auth_tokens: Vec<AuthBlob>,
     ) -> Self {
         Self {
             publisher,
             locals,
             remotes,
             scope,
+            auth_hook,
+            session_ctx,
+            auth_tokens,
         }
     }
 
@@ -107,6 +119,29 @@ impl Producer {
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();
 
+        // Auth check: on_request for Subscribe
+        let req_ctx = RequestContext {
+            session: &self.session_ctx,
+            operation: AuthzOperation::Subscribe {
+                namespace: &namespace,
+                track: track_name.as_bytes(),
+            },
+            request_id: None,
+        };
+        match self.auth_hook.on_request(&req_ctx, &self.auth_tokens).await {
+            Ok(decision) if !decision.is_allowed() => {
+                let err = ServeError::not_found_ctx("unauthorized");
+                subscribed.close(err.clone())?;
+                return Err(err.into());
+            }
+            Err(e) => {
+                let err = ServeError::internal_ctx(format!("auth error: {e}"));
+                subscribed.close(err.clone())?;
+                return Err(err.into());
+            }
+            _ => {}
+        }
+
         // Check local tracks first, and serve from local if possible
         if let Some(mut local) = self.locals.retrieve(self.scope.as_deref(), &namespace) {
             // Pass the full requested namespace, not the announced prefix
@@ -174,6 +209,27 @@ impl Producer {
         self,
         mut track_status_requested: TrackStatusRequested,
     ) -> Result<(), anyhow::Error> {
+        // Auth check: on_request for TrackStatus
+        let req_ctx = RequestContext {
+            session: &self.session_ctx,
+            operation: AuthzOperation::TrackStatus {
+                namespace: &track_status_requested.request_msg.track_namespace,
+                track: track_status_requested.request_msg.track_name.as_bytes(),
+            },
+            request_id: None,
+        };
+        match self.auth_hook.on_request(&req_ctx, &self.auth_tokens).await {
+            Ok(decision) if !decision.is_allowed() => {
+                track_status_requested.respond_error(4, "unauthorized")?;
+                return Err(anyhow::anyhow!("unauthorized track_status"));
+            }
+            Err(e) => {
+                track_status_requested.respond_error(4, "authorization error")?;
+                return Err(anyhow::anyhow!("auth hook error on track_status: {e}"));
+            }
+            _ => {}
+        }
+
         // Check local tracks first, and serve from local if possible
         if let Some(mut local_tracks) = self.locals.retrieve(
             self.scope.as_deref(),

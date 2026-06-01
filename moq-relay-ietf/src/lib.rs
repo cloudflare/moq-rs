@@ -46,6 +46,7 @@ pub use api::*;
 pub use consumer::*;
 pub use coordinator::*;
 pub use local::*;
+pub use moq_auth;
 pub use producer::*;
 pub use relay::*;
 pub use remote::RemoteManager;
