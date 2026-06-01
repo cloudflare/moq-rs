@@ -24,3 +24,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+chrono = "0.4"
