@@ -16,7 +16,7 @@ categories = ["authentication", "network-programming"]
 [dependencies]
 moq-auth = { path = "../moq-auth", version = "0.1" }
 moq-transport = { path = "../moq-transport", version = "0.14" }
-cat-token = { path = "../../cat.rs" }
+cat-token = "0.1.3"
 async-trait = "0.1"
 bytes = "1"
 anyhow = "1"
