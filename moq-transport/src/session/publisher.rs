@@ -88,7 +88,16 @@ impl Publisher {
         session: web_transport::Session,
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::connect(session, None, transport).await?;
+        Self::connect_with_auth(session, transport, vec![]).await
+    }
+
+    pub async fn connect_with_auth(
+        session: web_transport::Session,
+        transport: super::Transport,
+        auth_token_raw: Vec<u8>,
+    ) -> Result<(Session, Publisher), SessionError> {
+        let (session, publisher, _) =
+            Session::connect_with_auth(session, None, transport, auth_token_raw).await?;
         Ok((session, publisher))
     }
 

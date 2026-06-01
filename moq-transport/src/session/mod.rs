@@ -35,6 +35,40 @@ use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
 
+/// Encode a single auth token into AUTHORIZATION TOKEN wire format.
+/// Uses USE_VALUE (alias type 0x2) with the given token_type and value.
+pub fn encode_auth_token(token_type: u64, token_value: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_varint(&mut buf, 0x2); // USE_VALUE
+    encode_varint(&mut buf, token_type);
+    encode_varint(&mut buf, token_value.len() as u64);
+    buf.extend_from_slice(token_value);
+    buf
+}
+
+fn encode_varint(buf: &mut Vec<u8>, val: u64) {
+    if val < 0x40 {
+        buf.push(val as u8);
+    } else if val < 0x4000 {
+        buf.push(0x40 | (val >> 8) as u8);
+        buf.push(val as u8);
+    } else if val < 0x40000000 {
+        buf.push(0x80 | (val >> 24) as u8);
+        buf.push((val >> 16) as u8);
+        buf.push((val >> 8) as u8);
+        buf.push(val as u8);
+    } else {
+        buf.push(0xc0 | (val >> 56) as u8);
+        buf.push((val >> 48) as u8);
+        buf.push((val >> 40) as u8);
+        buf.push((val >> 32) as u8);
+        buf.push((val >> 24) as u8);
+        buf.push((val >> 16) as u8);
+        buf.push((val >> 8) as u8);
+        buf.push(val as u8);
+    }
+}
+
 /// The transport protocol negotiated for this MoQT connection.
 ///
 /// MoQT can run over either WebTransport (HTTP/3 + QUIC) or raw QUIC.
@@ -554,6 +588,15 @@ impl Session {
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_auth(session, mlog_path, transport, vec![]).await
+    }
+
+    pub async fn connect_with_auth(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        auth_token_raw: Vec<u8>,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         // Auto-extract path from the session URL.
         // This aligns with the unified moqt:// URI scheme direction (IETF PR #1486)
         // where the path is always part of the URI regardless of transport.
@@ -580,6 +623,13 @@ impl Session {
             if transport == Transport::RawQuic {
                 params.set_bytesvalue(setup::ParameterType::Path.into(), path.as_bytes().to_vec());
             }
+        }
+
+        if !auth_token_raw.is_empty() {
+            params.set_bytesvalue(
+                setup::ParameterType::AuthorizationToken.into(),
+                auth_token_raw,
+            );
         }
 
         let client = setup::Client {

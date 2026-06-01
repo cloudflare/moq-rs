@@ -10,7 +10,7 @@ use url::Url;
 
 use moq_native_ietf::quic;
 use moq_sub::media::Media;
-use moq_transport::{coding::TrackNamespace, serve::Tracks};
+use moq_transport::{coding::TrackNamespace, serve::Tracks, session::encode_auth_token};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,9 +36,15 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let (session, subscriber) = moq_transport::session::Subscriber::connect(session, transport)
-        .await
-        .context("failed to create MoQ Transport session")?;
+    let auth_raw = match &config.auth_token {
+        Some(token) => encode_auth_token(config.auth_token_type, token.as_bytes()),
+        None => vec![],
+    };
+
+    let (session, subscriber) =
+        moq_transport::session::Subscriber::connect_with_auth(session, transport, auth_raw)
+            .await
+            .context("failed to create MoQ Transport session")?;
 
     // Associate empty set of Tracks with provided namespace
     let tracks = Tracks::new(TrackNamespace::from_utf8_path(&config.name));
@@ -79,6 +85,14 @@ pub struct Config {
     /// "0.mp4" for the init track, "{track_id}.m4s" for the rest.
     #[arg(long)]
     pub catalog: bool,
+
+    /// C4M auth token string to include in CLIENT_SETUP.
+    #[arg(long)]
+    pub auth_token: Option<String>,
+
+    /// Token type for the auth token (default: C4M 0x63346d).
+    #[arg(long, default_value = "6501485")]
+    pub auth_token_type: u64,
 }
 
 fn moq_url(s: &str) -> Result<Url, String> {
