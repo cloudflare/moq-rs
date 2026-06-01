@@ -54,14 +54,19 @@ impl AuthHook for KeyValueAuthHook {
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    // XOR lengths and accumulate into diff to avoid leaking secret length
+    // via early return timing.
+    let len_diff = a.len() ^ b.len();
+    let mut diff = len_diff as u8;
+    for i in 0..a.len() {
+        let bval = if i < b.len() { b[i] } else { 0 };
+        diff |= a[i] ^ bval;
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    for i in 0..b.len() {
+        let aval = if i < a.len() { a[i] } else { 0 };
+        diff |= aval ^ b[i];
     }
-    diff == 0
+    diff == 0 && len_diff == 0
 }
 
 #[cfg(test)]

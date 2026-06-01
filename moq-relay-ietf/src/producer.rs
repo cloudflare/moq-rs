@@ -218,11 +218,16 @@ impl Producer {
             },
             request_id: None,
         };
-        if let Ok(decision) = self.auth_hook.on_request(&req_ctx, &self.auth_tokens).await {
-            if !decision.is_allowed() {
+        match self.auth_hook.on_request(&req_ctx, &self.auth_tokens).await {
+            Ok(decision) if !decision.is_allowed() => {
                 track_status_requested.respond_error(4, "unauthorized")?;
                 return Err(anyhow::anyhow!("unauthorized track_status"));
             }
+            Err(e) => {
+                track_status_requested.respond_error(4, "authorization error")?;
+                return Err(anyhow::anyhow!("auth hook error on track_status: {e}"));
+            }
+            _ => {}
         }
 
         // Check local tracks first, and serve from local if possible

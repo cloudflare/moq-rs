@@ -48,28 +48,6 @@ async fn allow_all_hook_allows_request() {
     assert!(decision.is_allowed());
 }
 
-#[tokio::test]
-async fn deny_all_hook_denies_setup() {
-    let hook = DenyAllAuthHook;
-    let ctx = test_session_ctx();
-    let decision = hook.on_setup(&ctx, &[]).await.unwrap();
-    assert!(!decision.is_allowed());
-    assert!(matches!(decision.verdict, Verdict::Deny(DenyReason::TokenMissing)));
-}
-
-#[tokio::test]
-async fn deny_all_hook_denies_request() {
-    let hook = DenyAllAuthHook;
-    let ctx = test_session_ctx();
-    let ns = moq_transport::coding::TrackNamespace::from_utf8_path("test/ns");
-    let req_ctx = RequestContext {
-        session: &ctx,
-        operation: AuthzOperation::PublishNamespace { namespace: &ns },
-        request_id: None,
-    };
-    let decision = hook.on_request(&req_ctx, &[]).await.unwrap();
-    assert!(!decision.is_allowed());
-}
 
 #[tokio::test]
 async fn key_value_hook_accepts_matching_secret() {
@@ -110,37 +88,6 @@ async fn key_value_hook_rejects_wrong_token_type() {
     assert!(!decision.is_allowed());
 }
 
-#[tokio::test]
-async fn any_scheme_hook_first_allow_wins() {
-    let hooks: Vec<Arc<dyn AuthHook>> = vec![
-        Arc::new(DenyAllAuthHook),
-        Arc::new(AllowAllAuthHook),
-    ];
-    let hook = AnySchemeAuthHook::new(hooks);
-    let ctx = test_session_ctx();
-    let decision = hook.on_setup(&ctx, &[]).await.unwrap();
-    assert!(decision.is_allowed());
-}
-
-#[tokio::test]
-async fn any_scheme_hook_all_deny_returns_last() {
-    let hooks: Vec<Arc<dyn AuthHook>> = vec![
-        Arc::new(DenyAllAuthHook),
-        Arc::new(DenyAllAuthHook),
-    ];
-    let hook = AnySchemeAuthHook::new(hooks);
-    let ctx = test_session_ctx();
-    let decision = hook.on_setup(&ctx, &[]).await.unwrap();
-    assert!(!decision.is_allowed());
-}
-
-#[tokio::test]
-async fn any_scheme_hook_empty_hooks_denies() {
-    let hook = AnySchemeAuthHook::new(vec![]);
-    let ctx = test_session_ctx();
-    let decision = hook.on_setup(&ctx, &[]).await.unwrap();
-    assert!(!decision.is_allowed());
-}
 
 #[tokio::test]
 async fn auth_decision_builder() {

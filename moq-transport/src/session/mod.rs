@@ -38,35 +38,14 @@ use std::path::PathBuf;
 /// Encode a single auth token into AUTHORIZATION TOKEN wire format.
 /// Uses USE_VALUE (alias type 0x2) with the given token_type and value.
 pub fn encode_auth_token(token_type: u64, token_value: &[u8]) -> Vec<u8> {
+    use crate::coding::{Encode, VarInt};
+
     let mut buf = Vec::new();
-    encode_varint(&mut buf, 0x2); // USE_VALUE
-    encode_varint(&mut buf, token_type);
-    encode_varint(&mut buf, token_value.len() as u64);
+    VarInt::from_u32(0x2).encode(&mut buf).unwrap(); // USE_VALUE
+    VarInt::try_from(token_type).unwrap().encode(&mut buf).unwrap();
+    VarInt::try_from(token_value.len() as u64).unwrap().encode(&mut buf).unwrap();
     buf.extend_from_slice(token_value);
     buf
-}
-
-fn encode_varint(buf: &mut Vec<u8>, val: u64) {
-    if val < 0x40 {
-        buf.push(val as u8);
-    } else if val < 0x4000 {
-        buf.push(0x40 | (val >> 8) as u8);
-        buf.push(val as u8);
-    } else if val < 0x40000000 {
-        buf.push(0x80 | (val >> 24) as u8);
-        buf.push((val >> 16) as u8);
-        buf.push((val >> 8) as u8);
-        buf.push(val as u8);
-    } else {
-        buf.push(0xc0 | (val >> 56) as u8);
-        buf.push((val >> 48) as u8);
-        buf.push((val >> 40) as u8);
-        buf.push((val >> 32) as u8);
-        buf.push((val >> 24) as u8);
-        buf.push((val >> 16) as u8);
-        buf.push((val >> 8) as u8);
-        buf.push(val as u8);
-    }
 }
 
 /// The transport protocol negotiated for this MoQT connection.

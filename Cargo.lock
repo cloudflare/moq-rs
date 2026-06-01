@@ -1654,6 +1654,7 @@ dependencies = [
  "moq-auth-cat",
  "moq-native-ietf",
  "moq-transport",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "thiserror 2.0.17",

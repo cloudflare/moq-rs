@@ -126,7 +126,10 @@ impl AuthHook for C4MAuthHook {
             return Ok(AuthDecision::deny(DenyReason::TokenMissing));
         };
 
-        let (action, namespace, track) = map_operation(&ctx.operation);
+        let Some((action, namespace, track)) = map_operation(&ctx.operation) else {
+            tracing::debug!(operation = ?ctx.operation, "C4M auth: unknown operation, denying");
+            return Ok(AuthDecision::deny(DenyReason::ScopeMismatch));
+        };
 
         match self.validate_and_authorize(blob, action, namespace, track) {
             Ok(decision) => Ok(decision),

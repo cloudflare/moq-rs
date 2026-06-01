@@ -96,7 +96,7 @@ pub struct Cli {
 
     /// Shared secret for token-type-0 auth (simple pre-shared key).
     /// Clients must pass --auth-token-type 0 --auth-token <secret>.
-    #[arg(long)]
+    #[arg(long, env = "MOQ_AUTH_SHARED_SECRET")]
     pub auth_shared_secret: Option<String>,
 
     /// Path to PEM-encoded ES256 public key for C4M token verification.
@@ -244,6 +244,12 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(feature = "auth-cat")]
 fn build_auth_hook(cli: &Cli) -> anyhow::Result<Option<Arc<dyn moq_auth::AuthHook>>> {
+    if cli.auth_shared_secret.is_some() && cli.auth_cat_public_key.is_some() {
+        anyhow::bail!(
+            "--auth-shared-secret and --auth-cat-public-key are mutually exclusive"
+        );
+    }
+
     if let Some(ref secret) = cli.auth_shared_secret {
         tracing::info!("shared-secret auth enabled (token type 0)");
         return Ok(Some(Arc::new(moq_auth::KeyValueAuthHook::new(

@@ -10,6 +10,7 @@ use moq_native_ietf::quic::{self, Endpoint};
 use url::Url;
 
 use moq_auth::{AllowAllAuthHook, AuthBlob, AuthHook, SessionContext};
+use moq_transport::coding::{Decode, VarInt};
 
 use crate::{metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, RemoteManager, Session};
 
@@ -180,10 +181,12 @@ impl Relay {
                 let forward_scope = session.connection_path().map(|s| s.to_string());
 
                 let forward_coordinator = coordinator.clone();
-                // Forward sessions use AllowAll — they are operator-configured relay peers.
+                // TODO: MoQT auth is hop-by-hop. Forward sessions are relay-to-relay
+                // (operator-configured via --announce) so they bypass client auth.
+                // Future work: mutual relay authentication for inter-relay links.
                 let forward_auth: Arc<dyn AuthHook> = Arc::new(AllowAllAuthHook);
                 let forward_ctx = SessionContext {
-                    session_id: 0,
+                    session_id: rand_session_id(),
                     connection_path: forward_scope.clone(),
                     peer: "0.0.0.0:0".parse().unwrap(),
                 };
@@ -455,32 +458,34 @@ fn parse_auth_tokens(raw: &[u8]) -> Vec<AuthBlob> {
     let mut buf = bytes::Bytes::copy_from_slice(raw);
 
     while buf.has_remaining() {
-        let Ok(alias_type) = decode_varint(&mut buf) else {
+        let Ok(alias_type) = VarInt::decode(&mut buf) else {
+            tracing::warn!(remaining = buf.remaining(), "malformed auth token parameter, truncating");
             break;
         };
 
-        match alias_type {
+        match alias_type.into_inner() {
             0x2 => {
-                // USE_VALUE: Token Type (vi64) + Token Value (length-prefixed bytes)
-                let Ok(token_type) = decode_varint(&mut buf) else {
+                let Ok(token_type) = VarInt::decode(&mut buf) else {
+                    tracing::warn!("malformed auth token: missing token type");
                     break;
                 };
-                let Ok(token_len) = decode_varint(&mut buf) else {
+                let Ok(token_len) = VarInt::decode(&mut buf) else {
+                    tracing::warn!("malformed auth token: missing token length");
                     break;
                 };
-                let token_len = token_len as usize;
+                let token_len: usize = token_len.into();
                 if buf.remaining() < token_len {
+                    tracing::warn!(expected = token_len, actual = buf.remaining(), "malformed auth token: truncated value");
                     break;
                 }
                 let token_value = buf.copy_to_bytes(token_len);
                 tokens.push(AuthBlob {
-                    token_type,
+                    token_type: token_type.into_inner(),
                     token_value,
                 });
             }
-            _ => {
-                // Unknown alias type — skip this token parameter.
-                // Future: handle REGISTER (0x0), USE_ALIAS (0x1), DELETE (0x3).
+            other => {
+                tracing::debug!(alias_type = other, "skipping unsupported auth token alias type");
                 break;
             }
         }
@@ -489,28 +494,6 @@ fn parse_auth_tokens(raw: &[u8]) -> Vec<AuthBlob> {
     tokens
 }
 
-fn decode_varint(buf: &mut bytes::Bytes) -> Result<u64, ()> {
-    use bytes::Buf;
-    if !buf.has_remaining() {
-        return Err(());
-    }
-    let first = buf.chunk()[0];
-    let len = 1 << (first >> 6);
-    if buf.remaining() < len {
-        return Err(());
-    }
-    let mut val = (first & 0x3f) as u64;
-    buf.advance(1);
-    for _ in 1..len {
-        val = (val << 8) | buf.get_u8() as u64;
-    }
-    Ok(val)
-}
-
 fn rand_session_id() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    t.as_nanos() as u64 ^ (std::process::id() as u64)
+    rand::random()
 }

@@ -27,7 +27,7 @@ impl<H: AuthHook> AuthHook for LoggingAuthHook<H> {
         let result: anyhow::Result<AuthDecision> = self.inner.on_setup(ctx, tokens).await;
         match &result {
             Ok(decision) => {
-                tracing::info!(
+                tracing::debug!(
                     session_id = ctx.session_id,
                     token_count = tokens.len(),
                     allowed = decision.is_allowed(),
@@ -54,10 +54,9 @@ impl<H: AuthHook> AuthHook for LoggingAuthHook<H> {
         let result: anyhow::Result<AuthDecision> = self.inner.on_request(ctx, tokens).await;
         match &result {
             Ok(decision) => {
-                tracing::info!(
+                tracing::debug!(
                     session_id = ctx.session.session_id,
                     operation = ?ctx.operation,
-                    token_count = tokens.len(),
                     allowed = decision.is_allowed(),
                     "auth on_request"
                 );

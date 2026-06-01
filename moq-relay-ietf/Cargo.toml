@@ -58,6 +58,9 @@ fs2 = "0.4"
 # Error handling
 anyhow = { version = "1", features = ["backtrace"] }
 
+# Random
+rand = "0.8"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
