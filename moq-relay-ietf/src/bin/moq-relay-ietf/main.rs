@@ -190,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
         node: cli.node,
         announce: cli.announce,
         coordinator,
+        auth_hook: None,
     })?;
 
     if cli.dev {

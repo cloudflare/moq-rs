@@ -4,10 +4,12 @@
 use std::{future::Future, net, path::PathBuf, pin::Pin, sync::Arc};
 
 use anyhow::Context;
-
+use bytes::Buf;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
 use url::Url;
+
+use moq_auth::{AllowAllAuthHook, AuthBlob, AuthHook, SessionContext};
 
 use crate::{metrics::GaugeGuard, Consumer, Coordinator, Locals, Producer, RemoteManager, Session};
 
@@ -53,6 +55,9 @@ pub struct RelayConfig {
 
     /// The coordinator for namespace/track registration and discovery.
     pub coordinator: Arc<dyn Coordinator>,
+
+    /// Authorization hook for validating tokens. Defaults to AllowAllAuthHook.
+    pub auth_hook: Option<Arc<dyn AuthHook>>,
 }
 
 /// MoQ Relay server.
@@ -63,6 +68,7 @@ pub struct Relay {
     locals: Locals,
     remotes: RemoteManager,
     coordinator: Arc<dyn Coordinator>,
+    auth_hook: Arc<dyn AuthHook>,
 }
 
 impl Relay {
@@ -108,6 +114,10 @@ impl Relay {
         // Create remote manager - uses coordinator for namespace lookups
         let remotes = RemoteManager::new(config.coordinator.clone(), remote_clients);
 
+        let auth_hook: Arc<dyn AuthHook> = config
+            .auth_hook
+            .unwrap_or_else(|| Arc::new(AllowAllAuthHook));
+
         Ok(Self {
             quic_endpoints: endpoints,
             announce_url: config.announce,
@@ -115,6 +125,7 @@ impl Relay {
             locals,
             remotes,
             coordinator: config.coordinator,
+            auth_hook,
         })
     }
 
@@ -127,6 +138,7 @@ impl Relay {
             locals,
             remotes,
             coordinator,
+            auth_hook,
         } = self;
 
         let run_result = async {
@@ -168,6 +180,13 @@ impl Relay {
                 let forward_scope = session.connection_path().map(|s| s.to_string());
 
                 let forward_coordinator = coordinator.clone();
+                // Forward sessions use AllowAll — they are operator-configured relay peers.
+                let forward_auth: Arc<dyn AuthHook> = Arc::new(AllowAllAuthHook);
+                let forward_ctx = SessionContext {
+                    session_id: 0,
+                    connection_path: forward_scope.clone(),
+                    peer: "0.0.0.0:0".parse().unwrap(),
+                };
                 let session = Session {
                     session,
                     producer: Some(Producer::new(
@@ -175,6 +194,9 @@ impl Relay {
                         locals.clone(),
                         remote_manager.clone(),
                         forward_scope.clone(),
+                        forward_auth.clone(),
+                        forward_ctx.clone(),
+                        vec![],
                     )),
                     consumer: Some(Consumer::new(
                         subscriber,
@@ -182,6 +204,9 @@ impl Relay {
                         forward_coordinator,
                         None,
                         forward_scope,
+                        forward_auth,
+                        forward_ctx,
+                        vec![],
                     )),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
@@ -244,6 +269,7 @@ impl Relay {
                         let remotes = remote_manager.clone();
                         let forward = forward_producer.clone();
                         let coordinator = coordinator.clone();
+                        let auth_hook = auth_hook.clone();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -268,6 +294,45 @@ impl Relay {
 
                             // Create our MoQ relay session
                             let moq_session = session;
+
+                            // Parse auth tokens from the raw AUTHORIZATION TOKEN parameter.
+                            let auth_tokens = parse_auth_tokens(moq_session.auth_token_raw());
+
+                            // Build session context for the auth hook.
+                            let session_ctx = SessionContext {
+                                session_id: rand_session_id(),
+                                connection_path: moq_session.connection_path().map(|s| s.to_string()),
+                                peer: "0.0.0.0:0".parse().unwrap(),
+                            };
+
+                            // Invoke auth hook at SETUP time.
+                            match auth_hook.on_setup(&session_ctx, &auth_tokens).await {
+                                Ok(decision) if decision.is_allowed() => {
+                                    if let Some(ref principal) = decision.principal {
+                                        tracing::debug!(
+                                            principal = principal.as_str(),
+                                            "auth on_setup: allowed"
+                                        );
+                                    }
+                                }
+                                Ok(decision) => {
+                                    tracing::info!(
+                                        verdict = ?decision.verdict,
+                                        "auth on_setup: denied, closing session"
+                                    );
+                                    raw_conn.close(0x2, "unauthorized");
+                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "auth_setup").increment(1);
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                    return Ok(());
+                                }
+                                Err(err) => {
+                                    tracing::error!(error = %err, "auth hook on_setup failed");
+                                    raw_conn.close(0x2, "authorization error");
+                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "auth_setup").increment(1);
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                    return Ok(());
+                                }
+                            }
 
                             // Resolve the connection path to a scope (identity + permissions).
                             // This translates the raw transport-level path into an application-level
@@ -316,13 +381,19 @@ impl Relay {
                             // to the Session's reject fields so unauthorized messages get
                             // an explicit error response instead of being silently ignored.
                             let (producer, reject_subscribes) = if can_subscribe {
-                                (publisher.map(|publisher| Producer::new(publisher, locals.clone(), remotes, scope_id.clone())), None)
+                                (publisher.map(|publisher| Producer::new(
+                                    publisher, locals.clone(), remotes, scope_id.clone(),
+                                    auth_hook.clone(), session_ctx.clone(), auth_tokens.clone(),
+                                )), None)
                             } else {
                                 (None, publisher)
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, forward, scope_id)), None)
+                                (subscriber.map(|subscriber| Consumer::new(
+                                    subscriber, locals, coordinator, forward, scope_id,
+                                    auth_hook.clone(), session_ctx.clone(), auth_tokens.clone(),
+                                )), None)
                             } else {
                                 (None, subscriber)
                             };
@@ -365,4 +436,83 @@ impl Relay {
         remotes.shutdown().await;
         run_result
     }
+}
+
+/// Parse the raw AUTHORIZATION TOKEN parameter into AuthBlobs.
+///
+/// For the initial implementation, we handle inline tokens (USE_VALUE, alias type 0x2)
+/// which carry Token Type + Token Value directly. Alias-based token operations
+/// (REGISTER, USE_ALIAS, DELETE) are not yet supported.
+///
+/// Wire format per token entry:
+///   Alias Type (vi64) = 0x2 (USE_VALUE)
+///   Token Type (vi64)
+///   Token Value (bytes: length-prefixed)
+fn parse_auth_tokens(raw: &[u8]) -> Vec<AuthBlob> {
+    if raw.is_empty() {
+        return vec![];
+    }
+
+    let mut tokens = Vec::new();
+    let mut buf = bytes::Bytes::copy_from_slice(raw);
+
+    while buf.has_remaining() {
+        let Ok(alias_type) = decode_varint(&mut buf) else {
+            break;
+        };
+
+        match alias_type {
+            0x2 => {
+                // USE_VALUE: Token Type (vi64) + Token Value (length-prefixed bytes)
+                let Ok(token_type) = decode_varint(&mut buf) else {
+                    break;
+                };
+                let Ok(token_len) = decode_varint(&mut buf) else {
+                    break;
+                };
+                let token_len = token_len as usize;
+                if buf.remaining() < token_len {
+                    break;
+                }
+                let token_value = buf.copy_to_bytes(token_len);
+                tokens.push(AuthBlob {
+                    token_type,
+                    token_value,
+                });
+            }
+            _ => {
+                // Unknown alias type — skip this token parameter.
+                // Future: handle REGISTER (0x0), USE_ALIAS (0x1), DELETE (0x3).
+                break;
+            }
+        }
+    }
+
+    tokens
+}
+
+fn decode_varint(buf: &mut bytes::Bytes) -> Result<u64, ()> {
+    use bytes::Buf;
+    if !buf.has_remaining() {
+        return Err(());
+    }
+    let first = buf.chunk()[0];
+    let len = 1 << (first >> 6);
+    if buf.remaining() < len {
+        return Err(());
+    }
+    let mut val = (first & 0x3f) as u64;
+    buf.advance(1);
+    for _ in 1..len {
+        val = (val << 8) | buf.get_u8() as u64;
+    }
+    Ok(val)
+}
+
+fn rand_session_id() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    t.as_nanos() as u64 ^ (std::process::id() as u64)
 }

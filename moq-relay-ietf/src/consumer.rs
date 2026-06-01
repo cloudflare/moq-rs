@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use moq_auth::{AuthBlob, AuthHook, AuthzOperation, RequestContext, SessionContext};
 use moq_transport::{
     serve::Tracks,
     session::{Announced, SessionError, Subscriber},
@@ -23,6 +24,9 @@ pub struct Consumer {
     /// Produced by `Coordinator::resolve_scope()` from the connection path.
     /// Passed to coordinator register/lookup calls to isolate namespaces.
     scope: Option<String>,
+    auth_hook: Arc<dyn AuthHook>,
+    session_ctx: SessionContext,
+    auth_tokens: Vec<AuthBlob>,
 }
 
 impl Consumer {
@@ -32,6 +36,9 @@ impl Consumer {
         coordinator: Arc<dyn Coordinator>,
         forward: Option<Producer>,
         scope: Option<String>,
+        auth_hook: Arc<dyn AuthHook>,
+        session_ctx: SessionContext,
+        auth_tokens: Vec<AuthBlob>,
     ) -> Self {
         Self {
             subscriber,
@@ -39,6 +46,9 @@ impl Consumer {
             coordinator,
             forward,
             scope,
+            auth_hook,
+            session_ctx,
+            auth_tokens,
         }
     }
 
@@ -76,6 +86,26 @@ impl Consumer {
     async fn serve(mut self, mut announce: Announced) -> Result<(), anyhow::Error> {
         // Track active publishers - decrements when this function returns
         let _publisher_guard = GaugeGuard::new("moq_relay_active_publishers");
+
+        // Auth check: on_request for PublishNamespace
+        let req_ctx = RequestContext {
+            session: &self.session_ctx,
+            operation: AuthzOperation::PublishNamespace {
+                namespace: &announce.namespace,
+            },
+            request_id: None,
+        };
+        match self.auth_hook.on_request(&req_ctx, &self.auth_tokens).await {
+            Ok(decision) if !decision.is_allowed() => {
+                metrics::counter!("moq_relay_announce_errors_total", "phase" => "auth").increment(1);
+                return Err(anyhow::anyhow!("unauthorized publish_namespace"));
+            }
+            Err(e) => {
+                metrics::counter!("moq_relay_announce_errors_total", "phase" => "auth").increment(1);
+                return Err(anyhow::anyhow!("auth error: {e}"));
+            }
+            _ => {}
+        }
 
         let mut tasks = FuturesUnordered::new();
 
