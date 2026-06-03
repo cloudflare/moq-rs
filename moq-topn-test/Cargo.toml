@@ -1,0 +1,56 @@
+[package]
+name = "moq-topn-test"
+version = "0.1.0"
+edition = "2021"
+description = "End-to-end test driver for MOQ TRACK_FILTER (Top-N) functionality"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "moq-topn-test"
+path = "src/main.rs"
+
+[[bin]]
+name = "topn-log-to-svg"
+path = "src/log_to_svg.rs"
+
+[[bin]]
+name = "topn-log-to-html"
+path = "src/bin/topn-log-to-html.rs"
+
+[dependencies]
+# MOQ dependencies
+moq-relay-ietf = { path = "../moq-relay-ietf" }
+moq-transport = { path = "../moq-transport" }
+moq-native-ietf = { path = "../moq-native-ietf" }
+
+# Async runtime
+tokio = { version = "1", features = ["full", "sync", "time", "macros", "rt-multi-thread"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Random
+rand = "0.8"
+
+# Stats
+hdrhistogram = "7"
+
+# Error handling
+anyhow = "1"
+
+# URL parsing
+url = "2"
+
+# WebTransport
+web-transport = { workspace = true }
+
+# JSON parsing for log-to-svg
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Bytes
+bytes = "1"
