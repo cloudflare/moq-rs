@@ -6,46 +6,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.14](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.13...moq-clock-ietf-v0.6.14) - 2026-05-20
-
-### Other
-
-- update Cargo.lock dependencies
-
-## [0.6.13](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.12...moq-clock-ietf-v0.6.13) - 2026-04-10
-
-### Fixed
-
-- cross-platform dual-stack binding for IPv6 sockets
-
-### Other
-
-- Merge pull request #151 from englishm-cloudflare/me/ipv6-dual-stack-binding
-
-## [0.6.12](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.11...moq-clock-ietf-v0.6.12) - 2026-03-31
-
-### Other
-
-- Make repo REUSE v3.3 compliant
-
-## [0.6.11](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.10...moq-clock-ietf-v0.6.11) - 2026-03-27
-
-### Added
-
-- add Transport enum and connection path extraction
-
-## [0.6.10](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.9...moq-clock-ietf-v0.6.10) - 2026-02-18
-
-### Other
-
-- update Cargo.lock dependencies
-
-## [0.6.9](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.8...moq-clock-ietf-v0.6.9) - 2026-02-18
-
-### Other
-
-- migrate from log crate to tracing
-
 ## [0.6.8](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.7...moq-clock-ietf-v0.6.8) - 2026-02-03
 
 ### Other

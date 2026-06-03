@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use std::net;
 
 use anyhow::Context;
@@ -14,29 +10,28 @@ use moq_transport::{coding::TrackNamespace, serve::Tracks};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing with env filter (respects RUST_LOG environment variable)
-    // Default to info level, but suppress quinn's verbose output
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
-        )
-        .init();
+    env_logger::init();
+
+    // Disable tracing so we don't get a bunch of Quinn spam.
+    let tracer = tracing_subscriber::FmtSubscriber::builder()
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    tracing::subscriber::set_global_default(tracer).unwrap();
 
     let out = tokio::io::stdout();
 
     let config = Config::parse();
     let tls = config.tls.load()?;
-    let quic = quic::Endpoint::new(quic::Config::new(config.bind, None, tls)?)?;
+    let quic = quic::Endpoint::new(quic::Config::new(config.bind, None, tls))?;
 
-    let (session, connection_id, transport) = quic.client.connect(&config.url, None).await?;
+    let (session, connection_id) = quic.client.connect(&config.url, None).await?;
 
-    tracing::info!(
+    log::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );
 
-    let (session, subscriber) = moq_transport::session::Subscriber::connect(session, transport)
+    let (session, subscriber) = moq_transport::session::Subscriber::connect(session)
         .await
         .context("failed to create MoQ Transport session")?;
 

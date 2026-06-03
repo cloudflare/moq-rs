@@ -1,18 +1,19 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use bytes::BytesMut;
 use std::net;
 use url::Url;
 
 use anyhow::Context;
 use clap::Parser;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::io::AsyncReadExt;
 
 use moq_native_ietf::quic;
 use moq_pub::Media;
-use moq_transport::{coding::TrackNamespace, serve, session::Publisher};
+use moq_transport::{
+    coding::TrackNamespace,
+    serve::{self, TracksReader},
+    session::{Publisher, SessionError},
+};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -43,16 +44,41 @@ pub struct Cli {
     pub tls: moq_native_ietf::tls::Args,
 }
 
+async fn serve_subscriptions(
+    mut publisher: Publisher,
+    tracks: TracksReader,
+) -> Result<(), SessionError> {
+    let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
+        FuturesUnordered::new();
+
+    loop {
+        tokio::select! {
+            Some(subscribed) = publisher.subscribed() => {
+                let info = subscribed.info.clone();
+                let tracks = tracks.clone();
+                log::info!("serving subscribe: {:?}", info);
+
+                tasks.push(async move {
+                    if let Err(err) = Publisher::serve_subscribe(subscribed, tracks).await {
+                        log::warn!("failed serving subscribe: {:?}, error: {}", info, err);
+                    }
+                }.boxed());
+            }
+            _ = tasks.next(), if !tasks.is_empty() => {}
+            else => return Ok(()),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing with env filter (respects RUST_LOG environment variable)
-    // Default to info level, but suppress quinn's verbose output
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
-        )
-        .init();
+    env_logger::init();
+
+    // Disable tracing so we don't get a bunch of Quinn spam.
+    let tracer = tracing_subscriber::FmtSubscriber::builder()
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    tracing::subscriber::set_global_default(tracer).unwrap();
 
     let cli = Cli::parse();
 
@@ -66,26 +92,35 @@ async fn main() -> anyhow::Result<()> {
         cli.bind,
         None,
         tls.clone(),
-    )?)?;
+    ))?;
 
-    tracing::info!("connecting to relay: url={}", cli.url);
-    let (session, connection_id, transport) = quic.client.connect(&cli.url, None).await?;
+    log::info!("connecting to relay: url={}", cli.url);
+    let (session, connection_id) = quic.client.connect(&cli.url, None).await?;
 
-    tracing::info!(
+    log::info!(
         "connected with CID: {} (use this to look up qlog/mlog on server)",
         connection_id
     );
 
-    let (session, mut publisher) = Publisher::connect(session, transport)
+    let (session, publisher) = Publisher::connect(session)
         .await
         .context("failed to create MoQ Transport publisher")?;
 
+    let namespace = reader.namespace.clone();
+
+    let publish_ns = publisher
+        .clone()
+        .publish_namespace(namespace)
+        .await
+        .context("failed to register namespace")?;
+
+    log::info!("namespace registered, starting media and subscription handling");
+
     tokio::select! {
         res = session.run() => res.context("session error")?,
-        res = run_media(media) => {
-            res.context("media error")?
-        },
-        res = publisher.announce(reader) => res.context("publisher error")?,
+        res = run_media(media) => res.context("media error")?,
+        res = serve_subscriptions(publisher, reader) => res.context("publisher error")?,
+        res = publish_ns.closed() => res.context("publisher error")?,
     }
 
     Ok(())

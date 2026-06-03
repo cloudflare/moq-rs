@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use crate::data::{ExtensionHeaders, ObjectStatus, StreamHeaderType};
 
@@ -19,7 +16,8 @@ pub struct SubgroupHeader {
     pub subgroup_id: Option<u64>,
 
     /// Publisher priority, where **smaller** values are sent first.
-    pub publisher_priority: u8,
+    /// Optional when using NoPriority header types (0x30-0x3D).
+    pub publisher_priority: Option<u8>,
 }
 
 // Note:  Not using the Decode trait, since we need to know the header_type to properly parse this, and it
@@ -29,38 +27,46 @@ impl SubgroupHeader {
         header_type: StreamHeaderType,
         r: &mut R,
     ) -> Result<Self, DecodeError> {
-        tracing::trace!(
+        log::trace!(
             "[DECODE] SubgroupHeader: starting decode with header_type={:?}, buffer_remaining={} bytes",
             header_type,
             r.remaining()
         );
 
         let track_alias = u64::decode(r)?;
-        tracing::trace!("[DECODE] SubgroupHeader: track_alias={}", track_alias);
+        log::trace!("[DECODE] SubgroupHeader: track_alias={}", track_alias);
 
         let group_id = u64::decode(r)?;
-        tracing::trace!("[DECODE] SubgroupHeader: group_id={}", group_id);
+        log::trace!("[DECODE] SubgroupHeader: group_id={}", group_id);
 
         let subgroup_id = match header_type.has_subgroup_id() {
             true => {
                 let id = u64::decode(r)?;
-                tracing::trace!("[DECODE] SubgroupHeader: subgroup_id={}", id);
+                log::trace!("[DECODE] SubgroupHeader: subgroup_id={}", id);
                 Some(id)
             }
             false => {
-                tracing::trace!(
+                log::trace!(
                     "[DECODE] SubgroupHeader: subgroup_id=None (not present for this header type)"
                 );
                 None
             }
         };
 
-        let publisher_priority = u8::decode(r)?;
-        tracing::trace!(
-            "[DECODE] SubgroupHeader: publisher_priority={}, buffer_remaining={} bytes",
-            publisher_priority,
-            r.remaining()
-        );
+        let publisher_priority = if header_type.has_priority() {
+            let priority = u8::decode(r)?;
+            log::trace!(
+                "[DECODE] SubgroupHeader: publisher_priority={}, buffer_remaining={} bytes",
+                priority,
+                r.remaining()
+            );
+            Some(priority)
+        } else {
+            log::trace!(
+                "[DECODE] SubgroupHeader: publisher_priority=None (not present for NoPriority header type)"
+            );
+            None
+        };
 
         let result = Self {
             header_type,
@@ -70,8 +76,8 @@ impl SubgroupHeader {
             publisher_priority,
         };
 
-        tracing::debug!(
-            "[DECODE] SubgroupHeader complete: track_alias={}, group_id={}, subgroup_id={:?}, priority={}",
+        log::debug!(
+            "[DECODE] SubgroupHeader complete: track_alias={}, group_id={}, subgroup_id={:?}, priority={:?}",
             result.track_alias,
             result.group_id,
             result.subgroup_id,
@@ -84,8 +90,8 @@ impl SubgroupHeader {
 
 impl Encode for SubgroupHeader {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        tracing::trace!(
-            "[ENCODE] SubgroupHeader: starting encode - track_alias={}, group_id={}, subgroup_id={:?}, priority={}, header_type={:?}",
+        log::trace!(
+            "[ENCODE] SubgroupHeader: starting encode - track_alias={}, group_id={}, subgroup_id={:?}, priority={:?}, header_type={:?}",
             self.track_alias,
             self.group_id,
             self.subgroup_id,
@@ -96,16 +102,16 @@ impl Encode for SubgroupHeader {
         let start_pos = w.remaining_mut();
 
         self.header_type.encode(w)?;
-        tracing::trace!("[ENCODE] SubgroupHeader: encoded header_type");
+        log::trace!("[ENCODE] SubgroupHeader: encoded header_type");
 
         self.track_alias.encode(w)?;
-        tracing::trace!(
+        log::trace!(
             "[ENCODE] SubgroupHeader: encoded track_alias={}",
             self.track_alias
         );
 
         self.group_id.encode(w)?;
-        tracing::trace!(
+        log::trace!(
             "[ENCODE] SubgroupHeader: encoded group_id={}",
             self.group_id
         );
@@ -113,29 +119,43 @@ impl Encode for SubgroupHeader {
         if self.header_type.has_subgroup_id() {
             if let Some(subgroup_id) = self.subgroup_id {
                 subgroup_id.encode(w)?;
-                tracing::trace!(
+                log::trace!(
                     "[ENCODE] SubgroupHeader: encoded subgroup_id={}",
                     subgroup_id
                 );
             } else {
-                tracing::error!(
+                log::error!(
                     "[ENCODE] SubgroupHeader: MISSING subgroup_id for header_type={:?}",
                     self.header_type
                 );
                 return Err(EncodeError::MissingField("SubgroupId".to_string()));
             }
         } else {
-            tracing::trace!("[ENCODE] SubgroupHeader: subgroup_id not encoded (not required for this header type)");
+            log::trace!("[ENCODE] SubgroupHeader: subgroup_id not encoded (not required for this header type)");
         }
 
-        self.publisher_priority.encode(w)?;
-        tracing::trace!(
-            "[ENCODE] SubgroupHeader: encoded publisher_priority={}",
-            self.publisher_priority
-        );
+        if self.header_type.has_priority() {
+            if let Some(publisher_priority) = self.publisher_priority {
+                publisher_priority.encode(w)?;
+                log::trace!(
+                    "[ENCODE] SubgroupHeader: encoded publisher_priority={}",
+                    publisher_priority
+                );
+            } else {
+                log::error!(
+                    "[ENCODE] SubgroupHeader: MISSING publisher_priority for header_type={:?}",
+                    self.header_type
+                );
+                return Err(EncodeError::MissingField("PublisherPriority".to_string()));
+            }
+        } else {
+            log::trace!(
+                "[ENCODE] SubgroupHeader: publisher_priority not encoded (NoPriority header type)"
+            );
+        }
 
         let bytes_written = start_pos - w.remaining_mut();
-        tracing::debug!(
+        log::debug!(
             "[ENCODE] SubgroupHeader complete: wrote {} bytes",
             bytes_written
         );
@@ -155,28 +175,28 @@ pub struct SubgroupObject {
 
 impl Decode for SubgroupObject {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        tracing::trace!(
+        log::trace!(
             "[DECODE] SubgroupObject: starting decode, buffer_remaining={} bytes",
             r.remaining()
         );
 
         let object_id_delta = u64::decode(r)?;
-        tracing::trace!(
+        log::trace!(
             "[DECODE] SubgroupObject: object_id_delta={}",
             object_id_delta
         );
 
         let payload_length = usize::decode(r)?;
-        tracing::trace!("[DECODE] SubgroupObject: payload_length={}", payload_length);
+        log::trace!("[DECODE] SubgroupObject: payload_length={}", payload_length);
 
         let status = match payload_length {
             0 => {
                 let s = ObjectStatus::decode(r)?;
-                tracing::trace!("[DECODE] SubgroupObject: status={:?} (payload_length=0)", s);
+                log::trace!("[DECODE] SubgroupObject: status={:?} (payload_length=0)", s);
                 Some(s)
             }
             _ => {
-                tracing::trace!("[DECODE] SubgroupObject: status=None (payload_length > 0)");
+                log::trace!("[DECODE] SubgroupObject: status=None (payload_length > 0)");
                 None
             }
         };
@@ -184,7 +204,7 @@ impl Decode for SubgroupObject {
         //Self::decode_remaining(r, payload_length);
         //let payload = r.copy_to_bytes(payload_length);
 
-        tracing::debug!(
+        log::debug!(
             "[DECODE] SubgroupObject complete: object_id_delta={}, payload_length={}, status={:?}, buffer_remaining={} bytes",
             object_id_delta,
             payload_length,
@@ -203,7 +223,7 @@ impl Decode for SubgroupObject {
 
 impl Encode for SubgroupObject {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        tracing::trace!(
+        log::trace!(
             "[ENCODE] SubgroupObject: starting encode - object_id_delta={}, payload_length={}, status={:?}",
             self.object_id_delta,
             self.payload_length,
@@ -211,13 +231,13 @@ impl Encode for SubgroupObject {
         );
 
         self.object_id_delta.encode(w)?;
-        tracing::trace!(
+        log::trace!(
             "[ENCODE] SubgroupObject: encoded object_id_delta={}",
             self.object_id_delta
         );
 
         self.payload_length.encode(w)?;
-        tracing::trace!(
+        log::trace!(
             "[ENCODE] SubgroupObject: encoded payload_length={}",
             self.payload_length
         );
@@ -225,16 +245,16 @@ impl Encode for SubgroupObject {
         if self.payload_length == 0 {
             if let Some(status) = self.status {
                 status.encode(w)?;
-                tracing::trace!("[ENCODE] SubgroupObject: encoded status={:?}", status);
+                log::trace!("[ENCODE] SubgroupObject: encoded status={:?}", status);
             } else {
-                tracing::error!("[ENCODE] SubgroupObject: MISSING status for payload_length=0");
+                log::error!("[ENCODE] SubgroupObject: MISSING status for payload_length=0");
                 return Err(EncodeError::MissingField("Status".to_string()));
             }
         }
         //Self::encode_remaining(w, self.payload.len())?;
         //w.put_slice(&self.payload);
 
-        tracing::debug!("[ENCODE] SubgroupObject complete");
+        log::debug!("[ENCODE] SubgroupObject complete");
 
         Ok(())
     }
@@ -252,25 +272,25 @@ pub struct SubgroupObjectExt {
 
 impl Decode for SubgroupObjectExt {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        tracing::trace!(
+        log::trace!(
             "[DECODE] SubgroupObjectExt: starting decode, buffer_remaining={} bytes",
             r.remaining()
         );
 
         let object_id_delta = u64::decode(r)?;
-        tracing::trace!(
+        log::trace!(
             "[DECODE] SubgroupObjectExt: object_id_delta={}",
             object_id_delta
         );
 
         let extension_headers = ExtensionHeaders::decode(r)?;
-        tracing::trace!(
+        log::trace!(
             "[DECODE] SubgroupObjectExt: extension_headers={:?}",
             extension_headers
         );
 
         let payload_length = usize::decode(r)?;
-        tracing::trace!(
+        log::trace!(
             "[DECODE] SubgroupObjectExt: payload_length={}",
             payload_length
         );
@@ -278,14 +298,14 @@ impl Decode for SubgroupObjectExt {
         let status = match payload_length {
             0 => {
                 let s = ObjectStatus::decode(r)?;
-                tracing::trace!(
+                log::trace!(
                     "[DECODE] SubgroupObjectExt: status={:?} (payload_length=0)",
                     s
                 );
                 Some(s)
             }
             _ => {
-                tracing::trace!("[DECODE] SubgroupObjectExt: status=None (payload_length > 0)");
+                log::trace!("[DECODE] SubgroupObjectExt: status=None (payload_length > 0)");
                 None
             }
         };
@@ -293,7 +313,7 @@ impl Decode for SubgroupObjectExt {
         //Self::decode_remaining(r, payload_length);
         //let payload = r.copy_to_bytes(payload_length);
 
-        tracing::debug!(
+        log::debug!(
             "[DECODE] SubgroupObjectExt complete: object_id_delta={}, payload_length={}, status={:?}, buffer_remaining={} bytes",
             object_id_delta,
             payload_length,
@@ -313,7 +333,7 @@ impl Decode for SubgroupObjectExt {
 
 impl Encode for SubgroupObjectExt {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        tracing::trace!(
+        log::trace!(
             "[ENCODE] SubgroupObjectExt: starting encode - object_id_delta={}, payload_length={}, status={:?}, extension_headers={:?}",
             self.object_id_delta,
             self.payload_length,
@@ -322,16 +342,16 @@ impl Encode for SubgroupObjectExt {
         );
 
         self.object_id_delta.encode(w)?;
-        tracing::trace!(
+        log::trace!(
             "[ENCODE] SubgroupObjectExt: encoded object_id_delta={}",
             self.object_id_delta
         );
 
         self.extension_headers.encode(w)?;
-        tracing::trace!("[ENCODE] SubgroupObjectExt: encoded extension_headers");
+        log::trace!("[ENCODE] SubgroupObjectExt: encoded extension_headers");
 
         self.payload_length.encode(w)?;
-        tracing::trace!(
+        log::trace!(
             "[ENCODE] SubgroupObjectExt: encoded payload_length={}",
             self.payload_length
         );
@@ -339,16 +359,16 @@ impl Encode for SubgroupObjectExt {
         if self.payload_length == 0 {
             if let Some(status) = self.status {
                 status.encode(w)?;
-                tracing::trace!("[ENCODE] SubgroupObjectExt: encoded status={:?}", status);
+                log::trace!("[ENCODE] SubgroupObjectExt: encoded status={:?}", status);
             } else {
-                tracing::error!("[ENCODE] SubgroupObjectExt: MISSING status for payload_length=0");
+                log::error!("[ENCODE] SubgroupObjectExt: MISSING status for payload_length=0");
                 return Err(EncodeError::MissingField("Status".to_string()));
             }
         }
         //Self::encode_remaining(w, self.payload.len())?;
         //w.put_slice(&self.payload);
 
-        tracing::debug!("[ENCODE] SubgroupObjectExt complete");
+        log::debug!("[ENCODE] SubgroupObjectExt complete");
 
         Ok(())
     }

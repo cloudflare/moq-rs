@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Low-level message sent over the wire, as defined in the specification.
 //!
 //! All of these messages are sent over a bidirectional QUIC stream.
@@ -9,73 +5,65 @@
 //! The only exception are OBJECT "messages", which are sent over dedicated QUIC streams.
 //!
 
+mod dynamic_groups;
 mod fetch;
 mod fetch_cancel;
-mod fetch_error;
 mod fetch_ok;
 mod fetch_type;
 mod filter_type;
 mod go_away;
 mod group_order;
 mod max_request_id;
-mod pubilsh_namespace_done;
+mod namespace;
+mod parameters;
 mod publish;
 mod publish_done;
-mod publish_error;
 mod publish_namespace;
 mod publish_namespace_cancel;
-mod publish_namespace_error;
-mod publish_namespace_ok;
+mod publish_namespace_done;
 mod publish_ok;
 mod publisher;
+mod request_error;
+mod request_ok;
 mod requests_blocked;
 mod subscribe;
-mod subscribe_error;
 mod subscribe_namespace;
-mod subscribe_namespace_error;
-mod subscribe_namespace_ok;
 mod subscribe_ok;
 mod subscribe_update;
 mod subscriber;
 mod track_status;
-mod track_status_error;
 mod track_status_ok;
 mod unsubscribe;
-mod unsubscribe_namespace;
 
+pub use dynamic_groups::*;
 pub use fetch::*;
 pub use fetch_cancel::*;
-pub use fetch_error::*;
 pub use fetch_ok::*;
 pub use fetch_type::*;
 pub use filter_type::*;
 pub use go_away::*;
 pub use group_order::*;
 pub use max_request_id::*;
-pub use pubilsh_namespace_done::*;
+pub use namespace::*;
+pub use parameters::*;
 pub use publish::*;
 pub use publish_done::*;
-pub use publish_error::*;
 pub use publish_namespace::*;
 pub use publish_namespace_cancel::*;
-pub use publish_namespace_error::*;
-pub use publish_namespace_ok::*;
+pub use publish_namespace_done::*;
 pub use publish_ok::*;
 pub use publisher::*;
+pub use request_error::*;
+pub use request_ok::*;
 pub use requests_blocked::*;
 pub use subscribe::*;
-pub use subscribe_error::*;
 pub use subscribe_namespace::*;
-pub use subscribe_namespace_error::*;
-pub use subscribe_namespace_ok::*;
 pub use subscribe_ok::*;
 pub use subscribe_update::*;
 pub use subscriber::*;
 pub use track_status::*;
-pub use track_status_error::*;
 pub use track_status_ok::*;
 pub use unsubscribe::*;
-pub use unsubscribe_namespace::*;
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use std::fmt;
@@ -93,13 +81,18 @@ macro_rules! message_types {
 		impl Decode for Message {
 			fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
 				let t = u64::decode(r)?;
-				let _len = u16::decode(r)?;
+				let len = u16::decode(r)? as usize;
 
-				// TODO: Check the length of the message.
+				// Read exactly len bytes into a sub-buffer to properly handle Track Extensions
+				if r.remaining() < len {
+					return Err(DecodeError::More(len - r.remaining()));
+				}
+				let payload = r.copy_to_bytes(len);
+				let mut payload_reader = std::io::Cursor::new(payload);
 
 				match t {
 					$($val => {
-						let msg = $name::decode(r)?;
+						let msg = $name::decode(&mut payload_reader)?;
 						Ok(Self::$name(msg))
 					})*
 					_ => Err(DecodeError::InvalidMessage(t)),
@@ -189,40 +182,36 @@ message_types! {
     Unsubscribe = 0xa,
     // SUBSCRIBE family, sent by publisher
     SubscribeOk = 0x4,
-    SubscribeError = 0x5,
 
     // ANNOUNCE family, sent by publisher
     PublishNamespace = 0x6,
     PublishNamespaceDone = 0x9,
     // ANNOUNCE family, sent by subscriber
-    PublishNamespaceOk = 0x7,
-    PublishNamespaceError = 0x8,
+    RequestOk = 0x7,
     PublishNamespaceCancel = 0xc,
+
+    // NAMESPACE family, sent by relay to subscriber (draft-16)
+    Namespace = 0x8,
 
     // TRACK_STATUS family, sent by subscriber
     TrackStatus = 0xd,
     // TRACK_STATUS family, sent by publisher
     TrackStatusOk = 0xe,
-    TrackStatusError = 0xf,
 
     // NAMESPACE family, sent by subscriber
     SubscribeNamespace = 0x11,
-    UnsubscribeNamespace = 0x14,
-    // NAMESPACE family, sent by publisher
-    SubscribeNamespaceOk = 0x12,
-    SubscribeNamespaceError = 0x13,
 
     // FETCH family, sent by subscriber
     Fetch = 0x16,
     FetchCancel = 0x17,
     // FETCH family, sent by publisher
     FetchOk = 0x18,
-    FetchError = 0x19,
 
     // PUBLISH family, sent by publisher
     Publish = 0x1d,
     PublishDone = 0xb,
     // PUBLISH family, sent by subscriber
     PublishOk = 0x1e,
-    PublishError = 0x1f,
+
+    RequestError = 0x5,
 }

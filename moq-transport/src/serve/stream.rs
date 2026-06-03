@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use bytes::Bytes;
 use std::{ops::Deref, sync::Arc};
 
@@ -193,7 +189,6 @@ impl StreamReader {
             })
     }
 
-    /// Check if the stream writer has been closed or dropped.
     pub fn is_closed(&self) -> bool {
         let state = self.state.lock();
         state.closed.is_err() || state.modified().is_none()

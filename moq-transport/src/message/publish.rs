@@ -1,12 +1,10 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
-use crate::coding::{
-    Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location, TrackNamespace,
-};
-use crate::message::GroupOrder;
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs, TrackNamespace};
+use crate::data::ExtensionHeaders;
 
 /// Sent by publisher to initiate a subscription to a track.
+///
+/// Draft-16: Fields like group_order, content_exists, largest_location, forward
+/// have been moved to Parameters (Section 9.2.2).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Publish {
     /// The publish request ID
@@ -17,14 +15,11 @@ pub struct Publish {
     pub track_name: String, // TODO SLG - consider making a FullTrackName base struct (total size limit of 4096)
     pub track_alias: u64,
 
-    pub group_order: GroupOrder,
-    pub content_exists: bool,
-    // The largest object available for this track, if content exists.
-    pub largest_location: Option<Location>,
-    pub forward: bool,
-
-    /// Optional parameters
+    /// Optional parameters (may contain Forward, GroupOrder, LargestObject, PublisherPriority, etc.)
     pub params: KeyValuePairs,
+
+    /// Track extensions
+    pub track_extensions: ExtensionHeaders,
 }
 
 impl Decode for Publish {
@@ -35,31 +30,18 @@ impl Decode for Publish {
         let track_name = String::decode(r)?;
         let track_alias = u64::decode(r)?;
 
-        let group_order = GroupOrder::decode(r)?;
-        // GroupOrder enum has Publisher in it, but it's not allowed to be used in this
-        // publish message, so validate it now so we can return a protocol error.
-        if group_order == GroupOrder::Publisher {
-            return Err(DecodeError::InvalidGroupOrder);
-        }
-        let content_exists = bool::decode(r)?;
-        let largest_location = match content_exists {
-            true => Some(Location::decode(r)?),
-            false => None,
-        };
-        let forward = bool::decode(r)?;
-
         let params = KeyValuePairs::decode(r)?;
+
+        // Track Extensions use remaining bytes (no length prefix per draft-16)
+        let track_extensions = ExtensionHeaders::decode_remaining_bytes(r)?;
 
         Ok(Self {
             id,
             track_namespace,
             track_name,
             track_alias,
-            group_order,
-            content_exists,
-            largest_location,
-            forward,
             params,
+            track_extensions,
         })
     }
 }
@@ -72,22 +54,9 @@ impl Encode for Publish {
         self.track_name.encode(w)?;
         self.track_alias.encode(w)?;
 
-        // GroupOrder enum has Publisher in it, but it's not allowed to be used in this
-        // publish message.
-        if self.group_order == GroupOrder::Publisher {
-            return Err(EncodeError::InvalidValue);
-        }
-        self.group_order.encode(w)?;
-        self.content_exists.encode(w)?;
-        if self.content_exists {
-            if let Some(largest) = &self.largest_location {
-                largest.encode(w)?;
-            } else {
-                return Err(EncodeError::MissingField("LargestLocation".to_string()));
-            }
-        }
-        self.forward.encode(w)?;
         self.params.encode(w)?;
+        // Track Extensions use remaining bytes (no length prefix per draft-16)
+        self.track_extensions.encode_without_length(w)?;
 
         Ok(())
     }
@@ -102,37 +71,16 @@ mod tests {
     fn encode_decode() {
         let mut buf = BytesMut::new();
 
-        // One parameter for testing
         let mut kvps = KeyValuePairs::new();
         kvps.set_bytesvalue(123, vec![0x00, 0x01, 0x02, 0x03]);
 
-        // Content exists = true
         let msg = Publish {
             id: 12345,
             track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
             track_name: "audiotrack".to_string(),
             track_alias: 212,
-            group_order: GroupOrder::Ascending,
-            content_exists: true,
-            largest_location: Some(Location::new(2, 3)),
-            forward: true,
             params: kvps.clone(),
-        };
-        msg.encode(&mut buf).unwrap();
-        let decoded = Publish::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
-
-        // Content exists = false
-        let msg = Publish {
-            id: 12345,
-            track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
-            track_name: "audiotrack".to_string(),
-            track_alias: 212,
-            group_order: GroupOrder::Ascending,
-            content_exists: false,
-            largest_location: None,
-            forward: true,
-            params: kvps.clone(),
+            track_extensions: Default::default(),
         };
         msg.encode(&mut buf).unwrap();
         let decoded = Publish::decode(&mut buf).unwrap();
@@ -140,7 +88,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_missing_fields() {
+    fn encode_decode_no_params() {
         let mut buf = BytesMut::new();
 
         let msg = Publish {
@@ -148,32 +96,38 @@ mod tests {
             track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
             track_name: "audiotrack".to_string(),
             track_alias: 212,
-            group_order: GroupOrder::Ascending,
-            content_exists: true,
-            largest_location: None,
-            forward: true,
             params: Default::default(),
+            track_extensions: Default::default(),
         };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
+        msg.encode(&mut buf).unwrap();
+        let decoded = Publish::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
     }
 
     #[test]
-    fn encode_bad_group_order() {
+    fn encode_decode_with_track_extensions() {
         let mut buf = BytesMut::new();
 
+        let mut track_ext = ExtensionHeaders::new();
+        track_ext.set_intvalue(0x12, 50); // AUDIO_LEVEL_EXT = 0x12 (18), value = 50
+
         let msg = Publish {
-            id: 12345,
-            track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
-            track_name: "audiotrack".to_string(),
-            track_alias: 212,
-            group_order: GroupOrder::Publisher,
-            content_exists: false,
-            largest_location: None,
-            forward: true,
+            id: 1,
+            track_namespace: TrackNamespace::from_utf8_path("topn-test/speaker-0"),
+            track_name: "audio".to_string(),
+            track_alias: 0,
             params: Default::default(),
+            track_extensions: track_ext,
         };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::InvalidValue));
+        msg.encode(&mut buf).unwrap();
+        let decoded = Publish::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
+        // Verify the track extension was decoded correctly
+        let kvp = decoded.track_extensions.get(0x12).unwrap();
+        assert_eq!(kvp.key, 0x12);
+        match &kvp.value {
+            crate::coding::Value::IntValue(v) => assert_eq!(*v, 50),
+            _ => panic!("Expected int value"),
+        }
     }
 }

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! MoQ Relay library for building Media over QUIC relay servers.
 //!
 //! This crate provides the core relay functionality that can be embedded
@@ -35,11 +32,12 @@ mod api;
 mod consumer;
 mod coordinator;
 mod local;
-pub mod metrics;
 mod producer;
 mod relay;
 mod remote;
 mod session;
+mod subscriber_registry;
+mod top_n_tracker;
 mod web;
 
 pub use api::*;
@@ -48,6 +46,8 @@ pub use coordinator::*;
 pub use local::*;
 pub use producer::*;
 pub use relay::*;
-pub use remote::RemoteManager;
+pub use remote::*;
 pub use session::*;
+pub use subscriber_registry::*;
+pub use top_n_tracker::*;
 pub use web::*;

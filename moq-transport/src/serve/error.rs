@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum ServeError {
     // TODO stop using?
@@ -40,6 +36,10 @@ pub enum ServeError {
 
     #[error("not implemented: {0} [error:{1}]")]
     NotImplementedWithId(String, uuid::Uuid),
+
+    /// Relay already has an active SUBSCRIBE path, not interested in PUBLISH
+    #[error("uninterested")]
+    Uninterested,
 }
 
 impl ServeError {
@@ -64,6 +64,8 @@ impl ServeError {
             Self::NotImplemented(_) | Self::NotImplementedWithId(_, _) => 0x3,
             // INTERNAL_ERROR (0x0) - per-request error registries use 0x0
             Self::Internal(_) | Self::InternalWithId(_, _) => 0x0,
+            // UNINTERESTED (0x1) - relay already has data path via SUBSCRIBE
+            Self::Uninterested => 0x1,
         }
     }
 
@@ -75,7 +77,7 @@ impl ServeError {
     pub fn not_found_id() -> Self {
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        tracing::warn!("[{}] Not found at {}:{}", id, loc.file(), loc.line());
+        log::warn!("[{}] Not found at {}:{}", id, loc.file(), loc.line());
         Self::NotFoundWithId("Track not found".to_string(), id)
     }
 
@@ -88,7 +90,7 @@ impl ServeError {
         let context = internal_context.into();
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        tracing::warn!(
+        log::warn!(
             "[{}] Not found: {} at {}:{}",
             id,
             context,
@@ -111,7 +113,7 @@ impl ServeError {
         let message = external_message.into();
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        tracing::warn!(
+        log::warn!(
             "[{}] Not found: {} at {}:{}",
             id,
             context,
@@ -130,7 +132,7 @@ impl ServeError {
         let context = internal_context.into();
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        tracing::error!(
+        log::error!(
             "[{}] Internal error: {} at {}:{}",
             id,
             context,
@@ -149,7 +151,7 @@ impl ServeError {
         let feature = feature.into();
         let id = uuid::Uuid::new_v4();
         let loc = std::panic::Location::caller();
-        tracing::warn!(
+        log::warn!(
             "[{}] Not implemented: {} at {}:{}",
             id,
             feature,

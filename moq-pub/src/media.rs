@@ -1,9 +1,5 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use anyhow::{self, Context};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use moq_transport::serve::{SubgroupWriter, SubgroupsWriter, TrackWriter, TracksWriter};
 use mp4::{self, ReadBox, TrackType};
 use std::cmp::max;
@@ -266,7 +262,7 @@ impl Media {
 
         let catalog_str = serde_json::to_string_pretty(&catalog)?;
 
-        tracing::info!("catalog: {}", catalog_str);
+        log::info!("catalog: {}", catalog_str);
 
         // Create a single fragment for the segment.
         self.catalog.append(0)?.write(catalog_str.into())?;
@@ -327,11 +323,6 @@ struct Track {
     // The current segment
     current: Option<SubgroupWriter>,
 
-    // Pending moof header bytes, waiting to be combined with mdat.
-    // Per CMSF (draft-ietf-moq-cmsf-00 §3.3), each MoQ Object must contain
-    // at least one complete CMAF Chunk (moof+mdat pair).
-    pending_moof: Option<Bytes>,
-
     // The number of units per second.
     timescale: u64,
 
@@ -344,17 +335,15 @@ impl Track {
         Self {
             track: track.subgroups().unwrap(),
             current: None,
-            pending_moof: None,
             timescale,
             handler,
         }
     }
 
     pub fn header(&mut self, raw: Bytes, fragment: Fragment) -> anyhow::Result<()> {
-        if self.current.is_some() {
-            // Use the existing segment — just stash the moof for now.
-            debug_assert!(self.pending_moof.is_none(), "overwriting pending moof");
-            self.pending_moof = Some(raw);
+        if let Some(current) = self.current.as_mut() {
+            // Use the existing segment
+            current.write(raw)?;
             return Ok(());
         }
 
@@ -371,15 +360,15 @@ impl Track {
         let priority: u8 = 127;
 
         // Create a new segment.
-        let segment = self.track.append(priority)?;
+        let mut segment = self.track.append(priority)?;
 
         println!(
             "timestamp: {:?} segment: {:?}:{:?} priority: {:?}",
             fragment.timestamp, segment.info.group_id, segment.info.subgroup_id, priority
         );
 
-        // Stash the moof — it will be combined with mdat in data().
-        self.pending_moof = Some(raw);
+        // Write the fragment in it's own object.
+        segment.write(raw)?;
 
         // Save for the next iteration
         self.current = Some(segment);
@@ -388,20 +377,19 @@ impl Track {
     }
 
     pub fn data(&mut self, raw: Bytes) -> anyhow::Result<()> {
-        let moof = self.pending_moof.take().context("missing pending moof")?;
         let segment = self.current.as_mut().context("missing current fragment")?;
-        // Combine moof+mdat into a single MoQ Object (CMSF §3.3 compliance).
-        let mut combined = BytesMut::with_capacity(moof.len() + raw.len());
-        combined.put_slice(&moof);
-        combined.put_slice(&raw);
-        segment.write(combined.freeze())?;
+        segment.write(raw)?;
 
         Ok(())
     }
 
     pub fn end_group(&mut self) {
-        self.current = None;
-        self.pending_moof = None;
+        // Send EndOfGroup marker before dropping the writer
+        if let Some(mut current) = self.current.take() {
+            if let Err(e) = current.end_of_group() {
+                log::warn!("failed to send EndOfGroup marker: {}", e);
+            }
+        }
     }
 }
 

@@ -6,7 +6,7 @@ All subscriptions are deduplicated and cached, so that a single publisher can se
 ## Usage
 
 The publisher must choose a unique name for their broadcast, sent as the WebTransport path when connecting to the server.
-Connection paths are normalized and validated: trailing slashes are trimmed, dot segments and percent-encoded characters are rejected, and empty segments are not allowed. Capitalization matters.
+We currently do a dumb string comparison, so capatilization matters as do slashes.
 
 For example: `CONNECT https://relay.quic.video/BigBuckBunny`
 

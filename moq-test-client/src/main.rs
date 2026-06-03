@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! MoQT Interop Test Client
 //!
 //! A standardized test client for MoQT interoperability testing.
@@ -143,9 +140,9 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
 
     let result = match test_case {
         TestCase::SetupOnly => scenarios::test_setup_only(args).await,
-        TestCase::AnnounceOnly => scenarios::test_announce_only(args).await,
+        TestCase::AnnounceOnly => scenarios::test_publish_namespace_only(args).await,
         TestCase::SubscribeError => scenarios::test_subscribe_error(args).await,
-        TestCase::AnnounceSubscribe => scenarios::test_announce_subscribe(args).await,
+        TestCase::AnnounceSubscribe => scenarios::test_publish_namespace_subscribe(args).await,
         TestCase::SubscribeBeforeAnnounce => scenarios::test_subscribe_before_announce(args).await,
         TestCase::PublishNamespaceDone => scenarios::test_publish_namespace_done(args).await,
     };
@@ -213,14 +210,14 @@ fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing with env filter (respects RUST_LOG environment variable)
-    // Default to info level, but suppress quinn's verbose output
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
-        )
-        .init();
+    env_logger::init();
+
+    // Disable tracing so we don't get a bunch of Quinn spam
+    let tracer = tracing_subscriber::FmtSubscriber::builder()
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    // Ignore error if subscriber is already set (e.g., in tests)
+    let _ = tracing::subscriber::set_global_default(tracer);
 
     let args = Args::parse();
 

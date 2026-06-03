@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -41,7 +38,6 @@ impl MlogWriter {
             }
         });
 
-        writer.write_all(b"\x1e")?;
         serde_json::to_writer(&mut writer, &header)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
@@ -56,7 +52,6 @@ impl MlogWriter {
 
     /// Add an event to the log
     pub fn add_event(&mut self, event: Event) -> io::Result<()> {
-        self.writer.write_all(b"\x1e")?;
         serde_json::to_writer(&mut self.writer, &event)?;
         self.writer.write_all(b"\n")?;
         self.writer.flush()?;

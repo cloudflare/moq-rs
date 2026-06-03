@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use super::{Publisher, SessionError};
 use crate::coding::ReasonPhrase;
 use crate::message;
@@ -24,9 +21,10 @@ impl TrackStatusRequested {
         error_code: u64,
         error_message: &str,
     ) -> Result<(), SessionError> {
-        let status_error = message::TrackStatusError {
+        let status_error = message::RequestError {
             id: self.request_msg.id,
             error_code,
+            retry_interval: 0,
             reason_phrase: ReasonPhrase(error_message.to_string()),
         };
         self.publisher.send_message(status_error);

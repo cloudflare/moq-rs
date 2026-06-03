@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use std::{
     collections::HashSet,
     fmt,
@@ -14,10 +11,7 @@ use std::{
 
 use anyhow::Context;
 use clap::Parser;
-use socket2::{Domain, Protocol, Socket, Type};
 use url::Url;
-
-use moq_transport::session::Transport;
 
 use crate::tls;
 
@@ -30,7 +24,7 @@ use futures::FutureExt;
 pub enum AddressFamily {
     Ipv4,
     Ipv6,
-    /// IPv6 with dual-stack support (IPV6_V6ONLY=false)
+    /// IPv6 with dual-stack support (Linux)
     Ipv6DualStack,
 }
 
@@ -49,67 +43,6 @@ impl fmt::Display for AddressFamily {
     }
 }
 
-/// Bind a UDP socket, attempting dual-stack if the address is IPv6.
-///
-/// For IPv6 addresses, attempts to set `IPV6_V6ONLY = false` to enable
-/// dual-stack operation (accepting both IPv4 and IPv6 traffic). This is
-/// the default on Linux but must be explicitly requested on macOS/Windows.
-///
-/// Returns `(socket, is_dual_stack)` where `is_dual_stack` indicates
-/// whether the socket can handle both IPv4 and IPv6 destinations.
-fn bind_smart(addr: net::SocketAddr) -> anyhow::Result<(net::UdpSocket, bool)> {
-    let domain = if addr.is_ipv6() {
-        Domain::IPV6
-    } else {
-        Domain::IPV4
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
-        .context("failed to create UDP socket")?;
-
-    let mut is_dual_stack = false;
-
-    if addr.is_ipv6() {
-        match socket.set_only_v6(false) {
-            Ok(()) => {
-                is_dual_stack = true;
-                tracing::debug!(addr = %addr, "IPv6 dual-stack enabled (IPV6_V6ONLY=false)");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    addr = %addr,
-                    error = %e,
-                    "Could not enable dual-stack on IPv6 socket; \
-                     IPv4-only destinations may be unreachable"
-                );
-            }
-        }
-    }
-
-    socket
-        .bind(&addr.into())
-        .with_context(|| format!("failed to bind UDP socket to {}", addr))?;
-
-    let local_addr = match socket.local_addr() {
-        Ok(a) => a
-            .as_socket()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "<non-IP address>".to_string()),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to get local address after successful bind");
-            "<unknown>".to_string()
-        }
-    };
-
-    tracing::info!(
-        bind = %addr,
-        local = %local_addr,
-        dual_stack = is_dual_stack,
-        "UDP socket bound"
-    );
-
-    Ok((socket.into(), is_dual_stack))
-}
-
 /// Build a TransportConfig with our standard settings
 ///
 /// This is used both for the base endpoint config and when creating
@@ -126,11 +59,7 @@ fn build_transport_config() -> quinn::TransportConfig {
 #[derive(Parser, Clone)]
 pub struct Args {
     /// Listen for UDP packets on the given address.
-    ///
-    /// Defaults to [::]:0 (IPv6 with dual-stack). If the default IPv6 bind
-    /// fails, automatically falls back to 0.0.0.0 (IPv4-only) with a warning.
-    /// Explicitly provided IPv6 addresses will not fall back.
-    #[arg(long, default_value = Args::DEFAULT_BIND)]
+    #[arg(long, default_value = "[::]:0")]
     pub bind: net::SocketAddr,
 
     /// Directory to write qlog files (one per connection)
@@ -144,7 +73,7 @@ pub struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
-            bind: Self::DEFAULT_BIND.parse().unwrap(),
+            bind: "[::]:0".parse().unwrap(),
             qlog_dir: None,
             tls: Default::default(),
         }
@@ -152,62 +81,31 @@ impl Default for Args {
 }
 
 impl Args {
-    /// The default bind address used when `--bind` is not explicitly provided.
-    const DEFAULT_BIND: &str = "[::]:0";
-
     pub fn load(&self) -> anyhow::Result<Config> {
         let tls = self.tls.load()?;
-
-        match Config::new(self.bind, self.qlog_dir.clone(), tls.clone()) {
-            Ok(config) => Ok(config),
-            Err(e) if self.bind.to_string() == Self::DEFAULT_BIND => {
-                // IPv6 default bind failed -- try falling back to IPv4.
-                // Only do this for the default; if the user explicitly
-                // requested an IPv6 address, respect that and propagate
-                // the error.
-                let fallback = net::SocketAddr::new(
-                    net::IpAddr::V4(net::Ipv4Addr::UNSPECIFIED),
-                    self.bind.port(),
-                );
-                tracing::warn!(
-                    requested = %self.bind,
-                    fallback = %fallback,
-                    error = %e,
-                    "IPv6 bind failed, falling back to IPv4"
-                );
-                Config::new(fallback, self.qlog_dir.clone(), tls).with_context(|| {
-                    format!("IPv4 fallback also failed (original IPv6 error: {})", e)
-                })
-            }
-            Err(e) => Err(e),
-        }
+        Ok(Config::new(self.bind, self.qlog_dir.clone(), tls))
     }
 }
 
 pub struct Config {
     pub bind: Option<net::SocketAddr>,
     pub socket: net::UdpSocket,
-    pub is_dual_stack: bool,
     pub qlog_dir: Option<PathBuf>,
     pub tls: tls::Config,
     pub tags: HashSet<String>,
 }
 
 impl Config {
-    pub fn new(
-        bind: net::SocketAddr,
-        qlog_dir: Option<PathBuf>,
-        tls: tls::Config,
-    ) -> anyhow::Result<Self> {
-        let (socket, is_dual_stack) = bind_smart(bind)?;
-        Ok(Self {
+    pub fn new(bind: net::SocketAddr, qlog_dir: Option<PathBuf>, tls: tls::Config) -> Self {
+        Self {
             bind: Some(bind),
-            socket,
-            is_dual_stack,
+            socket: net::UdpSocket::bind(bind)
+                .context("failed to bind socket")
+                .unwrap(),
             qlog_dir,
             tls,
             tags: HashSet::new(),
-        })
+        }
     }
 
     pub fn with_socket(
@@ -215,18 +113,9 @@ impl Config {
         qlog_dir: Option<PathBuf>,
         tls: tls::Config,
     ) -> Self {
-        // Probe the socket to detect dual-stack capability rather than assuming.
-        let is_dual_stack = socket.local_addr().is_ok_and(|addr| {
-            addr.is_ipv6() && {
-                let sock_ref = socket2::SockRef::from(&socket);
-                sock_ref.only_v6().map(|v6only| !v6only).unwrap_or(false)
-            }
-        });
-
         Self {
             bind: None,
             socket,
-            is_dual_stack,
             qlog_dir,
             tls,
             tags: HashSet::new(),
@@ -261,7 +150,7 @@ impl Endpoint {
             if !qlog_dir.is_dir() {
                 anyhow::bail!("qlog path is not a directory: {}", qlog_dir.display());
             }
-            tracing::info!("qlog output enabled: {}", qlog_dir.display());
+            log::info!("qlog output enabled: {}", qlog_dir.display());
         }
 
         // Build transport config with our standard settings
@@ -303,7 +192,6 @@ impl Endpoint {
             quic,
             config: config.tls.client,
             transport,
-            is_dual_stack: config.is_dual_stack,
         };
 
         Ok(Self {
@@ -316,15 +204,13 @@ impl Endpoint {
 
 pub struct Server {
     quic: quinn::Endpoint,
-    accept: FuturesUnordered<
-        BoxFuture<'static, anyhow::Result<(web_transport::Session, String, Transport)>>,
-    >,
+    accept: FuturesUnordered<BoxFuture<'static, anyhow::Result<(web_transport::Session, String)>>>,
     qlog_dir: Option<Arc<PathBuf>>,
     base_server_config: Arc<quinn::ServerConfig>,
 }
 
 impl Server {
-    pub async fn accept(&mut self) -> Option<(web_transport::Session, String, Transport)> {
+    pub async fn accept(&mut self) -> Option<(web_transport::Session, String)> {
         loop {
             tokio::select! {
                 res = self.quic.accept() => {
@@ -337,7 +223,7 @@ impl Server {
                     match res? {
                         Ok(result) => return Some(result),
                         Err(err) => {
-                            tracing::warn!("failed to accept QUIC connection: {}", err.root_cause());
+                            log::warn!("failed to accept QUIC connection: {}", err.root_cause());
                             continue;
                         }
                     }
@@ -350,7 +236,7 @@ impl Server {
         conn: quinn::Incoming,
         qlog_dir: Option<Arc<PathBuf>>,
         base_server_config: Arc<quinn::ServerConfig>,
-    ) -> anyhow::Result<(web_transport::Session, String, Transport)> {
+    ) -> anyhow::Result<(web_transport::Session, String)> {
         // Capture the original destination connection ID BEFORE accepting
         // This is the actual QUIC CID that can be used for qlog/mlog correlation
         let orig_dst_cid = conn.orig_dst_cid();
@@ -376,7 +262,7 @@ impl Server {
             let mut server_config = (*base_server_config).clone();
             server_config.transport_config(Arc::new(transport));
 
-            tracing::debug!(
+            log::debug!(
                 "qlog enabled: cid={} path={}",
                 connection_id_hex,
                 qlog_path.display()
@@ -399,7 +285,7 @@ impl Server {
         let alpn = String::from_utf8_lossy(&alpn);
         let server_name = handshake.server_name.unwrap_or_default();
 
-        tracing::debug!(
+        log::debug!(
             "received QUIC handshake: cid={} ip={} alpn={} server={}",
             connection_id_hex,
             conn.remote_address(),
@@ -410,7 +296,7 @@ impl Server {
         // Wait for the QUIC connection to be established.
         let conn = conn.await.context("failed to establish QUIC connection")?;
 
-        tracing::debug!(
+        log::debug!(
             "established QUIC connection: cid={} stable_id={} ip={} alpn={} server={}",
             connection_id_hex,
             conn.stable_id(),
@@ -420,32 +306,26 @@ impl Server {
         );
 
         let alpn_bytes = alpn.as_bytes();
-        let (session, transport) = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
+        let session = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
             // Wait for the WebTransport CONNECT request (includes H3 SETTINGS exchange).
             let request = web_transport_quinn::Request::accept(conn)
                 .await
                 .context("failed to receive WebTransport request")?;
 
             // Accept the CONNECT request.
-            let session = request
+            request
                 .ok()
                 .await
-                .context("failed to respond to WebTransport request")?;
-            (session, Transport::WebTransport)
+                .context("failed to respond to WebTransport request")?
         } else if alpn_bytes == moq_transport::setup::ALPN {
-            // Raw QUIC mode — create a "fake" WebTransport session with no H3 framing.
+            // Raw QUIC mode — create a session with no H3 framing.
             let request = url::Url::parse("moqt://localhost").unwrap();
-            let session = web_transport_quinn::Session::raw(
-                conn,
-                request,
-                web_transport_quinn::proto::ConnectResponse::default(),
-            );
-            (session, Transport::RawQuic)
+            web_transport_quinn::Session::raw(conn, request, web_transport_quinn::proto::ConnectResponse::default())
         } else {
             anyhow::bail!("unsupported ALPN: {}", alpn)
         };
 
-        Ok((session.into(), connection_id_hex, transport))
+        Ok((session.into(), connection_id_hex))
     }
 
     pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {
@@ -460,7 +340,6 @@ pub struct Client {
     quic: quinn::Endpoint,
     config: rustls::ClientConfig,
     transport: Arc<quinn::TransportConfig>,
-    is_dual_stack: bool,
 }
 
 impl Client {
@@ -472,9 +351,6 @@ impl Client {
     }
 
     /// Returns the address family of the local QUIC socket.
-    ///
-    /// Uses the dual-stack state determined at bind time rather than
-    /// compile-time platform assumptions.
     pub fn address_family(&self) -> anyhow::Result<AddressFamily> {
         let local_addr = self
             .quic
@@ -483,7 +359,7 @@ impl Client {
 
         if local_addr.is_ipv4() {
             Ok(AddressFamily::Ipv4)
-        } else if self.is_dual_stack {
+        } else if cfg!(target_os = "linux") {
             Ok(AddressFamily::Ipv6DualStack)
         } else {
             Ok(AddressFamily::Ipv6)
@@ -494,7 +370,7 @@ impl Client {
         &self,
         url: &Url,
         socket_addr: Option<net::SocketAddr>,
-    ) -> anyhow::Result<(web_transport::Session, String, Transport)> {
+    ) -> anyhow::Result<(web_transport::Session, String)> {
         let mut config = self.config.clone();
 
         // TODO support connecting to both ALPNs at the same time
@@ -551,23 +427,20 @@ impl Client {
             .context("CID not captured")?
             .to_string();
 
-        let (session, transport) = match url.scheme() {
-            "https" => (
-                web_transport_quinn::Session::connect(connection, url.clone()).await?,
-                Transport::WebTransport,
-            ),
-            "moqt" => (
-                web_transport_quinn::Session::raw(
-                    connection,
-                    url.clone(),
-                    web_transport_quinn::proto::ConnectResponse::default(),
-                ),
-                Transport::RawQuic,
-            ),
+        let session = match url.scheme() {
+            "https" => {
+                // Build a ConnectRequest with the MoQT version as the WebTransport subprotocol.
+                // Per draft-15+, version negotiation uses ALPN (raw QUIC) or
+                // wt-available-protocols (WebTransport) instead of CLIENT_SETUP versions.
+                let request = web_transport_quinn::proto::ConnectRequest::new(url.clone())
+                    .with_protocol(std::str::from_utf8(moq_transport::setup::ALPN).unwrap());
+                web_transport_quinn::Session::connect(connection, request).await?
+            }
+            "moqt" => web_transport_quinn::Session::raw(connection, url.clone(), web_transport_quinn::proto::ConnectResponse::default()),
             _ => unreachable!(),
         };
 
-        Ok((session.into(), connection_id_hex, transport))
+        Ok((session.into(), connection_id_hex))
     }
 
     /// Default DNS resolution logic that filters results by address family.
@@ -595,14 +468,14 @@ impl Client {
         }
 
         // Log all DNS results for debugging
-        tracing::debug!(
+        log::debug!(
             "DNS lookup for {}, family {:?}: found {} results",
             host,
             address_family,
             addrs.len()
         );
         for (i, addr) in addrs.iter().enumerate() {
-            tracing::debug!(
+            log::debug!(
                 "  DNS[{}]: {} ({})",
                 i,
                 addr,
@@ -624,12 +497,15 @@ impl Client {
                     ))?
             }
             AddressFamily::Ipv6DualStack => {
-                // Dual-stack socket: any address family works, use first result
-                tracing::debug!("Using first DNS result (IPv6 dual-stack): {}", addrs[0]);
+                // IPv6 socket on Linux: dual-stack, use first result
+                log::debug!(
+                    "Using first DNS result (Linux IPv6 dual-stack): {}",
+                    addrs[0]
+                );
                 addrs[0]
             }
             AddressFamily::Ipv6 => {
-                // IPv6-only socket: filter to IPv6 addresses
+                // IPv6 socket non-Linux: filter to IPv6 addresses
                 addrs
                     .iter()
                     .find(|a| a.is_ipv6())
@@ -641,7 +517,7 @@ impl Client {
             }
         };
 
-        tracing::debug!(
+        log::debug!(
             "Connecting from {} to {} (selected from {} DNS results)",
             local_addr,
             compatible_addr,

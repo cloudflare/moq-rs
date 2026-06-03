@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! A broadcast is a collection of tracks, split into two handles: [Writer] and [Reader].
 //!
 //! The [Writer] can create tracks, either manually or on request.

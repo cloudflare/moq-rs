@@ -1,9 +1,6 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 mod datagram;
 mod extension_headers;
+mod extension_types;
 mod fetch;
 mod header;
 mod object_status;
@@ -11,6 +8,7 @@ mod subgroup;
 
 pub use datagram::*;
 pub use extension_headers::*;
+pub use extension_types::*;
 pub use fetch::*;
 pub use header::*;
 pub use object_status::*;

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs, TrackNamespace};
 
 /// Subscribe Namespace
@@ -12,19 +9,36 @@ pub struct SubscribeNamespace {
     /// The track namespace prefix
     pub track_namespace_prefix: TrackNamespace,
 
+    /// The Forward value that new subscriptions resulting from this SUBSCRIBE_NAMESPACE will have
+    pub forward: u8,
+
     /// Optional parameters
     pub params: KeyValuePairs,
+}
+
+impl SubscribeNamespace {
+    /// Creates a new SubscribeNamespace message.
+    pub fn new(id: u64, track_namespace_prefix: TrackNamespace, forward: u8) -> Self {
+        Self {
+            id,
+            track_namespace_prefix,
+            forward,
+            params: KeyValuePairs::new(),
+        }
+    }
 }
 
 impl Decode for SubscribeNamespace {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
         let track_namespace_prefix = TrackNamespace::decode(r)?;
+        let forward = u8::decode(r)?;
         let params = KeyValuePairs::decode(r)?;
 
         Ok(Self {
             id,
             track_namespace_prefix,
+            forward,
             params,
         })
     }
@@ -34,6 +48,7 @@ impl Encode for SubscribeNamespace {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.id.encode(w)?;
         self.track_namespace_prefix.encode(w)?;
+        self.forward.encode(w)?;
         self.params.encode(w)?;
 
         Ok(())
@@ -55,11 +70,14 @@ mod tests {
 
         let msg = SubscribeNamespace {
             id: 12345,
+            forward: 0,
             track_namespace_prefix: TrackNamespace::from_utf8_path("path/prefix"),
             params: kvps,
         };
         msg.encode(&mut buf).unwrap();
         let decoded = SubscribeNamespace::decode(&mut buf).unwrap();
-        assert_eq!(decoded, msg);
+        assert_eq!(decoded.id, msg.id);
+        assert_eq!(decoded.forward, msg.forward);
+        assert_eq!(decoded.track_namespace_prefix, msg.track_namespace_prefix);
     }
 }

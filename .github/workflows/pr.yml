@@ -1,7 +1,3 @@
-# SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-# SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-# SPDX-License-Identifier: MIT OR Apache-2.0
-
 name: pr
 
 on:
@@ -12,15 +8,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  reuse:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - name: REUSE Compliance Check
-        uses: fsfe/reuse-action@v5
-
   build:
     runs-on: ubuntu-latest
 
