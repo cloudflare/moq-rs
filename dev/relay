@@ -1,8 +1,4 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-# SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-# SPDX-License-Identifier: MIT OR Apache-2.0
-
 set -euo pipefail
 
 # Change directory to the root of the project
@@ -31,13 +27,6 @@ else
 	QLOG=""
 fi
 
-# Enable mlog logging if MLOG_DIR is set
-MLOG_DIR="${MLOG_DIR:-}"
-if [ -n "$MLOG_DIR" ]; then
-	MLOG="--mlog-dir $MLOG_DIR --mlog-serve"
-else
-	MLOG=""
-fi
 
 # A list of optional args
 ARGS=""
@@ -56,4 +45,4 @@ fi
 echo "Publish URL: https://quic.video/publish/?server=localhost:$PORT"
 
 # Run the relay and forward any arguments
-cargo run --bin moq-relay-ietf -- --bind "$BIND" --tls-cert "$CERT" --tls-key "$KEY" --dev $QLOG $MLOG $ARGS "$@"
+cargo run --bin moq-relay-ietf -- --bind "$BIND" --tls-cert "$CERT" --tls-key "$KEY" --dev $QLOG $ARGS "$@"

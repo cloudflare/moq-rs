@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! A track is a collection of semi-reliable and semi-ordered streams, split into a [Writer] and [Reader] handle.
 //!
 //! A [Writer] creates streams with a sequence number and priority.
@@ -89,14 +85,7 @@ impl TrackWriter {
         .produce();
 
         // Lock state to modify it
-        let mut state = self.state.lock_mut().ok_or_else(|| {
-            tracing::debug!(
-                namespace = %self.info.namespace.to_utf8_path(),
-                track = %self.info.name,
-                "track state dropped (Cancel) in stream()"
-            );
-            ServeError::Cancel
-        })?;
+        let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
         // Set the Stream mode to TrackReaderMode::Stream
         state.reader_mode = Some(reader.into());
@@ -112,14 +101,7 @@ impl TrackWriter {
         .produce();
 
         // Lock state to modify it
-        let mut state = self.state.lock_mut().ok_or_else(|| {
-            tracing::debug!(
-                namespace = %self.info.namespace.to_utf8_path(),
-                track = %self.info.name,
-                "track state dropped (Cancel) in subgroups()"
-            );
-            ServeError::Cancel
-        })?;
+        let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
         // Set the Stream mode to TrackReaderMode::Subgroups
         state.reader_mode = Some(reader.into());
@@ -133,14 +115,7 @@ impl TrackWriter {
         .produce();
 
         // Lock state to modify it
-        let mut state = self.state.lock_mut().ok_or_else(|| {
-            tracing::debug!(
-                namespace = %self.info.namespace.to_utf8_path(),
-                track = %self.info.name,
-                "track state dropped (Cancel) in datagrams()"
-            );
-            ServeError::Cancel
-        })?;
+        let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
 
         // Set the Stream mode to TrackReaderMode::Datagrams
         state.reader_mode = Some(reader.into());
@@ -149,23 +124,10 @@ impl TrackWriter {
 
     /// Close the track with an error.
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
-        tracing::debug!(
-            namespace = %self.info.namespace.to_utf8_path(),
-            track = %self.info.name,
-            error = %err,
-            "track closing"
-        );
         let state = self.state.lock();
         state.closed.clone()?;
 
-        let mut state = state.into_mut().ok_or_else(|| {
-            tracing::debug!(
-                namespace = %self.info.namespace.to_utf8_path(),
-                track = %self.info.name,
-                "track state already dropped during close"
-            );
-            ServeError::Cancel
-        })?;
+        let mut state = state.into_mut().ok_or(ServeError::Cancel)?;
         state.closed = Err(err);
         Ok(())
     }
@@ -359,9 +321,7 @@ mod tests {
         let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
         let (writer, reader) = track.produce();
 
-        let _subgroups_writer = writer
-            .subgroups()
-            .expect("subgroups transition should succeed");
+        let _subgroups_writer = writer.subgroups().expect("subgroups transition should succeed");
 
         assert!(
             !reader.is_closed(),
@@ -374,9 +334,7 @@ mod tests {
         let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
         let (writer, reader) = track.produce();
 
-        let subgroups_writer = writer
-            .subgroups()
-            .expect("subgroups transition should succeed");
+        let subgroups_writer = writer.subgroups().expect("subgroups transition should succeed");
         drop(subgroups_writer);
 
         assert!(
@@ -390,9 +348,7 @@ mod tests {
         let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
         let (writer, reader) = track.produce();
 
-        let subgroups_writer = writer
-            .subgroups()
-            .expect("subgroups transition should succeed");
+        let subgroups_writer = writer.subgroups().expect("subgroups transition should succeed");
         subgroups_writer.close(ServeError::Cancel).unwrap();
 
         assert!(
@@ -433,9 +389,7 @@ mod tests {
         let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
         let (writer, reader) = track.produce();
 
-        let _datagrams_writer = writer
-            .datagrams()
-            .expect("datagrams transition should succeed");
+        let _datagrams_writer = writer.datagrams().expect("datagrams transition should succeed");
 
         assert!(
             !reader.is_closed(),
@@ -448,9 +402,7 @@ mod tests {
         let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
         let (writer, reader) = track.produce();
 
-        let datagrams_writer = writer
-            .datagrams()
-            .expect("datagrams transition should succeed");
+        let datagrams_writer = writer.datagrams().expect("datagrams transition should succeed");
         drop(datagrams_writer);
 
         assert!(
@@ -464,15 +416,15 @@ mod tests {
         let track = Track::new(TrackNamespace::from_utf8_path("ns"), "t".to_string());
         let (writer, reader) = track.produce();
 
-        let mut subgroups_writer = writer
-            .subgroups()
-            .expect("subgroups transition should succeed");
+        let mut subgroups_writer =
+            writer.subgroups().expect("subgroups transition should succeed");
 
         let _subgroup_writer = subgroups_writer
             .create(Subgroup {
                 group_id: 0,
                 subgroup_id: 0,
                 priority: 0,
+                header_type: None,
             })
             .expect("create subgroup should succeed");
 

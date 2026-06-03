@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 
 /// Sent by the publisher to update the max allowed subscription ID for the session.

@@ -1,15 +1,11 @@
-# SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-# SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-# SPDX-License-Identifier: MIT OR Apache-2.0
-
 [package]
 name = "moq-api"
 description = "Media over QUIC"
-authors = ["moq-rs contributors"]
-repository = "https://github.com/cloudflare/moq-rs"
+authors = ["Luke Curley"]
+repository = "https://github.com/englishm/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.2.10"
+version = "0.2.7"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -42,6 +38,6 @@ redis = { version = "0.32", features = [
 url = { version = "2", features = ["serde"] }
 
 # Error handling
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
 thiserror = "1"

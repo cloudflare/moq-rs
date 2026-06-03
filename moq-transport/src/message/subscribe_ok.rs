@@ -1,9 +1,4 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
-use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location};
-use crate::message::GroupOrder;
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs, TrackExtensions};
 
 /// Sent by the publisher to accept a Subscribe.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,42 +9,26 @@ pub struct SubscribeOk {
     /// The identifier used for this track in Subgroups or Datagrams.
     pub track_alias: u64,
 
-    /// The time in milliseconds after which the subscription is not longer valid.
-    pub expires: u64,
-
-    /// Order groups will be delivered in
-    pub group_order: GroupOrder,
-
-    /// If content_exists, then largest_location is the location of the largest
-    /// object available for this track
-    pub content_exists: bool,
-    pub largest_location: Option<Location>, // Only provided if content_exists is 1/true
-
-    /// Subscribe Parameters
+    /// Subscribe Parameters (has count prefix per spec)
     pub params: KeyValuePairs,
+
+    /// Track extensions (NO prefix per draft-16 Section 9.10 - reads until end of message)
+    pub track_extensions: TrackExtensions,
 }
 
 impl Decode for SubscribeOk {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
         let track_alias = u64::decode(r)?;
-        let expires = u64::decode(r)?;
-        let group_order = GroupOrder::decode(r)?;
-        let content_exists = bool::decode(r)?;
-        let largest_location = match content_exists {
-            true => Some(Location::decode(r)?),
-            false => None,
-        };
         let params = KeyValuePairs::decode(r)?;
+        // Track extensions have NO prefix - read until end of message
+        let track_extensions = TrackExtensions::decode(r)?;
 
         Ok(Self {
             id,
             track_alias,
-            expires,
-            group_order,
-            content_exists,
-            largest_location,
             params,
+            track_extensions,
         })
     }
 }
@@ -58,17 +37,8 @@ impl Encode for SubscribeOk {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.id.encode(w)?;
         self.track_alias.encode(w)?;
-        self.expires.encode(w)?;
-        self.group_order.encode(w)?;
-        self.content_exists.encode(w)?;
-        if self.content_exists {
-            if let Some(largest) = &self.largest_location {
-                largest.encode(w)?;
-            } else {
-                return Err(EncodeError::MissingField("LargestLocation".to_string()));
-            }
-        }
         self.params.encode(w)?;
+        self.track_extensions.encode(w)?;
 
         Ok(())
     }
@@ -87,14 +57,15 @@ mod tests {
         let mut kvps = KeyValuePairs::new();
         kvps.set_bytesvalue(123, vec![0x00, 0x01, 0x02, 0x03]);
 
+        // Track extensions (no prefix)
+        let mut ext = TrackExtensions::new();
+        ext.set_intvalue(2, 42);
+
         let msg = SubscribeOk {
             id: 12345,
             track_alias: 100,
-            expires: 3600,
-            group_order: GroupOrder::Publisher,
-            content_exists: true,
-            largest_location: Some(Location::new(2, 3)),
-            params: kvps.clone(),
+            params: kvps,
+            track_extensions: ext,
         };
         msg.encode(&mut buf).unwrap();
         let decoded = SubscribeOk::decode(&mut buf).unwrap();
@@ -102,19 +73,22 @@ mod tests {
     }
 
     #[test]
-    fn encode_missing_fields() {
+    fn encode_decode_empty_extensions() {
         let mut buf = BytesMut::new();
 
         let msg = SubscribeOk {
-            id: 12345,
-            track_alias: 100,
-            expires: 3600,
-            group_order: GroupOrder::Publisher,
-            content_exists: true,
-            largest_location: None,
-            params: Default::default(),
+            id: 0,
+            track_alias: 0,
+            params: KeyValuePairs::new(),
+            track_extensions: TrackExtensions::new(),
         };
-        let encoded = msg.encode(&mut buf);
-        assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
+        msg.encode(&mut buf).unwrap();
+        // Expected: id=0 (1 byte), track_alias=0 (1 byte), params_count=0 (1 byte), NO track_extensions bytes
+        assert_eq!(buf.to_vec(), vec![0x00, 0x00, 0x00]);
+        let decoded = SubscribeOk::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
     }
+
+    // Note: encode_missing_fields test removed — content_exists was removed
+    // from the struct in draft-16; no fields to validate at encode time.
 }

@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! This module contains the structs and functions for the MoQ catalog format
 /// The catalog format is a JSON file that describes the tracks available in a broadcast.
 ///

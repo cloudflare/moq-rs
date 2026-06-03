@@ -6,66 +6,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.14.2](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.14.1...moq-transport-v0.14.2) - 2026-05-20
-
-### Fixed
-
-- subscribe cleaning on drop
-- apply suggestions from opencode review
-
-## [0.14.1](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.14.0...moq-transport-v0.14.1) - 2026-03-31
-
-### Other
-
-- Make repo REUSE v3.3 compliant
-- Bring copyright notices, license docs up to date
-
-## [0.14.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.13.1...moq-transport-v0.14.0) - 2026-03-27
-
-### Added
-
-- add Transport enum and connection path extraction
-
-## [0.13.1](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.13.0...moq-transport-v0.13.1) - 2026-03-02
-
-### Fixed
-
-- TrackReader::is_closed() false positive after mode transition
-
-### Other
-
-- Merge pull request #148 from englishm-cloudflare/me/fix-is-closed-false-positive
-
-## [0.13.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.12.3...moq-transport-v0.13.0) - 2026-02-18
-
-### Fixed
-
-- handle WebTransport graceful close in is_graceful_close()
-
-### Other
-
-- soften absolute claims about error conversion paths
-- remove unused direct deps from moq-transport
-- clarify graceful close semantics for WebTransport vs raw QUIC
-- Upgrade web-transport crates to v0.10.1
-
-## [0.12.3](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.12.2...moq-transport-v0.12.3) - 2026-02-18
-
-### Added
-
-- add additional debug logging for troubleshooting
-- add structured debug logging for MoQT control messages
-- *(metrics)* distinguish graceful close from connection errors
-
-### Fixed
-
-- cargo fmt and clippy lints
-- *(metrics)* address review feedback for metrics instrumentation
-
-### Other
-
-- migrate from log crate to tracing
-
 ## [0.12.2](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.12.1...moq-transport-v0.12.2) - 2026-01-29
 
 ### Fixed

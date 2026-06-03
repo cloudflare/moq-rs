@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, SessionUri};
 
 /// Sent by the server to indicate that the client should connect to a different server.

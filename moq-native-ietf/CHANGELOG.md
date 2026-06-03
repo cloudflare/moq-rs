@@ -6,40 +6,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.7.5...moq-native-ietf-v0.8.0) - 2026-04-10
-
-### Fixed
-
-- cross-platform dual-stack binding for IPv6 sockets
-
-### Other
-
-- Merge pull request #151 from englishm-cloudflare/me/ipv6-dual-stack-binding
-
-## [0.7.5](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.7.4...moq-native-ietf-v0.7.5) - 2026-03-31
-
-### Other
-
-- Make repo REUSE v3.3 compliant
-
-## [0.7.4](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.7.3...moq-native-ietf-v0.7.4) - 2026-03-27
-
-### Added
-
-- add Transport enum and connection path extraction
-
-## [0.7.3](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.7.2...moq-native-ietf-v0.7.3) - 2026-02-18
-
-### Other
-
-- Upgrade web-transport crates to v0.10.1
-
-## [0.7.2](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.7.1...moq-native-ietf-v0.7.2) - 2026-02-18
-
-### Other
-
-- migrate from log crate to tracing
-
 ## [0.7.1](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.7.0...moq-native-ietf-v0.7.1) - 2026-02-03
 
 ### Other

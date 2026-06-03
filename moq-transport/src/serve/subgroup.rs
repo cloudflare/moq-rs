@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! A stream is a stream of objects with a header, split into a [Writer] and [Reader] handle.
 //!
 //! A [Writer] writes an ordered stream of objects.
@@ -98,6 +95,7 @@ impl SubgroupsWriter {
             group_id,
             subgroup_id,
             priority,
+            header_type: None,
         })
     }
 
@@ -108,6 +106,7 @@ impl SubgroupsWriter {
             group_id: subgroup.group_id,
             subgroup_id: subgroup.subgroup_id,
             priority: subgroup.priority,
+            header_type: subgroup.header_type,
         };
         let (writer, reader) = subgroup.produce();
 
@@ -117,8 +116,17 @@ impl SubgroupsWriter {
             // TODO: Check this logic again
             if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Equal {
                 match writer.subgroup_id.cmp(&latest.subgroup_id) {
-                    cmp::Ordering::Less => return Ok(writer), // dropped immediately, lul
-                    cmp::Ordering::Equal => return Err(ServeError::Duplicate),
+                    cmp::Ordering::Less => return Ok(writer), // dropped immediately
+                    cmp::Ordering::Equal => {
+                        // Duplicate subgroup - silently drop instead of erroring
+                        // This can happen with SubgroupZeroIdEndOfGroup streams
+                        log::warn!(
+                            "duplicate subgroup: group_id={}, subgroup_id={} - dropping",
+                            writer.group_id,
+                            writer.subgroup_id
+                        );
+                        return Ok(writer); // writer dropped, data lost but relay continues
+                    }
                     cmp::Ordering::Greater => state.latest_subgroup_reader = Some(reader),
                 }
             } else if writer.group_id.cmp(&latest.group_id) == cmp::Ordering::Greater {
@@ -231,6 +239,9 @@ pub struct Subgroup {
 
     // The priority of the group within the track.
     pub priority: u8,
+
+    // The stream header type used for this subgroup (preserved from incoming stream)
+    pub header_type: Option<crate::data::StreamHeaderType>,
 }
 
 /// Static information about the group
@@ -248,6 +259,9 @@ pub struct SubgroupInfo {
 
     // The priority of the group within the track.
     pub priority: u8,
+
+    // The stream header type used for this subgroup (preserved from incoming stream)
+    pub header_type: Option<crate::data::StreamHeaderType>,
 }
 
 impl SubgroupInfo {
@@ -323,10 +337,20 @@ impl SubgroupWriter {
         size: usize,
         extension_headers: Option<crate::data::ExtensionHeaders>,
     ) -> Result<SubgroupObjectWriter, ServeError> {
+        self.create_with_status(size, extension_headers, ObjectStatus::NormalObject)
+    }
+
+    /// Write an object with a specific status (e.g., EndOfGroup).
+    pub fn create_with_status(
+        &mut self,
+        size: usize,
+        extension_headers: Option<crate::data::ExtensionHeaders>,
+        status: ObjectStatus,
+    ) -> Result<SubgroupObjectWriter, ServeError> {
         let (writer, reader) = SubgroupObject {
             group: self.info.clone(),
             object_id: self.next_object_id,
-            status: ObjectStatus::NormalObject,
+            status,
             size,
             extension_headers: extension_headers.unwrap_or_default(),
         }
@@ -338,6 +362,16 @@ impl SubgroupWriter {
         state.objects.push(reader);
 
         Ok(writer)
+    }
+
+    /// Write an EndOfGroup marker object to signal the end of this subgroup.
+    /// This should be called when the group is complete.
+    pub fn end_of_group(&mut self) -> Result<(), ServeError> {
+        // Create an object with size=0 and status=EndOfGroup
+        let object_writer = self.create_with_status(0, None, ObjectStatus::EndOfGroup)?;
+        // Object writer with size=0 will complete immediately when dropped
+        drop(object_writer);
+        Ok(())
     }
 
     /// Close the stream with an error.

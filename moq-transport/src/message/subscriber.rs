@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::message::{self, Message};
 use std::fmt;
 
@@ -57,10 +53,8 @@ subscriber_msgs! {
     FetchCancel,
     TrackStatus,
     SubscribeNamespace,
-    UnsubscribeNamespace,
     PublishNamespaceCancel,
-    PublishNamespaceOk,
-    PublishNamespaceError,
+    RequestOk,
     PublishOk,
-    PublishError,
+    RequestError,
 }

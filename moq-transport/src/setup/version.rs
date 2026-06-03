@@ -1,7 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::coding::{Decode, DecodeError, Encode, EncodeError, VarInt};
 
 use std::fmt;
@@ -27,6 +23,12 @@ impl Version {
 
     /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-14.html
     pub const DRAFT_14: Version = Version(0xff00000e);
+
+    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-15.html
+    pub const DRAFT_15: Version = Version(0xff00000f);
+
+    /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-16.html
+    pub const DRAFT_16: Version = Version(0xff000010);
 }
 
 impl From<u32> for Version {

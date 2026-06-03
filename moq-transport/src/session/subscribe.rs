@@ -1,13 +1,8 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use std::ops;
 
 use crate::{
-    coding::{KeyValuePairs, Location, TrackNamespace},
-    data,
-    message::{self, FilterType, GroupOrder},
+    coding::{KeyValuePairs, TrackNamespace},
+    data, message,
     serve::{self, ServeError, TrackWriter, TrackWriterMode},
 };
 
@@ -21,22 +16,6 @@ pub struct SubscribeInfo {
     pub id: u64,
     pub track_namespace: TrackNamespace,
     pub track_name: String,
-
-    /// Subscriber Priority
-    pub subscriber_priority: u8,
-    pub group_order: GroupOrder,
-
-    /// Forward Flag
-    pub forward: bool,
-
-    /// Filter type
-    pub filter_type: FilterType,
-
-    /// The starting location for this subscription. Only present for "AbsoluteStart" and "AbsoluteRange" filter types.
-    pub start_location: Option<Location>,
-    /// End group id, inclusive, for the subscription, if applicable. Only present for "AbsoluteRange" filter type.
-    pub end_group_id: Option<u64>,
-
     /// Optional parameters
     pub params: KeyValuePairs,
 
@@ -50,12 +29,6 @@ impl SubscribeInfo {
             id: msg.id,
             track_namespace: msg.track_namespace.clone(),
             track_name: msg.track_name.clone(),
-            subscriber_priority: msg.subscriber_priority,
-            group_order: msg.group_order,
-            forward: msg.forward,
-            filter_type: msg.filter_type,
-            start_location: msg.start_location,
-            end_group_id: msg.end_group_id,
             params: msg.params.clone(),
             track_status: false,
         }
@@ -97,13 +70,6 @@ impl Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
-            // TODO add prioritization logic on the publisher side
-            subscriber_priority: 127, // default to mid value, see: https://github.com/moq-wg/moq-transport/issues/504
-            group_order: GroupOrder::Publisher, // defer to publisher send order
-            forward: true,            // default to forwarding objects
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
             params: Default::default(),
         };
         let info = SubscribeInfo::new_from_subscribe(&subscribe_message);
@@ -140,32 +106,12 @@ impl Subscribe {
             .await;
         }
     }
-
-    pub async fn ok(&self) -> Result<(), ServeError> {
-        loop {
-            {
-                let state = self.state.lock();
-                state.closed.clone()?;
-
-                if state.ok {
-                    return Ok(());
-                }
-
-                match state.modified() {
-                    Some(notify) => notify,
-                    None => return Err(ServeError::Done),
-                }
-            }
-            .await;
-        }
-    }
 }
 
 impl Drop for Subscribe {
     fn drop(&mut self) {
         self.subscriber
             .send_message(message::Unsubscribe { id: self.info.id });
-        self.subscriber.remove_subscribe(self.info.id);
     }
 }
 
@@ -229,16 +175,20 @@ impl SubscribeRecv {
             _ => return Err(ServeError::Mode),
         };
 
-        let writer = subgroups.create(serve::Subgroup {
+        let result = subgroups.create(serve::Subgroup {
             group_id: header.group_id,
             // When subgroup_id is not present in the header type, it implicitly means subgroup 0
             subgroup_id: header.subgroup_id.unwrap_or(0),
-            priority: header.publisher_priority,
-        })?;
+            // When priority is not present (NoPriority header types), default to 0
+            priority: header.publisher_priority.unwrap_or(0),
+            // Preserve the incoming header type for forwarding
+            header_type: Some(header.header_type),
+        });
 
+        // Always put writer back, even on error, to avoid losing it
         self.writer = Some(subgroups.into());
 
-        Ok(writer)
+        result
     }
 
     pub fn datagram(&mut self, datagram: data::Datagram) -> Result<(), ServeError> {
@@ -248,23 +198,39 @@ impl SubscribeRecv {
             TrackWriterMode::Track(track) => {
                 // convert Track -> Datagrams writer, write, then put Datagrams back
                 let mut datagrams = track.datagrams()?;
+                // Determine status from datagram type or explicit status field
+                let status = if datagram.datagram_type.is_end_of_group() {
+                    Some(crate::data::ObjectStatus::EndOfGroup)
+                } else {
+                    datagram.status
+                };
                 datagrams.write(serve::Datagram {
                     group_id: datagram.group_id,
                     object_id: datagram.object_id.unwrap_or(0),
-                    priority: datagram.publisher_priority,
+                    // When priority is not present (NoPriority datagram types), default to 0
+                    priority: datagram.publisher_priority.unwrap_or(0),
                     payload: datagram.payload.unwrap_or_default(),
                     extension_headers: datagram.extension_headers.unwrap_or_default(),
+                    status,
                 })?;
                 self.writer = Some(TrackWriterMode::Datagrams(datagrams));
                 Ok(())
             }
             TrackWriterMode::Datagrams(mut datagrams) => {
+                // Determine status from datagram type or explicit status field
+                let status = if datagram.datagram_type.is_end_of_group() {
+                    Some(crate::data::ObjectStatus::EndOfGroup)
+                } else {
+                    datagram.status
+                };
                 datagrams.write(serve::Datagram {
                     group_id: datagram.group_id,
                     object_id: datagram.object_id.unwrap_or(0),
-                    priority: datagram.publisher_priority,
+                    // When priority is not present (NoPriority datagram types), default to 0
+                    priority: datagram.publisher_priority.unwrap_or(0),
                     payload: datagram.payload.unwrap_or_default(),
                     extension_headers: datagram.extension_headers.unwrap_or_default(),
+                    status,
                 })?;
                 self.writer = Some(TrackWriterMode::Datagrams(datagrams));
                 Ok(())

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! File-based coordinator for multi-relay deployments.
 //!
 //! This coordinator uses a shared JSON file with file locking to coordinate
@@ -27,15 +24,11 @@ use moq_relay_ietf::{
 /// Data stored in the shared file
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CoordinatorData {
-    /// Maps connection scope to namespace map
-    namespaces: HashMap<String, HashMap<String, String>>,
+    /// Maps namespace path (e.g., "/foo/bar") to relay URL
+    namespaces: HashMap<String, String>,
 }
 
 impl CoordinatorData {
-    fn scope_key(scope: Option<&str>) -> String {
-        scope.unwrap_or("").to_string()
-    }
-
     fn namespace_key(namespace: &TrackNamespace) -> String {
         namespace.to_utf8_path()
     }
@@ -43,23 +36,20 @@ impl CoordinatorData {
 
 /// Handle that unregisters a namespace when dropped
 struct NamespaceUnregisterHandle {
-    scope_key: String,
-    namespace_key: String,
+    namespace: TrackNamespace,
     file_path: PathBuf,
 }
 
 impl Drop for NamespaceUnregisterHandle {
     fn drop(&mut self) {
-        if let Err(err) =
-            unregister_namespace_sync(&self.file_path, &self.scope_key, &self.namespace_key)
-        {
-            tracing::warn!(namespace = %self.namespace_key, error = %err, "failed to unregister namespace on drop: {}", err);
+        if let Err(err) = unregister_namespace_sync(&self.file_path, &self.namespace) {
+            log::warn!("failed to unregister namespace on drop: {}", err);
         }
     }
 }
 
 /// Synchronous helper for unregistering namespace (used in Drop)
-fn unregister_namespace_sync(file_path: &Path, scope_key: &str, namespace_key: &str) -> Result<()> {
+fn unregister_namespace_sync(file_path: &Path, namespace: &TrackNamespace) -> Result<()> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -70,13 +60,10 @@ fn unregister_namespace_sync(file_path: &Path, scope_key: &str, namespace_key: &
     file.lock_exclusive()?;
 
     let mut data = read_data(&file)?;
-    tracing::debug!(namespace = %namespace_key, scope = %scope_key, "unregistering namespace: {}", namespace_key);
-    if let Some(bucket) = data.namespaces.get_mut(scope_key) {
-        bucket.remove(namespace_key);
-        if bucket.is_empty() {
-            data.namespaces.remove(scope_key);
-        }
-    }
+    let key = CoordinatorData::namespace_key(namespace);
+
+    log::debug!("unregistering namespace: {}", key);
+    data.namespaces.remove(&key);
 
     write_data(&file, &data)?;
     file.unlock()?;
@@ -96,9 +83,7 @@ fn read_data(file: &File) -> Result<CoordinatorData> {
         return Ok(CoordinatorData::default());
     }
 
-    let data: CoordinatorData =
-        serde_json::from_str(&contents).context("failed to parse coordinator data")?;
-    Ok(data)
+    serde_json::from_str(&contents).context("failed to parse coordinator data")
 }
 
 /// Write coordinator data to file
@@ -143,17 +128,14 @@ impl FileCoordinator {
 impl Coordinator for FileCoordinator {
     async fn register_namespace(
         &self,
-        scope: Option<&str>,
         namespace: &TrackNamespace,
     ) -> CoordinatorResult<NamespaceRegistration> {
-        let scope_key = CoordinatorData::scope_key(scope);
-        let namespace_key = CoordinatorData::namespace_key(namespace);
+        let namespace = namespace.clone();
         let relay_url = self.relay_url.to_string();
         let file_path = self.file_path.clone();
 
         // Run blocking file I/O in a separate thread
-        let scope_clone = scope_key.clone();
-        let key_clone = namespace_key.clone();
+        let ns_clone = namespace.clone();
         tokio::task::spawn_blocking(move || {
             let file = OpenOptions::new()
                 .read(true)
@@ -165,12 +147,10 @@ impl Coordinator for FileCoordinator {
             file.lock_exclusive()?;
 
             let mut data = read_data(&file)?;
-            tracing::info!(namespace = %key_clone, scope = %scope_clone, relay_url = %relay_url, "registering namespace: {} -> {}", key_clone, relay_url);
-            data
-                .namespaces
-                .entry(scope_clone)
-                .or_default()
-                .insert(key_clone, relay_url);
+            let key = CoordinatorData::namespace_key(&ns_clone);
+
+            log::info!("registering namespace: {} -> {}", key, relay_url);
+            data.namespaces.insert(key, relay_url);
 
             write_data(&file, &data)?;
             file.unlock()?;
@@ -180,8 +160,7 @@ impl Coordinator for FileCoordinator {
         .await??;
 
         let handle = NamespaceUnregisterHandle {
-            scope_key,
-            namespace_key,
+            namespace,
             file_path: self.file_path.clone(),
         };
 
@@ -190,31 +169,21 @@ impl Coordinator for FileCoordinator {
 
     // FIXME(itzmanish): Not being called currently but we need to call this on publish_namespace_done
     // currently unregister happens on drop of namespace
-    async fn unregister_namespace(
-        &self,
-        scope: Option<&str>,
-        namespace: &TrackNamespace,
-    ) -> CoordinatorResult<()> {
-        let scope_key = CoordinatorData::scope_key(scope);
-        let namespace_key = CoordinatorData::namespace_key(namespace);
+    async fn unregister_namespace(&self, namespace: &TrackNamespace) -> CoordinatorResult<()> {
+        let namespace = namespace.clone();
         let file_path = self.file_path.clone();
 
-        tokio::task::spawn_blocking(move || {
-            unregister_namespace_sync(&file_path, &scope_key, &namespace_key)
-        })
-        .await??;
+        tokio::task::spawn_blocking(move || unregister_namespace_sync(&file_path, &namespace))
+            .await??;
 
         Ok(())
     }
 
     async fn lookup(
         &self,
-        scope: Option<&str>,
         namespace: &TrackNamespace,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
         let namespace = namespace.clone();
-        let scope_key = CoordinatorData::scope_key(scope);
-        let namespace_key = CoordinatorData::namespace_key(&namespace);
         let file_path = self.file_path.clone();
 
         let result = tokio::task::spawn_blocking(
@@ -229,15 +198,12 @@ impl Coordinator for FileCoordinator {
                 file.lock_shared()?;
 
                 let data = read_data(&file)?;
-                tracing::debug!(namespace = %namespace_key, scope = %scope_key, "looking up namespace: {}", namespace_key);
+                let key = CoordinatorData::namespace_key(&namespace);
 
-                let Some(bucket) = data.namespaces.get(&scope_key) else {
-                    file.unlock()?;
-                    return Ok(None);
-                };
+                log::debug!("looking up namespace: {}", key);
 
                 // Try exact match first
-                if let Some(relay_url) = bucket.get(&namespace_key) {
+                if let Some(relay_url) = data.namespaces.get(&key) {
                     file.unlock()?;
                     let url = Url::parse(relay_url)?;
                     return Ok(Some((NamespaceOrigin::new(namespace, url, None), None)));
@@ -245,12 +211,12 @@ impl Coordinator for FileCoordinator {
 
                 // Try prefix matching (find longest matching prefix)
                 let mut best_match: Option<(String, String)> = None;
-                for (registered_key, url) in bucket {
+                for (registered_key, url) in &data.namespaces {
                     // FIXME(itzmanish): it would be much better to compare on TupleField
                     // instead of working on strings
                     let is_prefix = registered_key
                         .split('/')
-                        .zip(namespace_key.split('/'))
+                        .zip(key.split('/'))
                         .all(|(a, b)| a == b);
                     match best_match {
                         Some((ns, _)) if is_prefix && ns.len() < registered_key.len() => {

@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
 use std::fmt;
 
@@ -51,23 +48,56 @@ impl KeyValuePair {
             value: Value::BytesValue(value),
         }
     }
-}
 
-impl Decode for KeyValuePair {
-    fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        let key = u64::decode(r)?;
+    /// Validate that the key parity matches the value type.
+    /// Even keys => IntValue, Odd keys => BytesValue.
+    fn validate_key_parity(&self) -> Result<(), EncodeError> {
+        match &self.value {
+            Value::IntValue(_) => {
+                if !self.key.is_multiple_of(2) {
+                    return Err(EncodeError::InvalidValue);
+                }
+            }
+            Value::BytesValue(_) => {
+                if self.key.is_multiple_of(2) {
+                    return Err(EncodeError::InvalidValue);
+                }
+            }
+        }
+        Ok(())
+    }
 
-        if key % 2 == 0 {
+    /// Encode only the value portion of this KVP (not the key/delta).
+    /// The caller is responsible for encoding the key or delta type.
+    pub(crate) fn encode_value<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        self.validate_key_parity()?;
+        match &self.value {
+            Value::IntValue(v) => {
+                (*v).encode(w)?;
+            }
+            Value::BytesValue(v) => {
+                v.len().encode(w)?;
+                Self::encode_remaining(w, v.len())?;
+                w.put_slice(v);
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode only the value portion of a KVP given the absolute key.
+    /// The caller has already decoded the key/delta and resolved the absolute key.
+    pub(crate) fn decode_value<R: bytes::Buf>(key: u64, r: &mut R) -> Result<Self, DecodeError> {
+        if key.is_multiple_of(2) {
             // VarInt variant
             let value = u64::decode(r)?;
-            tracing::trace!("[KVP] Decoded even key={}, value={}", key, value);
+            log::trace!("[KVP] Decoded even key={}, value={}", key, value);
             Ok(KeyValuePair::new_int(key, value))
         } else {
             // Bytes variant
             let length = usize::decode(r)?;
-            tracing::trace!("[KVP] Decoded odd key={}, length={}", key, length);
+            log::trace!("[KVP] Decoded odd key={}, length={}", key, length);
             if length > u16::MAX as usize {
-                tracing::error!(
+                log::error!(
                     "[KVP] Length exceeded! key={}, length={} (max={})",
                     key,
                     length,
@@ -84,30 +114,22 @@ impl Decode for KeyValuePair {
     }
 }
 
+/// Legacy Decode for KeyValuePair — reads absolute key from wire.
+/// Used only by ExtensionHeaders which reads KVPs from a bounded byte slice.
+impl Decode for KeyValuePair {
+    fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+        let key = u64::decode(r)?;
+        Self::decode_value(key, r)
+    }
+}
+
+/// Legacy Encode for KeyValuePair — writes absolute key to wire.
+/// Used only by ExtensionHeaders which writes KVPs into a temporary buffer.
 impl Encode for KeyValuePair {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        match &self.value {
-            Value::IntValue(v) => {
-                // key must be even for IntValue
-                if !self.key.is_multiple_of(2) {
-                    return Err(EncodeError::InvalidValue);
-                }
-                self.key.encode(w)?;
-                (*v).encode(w)?;
-                Ok(())
-            }
-            Value::BytesValue(v) => {
-                // key must be odd for BytesValue
-                if self.key.is_multiple_of(2) {
-                    return Err(EncodeError::InvalidValue);
-                }
-                self.key.encode(w)?;
-                v.len().encode(w)?;
-                Self::encode_remaining(w, v.len())?;
-                w.put_slice(v);
-                Ok(())
-            }
-        }
+        self.validate_key_parity()?;
+        self.key.encode(w)?;
+        self.encode_value(w)
     }
 }
 
@@ -119,7 +141,10 @@ impl fmt::Debug for KeyValuePair {
 
 /// A collection of KeyValuePair entries, where the number of key-value-pairs are encoded/decoded first.
 /// This structure is appropriate for Control message parameters.
-/// Since duplicate parameters are allowed for unknown parameters, we don't do duplicate checking here.
+///
+/// Per draft-16 Section 1.4.2, Key-Value-Pairs use delta-encoded Type fields:
+/// each Type is encoded as a delta from the previous Type (or from 0 for the first).
+/// Entries are sorted by key (Type) in ascending order for encoding.
 #[derive(Default, Clone, Eq, PartialEq)]
 pub struct KeyValuePairs(pub Vec<KeyValuePair>);
 
@@ -153,16 +178,49 @@ impl KeyValuePairs {
     pub fn get(&self, key: u64) -> Option<&KeyValuePair> {
         self.0.iter().find(|k| k.key == key)
     }
+
+    /// Get an integer value by key, returning None if not found or if the value is not an integer
+    pub fn get_intvalue(&self, key: u64) -> Option<u64> {
+        self.get(key).and_then(|kvp| match &kvp.value {
+            Value::IntValue(v) => Some(*v),
+            Value::BytesValue(_) => None,
+        })
+    }
+
+    /// Get a bytes value by key, returning None if not found or if the value is not bytes
+    pub fn get_bytesvalue(&self, key: u64) -> Option<&Vec<u8>> {
+        self.get(key).and_then(|kvp| match &kvp.value {
+            Value::IntValue(_) => None,
+            Value::BytesValue(v) => Some(v),
+        })
+    }
 }
 
 impl Decode for KeyValuePairs {
-    fn decode<R: bytes::Buf>(mut r: &mut R) -> Result<Self, DecodeError> {
+    /// Decode Key-Value-Pairs with delta-encoded Type fields (draft-16 Section 1.4.2).
+    fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let mut kvps = Vec::new();
 
         let count = u64::decode(r)?;
+        let mut prev_key: u64 = 0;
+
         for _ in 0..count {
-            let kvp = KeyValuePair::decode(&mut r)?;
+            // Read delta type
+            let delta = u64::decode(r)?;
+
+            // Reconstruct absolute key: prev_key + delta
+            let key = prev_key.checked_add(delta).ok_or_else(|| {
+                log::error!(
+                    "[KVP] Delta type overflow: prev_key={}, delta={}",
+                    prev_key,
+                    delta
+                );
+                DecodeError::BoundsExceeded(crate::coding::BoundsExceeded)
+            })?;
+
+            let kvp = KeyValuePair::decode_value(key, r)?;
             kvps.push(kvp);
+            prev_key = key;
         }
 
         Ok(KeyValuePairs(kvps))
@@ -170,11 +228,32 @@ impl Decode for KeyValuePairs {
 }
 
 impl Encode for KeyValuePairs {
+    /// Encode Key-Value-Pairs with delta-encoded Type fields (draft-16 Section 1.4.2).
+    /// Entries are sorted by key in ascending order before encoding.
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.0.len().encode(w)?;
 
-        for kvp in &self.0 {
-            kvp.encode(w)?;
+        // Sort by key for delta encoding (Types must be in ascending order)
+        let mut sorted: Vec<&KeyValuePair> = self.0.iter().collect();
+        sorted.sort_by_key(|kvp| kvp.key);
+
+        let mut prev_key: u64 = 0;
+        for kvp in sorted {
+            // Compute and encode the delta
+            let delta = kvp.key.checked_sub(prev_key).ok_or_else(|| {
+                log::error!(
+                    "[KVP] Keys not sortable: prev_key={}, current_key={}",
+                    prev_key,
+                    kvp.key
+                );
+                EncodeError::InvalidValue
+            })?;
+            delta.encode(w)?;
+
+            // Encode the value (without the key)
+            kvp.encode_value(w)?;
+
+            prev_key = kvp.key;
         }
 
         Ok(())
@@ -246,9 +325,10 @@ mod tests {
     }
 
     #[test]
-    fn encode_decode_keyvaluepairs() {
+    fn encode_decode_keyvaluepairs_single() {
         let mut buf = BytesMut::new();
 
+        // Single entry: key=1 (odd, bytes). Delta from 0 = 1.
         let mut kvps = KeyValuePairs::new();
         kvps.set_bytesvalue(1, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
         kvps.encode(&mut buf).unwrap();
@@ -256,21 +336,79 @@ mod tests {
             buf.to_vec(),
             vec![
                 0x01, // 1 KeyValuePair
-                0x01, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05, // Key=1, Value=[1,2,3,4,5]
+                // Delta=1 (from 0), then length=5, then data
+                0x01, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05,
             ]
         );
         let decoded = KeyValuePairs::decode(&mut buf).unwrap();
         assert_eq!(decoded, kvps);
+    }
 
+    #[test]
+    fn encode_decode_keyvaluepairs_multiple() {
+        let mut buf = BytesMut::new();
+
+        // Multiple entries inserted out of order — encoding should sort by key.
+        // Keys: 0 (even, int), 1 (odd, bytes), 100 (even, int)
         let mut kvps = KeyValuePairs::new();
         kvps.set_intvalue(0, 0);
         kvps.set_intvalue(100, 100);
         kvps.set_bytesvalue(1, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
         kvps.encode(&mut buf).unwrap();
-        let buf_vec = buf.to_vec();
-        //  Validate the encoded length and the KeyValuePair count
-        assert_eq!(14, buf_vec.len()); // 14 bytes total
-        assert_eq!(3, buf_vec[0]); // 3 KeyValuePairs
+
+        #[rustfmt::skip]
+        let expected = vec![
+            0x03, // 3 KeyValuePairs
+            // Entry 1: key=0 (delta=0 from 0), even, int value=0
+            0x00, 0x00,
+            // Entry 2: key=1 (delta=1 from 0), odd, bytes len=5
+            0x01, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05,
+            // Entry 3: key=100 (delta=99 from 1), even, int value=100
+            0x40, 0x63, 0x40, 0x64,
+        ];
+        assert_eq!(buf.to_vec(), expected);
+
+        // Decode and verify — decoded entries will be in sorted order
+        let decoded = KeyValuePairs::decode(&mut buf).unwrap();
+        // Build expected sorted kvps for comparison
+        let mut expected_kvps = KeyValuePairs::new();
+        expected_kvps.set_intvalue(0, 0);
+        expected_kvps.set_bytesvalue(1, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+        expected_kvps.set_intvalue(100, 100);
+        assert_eq!(decoded, expected_kvps);
+    }
+
+    #[test]
+    fn encode_decode_keyvaluepairs_roundtrip_sorted() {
+        let mut buf = BytesMut::new();
+
+        // Insert in sorted order — should roundtrip exactly
+        let mut kvps = KeyValuePairs::new();
+        kvps.set_intvalue(2, 42);
+        kvps.set_intvalue(4, 100);
+        kvps.encode(&mut buf).unwrap();
+
+        #[rustfmt::skip]
+        let expected = vec![
+            0x02, // 2 KeyValuePairs
+            // Entry 1: key=2 (delta=2), int value=42
+            0x02, 0x2a,
+            // Entry 2: key=4 (delta=2 from 2), int value=100
+            0x02, 0x40, 0x64,
+        ];
+        assert_eq!(buf.to_vec(), expected);
+
+        let decoded = KeyValuePairs::decode(&mut buf).unwrap();
+        assert_eq!(decoded, kvps);
+    }
+
+    #[test]
+    fn encode_decode_keyvaluepairs_empty() {
+        let mut buf = BytesMut::new();
+
+        let kvps = KeyValuePairs::new();
+        kvps.encode(&mut buf).unwrap();
+        assert_eq!(buf.to_vec(), vec![0x00]); // count=0
         let decoded = KeyValuePairs::decode(&mut buf).unwrap();
         assert_eq!(decoded, kvps);
     }

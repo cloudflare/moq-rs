@@ -1,10 +1,7 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use std::{io::Cursor, sync::Arc};
 
 use anyhow::Context;
+use log::{debug, info, trace, warn};
 use moq_transport::serve::{
     SubgroupObjectReader, SubgroupReader, TrackReader, TrackReaderMode, Tracks, TracksReader,
     TracksWriter,
@@ -16,7 +13,6 @@ use tokio::{
     sync::Mutex,
     task::JoinSet,
 };
-use tracing::{debug, info, trace, warn};
 
 pub struct Media<O> {
     subscriber: Subscriber,
@@ -187,16 +183,54 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 
     async fn recv_group(mut group: SubgroupReader, out: Arc<Mutex<O>>) -> anyhow::Result<()> {
         trace!("group={} start", group.group_id);
+
+        // Pair moof+mdat into a single atomic write to prevent concurrent
+        // audio/video tasks from interleaving between them on stdout.
+        let mut pending_moof: Option<Vec<u8>> = None;
+
         while let Some(object) = group.next().await? {
             trace!(
                 "group={} fragment={} start",
                 group.group_id,
                 object.object_id
             );
-            let out = out.clone();
             let buf = Self::recv_object(object).await?;
 
-            out.lock().await.write_all(&buf).await?;
+            let is_moof = buf.len() >= 8 && &buf[4..8] == b"moof";
+            let is_mdat = buf.len() >= 8 && &buf[4..8] == b"mdat";
+
+            if is_moof {
+                if let Some(orphan) = pending_moof.take() {
+                    warn!(
+                        "group={}: flushing orphaned moof ({} bytes) without mdat",
+                        group.group_id,
+                        orphan.len()
+                    );
+                    out.lock().await.write_all(&orphan).await?;
+                }
+                pending_moof = Some(buf);
+            } else if is_mdat {
+                if let Some(mut moof) = pending_moof.take() {
+                    moof.extend_from_slice(&buf);
+                    out.lock().await.write_all(&moof).await?;
+                } else {
+                    warn!(
+                        "group={}: mdat without preceding moof ({} bytes)",
+                        group.group_id,
+                        buf.len()
+                    );
+                    out.lock().await.write_all(&buf).await?;
+                }
+            } else {
+                if let Some(orphan) = pending_moof.take() {
+                    out.lock().await.write_all(&orphan).await?;
+                }
+                out.lock().await.write_all(&buf).await?;
+            }
+        }
+
+        if let Some(orphan) = pending_moof.take() {
+            out.lock().await.write_all(&orphan).await?;
         }
 
         Ok(())

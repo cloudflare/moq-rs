@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! MoQ Transport logging (mlog) following qlog patterns
 //!
 //! Based on draft-pardue-moq-qlog-moq-events but adapted for MoQ Transport draft-14

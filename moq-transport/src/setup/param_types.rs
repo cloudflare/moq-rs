@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 /// Setup Parameter Types
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
@@ -10,7 +7,11 @@ pub enum ParameterType {
     AuthorizationToken = 0x3,
     MaxAuthTokenCacheSize = 0x4,
     Authority = 0x5,
+    /// Maximum number of Range pairs allowed per subscription/fetch (PR #1518)
+    MaxFilterRanges = 0x6,
     MOQTImplementation = 0x7,
+    /// Maximum value for MaxTracksSelected parameter in TRACK_FILTER (PR #1518)
+    MaxTracksSelected = 0x8,
 }
 
 impl From<ParameterType> for u64 {
