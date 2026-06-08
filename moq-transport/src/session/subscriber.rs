@@ -877,13 +877,14 @@ impl Subscriber {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::atomic, task::Poll};
+    use std::task::Poll;
 
     use super::*;
     use crate::{message, serve::Track};
 
     fn subscriber() -> Subscriber {
-        Subscriber::new(Queue::default(), Arc::new(atomic::AtomicU64::new(0)), None)
+        let request_id = RequestId::new(0, 100, 100, 0);
+        Subscriber::new(Queue::default(), None, request_id)
     }
 
     #[tokio::test]
