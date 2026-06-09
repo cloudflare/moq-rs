@@ -16,7 +16,7 @@ use crate::{
     data,
     message::{self, Message, RequestErrorCode},
     mlog,
-    serve::{self, FullTrackName, ServeError, TrackReader},
+    serve::{self, FullTrackName, ServeError},
 };
 
 use crate::watch::Queue;
@@ -168,17 +168,6 @@ impl Subscriber {
     /// [`PublishReceived::ok`] or dropped to reject.
     pub async fn publish_received(&mut self) -> Option<PublishReceived> {
         self.publish_received_queue.pop().await
-    }
-
-    /// Take the [`TrackReader`] stored for a PUBLISH request id.
-    ///
-    /// Called by [`PublishReceived::ok`] exactly once per subscription.
-    pub(super) fn take_publish_received_reader(&self, request_id: u64) -> Option<TrackReader> {
-        self.publishes_received
-            .lock()
-            .ok()?
-            .get_mut(&request_id)?
-            .take_reader()
     }
 
     /// Remove all subscriber-side state for an inbound PUBLISH.

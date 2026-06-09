@@ -502,6 +502,27 @@ pub trait Coordinator: Send + Sync {
         namespace: &TrackNamespace,
     ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)>;
 
+    /// Lookup where a specific track is served from.
+    ///
+    /// Called when a subscriber requests a full track name. Implementations
+    /// should prefer exact track registrations created by PUBLISH, then fall
+    /// back to namespace routing created by PUBLISH_NAMESPACE. This keeps the
+    /// common caller ergonomic while still allowing a single PUBLISH track to be
+    /// routed without pretending the whole namespace was published.
+    ///
+    /// # Default Implementation
+    ///
+    /// Falls back to [`lookup`], so existing coordinators that only implement
+    /// namespace-level routing retain their current behavior.
+    async fn lookup_track(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+        _track: &str,
+    ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        self.lookup(scope, namespace).await
+    }
+
     /// Graceful shutdown of the coordinator.
     ///
     /// Called when the relay is shutting down. Implementations should:
@@ -1101,6 +1122,30 @@ mod tests {
                 }
                 None => Err(CoordinatorError::NamespaceNotFound),
             }
+        }
+
+        async fn lookup_track(
+            &self,
+            scope: Option<&str>,
+            namespace: &TrackNamespace,
+            track: &str,
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+            let scope_key = MockState::scope_key(scope);
+            let track_key = MockState::track_key(namespace, track);
+
+            {
+                let state = self.state.lock().unwrap();
+                if let Some(relay_url) = state
+                    .tracks
+                    .get(&scope_key)
+                    .and_then(|bucket| bucket.get(&track_key))
+                {
+                    let url = Url::parse(relay_url).unwrap();
+                    return Ok((NamespaceOrigin::new(namespace.clone(), url, None), None));
+                }
+            }
+
+            self.lookup(scope, namespace).await
         }
 
         async fn get_scope_config(&self, scope: Option<&str>) -> CoordinatorResult<ScopeConfig> {
@@ -1748,6 +1793,44 @@ mod tests {
         assert!(names.contains(&"video-1080p"));
         assert!(names.contains(&"video-480p"));
         assert!(names.contains(&"audio-en"));
+    }
+
+    #[tokio::test]
+    async fn lookup_track_finds_exact_registered_track() {
+        let coord = MockCoordinator::new("https://relay-1.example.com");
+        let scope = Some("content-provider-123");
+        let match_ns = ns("sports/football/match-42");
+
+        let _reg = coord
+            .register_track(scope, &match_ns, "video-1080p")
+            .await
+            .unwrap();
+
+        let (origin, client) = coord
+            .lookup_track(scope, &match_ns, "video-1080p")
+            .await
+            .unwrap();
+
+        assert_eq!(origin.namespace(), &match_ns);
+        assert_eq!(origin.url().as_str(), "https://relay-1.example.com/");
+        assert!(client.is_none());
+    }
+
+    #[tokio::test]
+    async fn lookup_track_falls_back_to_namespace_registration() {
+        let coord = MockCoordinator::new("https://relay-1.example.com");
+        let scope = Some("content-provider-123");
+        let match_ns = ns("sports/football/match-42");
+
+        let _namespace = coord.register_namespace(scope, &match_ns).await.unwrap();
+
+        let (origin, client) = coord
+            .lookup_track(scope, &match_ns, "video-1080p")
+            .await
+            .unwrap();
+        assert_eq!(origin.namespace(), &match_ns);
+        assert_eq!(origin.url().as_str(), "https://relay-1.example.com/");
+        assert!(client.is_none());
     }
 
     #[tokio::test]

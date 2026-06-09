@@ -3,7 +3,7 @@
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    serve::{ServeError, TracksReader},
+    serve::{FullTrackName, ServeError, TracksReader},
     session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
 };
 
@@ -111,21 +111,22 @@ impl Producer {
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();
 
-        // Check local tracks first, and serve from local if possible
-        if let Some(mut local) = self.locals.retrieve(self.scope.as_deref(), &namespace) {
-            // Pass the full requested namespace, not the announced prefix
-            if let Some(track) = local.subscribe(namespace.clone(), &track_name) {
-                let ns = namespace.to_utf8_path();
-                tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
-                // Update label to indicate local source, timing recorded on drop
-                timing_guard.set_label("source", "local");
-                // Track active tracks - decrements when serve completes
-                let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
-                return Ok(subscribed.serve(track).await?);
-            }
+        // Local lookup order inside Locals:
+        // 1. actual FullTrackName -> TrackReader media cache
+        // 2. PUBLISH_NAMESPACE route source, which triggers upstream SUBSCRIBE
+        let mut locals = self.locals.clone();
+        if let Some(track) = locals
+            .get_or_request_track(self.scope.as_deref(), namespace.clone(), &track_name)
+            .await
+        {
+            let ns = namespace.to_utf8_path();
+            tracing::info!(namespace = %ns, track = %track_name, source = "local", "serving subscribe from local: {:?}", track.info);
+            timing_guard.set_label("source", "local");
+            let _track_guard = GaugeGuard::new("moq_relay_active_tracks");
+            return Ok(subscribed.serve(track).await?);
         }
 
-        // Check remote tracks second, and serve from remote if possible
+        // Check remote tracks after local exact tracks and namespace route sources.
         match self
             .remotes
             .subscribe(self.scope.as_deref(), &namespace, &track_name)
@@ -188,23 +189,20 @@ impl Producer {
         self,
         mut track_status_requested: TrackStatusRequested,
     ) -> Result<(), anyhow::Error> {
-        // Check local tracks first, and serve from local if possible
-        if let Some(mut local_tracks) = self.locals.retrieve(
-            self.scope.as_deref(),
-            &track_status_requested.request_msg.track_namespace,
-        ) {
-            if let Some(track) = local_tracks.get_track_reader(
-                &track_status_requested.request_msg.track_namespace,
-                &track_status_requested.request_msg.track_name,
-            ) {
-                let namespace = track_status_requested
-                    .request_msg
-                    .track_namespace
-                    .to_utf8_path();
-                let track_name = &track_status_requested.request_msg.track_name;
-                tracing::info!(namespace = %namespace, track = %track_name, source = "local", "serving track_status from local: {:?}", track.info);
-                return Ok(track_status_requested.respond_ok(&track)?);
-            }
+        let full_name = FullTrackName {
+            namespace: track_status_requested.request_msg.track_namespace.clone(),
+            name: track_status_requested.request_msg.track_name.clone(),
+        };
+
+        // Check actual local tracks first.
+        if let Some(track) = self
+            .locals
+            .retrieve_track(self.scope.as_deref(), &full_name)
+        {
+            let namespace = full_name.namespace.to_utf8_path();
+            let track_name = &full_name.name;
+            tracing::info!(namespace = %namespace, track = %track_name, source = "local", "serving track_status from local: {:?}", track.info);
+            return Ok(track_status_requested.respond_ok(&track)?);
         }
 
         // TODO - forward track status to remotes?

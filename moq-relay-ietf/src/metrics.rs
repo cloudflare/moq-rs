@@ -77,6 +77,14 @@ pub fn describe_metrics() {
         "Total publishers (PUBLISH_NAMESPACE requests) received"
     );
     describe_counter!(
+        "moq_relay_published_tracks_total",
+        "Total publisher-initiated PUBLISH track requests received"
+    );
+    describe_counter!(
+        "moq_relay_publish_errors_total",
+        "Publisher-initiated PUBLISH failures by phase (take_reader, local_register, coordinator_register, send_ok)"
+    );
+    describe_counter!(
         "moq_relay_announce_ok_total",
         "Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE"
     );
@@ -117,6 +125,10 @@ pub fn describe_metrics() {
     describe_gauge!(
         "moq_relay_active_tracks",
         "Current number of tracks being served"
+    );
+    describe_gauge!(
+        "moq_relay_active_published_tracks",
+        "Current number of exact tracks registered from PUBLISH"
     );
     describe_gauge!(
         "moq_relay_announced_namespaces",

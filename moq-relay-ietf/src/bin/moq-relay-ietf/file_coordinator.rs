@@ -22,13 +22,19 @@ use url::Url;
 
 use moq_relay_ietf::{
     Coordinator, CoordinatorError, CoordinatorResult, NamespaceOrigin, NamespaceRegistration,
+    TrackRegistration,
 };
 
 /// Data stored in the shared file
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CoordinatorData {
     /// Maps connection scope to namespace map
+    #[serde(default)]
     namespaces: HashMap<String, HashMap<String, String>>,
+    /// Maps connection scope to exact full-track map.
+    /// Key format: `<namespace utf8 path>--<track utf8/lossy>`.
+    #[serde(default)]
+    tracks: HashMap<String, HashMap<String, String>>,
 }
 
 impl CoordinatorData {
@@ -39,6 +45,10 @@ impl CoordinatorData {
     fn namespace_key(namespace: &TrackNamespace) -> String {
         namespace.to_utf8_path()
     }
+
+    fn track_key(namespace: &TrackNamespace, track: &str) -> String {
+        format!("{}--{}", namespace.to_utf8_path(), track)
+    }
 }
 
 /// Handle that unregisters a namespace when dropped
@@ -46,6 +56,21 @@ struct NamespaceUnregisterHandle {
     scope_key: String,
     namespace_key: String,
     file_path: PathBuf,
+}
+
+/// Handle that unregisters a track when dropped.
+struct TrackUnregisterHandle {
+    scope_key: String,
+    track_key: String,
+    file_path: PathBuf,
+}
+
+impl Drop for TrackUnregisterHandle {
+    fn drop(&mut self) {
+        if let Err(err) = unregister_track_sync(&self.file_path, &self.scope_key, &self.track_key) {
+            tracing::warn!(track = %self.track_key, error = %err, "failed to unregister track on drop: {}", err);
+        }
+    }
 }
 
 impl Drop for NamespaceUnregisterHandle {
@@ -75,6 +100,31 @@ fn unregister_namespace_sync(file_path: &Path, scope_key: &str, namespace_key: &
         bucket.remove(namespace_key);
         if bucket.is_empty() {
             data.namespaces.remove(scope_key);
+        }
+    }
+
+    write_data(&file, &data)?;
+    file.unlock()?;
+
+    Ok(())
+}
+
+fn unregister_track_sync(file_path: &Path, scope_key: &str, track_key: &str) -> Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(file_path)?;
+
+    file.lock_exclusive()?;
+
+    let mut data = read_data(&file)?;
+    tracing::debug!(track = %track_key, scope = %scope_key, "unregistering track: {}", track_key);
+    if let Some(bucket) = data.tracks.get_mut(scope_key) {
+        bucket.remove(track_key);
+        if bucket.is_empty() {
+            data.tracks.remove(scope_key);
         }
     }
 
@@ -279,8 +329,214 @@ impl Coordinator for FileCoordinator {
         result.ok_or(CoordinatorError::NamespaceNotFound)
     }
 
+    async fn register_track(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+        track: &str,
+    ) -> CoordinatorResult<TrackRegistration> {
+        let scope_key = CoordinatorData::scope_key(scope);
+        let track_key = CoordinatorData::track_key(namespace, track);
+        let relay_url = self.relay_url.to_string();
+        let file_path = self.file_path.clone();
+
+        let scope_clone = scope_key.clone();
+        let key_clone = track_key.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&file_path)?;
+
+            file.lock_exclusive()?;
+
+            let mut data = read_data(&file)?;
+            tracing::info!(track = %key_clone, scope = %scope_clone, relay_url = %relay_url, "registering track: {} -> {}", key_clone, relay_url);
+            data.tracks
+                .entry(scope_clone)
+                .or_default()
+                .insert(key_clone, relay_url);
+
+            write_data(&file, &data)?;
+            file.unlock()?;
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+
+        let handle = TrackUnregisterHandle {
+            scope_key,
+            track_key,
+            file_path: self.file_path.clone(),
+        };
+
+        Ok(TrackRegistration::new(handle))
+    }
+
+    async fn unregister_track(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+        track: &str,
+    ) -> CoordinatorResult<()> {
+        let scope_key = CoordinatorData::scope_key(scope);
+        let track_key = CoordinatorData::track_key(namespace, track);
+        let file_path = self.file_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            unregister_track_sync(&file_path, &scope_key, &track_key)
+        })
+        .await??;
+
+        Ok(())
+    }
+
+    async fn lookup_track(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+        track: &str,
+    ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
+        let namespace = namespace.clone();
+        let scope_key = CoordinatorData::scope_key(scope);
+        let namespace_key = CoordinatorData::namespace_key(&namespace);
+        let track_key = CoordinatorData::track_key(&namespace, track);
+        let file_path = self.file_path.clone();
+
+        let result = tokio::task::spawn_blocking(
+            move || -> Result<Option<(NamespaceOrigin, Option<Client>)>> {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&file_path)?;
+
+                file.lock_shared()?;
+
+                let data = read_data(&file)?;
+                tracing::debug!(track = %track_key, scope = %scope_key, "looking up track: {}", track_key);
+
+                if let Some(relay_url) = data
+                    .tracks
+                    .get(&scope_key)
+                    .and_then(|bucket| bucket.get(&track_key))
+                {
+                    let url = Url::parse(relay_url)?;
+                    file.unlock()?;
+                    return Ok(Some((NamespaceOrigin::new(namespace.clone(), url, None), None)));
+                }
+
+                let Some(bucket) = data.namespaces.get(&scope_key) else {
+                    file.unlock()?;
+                    return Ok(None);
+                };
+
+                if let Some(relay_url) = bucket.get(&namespace_key) {
+                    let url = Url::parse(relay_url)?;
+                    file.unlock()?;
+                    return Ok(Some((NamespaceOrigin::new(namespace.clone(), url, None), None)));
+                }
+
+                let mut best_match: Option<(String, String)> = None;
+                for (registered_key, url) in bucket {
+                    let is_prefix = registered_key
+                        .split('/')
+                        .zip(namespace_key.split('/'))
+                        .all(|(a, b)| a == b);
+                    match best_match {
+                        Some((ns, _)) if is_prefix && ns.len() < registered_key.len() => {
+                            best_match = Some((registered_key.clone(), url.clone()));
+                        }
+                        None if is_prefix => {
+                            best_match = Some((registered_key.clone(), url.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+
+                file.unlock()?;
+
+                if let Some((matched_key, relay_url)) = best_match {
+                    let matched_ns = TrackNamespace::from_utf8_path(&matched_key);
+                    let url = Url::parse(&relay_url)?;
+                    return Ok(Some((NamespaceOrigin::new(matched_ns, url, None), None)));
+                }
+
+                Ok(None)
+            },
+        )
+        .await??;
+
+        result.ok_or(CoordinatorError::NamespaceNotFound)
+    }
+
     async fn shutdown(&self) -> CoordinatorResult<()> {
         // Nothing to clean up - file will be unlocked automatically
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("moq-file-coordinator-{name}-{nanos}.json"))
+    }
+
+    #[tokio::test]
+    async fn lookup_track_finds_registered_track() {
+        let file = temp_file_path("track-lookup");
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(&file, relay_url.clone());
+        let namespace = TrackNamespace::from_utf8_path("room/123");
+
+        let _track = coordinator
+            .register_track(Some("scope-a"), &namespace, "audio")
+            .await
+            .expect("track should register");
+
+        let (origin, client) = coordinator
+            .lookup_track(Some("scope-a"), &namespace, "audio")
+            .await
+            .expect("track lookup should find registration");
+
+        assert_eq!(origin.namespace(), &namespace);
+        assert_eq!(origin.url(), relay_url);
+        assert!(client.is_none());
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn lookup_track_falls_back_to_namespace() {
+        let file = temp_file_path("track-namespace-fallback");
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(&file, relay_url.clone());
+        let namespace = TrackNamespace::from_utf8_path("room/123");
+
+        let _namespace = coordinator
+            .register_namespace(Some("scope-a"), &namespace)
+            .await
+            .expect("namespace should register");
+
+        let (origin, client) = coordinator
+            .lookup_track(Some("scope-a"), &namespace, "audio")
+            .await
+            .expect("track lookup should fall back to namespace");
+
+        assert_eq!(origin.namespace(), &namespace);
+        assert_eq!(origin.url(), relay_url);
+        assert!(client.is_none());
+
+        let _ = std::fs::remove_file(file);
     }
 }

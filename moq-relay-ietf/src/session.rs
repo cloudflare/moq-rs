@@ -54,19 +54,33 @@ impl Session {
         tasks.select_next_some().await
     }
 
-    /// Drain incoming PUBLISH_NAMESPACEs and reject each one.
+    /// Drain incoming PUBLISH_NAMESPACE and PUBLISH requests and reject each one.
     ///
     /// Dropping a `PublishedNamespace` without calling `ok()` triggers its
     /// `Drop` impl, which sends REQUEST_ERROR back to the peer.
-    async fn drain_and_reject_publishes(mut subscriber: Subscriber) -> Result<(), SessionError> {
-        while let Some(published_ns) = subscriber.published_namespace().await {
-            tracing::debug!(
-                namespace = %published_ns.namespace,
-                "rejecting PUBLISH_NAMESPACE: publish not permitted for this session"
-            );
-            drop(published_ns);
+    async fn drain_and_reject_publishes(subscriber: Subscriber) -> Result<(), SessionError> {
+        loop {
+            let mut namespace_subscriber = subscriber.clone();
+            let mut publish_subscriber = subscriber.clone();
+            tokio::select! {
+                Some(published_ns) = namespace_subscriber.published_namespace() => {
+                    tracing::debug!(
+                        namespace = %published_ns.namespace,
+                        "rejecting PUBLISH_NAMESPACE: publish not permitted for this session"
+                    );
+                    drop(published_ns);
+                },
+                Some(publish) = publish_subscriber.publish_received() => {
+                    tracing::debug!(
+                        namespace = %publish.namespace(),
+                        track = %publish.name(),
+                        "rejecting PUBLISH: publish not permitted for this session"
+                    );
+                    drop(publish);
+                },
+                else => return Ok(()),
+            }
         }
-        Ok(())
     }
 
     /// Drain incoming SUBSCRIBEs and reject each one.

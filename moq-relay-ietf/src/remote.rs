@@ -121,7 +121,15 @@ impl RemoteManager {
         track_name: impl Into<TrackName>,
     ) -> anyhow::Result<Option<TrackReader>> {
         let track_name = track_name.into();
-        let (origin, client) = match self.coordinator.lookup(scope, namespace).await {
+
+        // Coordinator::lookup_track is the ergonomic routing entry point: it
+        // tries exact PUBLISH track registrations first, then falls back to
+        // PUBLISH_NAMESPACE namespace routing.
+        let (origin, client) = match self
+            .coordinator
+            .lookup_track(scope, namespace, &track_name.to_string())
+            .await
+        {
             Ok(result) => result,
             Err(CoordinatorError::NamespaceNotFound) => return Ok(None),
             Err(err) => return Err(err.into()),

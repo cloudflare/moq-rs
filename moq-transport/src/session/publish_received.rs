@@ -58,6 +58,7 @@ impl Default for PublishReceivedState {
 pub struct PublishReceived {
     session: Subscriber,
     state: State<PublishReceivedState>,
+    reader: Option<TrackReader>,
 
     /// Request ID of the inbound PUBLISH (draft-16 §9.1).
     request_id: u64,
@@ -87,11 +88,13 @@ impl PublishReceived {
         name: TrackName,
         initial_forward: bool,
         largest_location: Option<Location>,
+        reader: TrackReader,
         state: State<PublishReceivedState>,
     ) -> Self {
         Self {
             session,
             state,
+            reader: Some(reader),
             request_id,
             track_alias,
             namespace,
@@ -103,9 +106,16 @@ impl PublishReceived {
         }
     }
 
-    /// Accept the PUBLISH by sending PUBLISH_OK (draft-16 §9.14).
+    /// Move out the `TrackReader` before sending PUBLISH_OK.
     ///
-    /// Returns the `TrackReader` the application should poll for Objects.
+    /// This lets relays register local/coordinator state before accepting the
+    /// PUBLISH. It does **not** send PUBLISH_OK; callers must still call
+    /// [`accept`](Self::accept) or drop this handle to reject.
+    pub fn take_reader(&mut self) -> Result<TrackReader, ServeError> {
+        self.reader.take().ok_or(ServeError::Done)
+    }
+
+    /// Accept the PUBLISH by sending PUBLISH_OK (draft-16 §9.14).
     ///
     /// `forward` sets the initial Forward State:
     ///   - `true`  — publisher may start transmitting Objects immediately.
@@ -118,7 +128,7 @@ impl PublishReceived {
     /// # Protocol note
     /// PUBLISH has a dedicated success response (§9.14, type 0x1E). Do not use
     /// REQUEST_OK (§9.7) here.
-    pub fn ok(&mut self, forward: bool) -> Result<TrackReader, ServeError> {
+    pub fn accept(&mut self, forward: bool) -> Result<(), ServeError> {
         if self.ok {
             return Err(ServeError::Duplicate);
         }
@@ -133,12 +143,13 @@ impl PublishReceived {
         });
         self.ok = true;
 
-        // Take the TrackReader that was pre-allocated in recv_publish.
-        let reader = self
-            .session
-            .take_publish_received_reader(self.request_id)
-            .ok_or(ServeError::Done)?;
+        Ok(())
+    }
 
+    /// Accept the PUBLISH and return the `TrackReader`.
+    pub fn ok(&mut self, forward: bool) -> Result<TrackReader, ServeError> {
+        let reader = self.take_reader()?;
+        self.accept(forward)?;
         Ok(reader)
     }
 
@@ -241,10 +252,6 @@ pub(crate) struct PublishReceivedRecv {
     /// Write half for inbound Objects. The transport owns this so it can push
     /// Objects without going through the application.
     writer: Option<TrackWriterMode>,
-
-    /// Read half returned to the application on `PublishReceived::ok`.
-    /// Wrapped in `Option` so it can be taken exactly once.
-    reader: Option<TrackReader>,
 }
 
 impl PublishReceivedRecv {
@@ -272,20 +279,15 @@ impl PublishReceivedRecv {
             name,
             initial_forward,
             largest_location,
+            reader,
             app_state,
         );
         let recv = Self {
             state: transport_state,
             writer: Some(writer.into()),
-            reader: Some(reader),
         };
 
         (app, recv)
-    }
-
-    /// Take the `TrackReader` out exactly once (for `PublishReceived::ok`).
-    pub fn take_reader(&mut self) -> Option<TrackReader> {
-        self.reader.take()
     }
 
     /// Open a subgroup writer for the given subgroup header.
@@ -404,10 +406,10 @@ mod tests {
 
     #[test]
     fn take_reader_returns_once() {
-        let (_pr, mut recv, _sub) = make_pair(0);
-        assert!(recv.take_reader().is_some());
+        let (mut pr, _recv, _sub) = make_pair(0);
+        assert!(pr.take_reader().is_ok());
         assert!(
-            recv.take_reader().is_none(),
+            pr.take_reader().is_err(),
             "reader must only be given out once"
         );
     }
