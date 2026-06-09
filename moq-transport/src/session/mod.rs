@@ -42,7 +42,7 @@ use std::path::PathBuf;
 ///
 /// MoQT can run over either WebTransport (HTTP/3 + QUIC) or raw QUIC.
 /// The transport type affects protocol behavior — for example, the PATH
-/// parameter is only sent in CLIENT_SETUP for raw QUIC connections,
+/// parameter is only sent in SETUP for raw QUIC connections,
 /// since WebTransport carries the path in the HTTP/3 CONNECT URL.
 ///
 /// This enum is intentionally extensible for future transport options
@@ -53,7 +53,7 @@ pub enum Transport {
     /// ALPN: "h3". Path carried in HTTP/3 CONNECT :path pseudo-header.
     WebTransport,
     /// Raw QUIC with MoQT framing directly on QUIC streams.
-    /// ALPN: "moqt-16". Path carried in CLIENT_SETUP PATH parameter.
+    /// ALPN: "moqt-16". Path carried in SETUP PATH parameter.
     RawQuic,
 }
 
@@ -83,9 +83,9 @@ pub struct Session {
     /// The transport protocol negotiated for this connection.
     transport: Transport,
 
-    /// The connection path, derived from the WebTransport URL path or CLIENT_SETUP PATH parameter.
+    /// The connection path, derived from the WebTransport URL path or SETUP PATH parameter.
     /// For incoming connections: extracted during accept() from the WebTransport CONNECT URL
-    /// (takes precedence) or the CLIENT_SETUP PATH parameter (key 0x1).
+    /// (takes precedence) or the SETUP PATH parameter (key 0x1).
     /// For outgoing connections: auto-extracted from the session URL in connect().
     connection_path: Option<String>,
 }
@@ -183,7 +183,7 @@ impl Session {
     ///
     /// For server-side sessions (created via `accept()`), this is derived from:
     /// 1. The WebTransport CONNECT URL path (takes precedence), or
-    /// 2. The CLIENT_SETUP PATH parameter (key 0x1), used for raw QUIC connections.
+    /// 2. The SETUP PATH parameter (key 0x1), used for raw QUIC connections.
     ///
     /// Returns `None` if no path was present or if the path was just "/".
     pub fn connection_path(&self) -> Option<&str> {
@@ -458,8 +458,8 @@ impl Session {
 
     /// Create an outbound/client QUIC connection.
     ///
-    /// Opens the bidirectional control stream, sends CLIENT_SETUP with
-    /// parameters only (version is agreed via ALPN), and waits for SERVER_SETUP.
+    /// Opens the bidirectional control stream, sends SETUP with
+    /// parameters only (version is agreed via ALPN), and waits for SETUP.
     ///
     /// For native `moqt://` connections the PATH and AUTHORITY parameters are
     /// sent automatically.  For WebTransport the path is carried in the HTTP/3
@@ -520,23 +520,23 @@ impl Session {
             our_max_request_id,
         );
 
-        let client = setup::Client { params };
+        let client = setup::Setup { params };
 
         tracing::debug!(
             target: "moq_transport::control",
             direction = "sent",
-            msg_type = "CLIENT_SETUP",
+            msg_type = "SETUP",
             ?transport,
             path = path.as_deref(),
             "MoQT control message"
         );
         sender.encode(&client).await?;
 
-        let server: setup::Server = recver.decode().await?;
+        let server: setup::Setup = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
-            msg_type = "SERVER_SETUP",
+            msg_type = "SETUP (recv)",
             "MoQT control message"
         );
 
@@ -549,8 +549,8 @@ impl Session {
 
     /// Accept an inbound server connection.
     ///
-    /// Waits for the bidirectional control stream, decodes CLIENT_SETUP,
-    /// sends SERVER_SETUP with parameters only.  Version is already agreed
+    /// Waits for the bidirectional control stream, decodes SETUP,
+    /// sends SETUP with parameters only.  Version is already agreed
     /// via ALPN before this is called.
     pub async fn accept(
         session: web_transport::Session,
@@ -567,11 +567,11 @@ impl Session {
         let mut sender = Writer::new(control.0);
         let mut recver = Reader::new(control.1);
 
-        let client: setup::Client = recver.decode().await?;
+        let client: setup::Setup = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
-            msg_type = "CLIENT_SETUP",
+            msg_type = "SETUP",
             "MoQT control message"
         );
 
@@ -611,12 +611,12 @@ impl Session {
             our_max_request_id,
         );
 
-        let server = setup::Server { params };
+        let server = setup::Setup { params };
 
         tracing::debug!(
             target: "moq_transport::control",
             direction = "sent",
-            msg_type = "SERVER_SETUP",
+            msg_type = "SETUP (recv)",
             "MoQT control message"
         );
 

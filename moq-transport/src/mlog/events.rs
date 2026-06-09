@@ -210,7 +210,7 @@ fn create_control_message_event(
 
 /// Create a control_message_parsed event for CLIENT_SETUP.
 /// From draft-16 the setup payload carries only parameters; version is agreed via ALPN.
-pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Event {
+pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Setup) -> Event {
     create_control_message_event(
         time,
         stream_id,
@@ -224,7 +224,7 @@ pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Ev
 
 /// Create a control_message_created event for SERVER_SETUP.
 /// From draft-16 the setup payload carries only parameters; version is agreed via ALPN.
-pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Server) -> Event {
+pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Setup) -> Event {
     create_control_message_event(
         time,
         stream_id,
