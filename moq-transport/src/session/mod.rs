@@ -12,6 +12,7 @@ mod publisher;
 mod reader;
 mod request_id;
 mod subscribe;
+mod subscribe_namespace;
 mod subscribed;
 mod subscriber;
 mod track_status_requested;
@@ -28,6 +29,7 @@ pub use published_namespace::*;
 pub use publisher::*;
 pub use request_id::{RequestId, RequestIdAllocation};
 pub use subscribe::*;
+pub use subscribe_namespace::*;
 pub use subscribed::*;
 pub use subscriber::*;
 pub use track_status_requested::*;
@@ -96,6 +98,9 @@ pub struct Session {
 
     /// Queue used by Publisher and Subscriber for sending Control Messages
     outgoing: Queue<Message>,
+
+    /// Queue used by Subscriber to request opening SUBSCRIBE_NAMESPACE bidi streams.
+    subscribe_namespace_open: Queue<OpenSubscribeNamespace>,
 
     /// Session-level request ID manager.
     /// Publisher and Subscriber share one outbound request ID sequence.
@@ -462,6 +467,7 @@ impl Session {
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let outgoing = Queue::default().split();
         let pending_requests = PendingRequests::default();
+        let subscribe_namespace_open = Queue::default().split();
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
@@ -475,6 +481,7 @@ impl Session {
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
+            subscribe_namespace_open.0,
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
@@ -487,6 +494,7 @@ impl Session {
             publisher: publisher.clone(),
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
+            subscribe_namespace_open: subscribe_namespace_open.1,
             request_id,
             pending_requests,
             mlog: mlog_shared,
@@ -710,6 +718,7 @@ impl Session {
         tokio::select! {
             res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
+            res = Self::run_subscribe_namespace_open(self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.publisher, self.subscriber, self.pending_requests) => res,
@@ -762,6 +771,51 @@ impl Session {
         }
 
         Ok(())
+    }
+
+    async fn run_subscribe_namespace_open(
+        webtransport: web_transport::Session,
+        mut requests: Queue<OpenSubscribeNamespace>,
+        _mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(), SessionError> {
+        let mut tasks = FuturesUnordered::new();
+        let mut requests_done = false;
+
+        loop {
+            tokio::select! {
+                request = requests.pop(), if !requests_done => {
+                    match request {
+                        Some(request) => {
+                            let webtransport = webtransport.clone();
+                            tasks.push(Self::open_subscribe_namespace(webtransport, request));
+                        }
+                        None => requests_done = true,
+                    }
+                }
+                Some(res) = tasks.next(), if !tasks.is_empty() => res?,
+                else => return Ok(()),
+            }
+        }
+    }
+
+    async fn open_subscribe_namespace(
+        webtransport: web_transport::Session,
+        request: OpenSubscribeNamespace,
+    ) -> Result<(), SessionError> {
+        let (send, recv) = webtransport.open_bi().await?;
+        let mut writer = Writer::new(send);
+        let reader = Reader::new(recv);
+
+        let msg = Message::SubscribeNamespace(request.message.clone());
+        Self::log_control_message(&msg, "sent");
+        writer.encode(&msg).await?;
+
+        let (send, recv) = SubscribeNamespace::new(request.subscriber, request.info, writer);
+        if request.reply.send(Ok(send)).is_err() {
+            return Ok(());
+        }
+
+        recv.run(reader).await
     }
 
     /// Receives inbound messages from the control stream reader/receiver.  Analyzes if the message

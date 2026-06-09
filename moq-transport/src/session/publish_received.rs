@@ -393,6 +393,7 @@ mod tests {
         let rid = RequestId::new(0, 100, 100, 0);
         let subscriber = crate::session::Subscriber::new(
             Queue::default(),
+            Queue::default(),
             None,
             rid,
             crate::session::PendingRequests::default(),

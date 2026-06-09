@@ -12,9 +12,9 @@ use std::{
 use tokio::sync::Notify;
 
 use crate::{
-    coding::{Decode, TrackName, TrackNamespace},
+    coding::{Decode, KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix},
     data,
-    message::{self, Message, RequestErrorCode},
+    message::{self, Message, RequestErrorCode, SubscribeOptions},
     mlog,
     serve::{self, FullTrackName, ServeError},
 };
@@ -24,7 +24,7 @@ use crate::watch::Queue;
 use super::{
     PendingRequest, PendingRequests, PublishReceived, PublishReceivedRecv, PublishedNamespace,
     PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session, SessionConfig,
-    SessionError, Subscribe, SubscribeRecv,
+    SessionError, Subscribe, SubscribeNamespace, SubscribeRecv,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -64,6 +64,12 @@ pub struct Subscriber {
     /// Queue of inbound PUBLISH events waiting for the application to accept.
     publish_received_queue: Queue<PublishReceived>,
 
+    /// Active outbound SUBSCRIBE_NAMESPACE requests, keyed by Request ID.
+    subscribe_namespaces: Arc<Mutex<HashMap<u64, TrackNamespacePrefix>>>,
+
+    /// Queue used to ask the session task to open a dedicated bidi stream.
+    subscribe_namespace_open: Queue<OpenSubscribeNamespace>,
+
     /// Tracks which (namespace, name) pairs this endpoint is subscribed to
     /// (as subscriber role) — covers both outbound SUBSCRIBE and inbound PUBLISH.
     /// Used for §5.1 same-role duplicate-subscription enforcement.
@@ -86,6 +92,34 @@ pub struct Subscriber {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+}
+
+struct SubscribeNamespaceCleanup {
+    subscriber: Subscriber,
+    request_id: u64,
+    active: bool,
+}
+
+impl SubscribeNamespaceCleanup {
+    fn new(subscriber: Subscriber, request_id: u64) -> Self {
+        Self {
+            subscriber,
+            request_id,
+            active: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for SubscribeNamespaceCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            self.subscriber.remove_subscribe_namespace(self.request_id);
+        }
+    }
 }
 
 /// Which subscription owns a given Track Alias (draft-16 §10.1).
@@ -177,6 +211,7 @@ impl SubscriberNameRegistry {
 impl Subscriber {
     pub(super) fn new(
         outgoing: Queue<Message>,
+        subscribe_namespace_open: Queue<OpenSubscribeNamespace>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
         pending_requests: PendingRequests,
@@ -190,6 +225,8 @@ impl Subscriber {
             track_alias_notify: Arc::new(Notify::new()),
             publishes_received: Default::default(),
             publish_received_queue: Default::default(),
+            subscribe_namespaces: Default::default(),
+            subscribe_namespace_open,
             subscriber_names: Default::default(),
             outgoing,
             request_id,
@@ -248,6 +285,53 @@ impl Subscriber {
         self.publish_received_queue.pop().await
     }
 
+    pub async fn subscribe_namespace(
+        &mut self,
+        namespace_prefix: TrackNamespacePrefix,
+        subscribe_options: SubscribeOptions,
+        params: KeyValuePairs,
+    ) -> Result<SubscribeNamespace, SessionError> {
+        let request_id = self.get_next_request_id()?;
+
+        {
+            let mut prefixes = self
+                .subscribe_namespaces
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if prefixes
+                .values()
+                .any(|existing| existing.overlaps(&namespace_prefix))
+            {
+                return Err(SessionError::Serve(ServeError::Duplicate));
+            }
+            prefixes.insert(request_id, namespace_prefix.clone());
+        }
+        let cleanup = SubscribeNamespaceCleanup::new(self.clone(), request_id);
+
+        let (reply, recv) = futures::channel::oneshot::channel();
+        let open = OpenSubscribeNamespace::new(
+            self.clone(),
+            request_id,
+            namespace_prefix,
+            subscribe_options,
+            params,
+            reply,
+        );
+
+        if self.subscribe_namespace_open.push(open).is_err() {
+            return Err(SessionError::Internal);
+        }
+
+        match recv.await {
+            Ok(Ok(subscribe_namespace)) => {
+                cleanup.disarm();
+                Ok(subscribe_namespace)
+            }
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(SessionError::Internal),
+        }
+    }
+
     /// Remove all subscriber-side state for an inbound PUBLISH.
     ///
     /// Called by `PublishReceived::drop` when the app did not call `ok()`.
@@ -271,6 +355,12 @@ impl Subscriber {
             .map_err(|_| SessionError::Internal)?
             .remove_by_request_id(request_id);
         Ok(())
+    }
+
+    pub(super) fn remove_subscribe_namespace(&self, request_id: u64) {
+        if let Ok(mut prefixes) = self.subscribe_namespaces.lock() {
+            prefixes.remove(&request_id);
+        }
     }
 
     fn add_mlog_event<F>(&self, make_event: F)
@@ -1351,6 +1441,7 @@ mod tests {
     fn subscriber() -> Subscriber {
         let request_id = RequestId::new(0, 100, 100, 0);
         Subscriber::new(
+            Queue::default(),
             Queue::default(),
             None,
             request_id,
