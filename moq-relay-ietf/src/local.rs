@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use moq_transport::{
-    coding::TrackNamespace,
+    coding::{TrackNamespace, TrackNamespacePrefix},
     serve::{FullTrackName, ServeError, Track, TrackReader, TrackWriter},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::metrics::GaugeGuard;
 
@@ -31,6 +31,13 @@ struct NamespaceSource {
     requests: mpsc::Sender<TrackWriter>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamespaceChange {
+    pub scope: Option<String>,
+    pub namespace: TrackNamespace,
+    pub added: bool,
+}
+
 /// Relay-local registry.
 ///
 /// Actual media tracks are always stored by exact Full Track Name. Namespace
@@ -44,6 +51,9 @@ pub struct Locals {
     /// Namespace route sources from PUBLISH_NAMESPACE, indexed by (scope,
     /// namespace) and matched by prefix.
     namespaces: Arc<Mutex<HashMap<ScopeKey, HashMap<TrackNamespace, NamespaceSource>>>>,
+
+    /// Namespace add/remove notifications for SUBSCRIBE_NAMESPACE handlers.
+    namespace_changes: broadcast::Sender<NamespaceChange>,
 }
 
 impl Default for Locals {
@@ -54,10 +64,35 @@ impl Default for Locals {
 
 impl Locals {
     pub fn new() -> Self {
+        let (namespace_changes, _) = broadcast::channel(1024);
         Self {
             tracks: Default::default(),
             namespaces: Default::default(),
+            namespace_changes,
         }
+    }
+
+    pub fn subscribe_namespace_changes(&self) -> broadcast::Receiver<NamespaceChange> {
+        self.namespace_changes.subscribe()
+    }
+
+    pub fn list_namespaces_matching(
+        &self,
+        scope: Option<&str>,
+        prefix: &TrackNamespacePrefix,
+    ) -> Vec<TrackNamespace> {
+        let Ok(namespaces) = self.namespaces.lock() else {
+            return Vec::new();
+        };
+        let Some(bucket) = namespaces.get(scope.unwrap_or(UNSCOPED)) else {
+            return Vec::new();
+        };
+
+        bucket
+            .keys()
+            .filter(|namespace| prefix.is_prefix_of(namespace))
+            .cloned()
+            .collect()
     }
 
     /// Register namespace routing metadata from PUBLISH_NAMESPACE.
@@ -88,9 +123,15 @@ impl Locals {
         let registration = LocalNamespaceRegistration {
             locals: self.clone(),
             scope_key,
-            namespace,
+            namespace: namespace.clone(),
             _gauge_guard: GaugeGuard::new("moq_relay_announced_namespaces"),
         };
+
+        let _ = self.namespace_changes.send(NamespaceChange {
+            scope: scope_key_to_option(&registration.scope_key),
+            namespace,
+            added: true,
+        });
 
         Ok((registration, rx))
     }
@@ -253,14 +294,31 @@ impl Drop for LocalNamespaceRegistration {
         };
         tracing::debug!(namespace = %ns, scope = %scope, "deregistering namespace route source from locals");
 
+        let mut removed = false;
         if let Ok(mut namespaces) = self.locals.namespaces.lock() {
             if let Some(bucket) = namespaces.get_mut(self.scope_key.as_str()) {
-                bucket.remove(&self.namespace);
+                removed = bucket.remove(&self.namespace).is_some();
                 if bucket.is_empty() {
                     namespaces.remove(self.scope_key.as_str());
                 }
             }
         }
+
+        if removed {
+            let _ = self.locals.namespace_changes.send(NamespaceChange {
+                scope: scope_key_to_option(&self.scope_key),
+                namespace: self.namespace.clone(),
+                added: false,
+            });
+        }
+    }
+}
+
+fn scope_key_to_option(scope_key: &str) -> Option<String> {
+    if scope_key.is_empty() {
+        None
+    } else {
+        Some(scope_key.to_string())
     }
 }
 
@@ -448,5 +506,88 @@ mod tests {
             .get_or_request_track(None, ns("unknown"), "video")
             .await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_namespaces_matching_filters_by_prefix_and_scope() {
+        let mut locals = Locals::new();
+        let _room = locals
+            .register_namespace(Some("scope-a"), ns("room/123"))
+            .await
+            .expect("room should register");
+        let _camera = locals
+            .register_namespace(Some("scope-a"), ns("room/123/camera"))
+            .await
+            .expect("camera should register");
+        let _other_scope = locals
+            .register_namespace(Some("scope-b"), ns("room/123/other"))
+            .await
+            .expect("other scope should register");
+
+        let mut matches = locals.list_namespaces_matching(
+            Some("scope-a"),
+            &TrackNamespacePrefix::from_utf8_path("room/123"),
+        );
+        matches.sort_by_key(|namespace| namespace.to_utf8_path());
+
+        assert_eq!(matches, vec![ns("room/123"), ns("room/123/camera")]);
+    }
+
+    #[tokio::test]
+    async fn namespace_changes_reports_register_and_drop() {
+        let mut locals = Locals::new();
+        let mut changes = locals.subscribe_namespace_changes();
+        let namespace = ns("room/123");
+
+        let registration = locals
+            .register_namespace(Some("scope-a"), namespace.clone())
+            .await
+            .expect("namespace should register")
+            .0;
+
+        let added = changes.recv().await.expect("added event");
+        assert_eq!(
+            added,
+            NamespaceChange {
+                scope: Some("scope-a".to_string()),
+                namespace: namespace.clone(),
+                added: true,
+            }
+        );
+
+        drop(registration);
+
+        let removed = changes.recv().await.expect("removed event");
+        assert_eq!(
+            removed,
+            NamespaceChange {
+                scope: Some("scope-a".to_string()),
+                namespace,
+                added: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_changes_uses_none_for_unscoped() {
+        let mut locals = Locals::new();
+        let mut changes = locals.subscribe_namespace_changes();
+        let namespace = ns("room/123");
+
+        let _registration = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace should register")
+            .0;
+
+        let added = changes.recv().await.expect("added event");
+        assert_eq!(
+            added,
+            NamespaceChange {
+                scope: None,
+                namespace,
+                added: true,
+            }
+        );
     }
 }
