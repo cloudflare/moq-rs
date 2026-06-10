@@ -778,10 +778,7 @@ impl Publisher {
                 .subscribed_namespace_prefixes
                 .lock()
                 .map_err(|_| SessionError::Internal)?;
-            if prefixes
-                .values()
-                .any(|existing| existing.overlaps(&msg.track_namespace_prefix))
-            {
+            if Self::has_subscribed_namespace_overlap(&prefixes, &msg.track_namespace_prefix) {
                 return Ok(SubscribedNamespaceRecv::rejected(
                     msg.id,
                     RequestErrorCode::PrefixOverlap as u64,
@@ -806,6 +803,13 @@ impl Publisher {
         }
 
         Ok(recv)
+    }
+
+    fn has_subscribed_namespace_overlap(
+        prefixes: &HashMap<u64, TrackNamespacePrefix>,
+        prefix: &TrackNamespacePrefix,
+    ) -> bool {
+        prefixes.values().any(|existing| existing.overlaps(prefix))
     }
 
     fn recv_unsubscribe(&mut self, msg: message::Unsubscribe) -> Result<(), SessionError> {
@@ -971,7 +975,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::{
-        coding::{TrackName, TrackNamespace},
+        coding::{TrackName, TrackNamespace, TrackNamespacePrefix},
         serve::FullTrackName,
     };
 
@@ -1014,5 +1018,27 @@ mod tests {
         assert_eq!(names.by_name.get(&track), Some(&6));
         assert_eq!(names.by_id.get(&6), Some(&track));
         assert!(!names.by_id.contains_key(&8));
+    }
+
+    #[test]
+    fn subscribed_namespace_overlap_detects_common_prefix() {
+        let mut prefixes = HashMap::new();
+        prefixes.insert(
+            0,
+            TrackNamespacePrefix::from_utf8_path("example.com/meeting=123"),
+        );
+
+        assert!(Publisher::has_subscribed_namespace_overlap(
+            &prefixes,
+            &TrackNamespacePrefix::from_utf8_path("example.com/meeting=123/participant=100")
+        ));
+        assert!(Publisher::has_subscribed_namespace_overlap(
+            &prefixes,
+            &TrackNamespacePrefix::from_utf8_path("example.com")
+        ));
+        assert!(!Publisher::has_subscribed_namespace_overlap(
+            &prefixes,
+            &TrackNamespacePrefix::from_utf8_path("example.com/meeting=456")
+        ));
     }
 }
