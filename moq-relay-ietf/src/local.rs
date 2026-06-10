@@ -31,6 +31,17 @@ struct NamespaceSource {
     requests: mpsc::Sender<TrackWriter>,
 }
 
+struct TrackEntry {
+    reader: TrackReader,
+    source: TrackSource,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TrackSource {
+    Published,
+    Cache,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamespaceChange {
     pub scope: Option<String>,
@@ -58,7 +69,7 @@ pub enum TrackChange {
 #[derive(Clone)]
 pub struct Locals {
     /// Actual media tracks, indexed by (scope, full track name).
-    tracks: Arc<Mutex<HashMap<ScopeKey, HashMap<FullTrackName, TrackReader>>>>,
+    tracks: Arc<Mutex<HashMap<ScopeKey, HashMap<FullTrackName, TrackEntry>>>>,
 
     /// Namespace route sources from PUBLISH_NAMESPACE, indexed by (scope,
     /// namespace) and matched by prefix.
@@ -128,11 +139,13 @@ impl Locals {
             return Vec::new();
         };
 
-        bucket.retain(|_, track| !track.is_closed());
+        bucket.retain(|_, entry| !entry.reader.is_closed());
         bucket
             .iter()
-            .filter(|(full_name, _)| prefix.is_prefix_of(&full_name.namespace))
-            .map(|(_, track)| track.clone())
+            .filter(|(full_name, entry)| {
+                entry.source == TrackSource::Published && prefix.is_prefix_of(&full_name.namespace)
+            })
+            .map(|(_, entry)| entry.reader.clone())
             .collect()
     }
 
@@ -205,7 +218,10 @@ impl Locals {
             .map_err(|_| ServeError::internal_ctx("locals track registry lock poisoned"))?;
         let bucket = tracks.entry(scope_key.clone()).or_default();
         match bucket.entry(full_name.clone()) {
-            hash_map::Entry::Vacant(entry) => entry.insert(track.clone()),
+            hash_map::Entry::Vacant(entry) => entry.insert(TrackEntry {
+                reader: track.clone(),
+                source: TrackSource::Published,
+            }),
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
         };
 
@@ -222,6 +238,30 @@ impl Locals {
         })
     }
 
+    async fn insert_track(
+        &mut self,
+        scope: Option<&str>,
+        full_name: FullTrackName,
+        track: TrackReader,
+    ) -> anyhow::Result<()> {
+        let scope_key = scope.unwrap_or(UNSCOPED).to_string();
+        let mut tracks = self
+            .tracks
+            .lock()
+            .map_err(|_| ServeError::internal_ctx("locals track registry lock poisoned"))?;
+        let bucket = tracks.entry(scope_key).or_default();
+        match bucket.entry(full_name) {
+            hash_map::Entry::Vacant(entry) => {
+                entry.insert(TrackEntry {
+                    reader: track,
+                    source: TrackSource::Cache,
+                });
+                Ok(())
+            }
+            hash_map::Entry::Occupied(_) => Err(ServeError::Duplicate.into()),
+        }
+    }
+
     /// Retrieve one actual media track by exact Full Track Name.
     pub fn retrieve_track(
         &self,
@@ -230,11 +270,14 @@ impl Locals {
     ) -> Option<TrackReader> {
         let mut tracks = self.tracks.lock().ok()?;
         let bucket = tracks.get_mut(scope.unwrap_or(UNSCOPED))?;
-        if bucket.get(full_name).is_some_and(|track| track.is_closed()) {
+        if bucket
+            .get(full_name)
+            .is_some_and(|entry| entry.reader.is_closed())
+        {
             bucket.remove(full_name);
             return None;
         }
-        bucket.get(full_name).cloned()
+        bucket.get(full_name).map(|entry| entry.reader.clone())
     }
 
     /// Return the best namespace route source for a requested namespace.
@@ -291,24 +334,9 @@ impl Locals {
         let source = self.route_namespace(scope, &namespace)?;
 
         let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
-        let reader = {
-            let scope_key = scope.unwrap_or(UNSCOPED).to_string();
-            let mut tracks = self.tracks.lock().ok()?;
-            let bucket = tracks.entry(scope_key).or_default();
-            match bucket.entry(full_name.clone()) {
-                hash_map::Entry::Vacant(entry) => {
-                    entry.insert(reader.clone());
-                    reader
-                }
-                hash_map::Entry::Occupied(mut entry) => {
-                    if !entry.get().is_closed() {
-                        return Some(entry.get().clone());
-                    }
-                    entry.insert(reader.clone());
-                    reader
-                }
-            }
-        };
+        self.insert_track(scope, full_name.clone(), reader.clone())
+            .await
+            .ok()?;
 
         if source.requests.send(writer).await.is_err() {
             if let Ok(mut tracks) = self.tracks.lock() {
@@ -700,6 +728,27 @@ mod tests {
         assert_eq!(tracks[0].name, TrackName::from("audio"));
         assert_eq!(tracks[1].namespace, ns("room/123/camera"));
         assert_eq!(tracks[1].name, TrackName::from("video"));
+    }
+
+    #[tokio::test]
+    async fn list_tracks_matching_excludes_pull_through_cache_entries() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let _reader = locals
+            .get_or_request_track(None, namespace.clone(), "video")
+            .await
+            .expect("missing track should be requested and cached");
+        let _requested = requests.recv().await.expect("source should get request");
+
+        let tracks =
+            locals.list_tracks_matching(None, &TrackNamespacePrefix::from_utf8_path("room/123"));
+
+        assert!(tracks.is_empty());
     }
 
     #[tokio::test]
