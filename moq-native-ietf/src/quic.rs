@@ -184,6 +184,18 @@ impl Args {
     }
 }
 
+/// A hook to wrap the endpoint's [`quinn::AsyncUdpSocket`] before it is handed
+/// to quinn.
+///
+/// This lets callers interpose custom socket behavior — for example,
+/// byte-counting for metrics — without this crate depending on the caller's
+/// instrumentation. The closure receives the runtime-wrapped socket and
+/// returns the socket quinn should actually use (typically the input wrapped
+/// in a decorator).
+pub type SocketWrapperFn = Arc<
+    dyn Fn(Arc<dyn quinn::AsyncUdpSocket>) -> Arc<dyn quinn::AsyncUdpSocket> + Send + Sync + 'static,
+>;
+
 pub struct Config {
     pub bind: Option<net::SocketAddr>,
     pub socket: net::UdpSocket,
@@ -191,6 +203,9 @@ pub struct Config {
     pub qlog_dir: Option<PathBuf>,
     pub tls: tls::Config,
     pub tags: HashSet<String>,
+    /// Optional hook to wrap the [`quinn::AsyncUdpSocket`] before endpoint
+    /// creation. Defaults to `None` (no wrapping). See [`SocketWrapperFn`].
+    pub socket_wrapper: Option<SocketWrapperFn>,
 }
 
 impl Config {
@@ -207,6 +222,7 @@ impl Config {
             qlog_dir,
             tls,
             tags: HashSet::new(),
+            socket_wrapper: None,
         })
     }
 
@@ -230,11 +246,19 @@ impl Config {
             qlog_dir,
             tls,
             tags: HashSet::new(),
+            socket_wrapper: None,
         }
     }
 
     pub fn with_tag(mut self, tag: String) -> Self {
         self.tags.insert(tag);
+        self
+    }
+
+    /// Attach a [`SocketWrapperFn`] that wraps the endpoint's
+    /// [`quinn::AsyncUdpSocket`] before it is handed to quinn.
+    pub fn with_socket_wrapper(mut self, wrapper: SocketWrapperFn) -> Self {
+        self.socket_wrapper = Some(wrapper);
         self
     }
 }
@@ -288,9 +312,26 @@ impl Endpoint {
         let endpoint_config = quinn::EndpointConfig::default();
         let socket = config.socket;
 
-        // Create the generic QUIC endpoint.
-        let quic = quinn::Endpoint::new(endpoint_config, server_config.clone(), socket, runtime)
-            .context("failed to create QUIC endpoint")?;
+        // Create the generic QUIC endpoint. When a socket wrapper is configured,
+        // wrap the std socket into quinn's AsyncUdpSocket and let the caller
+        // interpose (e.g. for byte-counting metrics) before quinn takes it.
+        let quic = match config.socket_wrapper {
+            Some(wrap) => {
+                let async_socket = runtime
+                    .wrap_udp_socket(socket)
+                    .context("failed to wrap UDP socket")?;
+                let wrapped = wrap(async_socket);
+                quinn::Endpoint::new_with_abstract_socket(
+                    endpoint_config,
+                    server_config.clone(),
+                    wrapped,
+                    runtime,
+                )
+                .context("failed to create QUIC endpoint")?
+            }
+            None => quinn::Endpoint::new(endpoint_config, server_config.clone(), socket, runtime)
+                .context("failed to create QUIC endpoint")?,
+        };
 
         let server = server_config.map(|base_server_config| Server {
             quic: quic.clone(),
