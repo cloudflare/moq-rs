@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::HashSet;
+
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
+    coding::TrackNamespace,
+    message::{RequestErrorCode, SubscribeOptions},
     serve::{FullTrackName, ServeError, TracksReader},
-    session::{Publisher, SessionError, Subscribed, TrackStatusRequested},
+    session::{Publisher, SessionError, Subscribed, SubscribedNamespace, TrackStatusRequested},
 };
+use tokio::sync::broadcast;
 
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
-    Locals, RemoteManager,
+    Locals, NamespaceChange, RemoteManager,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -52,6 +57,7 @@ impl Producer {
         loop {
             let mut publisher_subscribed = self.publisher.clone();
             let mut publisher_track_status = self.publisher.clone();
+            let mut publisher_subscribed_namespace = self.publisher.clone();
 
             tokio::select! {
                 // Handle a new subscribe request
@@ -91,6 +97,23 @@ impl Producer {
                         // Serve the track_status request
                         if let Err(err) = this.serve_track_status(track_status_requested).await {
                             tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving track_status: {:?}, error: {}", info, err)
+                        }
+                    }.boxed())
+                },
+                // Handle a new namespace subscription request.
+                Some(subscribed_namespace) = publisher_subscribed_namespace.subscribed_namespace() => {
+                    let this = self.clone();
+
+                    tasks.push(async move {
+                        let prefix = subscribed_namespace.namespace_prefix.to_utf8_path();
+                        tracing::info!(namespace_prefix = %prefix, "serving subscribe namespace");
+
+                        if let Err(err) = this.serve_subscribe_namespace(subscribed_namespace).await {
+                            if Self::is_expected_serve_shutdown(&err) {
+                                tracing::debug!(namespace_prefix = %prefix, error = %err, "stopped serving subscribe namespace");
+                            } else {
+                                tracing::warn!(namespace_prefix = %prefix, error = %err, "failed serving subscribe namespace");
+                            }
                         }
                     }.boxed())
                 },
@@ -172,6 +195,120 @@ impl Producer {
         ));
         subscribed.close(err.clone())?;
         Err(err.into())
+    }
+
+    /// Serve a SUBSCRIBE_NAMESPACE request using relay-local namespace state.
+    async fn serve_subscribe_namespace(
+        self,
+        mut subscribed_namespace: SubscribedNamespace,
+    ) -> Result<(), anyhow::Error> {
+        // PUBLISH fan-out is a separate part of the feature. Reject requests
+        // that ask for it rather than accepting incomplete behavior.
+        if subscribed_namespace.subscribe_options != SubscribeOptions::Namespace {
+            subscribed_namespace.reject(
+                RequestErrorCode::NotSupported as u64,
+                "publish option not supported",
+            )?;
+            return Ok(());
+        }
+
+        let mut changes = self.locals.subscribe_namespace_changes();
+
+        subscribed_namespace.ok()?;
+
+        let mut known = HashSet::new();
+        self.send_namespace_snapshot(&mut subscribed_namespace, &mut known)?;
+
+        loop {
+            tokio::select! {
+                res = subscribed_namespace.closed() => {
+                    res?;
+                    return Ok(());
+                }
+                change = changes.recv() => {
+                    match change {
+                        Ok(change) => {
+                            self.apply_namespace_change(&mut subscribed_namespace, &mut known, change)?;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            self.resync_namespaces(&mut subscribed_namespace, &mut known)?;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+
+    fn send_namespace_snapshot(
+        &self,
+        subscribed_namespace: &mut SubscribedNamespace,
+        known: &mut HashSet<TrackNamespace>,
+    ) -> Result<(), ServeError> {
+        for namespace in self.locals.list_namespaces_matching(
+            self.scope.as_deref(),
+            &subscribed_namespace.namespace_prefix,
+        ) {
+            if known.insert(namespace.clone()) {
+                subscribed_namespace.namespace(&namespace)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_namespace_change(
+        &self,
+        subscribed_namespace: &mut SubscribedNamespace,
+        known: &mut HashSet<TrackNamespace>,
+        change: NamespaceChange,
+    ) -> Result<(), ServeError> {
+        if change.scope.as_deref() != self.scope.as_deref() {
+            return Ok(());
+        }
+
+        if !subscribed_namespace
+            .namespace_prefix
+            .is_prefix_of(&change.namespace)
+        {
+            return Ok(());
+        }
+
+        if change.added {
+            if known.insert(change.namespace.clone()) {
+                subscribed_namespace.namespace(&change.namespace)?;
+            }
+        } else if known.remove(&change.namespace) {
+            subscribed_namespace.namespace_done(&change.namespace)?;
+        }
+
+        Ok(())
+    }
+
+    fn resync_namespaces(
+        &self,
+        subscribed_namespace: &mut SubscribedNamespace,
+        known: &mut HashSet<TrackNamespace>,
+    ) -> Result<(), ServeError> {
+        let current: HashSet<_> = self
+            .locals
+            .list_namespaces_matching(
+                self.scope.as_deref(),
+                &subscribed_namespace.namespace_prefix,
+            )
+            .into_iter()
+            .collect();
+
+        for namespace in current.difference(known) {
+            subscribed_namespace.namespace(namespace)?;
+        }
+
+        for namespace in known.difference(&current) {
+            subscribed_namespace.namespace_done(namespace)?;
+        }
+
+        *known = current;
+        Ok(())
     }
 
     fn is_expected_serve_shutdown(err: &anyhow::Error) -> bool {
