@@ -3,13 +3,18 @@
 
 //! Outbound SUBSCRIBE_NAMESPACE handling.
 
-use std::{collections::HashSet, ops};
+use std::{
+    collections::HashSet,
+    ops,
+    sync::{Arc, Mutex},
+};
 
 use futures::channel::oneshot;
 
 use crate::{
     coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message, SubscribeOptions},
+    mlog,
     serve::ServeError,
     watch::State,
 };
@@ -166,15 +171,50 @@ pub(super) struct SubscribeNamespaceRecv {
 }
 
 impl SubscribeNamespaceRecv {
-    pub async fn run(mut self, mut reader: Reader) -> Result<(), SessionError> {
+    pub async fn run(
+        mut self,
+        mut reader: Reader,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(), SessionError> {
         loop {
             if self.responded && reader.done().await? {
                 return Ok(());
             }
 
             let msg = reader.decode::<Message>().await?;
+            self.emit_mlog(&mlog, &msg);
             if !self.recv_message(msg)? {
                 return Ok(());
+            }
+        }
+    }
+
+    fn emit_mlog(&self, mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>, msg: &Message) {
+        if let Some(mlog) = mlog {
+            if let Ok(mut mlog) = mlog.lock() {
+                let time = mlog.elapsed_ms();
+                let event = match msg {
+                    Message::RequestOk(msg) => Some(mlog::events::request_ok_parsed(
+                        time,
+                        0,
+                        "subscribe_namespace",
+                        msg,
+                    )),
+                    Message::RequestError(msg) => Some(mlog::events::request_error_parsed(
+                        time,
+                        0,
+                        "subscribe_namespace",
+                        msg,
+                    )),
+                    Message::Namespace(msg) => Some(mlog::events::namespace_parsed(time, 0, msg)),
+                    Message::NamespaceDone(msg) => {
+                        Some(mlog::events::namespace_done_parsed(time, 0, msg))
+                    }
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    let _ = mlog.add_event(event);
+                }
             }
         }
     }

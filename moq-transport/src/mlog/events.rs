@@ -5,12 +5,12 @@
 // - PublishNamespaceDone (parsed/created)
 // - PublishNamespaceCancel (parsed/created)
 // - TrackStatus (parsed/created)
-// - SubscribeNamespace (parsed/created)
 // - RequestUpdate (parsed/created)
 // - Fetch, FetchOk, FetchCancel (parsed/created)
 // - Publish, PublishOk, PublishDone (parsed/created)
 // - MaxRequestId (parsed/created)
 // - RequestsBlocked (parsed/created)
+// - Namespace and NamespaceDone are implemented for SUBSCRIBE_NAMESPACE response streams.
 //
 // TODO: Unimplemented data plane events (from draft-pardue-moq-qlog-moq-events):
 // - stream_type_set (when stream type becomes known)
@@ -324,6 +324,89 @@ pub fn publish_namespace_created(
         false,
         "publish_namespace",
         publish_namespace_to_json(msg),
+    )
+}
+
+fn subscribe_namespace_to_json(msg: &message::SubscribeNamespace) -> JsonValue {
+    json!({
+        "request_id": msg.id,
+        "track_namespace_prefix": msg.track_namespace_prefix.to_string(),
+        "subscribe_options": format!("{:?}", msg.subscribe_options),
+        "parameters": key_value_pairs_to_vec(&msg.params.0),
+    })
+}
+
+/// Create a control_message_parsed event for SUBSCRIBE_NAMESPACE.
+pub fn subscribe_namespace_parsed(
+    time: f64,
+    stream_id: u64,
+    msg: &message::SubscribeNamespace,
+) -> Event {
+    create_control_message_event(
+        time,
+        stream_id,
+        true,
+        "subscribe_namespace",
+        subscribe_namespace_to_json(msg),
+    )
+}
+
+/// Create a control_message_created event for SUBSCRIBE_NAMESPACE.
+pub fn subscribe_namespace_created(
+    time: f64,
+    stream_id: u64,
+    msg: &message::SubscribeNamespace,
+) -> Event {
+    create_control_message_event(
+        time,
+        stream_id,
+        false,
+        "subscribe_namespace",
+        subscribe_namespace_to_json(msg),
+    )
+}
+
+fn namespace_to_json(msg: &message::Namespace) -> JsonValue {
+    json!({
+        "track_namespace_suffix": msg.track_namespace_suffix.to_string(),
+    })
+}
+
+/// Create a control_message_parsed event for NAMESPACE.
+pub fn namespace_parsed(time: f64, stream_id: u64, msg: &message::Namespace) -> Event {
+    create_control_message_event(time, stream_id, true, "namespace", namespace_to_json(msg))
+}
+
+/// Create a control_message_created event for NAMESPACE.
+pub fn namespace_created(time: f64, stream_id: u64, msg: &message::Namespace) -> Event {
+    create_control_message_event(time, stream_id, false, "namespace", namespace_to_json(msg))
+}
+
+fn namespace_done_to_json(msg: &message::NamespaceDone) -> JsonValue {
+    json!({
+        "track_namespace_suffix": msg.track_namespace_suffix.to_string(),
+    })
+}
+
+/// Create a control_message_parsed event for NAMESPACE_DONE.
+pub fn namespace_done_parsed(time: f64, stream_id: u64, msg: &message::NamespaceDone) -> Event {
+    create_control_message_event(
+        time,
+        stream_id,
+        true,
+        "namespace_done",
+        namespace_done_to_json(msg),
+    )
+}
+
+/// Create a control_message_created event for NAMESPACE_DONE.
+pub fn namespace_done_created(time: f64, stream_id: u64, msg: &message::NamespaceDone) -> Event {
+    create_control_message_event(
+        time,
+        stream_id,
+        false,
+        "namespace_done",
+        namespace_done_to_json(msg),
     )
 }
 
@@ -717,5 +800,36 @@ pub fn loglevel_event(time: f64, level: LogLevel, message: String) -> Event {
         time,
         name: format!("loglevel:{}", level.as_str()),
         data: EventData::LogLevel(LogLevelEvent { message }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::{KeyValuePairs, TrackNamespacePrefix};
+    use crate::message::{SubscribeNamespace, SubscribeOptions};
+
+    #[test]
+    fn subscribe_namespace_event_includes_prefix_and_options() {
+        let msg = SubscribeNamespace {
+            id: 10,
+            track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("example.com/meeting"),
+            subscribe_options: SubscribeOptions::Both,
+            params: KeyValuePairs::default(),
+        };
+
+        let event = subscribe_namespace_created(1.0, 7, &msg);
+
+        let EventData::ControlMessageCreated(data) = event.data else {
+            panic!("expected control_message_created event");
+        };
+        assert_eq!(data.stream_id, 7);
+        assert_eq!(data.message_type, "subscribe_namespace");
+        assert_eq!(data.message["request_id"], 10);
+        assert_eq!(
+            data.message["track_namespace_prefix"],
+            "/example.com/meeting"
+        );
+        assert_eq!(data.message["subscribe_options"], "Both");
     }
 }

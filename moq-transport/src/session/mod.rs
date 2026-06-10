@@ -50,6 +50,18 @@ use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
 
+fn add_mlog_event<F>(mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>, make_event: F)
+where
+    F: FnOnce(f64) -> mlog::Event,
+{
+    if let Some(mlog) = mlog {
+        if let Ok(mut mlog) = mlog.lock() {
+            let event = make_event(mlog.elapsed_ms());
+            let _ = mlog.add_event(event);
+        }
+    }
+}
+
 /// The transport protocol negotiated for this MoQT connection.
 ///
 /// MoQT can run over either WebTransport (HTTP/3 + QUIC) or raw QUIC.
@@ -721,7 +733,7 @@ impl Session {
             res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_subscribe_namespace_open(self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_accept(self.webtransport.clone(), self.publisher.clone(), self.request_id.clone()) => res,
+            res = Self::run_subscribe_namespace_accept(self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.publisher, self.subscriber, self.pending_requests) => res,
@@ -779,7 +791,7 @@ impl Session {
     async fn run_subscribe_namespace_open(
         webtransport: web_transport::Session,
         mut requests: Queue<OpenSubscribeNamespace>,
-        _mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
         let mut requests_done = false;
@@ -790,7 +802,7 @@ impl Session {
                     match request {
                         Some(request) => {
                             let webtransport = webtransport.clone();
-                            tasks.push(Self::open_subscribe_namespace(webtransport, request));
+                            tasks.push(Self::open_subscribe_namespace(webtransport, request, mlog.clone()));
                         }
                         None => requests_done = true,
                     }
@@ -804,6 +816,7 @@ impl Session {
     async fn open_subscribe_namespace(
         webtransport: web_transport::Session,
         request: OpenSubscribeNamespace,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let (send, recv) = webtransport.open_bi().await?;
         let mut writer = Writer::new(send);
@@ -811,6 +824,9 @@ impl Session {
 
         let msg = Message::SubscribeNamespace(request.message.clone());
         Self::log_control_message(&msg, "sent");
+        add_mlog_event(&mlog, |time| {
+            mlog::events::subscribe_namespace_created(time, 0, &request.message)
+        });
         writer.encode(&msg).await?;
 
         let (send, recv) = SubscribeNamespace::new(request.subscriber, request.info, writer);
@@ -818,13 +834,14 @@ impl Session {
             return Ok(());
         }
 
-        recv.run(reader).await
+        recv.run(reader, mlog).await
     }
 
     async fn run_subscribe_namespace_accept(
         webtransport: web_transport::Session,
         publisher: Option<Publisher>,
         request_id: RequestId,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
 
@@ -834,7 +851,7 @@ impl Session {
                     let (send, recv) = stream?;
                     let publisher = publisher.clone().ok_or(SessionError::RoleViolation)?;
                     let request_id = request_id.clone();
-                    tasks.push(Self::accept_subscribe_namespace_stream(publisher, request_id, send, recv));
+                    tasks.push(Self::accept_subscribe_namespace_stream(publisher, request_id, send, recv, mlog.clone()));
                 }
                 Some(res) = tasks.next(), if !tasks.is_empty() => res?,
             }
@@ -846,6 +863,7 @@ impl Session {
         request_id: RequestId,
         send: web_transport::SendStream,
         recv: web_transport::RecvStream,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
         let writer = Writer::new(send);
         let mut reader = Reader::new(recv);
@@ -862,10 +880,13 @@ impl Session {
         };
         let log_msg = Message::SubscribeNamespace(subscribe_namespace.clone());
         Self::log_control_message(&log_msg, "recv");
+        add_mlog_event(&mlog, |time| {
+            mlog::events::subscribe_namespace_parsed(time, 0, &subscribe_namespace)
+        });
 
         request_id.validate_incoming(subscribe_namespace.id)?;
         let recv = publisher.recv_subscribe_namespace(subscribe_namespace)?;
-        recv.run(writer, reader).await
+        recv.run(writer, reader, mlog).await
     }
 
     /// Receives inbound messages from the control stream reader/receiver.  Analyzes if the message

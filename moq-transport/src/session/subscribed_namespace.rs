@@ -12,6 +12,7 @@ use std::{
 use crate::{
     coding::{ReasonPhrase, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message, RequestErrorCode, SubscribeOptions},
+    mlog,
     serve::ServeError,
     watch::State,
 };
@@ -228,13 +229,19 @@ impl SubscribedNamespaceRecv {
         }
     }
 
-    pub async fn run(mut self, mut writer: Writer, mut reader: Reader) -> Result<(), SessionError> {
+    pub async fn run(
+        mut self,
+        mut writer: Writer,
+        mut reader: Reader,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(), SessionError> {
         loop {
             tokio::select! {
                 msg = self.outgoing.recv() => {
                     let Some(msg) = msg else {
                         return Ok(());
                     };
+                    self.emit_mlog(&mlog, &msg);
                     writer.encode(&msg).await?;
                 }
                 done = reader.done() => {
@@ -258,6 +265,36 @@ impl SubscribedNamespaceRecv {
                             return Ok(());
                         }
                     }
+                }
+            }
+        }
+    }
+
+    fn emit_mlog(&self, mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>, msg: &Message) {
+        if let Some(mlog) = mlog {
+            if let Ok(mut mlog) = mlog.lock() {
+                let time = mlog.elapsed_ms();
+                let event = match msg {
+                    Message::RequestOk(msg) => Some(mlog::events::request_ok_created(
+                        time,
+                        0,
+                        "subscribe_namespace",
+                        msg,
+                    )),
+                    Message::RequestError(msg) => Some(mlog::events::request_error_created(
+                        time,
+                        0,
+                        "subscribe_namespace",
+                        msg,
+                    )),
+                    Message::Namespace(msg) => Some(mlog::events::namespace_created(time, 0, msg)),
+                    Message::NamespaceDone(msg) => {
+                        Some(mlog::events::namespace_done_created(time, 0, msg))
+                    }
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    let _ = mlog.add_event(event);
                 }
             }
         }
