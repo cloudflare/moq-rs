@@ -7,7 +7,7 @@
 //! namespace registration across multiple relay instances. No separate
 //! server process is required.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use url::Url;
 
 use moq_relay_ietf::{
     Coordinator, CoordinatorError, CoordinatorResult, NamespaceInfo, NamespaceOrigin,
-    NamespaceRegistration, NamespaceSubscription, TrackRegistration,
+    NamespaceRegistration, NamespaceSubscription, RelayInfo, TrackRegistration,
 };
 
 /// Data stored in the shared file
@@ -35,6 +35,10 @@ struct CoordinatorData {
     /// Key format: `<namespace utf8 byte len>:<namespace utf8 path><track utf8/lossy>`.
     #[serde(default)]
     tracks: HashMap<String, HashMap<String, String>>,
+    /// Maps connection scope to namespace-prefix interest map.
+    /// Inner map: prefix key -> relay URL -> reference count.
+    #[serde(default)]
+    namespace_subscribers: HashMap<String, HashMap<String, HashMap<String, u64>>>,
 }
 
 impl CoordinatorData {
@@ -64,6 +68,27 @@ struct TrackUnregisterHandle {
     scope_key: String,
     track_key: String,
     file_path: PathBuf,
+}
+
+/// Handle that unregisters namespace interest when dropped.
+struct NamespaceSubscriptionHandle {
+    scope_key: String,
+    prefix_key: String,
+    relay_url: String,
+    file_path: PathBuf,
+}
+
+impl Drop for NamespaceSubscriptionHandle {
+    fn drop(&mut self) {
+        if let Err(err) = unregister_namespace_subscription_sync(
+            &self.file_path,
+            &self.scope_key,
+            &self.prefix_key,
+            &self.relay_url,
+        ) {
+            tracing::warn!(prefix = %self.prefix_key, relay_url = %self.relay_url, error = %err, "failed to unregister namespace subscription on drop: {}", err);
+        }
+    }
 }
 
 impl Drop for TrackUnregisterHandle {
@@ -135,6 +160,48 @@ fn unregister_track_sync(file_path: &Path, scope_key: &str, track_key: &str) -> 
     Ok(())
 }
 
+fn unregister_namespace_subscription_sync(
+    file_path: &Path,
+    scope_key: &str,
+    prefix_key: &str,
+    relay_url: &str,
+) -> Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(file_path)?;
+
+    file.lock_exclusive()?;
+
+    let mut data = read_data(&file)?;
+    if let Some(scope_bucket) = data.namespace_subscribers.get_mut(scope_key) {
+        if let Some(prefix_bucket) = scope_bucket.get_mut(prefix_key) {
+            match prefix_bucket.get_mut(relay_url) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    prefix_bucket.remove(relay_url);
+                }
+                None => {}
+            }
+
+            if prefix_bucket.is_empty() {
+                scope_bucket.remove(prefix_key);
+            }
+        }
+
+        if scope_bucket.is_empty() {
+            data.namespace_subscribers.remove(scope_key);
+        }
+    }
+
+    write_data(&file, &data)?;
+    file.unlock()?;
+
+    Ok(())
+}
+
 /// Read coordinator data from file
 fn read_data(file: &File) -> Result<CoordinatorData> {
     let mut file = file;
@@ -166,10 +233,10 @@ fn write_data(file: &File, data: &CoordinatorData) -> Result<()> {
 }
 
 fn namespace_key_has_prefix(namespace_key: &str, prefix_key: &str) -> bool {
-    namespace_key
+    let mut namespace_parts = namespace_key.split('/');
+    prefix_key
         .split('/')
-        .zip(prefix_key.split('/'))
-        .all(|(namespace_part, prefix_part)| namespace_part == prefix_part)
+        .all(|prefix_part| namespace_parts.next() == Some(prefix_part))
 }
 
 /// A coordinator that uses a shared file for state storage.
@@ -344,9 +411,75 @@ impl Coordinator for FileCoordinator {
     ) -> CoordinatorResult<NamespaceSubscription> {
         let scope_key = CoordinatorData::scope_key(scope);
         let prefix_key = CoordinatorData::namespace_key(prefix);
+        let relay_url = self.relay_url.to_string();
         let file_path = self.file_path.clone();
 
-        let existing = tokio::task::spawn_blocking(move || -> Result<Vec<NamespaceInfo>> {
+        let existing = tokio::task::spawn_blocking({
+            let scope_key = scope_key.clone();
+            let prefix_key = prefix_key.clone();
+            let relay_url = relay_url.clone();
+            move || -> Result<Vec<NamespaceInfo>> {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&file_path)?;
+
+                file.lock_exclusive()?;
+
+                let mut data = read_data(&file)?;
+                let existing = data
+                    .namespaces
+                    .get(&scope_key)
+                    .into_iter()
+                    .flat_map(|bucket| bucket.keys())
+                    .filter(|namespace_key| namespace_key_has_prefix(namespace_key, &prefix_key))
+                    .map(|namespace_key| {
+                        TrackNamespace::try_from(namespace_key.as_str()).map(NamespaceInfo::new)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let count = data
+                    .namespace_subscribers
+                    .entry(scope_key)
+                    .or_default()
+                    .entry(prefix_key)
+                    .or_default()
+                    .entry(relay_url)
+                    .or_default();
+                *count = count.saturating_add(1);
+
+                write_data(&file, &data)?;
+
+                file.unlock()?;
+
+                Ok(existing)
+            }
+        })
+        .await??;
+
+        Ok(NamespaceSubscription::new(
+            existing,
+            NamespaceSubscriptionHandle {
+                scope_key,
+                prefix_key,
+                relay_url,
+                file_path: self.file_path.clone(),
+            },
+        ))
+    }
+
+    async fn lookup_namespace_subscribers(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+    ) -> CoordinatorResult<Vec<RelayInfo>> {
+        let scope_key = CoordinatorData::scope_key(scope);
+        let namespace_key = CoordinatorData::namespace_key(namespace);
+        let file_path = self.file_path.clone();
+
+        let subscribers = tokio::task::spawn_blocking(move || -> Result<Vec<RelayInfo>> {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -357,24 +490,29 @@ impl Coordinator for FileCoordinator {
             file.lock_shared()?;
 
             let data = read_data(&file)?;
-            let existing = data
-                .namespaces
-                .get(&scope_key)
-                .into_iter()
-                .flat_map(|bucket| bucket.keys())
-                .filter(|namespace_key| namespace_key_has_prefix(namespace_key, &prefix_key))
-                .map(|namespace_key| {
-                    TrackNamespace::try_from(namespace_key.as_str()).map(NamespaceInfo::new)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut urls = HashSet::new();
+            let mut subscribers = Vec::new();
+            if let Some(bucket) = data.namespace_subscribers.get(&scope_key) {
+                for (prefix_key, relays) in bucket {
+                    if !namespace_key_has_prefix(&namespace_key, prefix_key) {
+                        continue;
+                    }
+
+                    for relay_url in relays.keys() {
+                        if urls.insert(relay_url.clone()) {
+                            subscribers.push(RelayInfo::new(Url::parse(relay_url)?));
+                        }
+                    }
+                }
+            }
 
             file.unlock()?;
 
-            Ok(existing)
+            Ok(subscribers)
         })
         .await??;
 
-        Ok(NamespaceSubscription::new(existing, ()))
+        Ok(subscribers)
     }
 
     async fn register_track(
@@ -700,6 +838,122 @@ mod tests {
             scoped.existing_namespaces[0].namespace,
             TrackNamespace::from_utf8_path("room/scoped")
         );
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn lookup_namespace_subscribers_finds_matching_prefixes() {
+        let file = temp_file_path("namespace-subscribers");
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(&file, relay_url.clone());
+
+        let _subscription = coordinator
+            .subscribe_namespace(Some("scope-a"), &TrackNamespace::from_utf8_path("room/123"))
+            .await
+            .expect("namespace subscription should register");
+
+        let subscribers = coordinator
+            .lookup_namespace_subscribers(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/123/camera"),
+            )
+            .await
+            .expect("subscriber lookup should succeed");
+
+        assert_eq!(subscribers.len(), 1);
+        assert_eq!(subscribers[0].url, relay_url);
+
+        let no_match = coordinator
+            .lookup_namespace_subscribers(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/456"),
+            )
+            .await
+            .expect("subscriber lookup should succeed");
+        assert!(no_match.is_empty());
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn namespace_subscription_drop_unregisters_with_refcount() {
+        let file = temp_file_path("namespace-subscriber-refcount");
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(&file, relay_url.clone());
+        let prefix = TrackNamespace::from_utf8_path("room/123");
+        let namespace = TrackNamespace::from_utf8_path("room/123/camera");
+
+        let first = coordinator
+            .subscribe_namespace(Some("scope-a"), &prefix)
+            .await
+            .expect("first subscription should register");
+        let second = coordinator
+            .subscribe_namespace(Some("scope-a"), &prefix)
+            .await
+            .expect("second subscription should register");
+
+        drop(first);
+
+        let subscribers = coordinator
+            .lookup_namespace_subscribers(Some("scope-a"), &namespace)
+            .await
+            .expect("subscriber lookup should succeed");
+        assert_eq!(subscribers.len(), 1);
+        assert_eq!(subscribers[0].url, relay_url);
+
+        drop(second);
+
+        let subscribers = coordinator
+            .lookup_namespace_subscribers(Some("scope-a"), &namespace)
+            .await
+            .expect("subscriber lookup should succeed");
+        assert!(subscribers.is_empty());
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn lookup_namespace_subscribers_keeps_scopes_isolated() {
+        let file = temp_file_path("namespace-subscriber-scopes");
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(&file, relay_url);
+
+        let _global = coordinator
+            .subscribe_namespace(None, &TrackNamespace::from_utf8_path("room/global"))
+            .await
+            .expect("global subscription should register");
+        let _scoped = coordinator
+            .subscribe_namespace(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/scoped"),
+            )
+            .await
+            .expect("scoped subscription should register");
+
+        let global = coordinator
+            .lookup_namespace_subscribers(None, &TrackNamespace::from_utf8_path("room/global/cam"))
+            .await
+            .expect("global lookup should succeed");
+        assert_eq!(global.len(), 1);
+
+        let scoped = coordinator
+            .lookup_namespace_subscribers(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/scoped/cam"),
+            )
+            .await
+            .expect("scoped lookup should succeed");
+        assert_eq!(scoped.len(), 1);
+
+        let no_cross_scope = coordinator
+            .lookup_namespace_subscribers(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/global/cam"),
+            )
+            .await
+            .expect("scoped lookup should succeed");
+        assert!(no_cross_scope.is_empty());
 
         let _ = std::fs::remove_file(file);
     }
