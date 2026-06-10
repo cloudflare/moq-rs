@@ -184,6 +184,26 @@ impl Args {
     }
 }
 
+/// A hook to wrap the endpoint's [`quinn::AsyncUdpSocket`] before it is handed
+/// to quinn.
+///
+/// This lets callers interpose custom socket behavior — for example,
+/// byte-counting for metrics — without this crate depending on the caller's
+/// instrumentation. The closure receives the runtime-wrapped socket and
+/// returns the socket quinn should actually use (typically the input wrapped
+/// in a decorator).
+///
+/// Construct one via [`Config::with_socket_wrapper`], which accepts any
+/// matching closure; this boxed alias is the stored form. `Box` (rather than
+/// `Arc`) is sufficient because `Config` is not `Clone` and the wrapper is
+/// invoked exactly once, during [`Endpoint::new`].
+pub type SocketWrapperFn = Box<
+    dyn Fn(Arc<dyn quinn::AsyncUdpSocket>) -> Arc<dyn quinn::AsyncUdpSocket>
+        + Send
+        + Sync
+        + 'static,
+>;
+
 pub struct Config {
     pub bind: Option<net::SocketAddr>,
     pub socket: net::UdpSocket,
@@ -191,6 +211,9 @@ pub struct Config {
     pub qlog_dir: Option<PathBuf>,
     pub tls: tls::Config,
     pub tags: HashSet<String>,
+    /// Optional hook to wrap the [`quinn::AsyncUdpSocket`] before endpoint
+    /// creation. Defaults to `None` (no wrapping). See [`SocketWrapperFn`].
+    pub socket_wrapper: Option<SocketWrapperFn>,
 }
 
 impl Config {
@@ -207,6 +230,7 @@ impl Config {
             qlog_dir,
             tls,
             tags: HashSet::new(),
+            socket_wrapper: None,
         })
     }
 
@@ -230,11 +254,25 @@ impl Config {
             qlog_dir,
             tls,
             tags: HashSet::new(),
+            socket_wrapper: None,
         }
     }
 
     pub fn with_tag(mut self, tag: String) -> Self {
         self.tags.insert(tag);
+        self
+    }
+
+    /// Attach a closure that wraps the endpoint's [`quinn::AsyncUdpSocket`]
+    /// before it is handed to quinn. See [`SocketWrapperFn`].
+    pub fn with_socket_wrapper<F>(mut self, wrapper: F) -> Self
+    where
+        F: Fn(Arc<dyn quinn::AsyncUdpSocket>) -> Arc<dyn quinn::AsyncUdpSocket>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.socket_wrapper = Some(Box::new(wrapper));
         self
     }
 }
@@ -288,9 +326,26 @@ impl Endpoint {
         let endpoint_config = quinn::EndpointConfig::default();
         let socket = config.socket;
 
-        // Create the generic QUIC endpoint.
-        let quic = quinn::Endpoint::new(endpoint_config, server_config.clone(), socket, runtime)
-            .context("failed to create QUIC endpoint")?;
+        // Create the generic QUIC endpoint. When a socket wrapper is configured,
+        // wrap the std socket into quinn's AsyncUdpSocket and let the caller
+        // interpose (e.g. for byte-counting metrics) before quinn takes it.
+        let quic = match config.socket_wrapper {
+            Some(wrap) => {
+                let async_socket = runtime
+                    .wrap_udp_socket(socket)
+                    .context("failed to wrap UDP socket")?;
+                let wrapped = wrap(async_socket);
+                quinn::Endpoint::new_with_abstract_socket(
+                    endpoint_config,
+                    server_config.clone(),
+                    wrapped,
+                    runtime,
+                )
+                .context("failed to create QUIC endpoint")?
+            }
+            None => quinn::Endpoint::new(endpoint_config, server_config.clone(), socket, runtime)
+                .context("failed to create QUIC endpoint")?,
+        };
 
         let server = server_config.map(|base_server_config| Server {
             quic: quic.clone(),
@@ -654,5 +709,47 @@ impl Client {
     fn parse_socket_addr(host: &str, port: u16) -> Result<net::SocketAddr, net::AddrParseError> {
         let host = format!("{}:{}", host, port);
         host.parse::<net::SocketAddr>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Installing a pass-through socket wrapper must still produce a working
+    /// endpoint. Exercises the `socket_wrapper` branch of `Endpoint::new`,
+    /// including `wrap_udp_socket` and `new_with_abstract_socket`, and verifies
+    /// the wrapper closure is actually invoked.
+    #[tokio::test]
+    async fn socket_wrapper_passthrough_builds_endpoint() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP socket");
+
+        // Client-only TLS config: no cert/key, so `tls.server` is `None` and
+        // `Endpoint::new` builds a client without needing certificates.
+        let tls = tls::Args {
+            disable_verify: true,
+            ..Default::default()
+        }
+        .load()
+        .expect("load client TLS config");
+
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_wrapper = called.clone();
+        let config = Config::with_socket(socket, None, tls).with_socket_wrapper(move |inner| {
+            called_in_wrapper.store(true, Ordering::SeqCst);
+            inner // pass through unchanged
+        });
+
+        let endpoint = Endpoint::new(config).expect("endpoint builds with wrapper");
+
+        assert!(
+            called.load(Ordering::SeqCst),
+            "the socket wrapper closure should have been invoked"
+        );
+        assert!(
+            endpoint.server.is_none(),
+            "client-only TLS config should yield no server"
+        );
     }
 }
