@@ -14,7 +14,10 @@
 //! blocking inbound validation while still keeping all request-ID state tied to
 //! one session handle.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use crate::coding::KeyValuePairs;
 use crate::message::{MaxRequestId, RequestsBlocked};
@@ -40,7 +43,9 @@ struct SendState {
 
 #[derive(Debug)]
 struct RecvState {
-    next_expected: u64,
+    first: u64,
+    low_water: u64,
+    received_above_low_water: HashSet<u64>,
     our_max: u64,
 }
 
@@ -84,7 +89,9 @@ impl RequestId {
                     blocked_sent_for: None,
                 }),
                 recv: Mutex::new(RecvState {
-                    next_expected: peer_first_id,
+                    first: peer_first_id,
+                    low_water: peer_first_id,
+                    received_above_low_water: HashSet::new(),
                     our_max,
                 }),
             }),
@@ -140,18 +147,28 @@ impl RequestId {
     pub fn validate_incoming(&self, id: u64) -> Result<(), SessionError> {
         let mut recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
 
-        if id != recv.next_expected {
-            return Err(SessionError::InvalidRequestId);
-        }
-
         if id >= recv.our_max {
             return Err(SessionError::TooManyRequests);
         }
 
-        recv.next_expected = recv
-            .next_expected
-            .checked_add(2)
-            .ok_or(SessionError::InvalidRequestId)?;
+        if id < recv.first || id % 2 != recv.first % 2 || id < recv.low_water {
+            return Err(SessionError::InvalidRequestId);
+        }
+
+        if !recv.received_above_low_water.insert(id) {
+            return Err(SessionError::InvalidRequestId);
+        }
+
+        while {
+            let low_water = recv.low_water;
+            recv.received_above_low_water.remove(&low_water)
+        } {
+            recv.low_water = recv
+                .low_water
+                .checked_add(2)
+                .ok_or(SessionError::InvalidRequestId)?;
+        }
+
         Ok(())
     }
 
@@ -321,27 +338,28 @@ mod tests {
     fn rejects_wrong_first_id() {
         let ids = server_ids(10, 10);
         assert!(matches!(
-            ids.validate_incoming(2).unwrap_err(),
+            ids.validate_incoming(1).unwrap_err(),
             SessionError::InvalidRequestId
         ));
     }
 
     #[test]
-    fn rejects_skipped_id() {
+    fn accepts_cross_stream_out_of_order_ids() {
         let ids = server_ids(10, 10);
+        ids.validate_incoming(4).unwrap();
         ids.validate_incoming(0).unwrap();
-        assert!(matches!(
-            ids.validate_incoming(4).unwrap_err(),
-            SessionError::InvalidRequestId
-        ));
+        ids.validate_incoming(2).unwrap();
+        ids.validate_incoming(6).unwrap();
     }
 
     #[test]
     fn rejects_repeated_id() {
         let ids = server_ids(10, 10);
+        ids.validate_incoming(4).unwrap();
         ids.validate_incoming(0).unwrap();
+        ids.validate_incoming(2).unwrap();
         assert!(matches!(
-            ids.validate_incoming(0).unwrap_err(),
+            ids.validate_incoming(4).unwrap_err(),
             SessionError::InvalidRequestId
         ));
     }
