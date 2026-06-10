@@ -85,9 +85,11 @@ pub enum TestCase {
     PublishTrackSubscribe,
     /// T0.9: Subscriber sends SUBSCRIBE_NAMESPACE and receives NAMESPACE
     SubscribeNamespaceExisting,
-    /// T0.8: SUBSCRIBE_NAMESPACE Both receives NAMESPACE and PUBLISH
+    /// T0.8: SUBSCRIBE_NAMESPACE Publish receives PUBLISH only
+    SubscribeNamespacePublish,
+    /// T0.9: SUBSCRIBE_NAMESPACE Both receives NAMESPACE and PUBLISH
     SubscribeNamespaceBoth,
-    /// T0.9: SUBSCRIBE_NAMESPACE receives future NAMESPACE and NAMESPACE_DONE
+    /// T0.10: SUBSCRIBE_NAMESPACE receives future NAMESPACE and NAMESPACE_DONE
     SubscribeNamespaceUpdates,
 }
 
@@ -103,6 +105,7 @@ impl TestCase {
             TestCase::PublishTrackOnly,
             TestCase::PublishTrackSubscribe,
             TestCase::SubscribeNamespaceExisting,
+            TestCase::SubscribeNamespacePublish,
             TestCase::SubscribeNamespaceBoth,
             TestCase::SubscribeNamespaceUpdates,
         ]
@@ -119,6 +122,7 @@ impl TestCase {
             TestCase::PublishTrackOnly => "publish-track-only",
             TestCase::PublishTrackSubscribe => "publish-track-subscribe",
             TestCase::SubscribeNamespaceExisting => "subscribe-namespace-existing",
+            TestCase::SubscribeNamespacePublish => "subscribe-namespace-publish",
             TestCase::SubscribeNamespaceBoth => "subscribe-namespace-both",
             TestCase::SubscribeNamespaceUpdates => "subscribe-namespace-updates",
         }
@@ -176,6 +180,9 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
         TestCase::PublishTrackSubscribe => scenarios::test_publish_track_subscribe(args).await,
         TestCase::SubscribeNamespaceExisting => {
             scenarios::test_subscribe_namespace_existing(args).await
+        }
+        TestCase::SubscribeNamespacePublish => {
+            scenarios::test_subscribe_namespace_publish(args).await
         }
         TestCase::SubscribeNamespaceBoth => scenarios::test_subscribe_namespace_both(args).await,
         TestCase::SubscribeNamespaceUpdates => {
