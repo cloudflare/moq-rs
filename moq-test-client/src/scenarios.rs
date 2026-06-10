@@ -15,9 +15,10 @@ use tokio::time::{timeout, Duration};
 
 use moq_native_ietf::quic;
 use moq_transport::{
-    coding::{KeyValuePairs, TrackNamespace},
+    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
+    message::SubscribeOptions,
     serve::{Track, TrackReaderMode, TrackWriter, Tracks},
-    session::Session,
+    session::{NamespaceEvent, Session},
 };
 
 use crate::Args;
@@ -468,6 +469,95 @@ pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionI
         };
 
         result?;
+        Ok(cids)
+    })
+    .await
+    .context("test timed out")?
+}
+
+/// T0.9: Subscribe Namespace Existing
+///
+/// Publisher sends PUBLISH_NAMESPACE, then subscriber sends SUBSCRIBE_NAMESPACE
+/// for a prefix and receives the matching NAMESPACE update.
+pub async fn test_subscribe_namespace_existing(args: &Args) -> Result<TestConnectionIds> {
+    timeout(TEST_TIMEOUT, async {
+        let mut cids = TestConnectionIds::default();
+
+        let (pub_session, pub_cid, pub_transport) =
+            connect(args).await.context("publisher failed to connect")?;
+        cids.add(pub_cid);
+        let (pub_session, mut publisher, _) = Session::connect(pub_session, None, pub_transport)
+            .await
+            .context("publisher SETUP failed")?;
+
+        let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
+        let (_, _, pub_reader) = Tracks::new(namespace.clone()).produce();
+
+        let publisher_task = tokio::spawn(async move {
+            tokio::select! {
+                res = publisher.publish_namespace(pub_reader) => {
+                    res.map_err(anyhow::Error::from)
+                }
+                res = pub_session.run() => {
+                    res.context("publisher session error")
+                }
+                _ = tokio::time::sleep(TEST_TIMEOUT) => Ok(()),
+            }
+        });
+
+        // Give the relay a chance to register the namespace. The test also
+        // succeeds if the NAMESPACE arrives as a future update instead.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let (sub_session, sub_cid, sub_transport) = connect(args)
+            .await
+            .context("subscriber failed to connect")?;
+        cids.add(sub_cid);
+        let (sub_session, _, mut subscriber) = Session::connect(sub_session, None, sub_transport)
+            .await
+            .context("subscriber SETUP failed")?;
+
+        let expected = namespace.clone();
+        let subscribe = async move {
+            let subscribed_namespace = subscriber
+                .subscribe_namespace(
+                    TrackNamespacePrefix::from_utf8_path("moq-test"),
+                    SubscribeOptions::Namespace,
+                    KeyValuePairs::default(),
+                )
+                .await
+                .context("failed to send SUBSCRIBE_NAMESPACE")?;
+
+            subscribed_namespace
+                .ok()
+                .await
+                .context("SUBSCRIBE_NAMESPACE rejected")?;
+
+            let event = timeout(Duration::from_secs(3), subscribed_namespace.next())
+                .await
+                .context("timed out waiting for NAMESPACE")?
+                .context("SUBSCRIBE_NAMESPACE closed while waiting for NAMESPACE")?
+                .ok_or_else(|| anyhow::anyhow!("SUBSCRIBE_NAMESPACE ended without NAMESPACE"))?;
+
+            match event {
+                NamespaceEvent::Added(namespace) if namespace == expected => Ok(()),
+                NamespaceEvent::Added(namespace) => anyhow::bail!(
+                    "received wrong namespace: got {}, expected {}",
+                    namespace,
+                    expected
+                ),
+                NamespaceEvent::Removed(namespace) => {
+                    anyhow::bail!("received NAMESPACE_DONE before NAMESPACE: {}", namespace)
+                }
+            }
+        };
+
+        tokio::select! {
+            res = subscribe => res?,
+            res = sub_session.run() => res.context("subscriber session error")?,
+        }
+
+        publisher_task.abort();
         Ok(cids)
     })
     .await

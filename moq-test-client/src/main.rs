@@ -83,6 +83,8 @@ pub enum TestCase {
     PublishTrackOnly,
     /// T0.8: Publisher sends PUBLISH for one track, subscriber receives it through relay routing
     PublishTrackSubscribe,
+    /// T0.9: Subscriber sends SUBSCRIBE_NAMESPACE and receives NAMESPACE
+    SubscribeNamespaceExisting,
 }
 
 impl TestCase {
@@ -96,6 +98,7 @@ impl TestCase {
             TestCase::PublishNamespaceDone,
             TestCase::PublishTrackOnly,
             TestCase::PublishTrackSubscribe,
+            TestCase::SubscribeNamespaceExisting,
         ]
     }
 
@@ -109,6 +112,7 @@ impl TestCase {
             TestCase::PublishNamespaceDone => "publish-namespace-done",
             TestCase::PublishTrackOnly => "publish-track-only",
             TestCase::PublishTrackSubscribe => "publish-track-subscribe",
+            TestCase::SubscribeNamespaceExisting => "subscribe-namespace-existing",
         }
     }
 }
@@ -162,6 +166,9 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
         TestCase::PublishNamespaceDone => scenarios::test_publish_namespace_done(args).await,
         TestCase::PublishTrackOnly => scenarios::test_publish_track_only(args).await,
         TestCase::PublishTrackSubscribe => scenarios::test_publish_track_subscribe(args).await,
+        TestCase::SubscribeNamespaceExisting => {
+            scenarios::test_subscribe_namespace_existing(args).await
+        }
     };
 
     let duration = start.elapsed();
