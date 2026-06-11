@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    coding::{KeyValuePairs, TrackNamespace},
+    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
     message::SubscribeOptions,
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{Publisher, SessionError, Subscribed, SubscribedNamespace, TrackStatusRequested},
@@ -14,7 +15,7 @@ use tokio::sync::broadcast;
 
 use crate::{
     metrics::{GaugeGuard, TimingGuard},
-    Locals, NamespaceChange, RemoteManager, TrackChange,
+    Coordinator, Locals, NamespaceChange, RemoteManager, TrackChange,
 };
 
 /// Producer of tracks to a remote Subscriber
@@ -23,6 +24,7 @@ pub struct Producer {
     publisher: Publisher,
     locals: Locals,
     remotes: RemoteManager,
+    coordinator: Arc<dyn Coordinator>,
     /// The resolved scope identity for this session, if any.
     /// Produced by `Coordinator::resolve_scope()` from the connection path.
     /// Passed to locals/remotes to isolate namespace lookups.
@@ -34,12 +36,14 @@ impl Producer {
         publisher: Publisher,
         locals: Locals,
         remotes: RemoteManager,
+        coordinator: Arc<dyn Coordinator>,
         scope: Option<String>,
     ) -> Self {
         Self {
             publisher,
             locals,
             remotes,
+            coordinator,
             scope,
         }
     }
@@ -204,14 +208,35 @@ impl Producer {
     ) -> Result<(), anyhow::Error> {
         let wants_namespace = wants_namespace(subscribed_namespace.subscribe_options);
         let wants_publish = wants_publish(subscribed_namespace.subscribe_options);
-        let mut namespace_changes = self.locals.subscribe_namespace_changes();
-        let mut track_changes = self.locals.subscribe_track_changes();
+        let namespace_changes = self.locals.subscribe_namespace_changes();
+        let track_changes = self.locals.subscribe_track_changes();
         let mut publish_tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
             FuturesUnordered::new();
 
         subscribed_namespace.ok()?;
 
         let mut known_namespaces = HashSet::new();
+        let coordinator_subscription = if wants_namespace {
+            if let Some(prefix) = prefix_as_namespace(&subscribed_namespace.namespace_prefix) {
+                let subscription = self
+                    .coordinator
+                    .subscribe_namespace(self.scope.as_deref(), &prefix)
+                    .await?;
+
+                for info in &subscription.existing_namespaces {
+                    if known_namespaces.insert(info.namespace.clone()) {
+                        subscribed_namespace.namespace(&info.namespace)?;
+                    }
+                }
+
+                Some(subscription)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if wants_namespace {
             self.send_namespace_snapshot(&mut subscribed_namespace, &mut known_namespaces)?;
         }
@@ -226,6 +251,35 @@ impl Producer {
             .await?;
         }
 
+        let res = self
+            .serve_subscribe_namespace_loop(
+                subscribed_namespace,
+                wants_namespace,
+                wants_publish,
+                namespace_changes,
+                track_changes,
+                publish_tasks,
+                known_namespaces,
+                known_tracks,
+            )
+            .await;
+        drop(coordinator_subscription);
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_subscribe_namespace_loop(
+        self,
+        subscribed_namespace: SubscribedNamespace,
+        wants_namespace: bool,
+        wants_publish: bool,
+        mut namespace_changes: tokio::sync::broadcast::Receiver<NamespaceChange>,
+        mut track_changes: tokio::sync::broadcast::Receiver<TrackChange>,
+        mut publish_tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
+        mut known_namespaces: HashSet<TrackNamespace>,
+        mut known_tracks: HashSet<FullTrackName>,
+    ) -> Result<(), anyhow::Error> {
+        let mut subscribed_namespace = subscribed_namespace;
         loop {
             tokio::select! {
                 res = subscribed_namespace.closed() => {
@@ -523,6 +577,10 @@ fn full_name_for_track(track: &TrackReader) -> FullTrackName {
         namespace: track.namespace.clone(),
         name: track.name.clone(),
     }
+}
+
+fn prefix_as_namespace(prefix: &TrackNamespacePrefix) -> Option<TrackNamespace> {
+    TrackNamespace::try_from(prefix.fields.clone()).ok()
 }
 
 #[cfg(test)]
