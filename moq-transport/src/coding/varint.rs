@@ -2,11 +2,25 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Based on quinn-proto
-// https://github.com/quinn-rs/quinn/blob/main/quinn-proto/src/varint.rs
-// Licensed via Apache 2.0 and MIT
+// Variable-length integer encoding for MoQ Transport draft-18+.
+//
+// Uses the "leading-1-bits" encoding defined in draft-ietf-moq-transport-17 §1.4.1:
+// Count the leading 1-bits of the first byte to determine the total length.
+// Non-minimal encodings are explicitly allowed by the spec.
+//
+// | Leading bits | Total bytes | Usable bits | Max value         |
+// |--------------|-------------|-------------|-------------------|
+// | 0            | 1           | 7           | 127               |
+// | 10           | 2           | 14          | 16383             |
+// | 110          | 3           | 21          | 2097151           |
+// | 1110         | 4           | 28          | 268435455         |
+// | 11110        | 5           | 35          | 34359738367       |
+// | 111110       | 6           | 42          | 4398046511103     |
+// | 1111110      | 7           | 49          | 562949953421311   |
+// | 11111110     | 8           | 56          | 72057594037927935 |
+// | 11111111     | 9           | 64          | u64::MAX          |
 
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryFrom;
 use std::fmt;
 
 use thiserror::Error;
@@ -17,28 +31,26 @@ use super::{Decode, DecodeError, Encode, EncodeError};
 #[error("value out of range")]
 pub struct BoundsExceeded;
 
-/// An integer less than 2^62
+/// A variable-length integer (vi64) as defined in MoQ Transport draft-18.
 ///
-/// Values of this type are suitable for encoding as QUIC variable-length integer.
-/// It would be neat if we could express to Rust that the top two bits are available for use as enum
-/// discriminants
+/// All u64 values are representable. The encoding uses 1-9 bytes with
+/// leading-1-bits to signal the length.
 #[derive(Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct VarInt(u64);
 
 impl VarInt {
-    /// The largest possible value.
-    pub const MAX: Self = Self((1 << 62) - 1);
+    /// The largest representable value.
+    pub const MAX: Self = Self(u64::MAX);
 
     /// The smallest possible value.
     pub const ZERO: Self = Self(0);
 
-    /// Construct a `VarInt` infallibly using the largest available type.
-    /// Larger values need to use `try_from` instead.
+    /// Construct a `VarInt` infallibly from a u32.
     pub const fn from_u32(x: u32) -> Self {
         Self(x as u64)
     }
 
-    /// Extract the integer value
+    /// Extract the integer value.
     pub const fn into_inner(self) -> u64 {
         self.0
     }
@@ -80,26 +92,19 @@ impl From<u32> for VarInt {
     }
 }
 
-impl TryFrom<u64> for VarInt {
-    type Error = BoundsExceeded;
-
-    /// Succeeds iff `x` < 2^62
-    fn try_from(x: u64) -> Result<Self, BoundsExceeded> {
-        let x = Self(x);
-        if x <= Self::MAX {
-            Ok(x)
-        } else {
-            Err(BoundsExceeded)
-        }
+impl From<u64> for VarInt {
+    fn from(x: u64) -> Self {
+        Self(x)
     }
 }
+
 
 impl TryFrom<u128> for VarInt {
     type Error = BoundsExceeded;
 
-    /// Succeeds iff `x` < 2^62
+    /// Succeeds iff `x` fits in a u64.
     fn try_from(x: u128) -> Result<Self, BoundsExceeded> {
-        if x <= Self::MAX.into() {
+        if x <= u64::MAX as u128 {
             Ok(Self(x as u64))
         } else {
             Err(BoundsExceeded)
@@ -110,16 +115,14 @@ impl TryFrom<u128> for VarInt {
 impl TryFrom<usize> for VarInt {
     type Error = BoundsExceeded;
 
-    /// Succeeds iff `x` < 2^62
     fn try_from(x: usize) -> Result<Self, BoundsExceeded> {
-        Self::try_from(x as u64)
+        Ok(Self(x as u64))
     }
 }
 
 impl TryFrom<VarInt> for u32 {
     type Error = BoundsExceeded;
 
-    /// Succeeds iff `x` < 2^32
     fn try_from(x: VarInt) -> Result<Self, BoundsExceeded> {
         if x.0 <= u32::MAX.into() {
             Ok(x.0 as u32)
@@ -132,7 +135,6 @@ impl TryFrom<VarInt> for u32 {
 impl TryFrom<VarInt> for u16 {
     type Error = BoundsExceeded;
 
-    /// Succeeds iff `x` < 2^16
     fn try_from(x: VarInt) -> Result<Self, BoundsExceeded> {
         if x.0 <= u16::MAX.into() {
             Ok(x.0 as u16)
@@ -145,7 +147,6 @@ impl TryFrom<VarInt> for u16 {
 impl TryFrom<VarInt> for u8 {
     type Error = BoundsExceeded;
 
-    /// Succeeds iff `x` < 2^8
     fn try_from(x: VarInt) -> Result<Self, BoundsExceeded> {
         if x.0 <= u8::MAX.into() {
             Ok(x.0 as u8)
@@ -167,71 +168,98 @@ impl fmt::Display for VarInt {
     }
 }
 
+/// Determine the minimal number of bytes needed to encode `x`.
+#[inline]
+fn encoded_size(x: u64) -> usize {
+    if x <= 0x7F { 1 }
+    else if x <= 0x3FFF { 2 }
+    else if x <= 0x1F_FFFF { 3 }
+    else if x <= 0x0FFF_FFFF { 4 }
+    else if x <= 0x07_FFFF_FFFF { 5 }
+    else if x <= 0x03FF_FFFF_FFFF { 6 }
+    else if x <= 0x01_FFFF_FFFF_FFFF { 7 }
+    else if x <= 0x00FF_FFFF_FFFF_FFFF { 8 }
+    else { 9 }
+}
+
 impl Decode for VarInt {
-    /// Decode a varint from the given reader.
+    /// Decode a leading-1-bits varint from the given reader.
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         Self::decode_remaining(r, 1)?;
+        let first = r.get_u8();
 
-        let b = r.get_u8();
-        let tag = b >> 6;
+        let ones = (!first).leading_zeros() as usize; // count of leading 1-bits
+        let extra = ones.min(8); // additional bytes after the first
 
-        let mut buf = [0u8; 8];
-        buf[0] = b & 0b0011_1111;
+        Self::decode_remaining(r, extra)?;
 
-        let x = match tag {
-            0b00 => u64::from(buf[0]),
-            0b01 => {
-                Self::decode_remaining(r, 1)?;
-                r.copy_to_slice(buf[1..2].as_mut());
-                u64::from(u16::from_be_bytes(buf[..2].try_into().unwrap()))
+        let value = match extra {
+            0 => {
+                // 0xxxxxxx -- 7 usable bits
+                u64::from(first & 0x7F)
             }
-            0b10 => {
-                Self::decode_remaining(r, 3)?;
-                r.copy_to_slice(buf[1..4].as_mut());
-                u64::from(u32::from_be_bytes(buf[..4].try_into().unwrap()))
-            }
-            0b11 => {
-                Self::decode_remaining(r, 7)?;
-                r.copy_to_slice(buf[1..8].as_mut());
+            8 => {
+                // 11111111 + 8 more bytes -- full u64
+                let mut buf = [0u8; 8];
+                r.copy_to_slice(&mut buf);
                 u64::from_be_bytes(buf)
             }
-            _ => unreachable!(),
+            7 => {
+                // 11111110 + 7 more bytes -- 56 usable bits, no data bits in first byte
+                let mut buf = [0u8; 8];
+                r.copy_to_slice(&mut buf[1..]);
+                u64::from_be_bytes(buf)
+            }
+            n => {
+                // n leading 1-bits, then a 0-bit, then (7 - n) data bits in first byte,
+                // plus n more bytes. Mask off the tag: clear the top (n+1) bits.
+                let mask = 0xFFu8 >> (n + 1);
+                let mut buf = [0u8; 8];
+                buf[8 - 1 - n] = first & mask;
+                r.copy_to_slice(&mut buf[8 - n..]);
+                u64::from_be_bytes(buf)
+            }
         };
 
-        Ok(Self(x))
+        Ok(Self(value))
     }
 }
 
 impl Encode for VarInt {
-    /// Encode a varint to the given writer.
+    /// Encode a leading-1-bits varint to the given writer.
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         let x = self.0;
-        if x < 2u64.pow(6) {
-            Self::encode_remaining(w, 1)?;
-            w.put_u8(x as u8)
-        } else if x < 2u64.pow(14) {
-            Self::encode_remaining(w, 2)?;
-            w.put_u16((0b01 << 14) | x as u16)
-        } else if x < 2u64.pow(30) {
-            Self::encode_remaining(w, 4)?;
-            w.put_u32((0b10 << 30) | x as u32)
-        } else if x < 2u64.pow(62) {
-            Self::encode_remaining(w, 8)?;
-            w.put_u64((0b11 << 62) | x)
-        } else {
-            return Err(BoundsExceeded.into());
+        let size = encoded_size(x);
+
+        Self::encode_remaining(w, size)?;
+
+        match size {
+            1 => {
+                w.put_u8(x as u8);
+            }
+            9 => {
+                w.put_u8(0xFF);
+                w.put_u64(x);
+            }
+            n => {
+                // n bytes total: (n-1) leading 1-bits, then 0-bit, then data.
+                let first_data = (x >> ((n - 1) * 8)) as u8;
+                let tag: u8 = !((1u16 << (9 - n)) - 1) as u8;
+                debug_assert!(first_data < (1u8 << (8 - n)));
+                w.put_u8(tag | first_data);
+                let remaining = x.to_be_bytes();
+                w.put_slice(&remaining[8 - (n - 1)..]);
+            }
         }
 
         Ok(())
     }
 }
 
-// It is doubtful the MOQ specs would ever ask us to encode/decode a u64 to the wire directly without
-// VarInt encoding. These encode/decode methods offer some nice syntactic sugar.
+// Encode/Decode u64 via VarInt for wire convenience.
 impl Encode for u64 {
-    /// Encode a varint to the given writer.
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        VarInt::try_from(*self)?.encode(w)
+        VarInt::from(*self).encode(w)
     }
 }
 
@@ -241,21 +269,15 @@ impl Decode for u64 {
     }
 }
 
-// The MOQ specs would never ask us to encode/decode a usize to the wire directly without VarInt
-// encoding, since it's actual size is depended on 32bit vs 64bit compilations.  These encode/decode
-// methods offer some nice syntactic sugar.
 impl Encode for usize {
-    /// Encode a varint to the given writer.
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        let var = VarInt::try_from(*self)?;
-        var.encode(w)
+        VarInt::from(*self as u64).encode(w)
     }
 }
 
 impl Decode for usize {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let var = VarInt::decode(r)?;
-        // Note: If 32-bit system, then VarInt may not fit into usize
         #[allow(clippy::unnecessary_fallible_conversions)]
         usize::try_from(var).map_err(|_| DecodeError::BoundsExceeded(BoundsExceeded))
     }
@@ -266,150 +288,109 @@ mod tests {
     use super::*;
     use bytes::BytesMut;
 
-    #[test]
-    fn encode_decode_usize() {
+    fn round_trip(value: u64) {
+        let v = VarInt::from(value);
         let mut buf = BytesMut::new();
-
-        let i: usize = 123;
-        i.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x40, 0x7b]); // first 2 bits are 01
-        let decoded = usize::decode(&mut buf).unwrap();
-        assert_eq!(decoded, i);
+        v.encode(&mut buf).unwrap();
+        let decoded = VarInt::decode(&mut buf).unwrap();
+        assert_eq!(decoded, v, "round-trip failed for {value}");
+        assert!(buf.is_empty(), "leftover bytes for {value}");
     }
 
-    #[test]
-    fn encode_usize_overflow() {
-        let i: u64 = 4611686018427387904;
-        // This test is only applicable on 64-bit systems
-        if i < usize::MAX as u64 {
-            let i = i as usize;
-            let mut buf = BytesMut::new();
-            let encoded = i.encode(&mut buf);
-            assert!(matches!(
-                encoded.unwrap_err(),
-                EncodeError::BoundsExceeded(_)
-            ));
-        }
-    }
-
-    #[test]
-    fn encode_decode_u64() {
+    fn encode_check(value: u64, expected: &[u8]) {
+        let v = VarInt::from(value);
         let mut buf = BytesMut::new();
+        v.encode(&mut buf).unwrap();
+        assert_eq!(&buf[..], expected, "encode mismatch for {value}");
+    }
 
-        let i: u64 = 123;
-        i.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0x40, 0x7b]); // first 2 bits are 01
-        let decoded = u64::decode(&mut buf).unwrap();
-        assert_eq!(decoded, i);
+    fn decode_check(bytes: &[u8], expected: u64) {
+        let mut buf = BytesMut::from(bytes);
+        let v = VarInt::decode(&mut buf).unwrap();
+        assert_eq!(v.into_inner(), expected, "decode mismatch for {bytes:?}");
+        assert!(buf.is_empty(), "leftover bytes for {bytes:?}");
+    }
+
+    // --- Test vectors from draft-ietf-moq-transport-18 Section 1.4.1 ---
+
+    #[test]
+    fn spec_37() { encode_check(37, &[0x25]); decode_check(&[0x25], 37); }
+
+    #[test]
+    fn spec_37_nonminimal() { decode_check(&[0x80, 0x25], 37); }
+
+    #[test]
+    fn spec_15293() { encode_check(15293, &[0xBB, 0xBD]); decode_check(&[0xBB, 0xBD], 15293); }
+
+    #[test]
+    fn spec_226442877() {
+        encode_check(226442877, &[0xED, 0x7F, 0x3E, 0x7D]);
+        decode_check(&[0xED, 0x7F, 0x3E, 0x7D], 226442877);
     }
 
     #[test]
-    fn encode_u64_overflow() {
-        let mut buf = BytesMut::new();
-
-        let i: u64 = 4611686018427387904;
-        let encoded = i.encode(&mut buf);
-        assert!(matches!(
-            encoded.unwrap_err(),
-            EncodeError::BoundsExceeded(_)
-        ));
+    fn spec_2893212287960() {
+        encode_check(2893212287960, &[0xFA, 0xA1, 0xA0, 0xE4, 0x03, 0xD8]);
+        decode_check(&[0xFA, 0xA1, 0xA0, 0xE4, 0x03, 0xD8], 2893212287960);
     }
 
     #[test]
-    fn encode_decode_varint() {
-        let mut buf = BytesMut::new();
-
-        // 0 -> 1 byte
-        let i = 0;
-        let vi = VarInt(i);
-        vi.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0b0000_0000]); // first 2 bits are 00
-        let decoded = VarInt::decode(&mut buf).unwrap();
-        assert_eq!(decoded, vi);
-        assert_eq!(u64::from(decoded), i);
-
-        // 63 -> 1 byte
-        let i = 63;
-        let vi = VarInt(i);
-        vi.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0b0011_1111]); // first 2 bits are 00
-        let decoded = VarInt::decode(&mut buf).unwrap();
-        assert_eq!(decoded, vi);
-        assert_eq!(u64::from(decoded), i);
-
-        // 64 -> 2 bytes
-        let i = 64;
-        let vi = VarInt(i);
-        vi.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0b0100_0000, 0b0100_0000]); // first 2 bits are 01
-        let decoded = VarInt::decode(&mut buf).unwrap();
-        assert_eq!(decoded, vi);
-        assert_eq!(u64::from(decoded), i);
-
-        // 16383 -> 2 bytes
-        let i = 16383;
-        let vi = VarInt(i);
-        vi.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0b0111_1111, 0xff]); // first 2 bits are 01
-        let decoded = VarInt::decode(&mut buf).unwrap();
-        assert_eq!(decoded, vi);
-        assert_eq!(u64::from(decoded), i);
-
-        // 16384 -> 4 bytes
-        let i = 16384;
-        let vi = VarInt(i);
-        vi.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0b1000_0000, 0x00, 0x40, 0x00]); // first 2 bits are 10
-        let decoded = VarInt::decode(&mut buf).unwrap();
-        assert_eq!(decoded, vi);
-        assert_eq!(u64::from(decoded), i);
-
-        // 1073741823 -> 4 bytes
-        let i = 1073741823;
-        let vi = VarInt(i);
-        vi.encode(&mut buf).unwrap();
-        assert_eq!(buf.to_vec(), vec![0b1011_1111, 0xff, 0xff, 0xff]); // first 2 bits are 10
-        let decoded = VarInt::decode(&mut buf).unwrap();
-        assert_eq!(decoded, vi);
-        assert_eq!(u64::from(decoded), i);
-
-        // 1073741824 -> 8 bytes
-        let i = 1073741824;
-        let vi = VarInt(i);
-        vi.encode(&mut buf).unwrap();
-        assert_eq!(
-            buf.to_vec(),
-            // first 2 bits are 11
-            vec![0b1100_0000, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]
-        );
-        let decoded = VarInt::decode(&mut buf).unwrap();
-        assert_eq!(decoded, vi);
-        assert_eq!(u64::from(decoded), i);
-
-        // 4611686018427387903 -> 8 bytes
-        let i = 4611686018427387903;
-        let vi = VarInt(i);
-        vi.encode(&mut buf).unwrap();
-        assert_eq!(
-            buf.to_vec(),
-            // first 2 bits are 11
-            vec![0b1111_1111, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
-        );
-        let decoded = VarInt::decode(&mut buf).unwrap();
-        assert_eq!(decoded, vi);
-        assert_eq!(u64::from(decoded), i);
+    fn spec_151288809941952() {
+        encode_check(151288809941952, &[0xFC, 0x89, 0x98, 0xAB, 0xC6, 0x6B, 0xC0]);
+        decode_check(&[0xFC, 0x89, 0x98, 0xAB, 0xC6, 0x6B, 0xC0], 151288809941952);
     }
 
     #[test]
-    fn overflow() {
-        let mut buf = BytesMut::new();
-
-        let i = 4611686018427387904;
-        let vi = VarInt(i);
-        let decoded = vi.encode(&mut buf);
-        assert!(matches!(
-            decoded.unwrap_err(),
-            EncodeError::BoundsExceeded(_)
-        ));
+    fn spec_70423237261249041() {
+        encode_check(70423237261249041, &[0xFE, 0xFA, 0x31, 0x8F, 0xA8, 0xE3, 0xCA, 0x11]);
+        decode_check(&[0xFE, 0xFA, 0x31, 0x8F, 0xA8, 0xE3, 0xCA, 0x11], 70423237261249041);
     }
+
+    #[test]
+    fn spec_u64_max() {
+        encode_check(u64::MAX, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        decode_check(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], u64::MAX);
+    }
+
+    // --- Boundary values ---
+
+    #[test]
+    fn boundary_1byte() { round_trip(0); round_trip(0x7F); encode_check(0, &[0x00]); encode_check(0x7F, &[0x7F]); }
+
+    #[test]
+    fn boundary_2byte() { round_trip(0x80); round_trip(0x3FFF); encode_check(0x80, &[0x80, 0x80]); }
+
+    #[test]
+    fn boundary_3to8() {
+        round_trip(0x4000); round_trip(0x1F_FFFF);
+        round_trip(0x20_0000); round_trip(0x0FFF_FFFF);
+        round_trip(0x1000_0000); round_trip(0x07_FFFF_FFFF);
+        round_trip(0x08_0000_0000); round_trip(0x03FF_FFFF_FFFF);
+        round_trip(0x0400_0000_0000); round_trip(0x01_FFFF_FFFF_FFFF);
+        round_trip(0x02_0000_0000_0000); round_trip(0x00FF_FFFF_FFFF_FFFF);
+    }
+
+    #[test]
+    fn boundary_9byte() { round_trip(0x0100_0000_0000_0000); round_trip(u64::MAX); round_trip(u64::MAX - 1); }
+
+    #[test]
+    fn round_trip_small() { for i in 0..=200 { round_trip(i); } }
+
+    #[test]
+    fn round_trip_large() { round_trip(1_000_000); round_trip(1_000_000_000); round_trip(u64::MAX / 2); }
+
+    #[test]
+    fn nonminimal_zero() { decode_check(&[0x80, 0x00], 0); }
+
+    #[test]
+    fn nonminimal_one() { decode_check(&[0xC0, 0x00, 0x01], 1); }
+
+    #[test]
+    fn setup_stream_type_0x2f00() { encode_check(0x2F00, &[0xAF, 0x00]); round_trip(0x2F00); }
+
+    #[test]
+    fn from_u64_always_succeeds() { assert_eq!(VarInt::try_from(u64::MAX).unwrap(), VarInt::MAX); }
+
+    #[test]
+    fn max_is_u64_max() { assert_eq!(VarInt::MAX.into_inner(), u64::MAX); }
 }

@@ -32,8 +32,8 @@ pub struct Cli {
     #[arg(long)]
     pub mlog_dir: Option<PathBuf>,
 
-    /// Forward all announces to the provided server for authentication/routing.
-    /// If not provided, the relay accepts every unique announce.
+    /// Forward all PUBLISH_NAMESPACE messages to the provided server for auth/routing.
+    /// If not provided, the relay accepts every unique namespace publish.
     #[arg(long)]
     pub announce: Option<Url>,
 

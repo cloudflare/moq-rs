@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::coding::{
-    Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location, TrackNamespace,
+    validate_full_track_name, Decode, DecodeError, Encode, EncodeError, KeyValuePairs, Location,
+    TrackName, TrackNamespace,
 };
-use crate::message::{FetchType, GroupOrder};
+use crate::message::FetchType;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StandaloneFetch {
     pub track_namespace: TrackNamespace,
-    pub track_name: String,
+    pub track_name: TrackName,
     pub start_location: Location,
     pub end_location: Location,
 }
@@ -17,7 +18,8 @@ pub struct StandaloneFetch {
 impl Decode for StandaloneFetch {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let track_namespace = TrackNamespace::decode(r)?;
-        let track_name = String::decode(r)?;
+        let track_name = TrackName::decode(r)?;
+        validate_full_track_name(&track_namespace, track_name.as_bytes())?;
         let start_location = Location::decode(r)?;
         let end_location = Location::decode(r)?;
 
@@ -76,12 +78,6 @@ pub struct Fetch {
     /// The fetch request ID
     pub id: u64,
 
-    /// Subscriber Priority
-    pub subscriber_priority: u8,
-
-    /// Object delivery order
-    pub group_order: GroupOrder,
-
     /// Standalone fetch vs Relative Joining fetch vs Absolute Joining fetch
     pub fetch_type: FetchType,
 
@@ -98,10 +94,6 @@ pub struct Fetch {
 impl Decode for Fetch {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
-
-        let subscriber_priority = u8::decode(r)?;
-        let group_order = GroupOrder::decode(r)?;
-
         let fetch_type = FetchType::decode(r)?;
 
         let standalone_fetch: Option<StandaloneFetch>;
@@ -121,8 +113,6 @@ impl Decode for Fetch {
 
         Ok(Self {
             id,
-            subscriber_priority,
-            group_order,
             fetch_type,
             standalone_fetch,
             joining_fetch,
@@ -134,10 +124,6 @@ impl Decode for Fetch {
 impl Encode for Fetch {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.id.encode(w)?;
-
-        self.subscriber_priority.encode(w)?;
-        self.group_order.encode(w)?;
-
         self.fetch_type.encode(w)?;
 
         match self.fetch_type {
@@ -181,12 +167,10 @@ mod tests {
         // FetchType = Standlone
         let msg = Fetch {
             id: 12345,
-            subscriber_priority: 127,
-            group_order: GroupOrder::Publisher,
             fetch_type: FetchType::Standalone,
             standalone_fetch: Some(StandaloneFetch {
                 track_namespace: TrackNamespace::from_utf8_path("test/path/to/resource"),
-                track_name: "audiotrack".to_string(),
+                track_name: "audiotrack".into(),
                 start_location: Location::new(34, 53),
                 end_location: Location::new(34, 53),
             }),
@@ -200,8 +184,6 @@ mod tests {
         // FetchType = RelativeJoining
         let msg = Fetch {
             id: 12345,
-            subscriber_priority: 127,
-            group_order: GroupOrder::Publisher,
             fetch_type: FetchType::RelativeJoining,
             standalone_fetch: None,
             joining_fetch: Some(JoiningFetch {
@@ -217,8 +199,6 @@ mod tests {
         // FetchType = AbsoluteJoining
         let msg = Fetch {
             id: 12345,
-            subscriber_priority: 127,
-            group_order: GroupOrder::Publisher,
             fetch_type: FetchType::AbsoluteJoining,
             standalone_fetch: None,
             joining_fetch: Some(JoiningFetch {
@@ -239,8 +219,6 @@ mod tests {
         // FetchType = Standlone - missing standalone_fetch
         let msg = Fetch {
             id: 12345,
-            subscriber_priority: 127,
-            group_order: GroupOrder::Publisher,
             fetch_type: FetchType::Standalone,
             standalone_fetch: None,
             joining_fetch: None,
@@ -252,8 +230,6 @@ mod tests {
         // FetchType = AbsoluteJoining - missing joining_fetch
         let msg = Fetch {
             id: 12345,
-            subscriber_priority: 127,
-            group_order: GroupOrder::Publisher,
             fetch_type: FetchType::AbsoluteJoining,
             standalone_fetch: None,
             joining_fetch: None,

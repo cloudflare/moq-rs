@@ -48,19 +48,21 @@ macro_rules! subscriber_msgs {
     }
 }
 
-// Defines messages that a SUBSCRIBER would send, or that a PUBLISHER would handle
+// Defines messages that a SUBSCRIBER would send, or that a PUBLISHER would handle.
 subscriber_msgs! {
+    // Subscriber-initiated requests.
     Subscribe,
-    SubscribeUpdate,
+    RequestUpdate,
+    // Shared responses used by subscriber-side request handlers.
+    RequestOk,
+    RequestError,
+    // Subscription and fetch control.
     Unsubscribe,
     Fetch,
     FetchCancel,
     TrackStatus,
     SubscribeNamespace,
-    UnsubscribeNamespace,
+    // Responses/control for publisher-initiated requests.
     PublishNamespaceCancel,
-    PublishNamespaceOk,
-    PublishNamespaceError,
     PublishOk,
-    PublishError,
 }

@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // TODO: Unimplemented control message events (not yet needed for basic relay interop testing):
-// - SubscribeUpdate (parsed/created)
 // - PublishNamespaceDone (parsed/created)
 // - PublishNamespaceCancel (parsed/created)
-// - TrackStatus, TrackStatusOk, TrackStatusError (parsed/created)
-// - SubscribeNamespace, SubscribeNamespaceOk, SubscribeNamespaceError, UnsubscribeNamespace (parsed/created)
-// - Fetch, FetchOk, FetchError, FetchCancel (parsed/created)
-// - Publish, PublishOk, PublishError, PublishDone (parsed/created)
+// - TrackStatus (parsed/created)
+// - SubscribeNamespace (parsed/created)
+// - RequestUpdate (parsed/created)
+// - Fetch, FetchOk, FetchCancel (parsed/created)
+// - Publish, PublishOk, PublishDone (parsed/created)
 // - MaxRequestId (parsed/created)
 // - RequestsBlocked (parsed/created)
 //
@@ -208,33 +208,29 @@ fn create_control_message_event(
     }
 }
 
-/// Create a control_message_parsed event for CLIENT_SETUP
-pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Event {
-    let versions: Vec<String> = msg.versions.0.iter().map(|v| format!("{:?}", v)).collect();
+/// Create a control_message_parsed event for CLIENT_SETUP.
+/// From draft-16 the setup payload carries only parameters; version is agreed via ALPN.
+pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Setup) -> Event {
     create_control_message_event(
         time,
         stream_id,
         true,
         "client_setup",
-        json!(
-        {
-            "number_of_supported_versions": msg.versions.0.len(),
-            "supported_versions": versions,
+        json!({
             "parameters": key_value_pairs_to_vec(&msg.params.0),
         }),
     )
 }
 
-/// Create a control_message_created event for SERVER_SETUP
-pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Server) -> Event {
+/// Create a control_message_created event for SERVER_SETUP.
+/// From draft-16 the setup payload carries only parameters; version is agreed via ALPN.
+pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Setup) -> Event {
     create_control_message_event(
         time,
         stream_id,
         false,
         "server_setup",
-        json!(
-        {
-            "selected_version": format!("{:?}", msg.version),
+        json!({
             "parameters": key_value_pairs_to_vec(&msg.params.0),
         }),
     )
@@ -242,26 +238,12 @@ pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Server) -> E
 
 /// Helper to convert SUBSCRIBE message to JSON
 fn subscribe_to_json(msg: &message::Subscribe) -> JsonValue {
-    let mut json = json!({
+    json!({
         "subscribe_id": msg.id,
         "track_namespace": msg.track_namespace.to_string(),
-        "track_name": &msg.track_name,
-        "subscriber_priority": msg.subscriber_priority,
-        "group_order": format!("{:?}", msg.group_order),
-        "filter_type": format!("{:?}", msg.filter_type),
+        "track_name": msg.track_name.to_string(),
         "parameters": key_value_pairs_to_vec(&msg.params.0),
-    });
-
-    // Add optional fields based on filter type
-    if let Some(start_loc) = &msg.start_location {
-        json["start_group"] = json!(start_loc.group_id);
-        json["start_object"] = json!(start_loc.object_id);
-    }
-    if let Some(end_group) = msg.end_group_id {
-        json["end_group"] = json!(end_group);
-    }
-
-    json
+    })
 }
 
 /// Create a control_message_parsed event for SUBSCRIBE
@@ -276,24 +258,12 @@ pub fn subscribe_created(time: f64, stream_id: u64, msg: &message::Subscribe) ->
 
 /// Helper to convert SUBSCRIBE_OK message to JSON
 fn subscribe_ok_to_json(msg: &message::SubscribeOk) -> JsonValue {
-    let mut json = json!({
+    json!({
         "subscribe_id": msg.id,
         "track_alias": msg.track_alias,
-        "expires": msg.expires,
-        "group_order": format!("{:?}", msg.group_order),
-        "content_exists": msg.content_exists,
         "parameters": key_value_pairs_to_vec(&msg.params.0),
-    });
-
-    // Add optional largest_location fields if content exists
-    if msg.content_exists {
-        if let Some(largest) = &msg.largest_location {
-            json["largest_group_id"] = json!(largest.group_id);
-            json["largest_object_id"] = json!(largest.object_id);
-        }
-    }
-
-    json
+        "track_extensions": key_value_pairs_to_vec(&msg.track_extensions.0),
+    })
 }
 
 /// Create a control_message_parsed event for SUBSCRIBE_OK
@@ -315,37 +285,6 @@ pub fn subscribe_ok_created(time: f64, stream_id: u64, msg: &message::SubscribeO
         false,
         "subscribe_ok",
         subscribe_ok_to_json(msg),
-    )
-}
-
-/// Helper to convert SUBSCRIBE_ERROR message to JSON
-fn subscribe_error_to_json(msg: &message::SubscribeError) -> JsonValue {
-    json!({
-        "subscribe_id": msg.id,
-        "error_code": msg.error_code,
-        "reason_phrase": &msg.reason_phrase.0,
-    })
-}
-
-/// Create a control_message_parsed event for SUBSCRIBE_ERROR
-pub fn subscribe_error_parsed(time: f64, stream_id: u64, msg: &message::SubscribeError) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        true,
-        "subscribe_error",
-        subscribe_error_to_json(msg),
-    )
-}
-
-/// Create a control_message_created event for SUBSCRIBE_ERROR
-pub fn subscribe_error_created(time: f64, stream_id: u64, msg: &message::SubscribeError) -> Event {
-    create_control_message_event(
-        time,
-        stream_id,
-        false,
-        "subscribe_error",
-        subscribe_error_to_json(msg),
     )
 }
 
@@ -388,79 +327,85 @@ pub fn publish_namespace_created(
     )
 }
 
-/// Helper to convert PUBLISH_NAMESPACE_OK message to JSON
-fn publish_namespace_ok_to_json(msg: &message::PublishNamespaceOk) -> JsonValue {
+fn request_ok_to_json(request_kind: &str, msg: &message::RequestOk) -> JsonValue {
     json!({
         "request_id": msg.id,
+        "request_kind": request_kind,
+        "parameters": key_value_pairs_to_vec(&msg.params.0),
     })
 }
 
-/// Create a control_message_parsed event for PUBLISH_NAMESPACE_OK (was ANNOUNCE_OK)
-pub fn publish_namespace_ok_parsed(
+/// Create a control_message_parsed event for REQUEST_OK.
+pub fn request_ok_parsed(
     time: f64,
     stream_id: u64,
-    msg: &message::PublishNamespaceOk,
+    request_kind: &str,
+    msg: &message::RequestOk,
 ) -> Event {
     create_control_message_event(
         time,
         stream_id,
         true,
-        "publish_namespace_ok",
-        publish_namespace_ok_to_json(msg),
+        "request_ok",
+        request_ok_to_json(request_kind, msg),
     )
 }
 
-/// Create a control_message_created event for PUBLISH_NAMESPACE_OK
-pub fn publish_namespace_ok_created(
+/// Create a control_message_created event for REQUEST_OK.
+pub fn request_ok_created(
     time: f64,
     stream_id: u64,
-    msg: &message::PublishNamespaceOk,
+    request_kind: &str,
+    msg: &message::RequestOk,
 ) -> Event {
     create_control_message_event(
         time,
         stream_id,
         false,
-        "publish_namespace_ok",
-        publish_namespace_ok_to_json(msg),
+        "request_ok",
+        request_ok_to_json(request_kind, msg),
     )
 }
 
-/// Helper to convert PUBLISH_NAMESPACE_ERROR message to JSON
-fn publish_namespace_error_to_json(msg: &message::PublishNamespaceError) -> JsonValue {
+fn request_error_to_json(request_kind: &str, msg: &message::RequestError) -> JsonValue {
     json!({
         "request_id": msg.id,
+        "request_kind": request_kind,
         "error_code": msg.error_code,
-        "reason_phrase": &msg.reason_phrase.0,
+        "retry_interval": msg.retry_interval,
+        "reason_phrase": &msg.reason.0,
     })
 }
 
-/// Create a control_message_parsed event for PUBLISH_NAMESPACE_ERROR (was ANNOUNCE_ERROR)
-pub fn publish_namespace_error_parsed(
+/// Create a control_message_parsed event for REQUEST_ERROR.
+pub fn request_error_parsed(
     time: f64,
     stream_id: u64,
-    msg: &message::PublishNamespaceError,
+    request_kind: &str,
+    msg: &message::RequestError,
 ) -> Event {
     create_control_message_event(
         time,
         stream_id,
         true,
-        "publish_namespace_error",
-        publish_namespace_error_to_json(msg),
+        "request_error",
+        request_error_to_json(request_kind, msg),
     )
 }
 
-/// Create a control_message_created event for PUBLISH_NAMESPACE_ERROR
-pub fn publish_namespace_error_created(
+/// Create a control_message_created event for REQUEST_ERROR.
+pub fn request_error_created(
     time: f64,
     stream_id: u64,
-    msg: &message::PublishNamespaceError,
+    request_kind: &str,
+    msg: &message::RequestError,
 ) -> Event {
     create_control_message_event(
         time,
         stream_id,
         false,
-        "publish_namespace_error",
-        publish_namespace_error_to_json(msg),
+        "request_error",
+        request_error_to_json(request_kind, msg),
     )
 }
 

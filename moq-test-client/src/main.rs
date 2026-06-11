@@ -69,15 +69,15 @@ pub struct Args {
 pub enum TestCase {
     /// T0.1: Connect, complete SETUP exchange, close gracefully
     SetupOnly,
-    /// T0.2: Connect, announce namespace, receive OK, close
-    AnnounceOnly,
+    /// T0.2: Connect, send PUBLISH_NAMESPACE, receive REQUEST_OK, close
+    PublishNamespaceOnly,
     /// T0.3: Subscribe to non-existent track, expect error
     SubscribeError,
-    /// T0.4: Publisher announces, subscriber subscribes, verify handshake
-    AnnounceSubscribe,
-    /// T0.5: Subscriber subscribes before publisher announces
-    SubscribeBeforeAnnounce,
-    /// T0.6: Announce namespace, receive OK, send PUBLISH_NAMESPACE_DONE
+    /// T0.4: Publisher sends PUBLISH_NAMESPACE, subscriber subscribes, verify handshake
+    PublishNamespaceSubscribe,
+    /// T0.5: Subscriber subscribes before publisher sends PUBLISH_NAMESPACE
+    SubscribeBeforePublishNamespace,
+    /// T0.6: Send PUBLISH_NAMESPACE, receive REQUEST_OK, send PUBLISH_NAMESPACE_DONE
     PublishNamespaceDone,
 }
 
@@ -85,10 +85,10 @@ impl TestCase {
     fn all() -> Vec<TestCase> {
         vec![
             TestCase::SetupOnly,
-            TestCase::AnnounceOnly,
+            TestCase::PublishNamespaceOnly,
             TestCase::SubscribeError,
-            TestCase::AnnounceSubscribe,
-            TestCase::SubscribeBeforeAnnounce,
+            TestCase::PublishNamespaceSubscribe,
+            TestCase::SubscribeBeforePublishNamespace,
             TestCase::PublishNamespaceDone,
         ]
     }
@@ -96,10 +96,10 @@ impl TestCase {
     fn name(&self) -> &'static str {
         match self {
             TestCase::SetupOnly => "setup-only",
-            TestCase::AnnounceOnly => "announce-only",
+            TestCase::PublishNamespaceOnly => "publish-namespace-only",
             TestCase::SubscribeError => "subscribe-error",
-            TestCase::AnnounceSubscribe => "announce-subscribe",
-            TestCase::SubscribeBeforeAnnounce => "subscribe-before-announce",
+            TestCase::PublishNamespaceSubscribe => "publish-namespace-subscribe",
+            TestCase::SubscribeBeforePublishNamespace => "subscribe-before-publish-namespace",
             TestCase::PublishNamespaceDone => "publish-namespace-done",
         }
     }
@@ -143,10 +143,14 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
 
     let result = match test_case {
         TestCase::SetupOnly => scenarios::test_setup_only(args).await,
-        TestCase::AnnounceOnly => scenarios::test_announce_only(args).await,
+        TestCase::PublishNamespaceOnly => scenarios::test_publish_namespace_only(args).await,
         TestCase::SubscribeError => scenarios::test_subscribe_error(args).await,
-        TestCase::AnnounceSubscribe => scenarios::test_announce_subscribe(args).await,
-        TestCase::SubscribeBeforeAnnounce => scenarios::test_subscribe_before_announce(args).await,
+        TestCase::PublishNamespaceSubscribe => {
+            scenarios::test_publish_namespace_subscribe(args).await
+        }
+        TestCase::SubscribeBeforePublishNamespace => {
+            scenarios::test_subscribe_before_publish_namespace(args).await
+        }
         TestCase::PublishNamespaceDone => scenarios::test_publish_namespace_done(args).await,
     };
 
@@ -174,7 +178,7 @@ fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
         2 => {
             // Multi-connection tests: first is publisher, second is subscriber
             // (except subscribe-before-announce where subscriber connects first)
-            if result.test_case == TestCase::SubscribeBeforeAnnounce {
+            if result.test_case == TestCase::SubscribeBeforePublishNamespace {
                 println!("  subscriber_connection_id: {}", result.cids[0]);
                 println!("  publisher_connection_id: {}", result.cids[1]);
             } else {

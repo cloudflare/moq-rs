@@ -39,9 +39,9 @@ impl Producer {
         }
     }
 
-    /// Announce new tracks to the remote server.
-    pub async fn announce(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        self.publisher.announce(tracks).await
+    /// Send PUBLISH_NAMESPACE for a set of tracks to the remote peer.
+    pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+        self.publisher.publish_namespace(tracks).await
     }
 
     /// Run the producer to serve subscribe requests.
@@ -69,7 +69,11 @@ impl Producer {
 
                         // Serve the subscribe request
                         if let Err(err) = this.serve_subscribe(subscribed).await {
-                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving subscribe: {:?}, error: {}", info, err);
+                            if Self::is_expected_serve_shutdown(&err) {
+                                tracing::debug!(namespace = %namespace, track = %track_name, subscribe_info = ?info, error = %err, "stopped serving subscribe");
+                            } else {
+                                tracing::warn!(namespace = %namespace, track = %track_name, subscribe_info = ?info, error = %err, "failed serving subscribe");
+                            }
                         }
                     }.boxed())
                 },
@@ -169,6 +173,16 @@ impl Producer {
         Err(err.into())
     }
 
+    fn is_expected_serve_shutdown(err: &anyhow::Error) -> bool {
+        matches!(
+            err.downcast_ref::<SessionError>(),
+            Some(SessionError::Serve(ServeError::Cancel | ServeError::Done))
+        ) || matches!(
+            err.downcast_ref::<ServeError>(),
+            Some(ServeError::Cancel | ServeError::Done)
+        )
+    }
+
     /// Serve a track_status request.
     async fn serve_track_status(
         self,
@@ -210,7 +224,10 @@ impl Producer {
             }
         }*/
 
-        track_status_requested.respond_error(4, "Track not found")?;
+        track_status_requested.respond_error(
+            moq_transport::message::RequestErrorCode::DoesNotExist as u64,
+            "track not found",
+        )?;
 
         Err(ServeError::not_found_ctx(format!(
             "track '{}/{}' not found for track_status",
@@ -218,5 +235,38 @@ impl Producer {
             track_status_requested.request_msg.track_name
         ))
         .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use moq_transport::{serve::ServeError, session::SessionError};
+
+    use super::Producer;
+
+    #[test]
+    fn expected_serve_shutdown_accepts_wrapped_session_errors() {
+        assert!(Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            SessionError::Serve(ServeError::Cancel)
+        )));
+        assert!(Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            SessionError::Serve(ServeError::Done)
+        )));
+        assert!(!Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            SessionError::Serve(ServeError::NotFound)
+        )));
+    }
+
+    #[test]
+    fn expected_serve_shutdown_accepts_direct_serve_errors() {
+        assert!(Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            ServeError::Cancel
+        )));
+        assert!(Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            ServeError::Done
+        )));
+        assert!(!Producer::is_expected_serve_shutdown(&anyhow::Error::new(
+            ServeError::NotFound
+        )));
     }
 }

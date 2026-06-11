@@ -19,6 +19,23 @@ pub enum DatagramType {
     ObjectIdStatusExt = 0x21,
 }
 
+impl DatagramType {
+    fn has_extension_headers(self) -> bool {
+        matches!(
+            self,
+            Self::ObjectIdPayloadExt
+                | Self::ObjectIdPayloadExtEndOfGroup
+                | Self::PayloadExt
+                | Self::PayloadExtEndOfGroup
+                | Self::ObjectIdStatusExt
+        )
+    }
+
+    fn has_status(self) -> bool {
+        matches!(self, Self::ObjectIdStatus | Self::ObjectIdStatusExt)
+    }
+}
+
 impl Decode for DatagramType {
     fn decode<B: bytes::Buf>(r: &mut B) -> Result<Self, DecodeError> {
         match u64::decode(r)? {
@@ -92,22 +109,28 @@ impl Decode for Datagram {
         let publisher_priority = u8::decode(r)?;
 
         // Decode Extension Headers if required
-        let extension_headers = match datagram_type {
-            DatagramType::ObjectIdPayloadExt
-            | DatagramType::ObjectIdPayloadExtEndOfGroup
-            | DatagramType::PayloadExt
-            | DatagramType::PayloadExtEndOfGroup
-            | DatagramType::ObjectIdStatusExt => Some(ExtensionHeaders::decode(r)?),
-            _ => None,
+        let extension_headers = if datagram_type.has_extension_headers() {
+            let headers = ExtensionHeaders::decode(r)?;
+            if headers.is_empty() {
+                return Err(DecodeError::InvalidValue);
+            }
+            Some(headers)
+        } else {
+            None
         };
 
         // Decode Status if required
-        let status = match datagram_type {
-            DatagramType::ObjectIdStatus | DatagramType::ObjectIdStatusExt => {
-                Some(ObjectStatus::decode(r)?)
-            }
-            _ => None,
+        let status = if datagram_type.has_status() {
+            Some(ObjectStatus::decode(r)?)
+        } else {
+            None
         };
+
+        if status.is_some_and(|status| status != ObjectStatus::NormalObject)
+            && extension_headers.is_some()
+        {
+            return Err(DecodeError::InvalidValue);
+        }
 
         // Decode Payload if required
         let payload = match datagram_type {
@@ -168,6 +191,9 @@ impl Encode for Datagram {
             | DatagramType::PayloadExtEndOfGroup
             | DatagramType::ObjectIdStatusExt => {
                 if let Some(extension_headers) = &self.extension_headers {
+                    if extension_headers.is_empty() {
+                        return Err(EncodeError::InvalidValue);
+                    }
                     extension_headers.encode(w)?;
                 } else {
                     return Err(EncodeError::MissingField("ExtensionHeaders".to_string()));
@@ -180,6 +206,9 @@ impl Encode for Datagram {
         match self.datagram_type {
             DatagramType::ObjectIdStatus | DatagramType::ObjectIdStatusExt => {
                 if let Some(status) = &self.status {
+                    if self.extension_headers.is_some() && *status != ObjectStatus::NormalObject {
+                        return Err(EncodeError::InvalidValue);
+                    }
                     status.encode(w)?;
                 } else {
                     return Err(EncodeError::MissingField("Status".to_string()));
@@ -320,8 +349,8 @@ mod tests {
             payload: Some(Bytes::from("payload")),
         };
         msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(2),ExtensionValueLen(1),ExtensionValue(4) = 13 + 8 = 21
-        assert_eq!(21, buf.len());
+        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 13 + 7 = 20
+        assert_eq!(20, buf.len());
         let decoded = Datagram::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
 
@@ -354,8 +383,8 @@ mod tests {
             payload: Some(Bytes::from("payload")),
         };
         msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(2),ExtensionValueLen(1),ExtensionValue(4) = 13 + 8 = 21
-        assert_eq!(21, buf.len());
+        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 13 + 7 = 20
+        assert_eq!(20, buf.len());
         let decoded = Datagram::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
 
@@ -367,7 +396,7 @@ mod tests {
             object_id: Some(1234),
             publisher_priority: 127,
             extension_headers: None,
-            status: Some(ObjectStatus::EndOfTrack),
+            status: Some(ObjectStatus::NormalObject),
             payload: None,
         };
         msg.encode(&mut buf).unwrap();
@@ -384,12 +413,12 @@ mod tests {
             object_id: Some(1234),
             publisher_priority: 127,
             extension_headers: Some(ext_hdrs.clone()),
-            status: Some(ObjectStatus::EndOfTrack),
+            status: Some(ObjectStatus::NormalObject),
             payload: None,
         };
         msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(2),ExtensionValueLen(1),ExtensionValue(4) = 7 + 8 = 15
-        assert_eq!(15, buf.len());
+        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 7 + 7 = 14
+        assert_eq!(14, buf.len());
         let decoded = Datagram::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
 
@@ -422,8 +451,8 @@ mod tests {
             payload: Some(Bytes::from("payload")),
         };
         msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(2),ExtensionValueLen(1),ExtensionValue(4) = 11 + 8 = 19
-        assert_eq!(19, buf.len());
+        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 11 + 7 = 18
+        assert_eq!(18, buf.len());
         let decoded = Datagram::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
 
@@ -456,8 +485,8 @@ mod tests {
             payload: Some(Bytes::from("payload")),
         };
         msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(2),ExtensionValueLen(1),ExtensionValue(4) = 11 + 8 = 19
-        assert_eq!(19, buf.len());
+        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 11 + 7 = 18
+        assert_eq!(18, buf.len());
         let decoded = Datagram::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
     }
@@ -537,5 +566,86 @@ mod tests {
         assert!(matches!(encoded.unwrap_err(), EncodeError::MissingField(_)));
 
         // TODO SLG - add tests
+    }
+
+    #[test]
+    fn decode_rejects_extension_bit_with_zero_length() {
+        let data = vec![
+            0x01, // ObjectIdPayloadExt
+            0x01, // track alias
+            0x01, // group id
+            0x01, // object id
+            0x7f, // publisher priority
+            0x00, // extension headers length
+        ];
+        let mut buf: Bytes = data.into();
+
+        assert!(matches!(
+            Datagram::decode(&mut buf).unwrap_err(),
+            DecodeError::InvalidValue
+        ));
+    }
+
+    #[test]
+    fn encode_rejects_extension_bit_with_empty_headers() {
+        let mut buf = BytesMut::new();
+        let msg = Datagram {
+            datagram_type: DatagramType::ObjectIdPayloadExt,
+            track_alias: 1,
+            group_id: 1,
+            object_id: Some(1),
+            publisher_priority: 1,
+            extension_headers: Some(ExtensionHeaders::default()),
+            status: None,
+            payload: Some(Bytes::new()),
+        };
+
+        assert!(matches!(
+            msg.encode(&mut buf).unwrap_err(),
+            EncodeError::InvalidValue
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_non_normal_status_with_extension_headers() {
+        let data = vec![
+            0x21, // ObjectIdStatusExt
+            0x01, // track alias
+            0x01, // group id
+            0x01, // object id
+            0x7f, // publisher priority
+            0x02, // extension headers byte length
+            0x00, // extension delta type
+            0x01, // extension value
+            0x04, // EndOfTrack
+        ];
+        let mut buf: Bytes = data.into();
+
+        assert!(matches!(
+            Datagram::decode(&mut buf).unwrap_err(),
+            DecodeError::InvalidValue
+        ));
+    }
+
+    #[test]
+    fn encode_rejects_non_normal_status_with_extension_headers() {
+        let mut ext_hdrs = ExtensionHeaders::new();
+        ext_hdrs.set_intvalue(0, 1);
+        let mut buf = BytesMut::new();
+        let msg = Datagram {
+            datagram_type: DatagramType::ObjectIdStatusExt,
+            track_alias: 1,
+            group_id: 1,
+            object_id: Some(1),
+            publisher_priority: 1,
+            extension_headers: Some(ext_hdrs),
+            status: Some(ObjectStatus::EndOfTrack),
+            payload: None,
+        };
+
+        assert!(matches!(
+            msg.encode(&mut buf).unwrap_err(),
+            EncodeError::InvalidValue
+        ));
     }
 }

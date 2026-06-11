@@ -2,21 +2,23 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-mod announce;
-mod announced;
 mod error;
+mod publish_namespace;
+mod published_namespace;
 mod publisher;
 mod reader;
+mod request_id;
 mod subscribe;
 mod subscribed;
 mod subscriber;
 mod track_status_requested;
 mod writer;
 
-pub use announce::*;
-pub use announced::*;
 pub use error::*;
+pub use publish_namespace::*;
+pub use published_namespace::*;
 pub use publisher::*;
+pub use request_id::{RequestId, RequestIdAllocation};
 pub use subscribe::*;
 pub use subscribed::*;
 pub use subscriber::*;
@@ -26,7 +28,8 @@ use reader::*;
 use writer::*;
 
 use futures::{stream::FuturesUnordered, StreamExt};
-use std::sync::{atomic, Arc, Mutex};
+use request_id::max_request_id_from_params;
+use std::sync::{Arc, Mutex};
 
 use crate::coding::{KeyValuePairs, Value};
 use crate::message::Message;
@@ -39,7 +42,7 @@ use std::path::PathBuf;
 ///
 /// MoQT can run over either WebTransport (HTTP/3 + QUIC) or raw QUIC.
 /// The transport type affects protocol behavior — for example, the PATH
-/// parameter is only sent in CLIENT_SETUP for raw QUIC connections,
+/// parameter is only sent in SETUP for raw QUIC connections,
 /// since WebTransport carries the path in the HTTP/3 CONNECT URL.
 ///
 /// This enum is intentionally extensible for future transport options
@@ -50,7 +53,7 @@ pub enum Transport {
     /// ALPN: "h3". Path carried in HTTP/3 CONNECT :path pseudo-header.
     WebTransport,
     /// Raw QUIC with MoQT framing directly on QUIC streams.
-    /// ALPN: "moq-00". Path carried in CLIENT_SETUP PATH parameter.
+    /// ALPN: "moqt-16". Path carried in SETUP PATH parameter.
     RawQuic,
 }
 
@@ -69,6 +72,10 @@ pub struct Session {
     /// Queue used by Publisher and Subscriber for sending Control Messages
     outgoing: Queue<Message>,
 
+    /// Session-level request ID manager.
+    /// Publisher and Subscriber share one outbound request ID sequence.
+    request_id: RequestId,
+
     /// Optional mlog writer for MoQ Transport events
     /// Wrapped in Arc<Mutex<>> to share across send/recv tasks when enabled
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
@@ -76,9 +83,9 @@ pub struct Session {
     /// The transport protocol negotiated for this connection.
     transport: Transport,
 
-    /// The connection path, derived from the WebTransport URL path or CLIENT_SETUP PATH parameter.
+    /// The connection path, derived from the WebTransport URL path or SETUP PATH parameter.
     /// For incoming connections: extracted during accept() from the WebTransport CONNECT URL
-    /// (takes precedence) or the CLIENT_SETUP PATH parameter (key 0x1).
+    /// (takes precedence) or the SETUP PATH parameter (key 0x1).
     /// For outgoing connections: auto-extracted from the session URL in connect().
     connection_path: Option<String>,
 }
@@ -176,19 +183,11 @@ impl Session {
     ///
     /// For server-side sessions (created via `accept()`), this is derived from:
     /// 1. The WebTransport CONNECT URL path (takes precedence), or
-    /// 2. The CLIENT_SETUP PATH parameter (key 0x1), used for raw QUIC connections.
+    /// 2. The SETUP PATH parameter (key 0x1), used for raw QUIC connections.
     ///
     /// Returns `None` if no path was present or if the path was just "/".
     pub fn connection_path(&self) -> Option<&str> {
         self.connection_path.as_deref()
-    }
-
-    // Helper for determining the largest supported version
-    fn largest_common<T: Ord + Clone + Eq>(a: &[T], b: &[T]) -> Option<T> {
-        a.iter()
-            .filter(|x| b.contains(x)) // keep only items also in b
-            .cloned() // clone because we return T, not &T
-            .max() // take the largest
     }
 
     /// Log a control message with structured fields for observability.
@@ -203,7 +202,6 @@ impl Session {
                     subscribe_id = m.id,
                     namespace = %m.track_namespace,
                     track_name = %m.track_name,
-                    filter_type = ?m.filter_type,
                     "MoQT control message"
                 );
             }
@@ -214,28 +212,6 @@ impl Session {
                     msg_type = "SUBSCRIBE_OK",
                     subscribe_id = m.id,
                     track_alias = m.track_alias,
-                    content_exists = m.content_exists,
-                    "MoQT control message"
-                );
-            }
-            Message::SubscribeError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "SUBSCRIBE_ERROR",
-                    subscribe_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
-                    "MoQT control message"
-                );
-            }
-            Message::SubscribeUpdate(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "SUBSCRIBE_UPDATE",
-                    request_id = m.id,
-                    subscription_request_id = m.subscription_request_id,
                     "MoQT control message"
                 );
             }
@@ -258,32 +234,30 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::PublishNamespaceOk(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "PUBLISH_NAMESPACE_OK",
-                    request_id = m.id,
-                    "MoQT control message"
-                );
-            }
-            Message::PublishNamespaceError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "PUBLISH_NAMESPACE_ERROR",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
-                    "MoQT control message"
-                );
-            }
             Message::PublishNamespaceDone(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     direction,
                     msg_type = "PUBLISH_NAMESPACE_DONE",
-                    namespace = %m.track_namespace,
+                    request_id = m.id,
+                    "MoQT control message"
+                );
+            }
+            Message::Namespace(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "NAMESPACE",
+                    namespace_suffix = %m.track_namespace_suffix,
+                    "MoQT control message"
+                );
+            }
+            Message::NamespaceDone(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "NAMESPACE_DONE",
+                    namespace_suffix = %m.track_namespace_suffix,
                     "MoQT control message"
                 );
             }
@@ -292,7 +266,7 @@ impl Session {
                     target: "moq_transport::control",
                     direction,
                     msg_type = "PUBLISH_NAMESPACE_CANCEL",
-                    namespace = %m.track_namespace,
+                    request_id = m.id,
                     error_code = m.error_code,
                     reason = %m.reason_phrase.0,
                     "MoQT control message"
@@ -309,63 +283,12 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::TrackStatusOk(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "TRACK_STATUS_OK",
-                    request_id = m.id,
-                    track_alias = m.track_alias,
-                    content_exists = m.content_exists,
-                    "MoQT control message"
-                );
-            }
-            Message::TrackStatusError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "TRACK_STATUS_ERROR",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
-                    "MoQT control message"
-                );
-            }
             Message::SubscribeNamespace(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     direction,
                     msg_type = "SUBSCRIBE_NAMESPACE",
                     request_id = m.id,
-                    namespace_prefix = %m.track_namespace_prefix,
-                    "MoQT control message"
-                );
-            }
-            Message::SubscribeNamespaceOk(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "SUBSCRIBE_NAMESPACE_OK",
-                    request_id = m.id,
-                    "MoQT control message"
-                );
-            }
-            Message::SubscribeNamespaceError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "SUBSCRIBE_NAMESPACE_ERROR",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
-                    "MoQT control message"
-                );
-            }
-            Message::UnsubscribeNamespace(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "UNSUBSCRIBE_NAMESPACE",
                     namespace_prefix = %m.track_namespace_prefix,
                     "MoQT control message"
                 );
@@ -387,17 +310,6 @@ impl Session {
                     msg_type = "FETCH_OK",
                     request_id = m.id,
                     end_of_track = m.end_of_track,
-                    "MoQT control message"
-                );
-            }
-            Message::FetchError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "FETCH_ERROR",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
                     "MoQT control message"
                 );
             }
@@ -428,18 +340,6 @@ impl Session {
                     direction,
                     msg_type = "PUBLISH_OK",
                     request_id = m.id,
-                    filter_type = ?m.filter_type,
-                    "MoQT control message"
-                );
-            }
-            Message::PublishError(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "PUBLISH_ERROR",
-                    request_id = m.id,
-                    error_code = m.error_code,
-                    reason = %m.reason_phrase.0,
                     "MoQT control message"
                 );
             }
@@ -481,6 +381,36 @@ impl Session {
                     "MoQT control message"
                 );
             }
+            Message::RequestOk(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "REQUEST_OK",
+                    request_id = m.id,
+                    "MoQT control message"
+                );
+            }
+            Message::RequestError(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "REQUEST_ERROR",
+                    request_id = m.id,
+                    error_code = m.error_code,
+                    retry_interval = m.retry_interval,
+                    "MoQT control message"
+                );
+            }
+            Message::RequestUpdate(m) => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    direction,
+                    msg_type = "REQUEST_UPDATE",
+                    request_id = m.id,
+                    existing_request_id = m.existing_request_id,
+                    "MoQT control message"
+                );
+            }
         }
     }
 
@@ -488,12 +418,11 @@ impl Session {
         webtransport: web_transport::Session,
         sender: Writer,
         recver: Reader,
-        first_requestid: u64,
         mlog: Option<mlog::MlogWriter>,
         transport: Transport,
         connection_path: Option<String>,
+        request_id: RequestId,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
-        let next_requestid = Arc::new(atomic::AtomicU64::new(first_requestid));
         let outgoing = Queue::default().split();
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
@@ -502,13 +431,13 @@ impl Session {
         let publisher = Some(Publisher::new(
             outgoing.0.clone(),
             webtransport.clone(),
-            next_requestid.clone(),
             mlog_shared.clone(),
+            request_id.clone(),
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
-            next_requestid,
             mlog_shared.clone(),
+            request_id.clone(),
         ));
 
         let session = Self {
@@ -518,6 +447,7 @@ impl Session {
             publisher: publisher.clone(),
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
+            request_id,
             mlog: mlog_shared,
             transport,
             connection_path,
@@ -526,123 +456,144 @@ impl Session {
         (session, publisher, subscriber)
     }
 
-    /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for
-    /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
+    /// Create an outbound/client QUIC connection.
     ///
-    /// If the session URL contains a non-trivial path (not empty or "/"), the PATH
-    /// parameter (key 0x1) is automatically sent in CLIENT_SETUP. This propagates
-    /// the connection path (App ID / MoQT scope) to the remote peer, which is needed
-    /// for relay-to-relay connections. To connect without sending PATH, use a URL
-    /// with no path component.
+    /// Opens a unidirectional control stream, sends SETUP with
+    /// parameters only (version is agreed via ALPN), and waits for SETUP.
+    ///
+    /// For native `moqt://` connections the PATH and AUTHORITY parameters are
+    /// sent automatically.  For WebTransport the path is carried in the HTTP/3
+    /// CONNECT URL so PATH is not sent.
     pub async fn connect(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
-        // Auto-extract path from the session URL.
-        // This aligns with the unified moqt:// URI scheme direction (IETF PR #1486)
-        // where the path is always part of the URI regardless of transport.
-        let url_path = session.url().path();
+        let url = session.url().clone();
+        let url_path = url.path();
         let path = Self::normalize_connection_path(url_path)?;
-        let mlog = mlog_path.and_then(|path| {
-            mlog::MlogWriter::new(path)
+
+        let mlog = mlog_path.and_then(|p| {
+            mlog::MlogWriter::new(p)
                 .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
                 .ok()
         });
-        let control = session.open_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
 
-        let versions: setup::Versions = [setup::Version::DRAFT_14].into();
+        // Open our unidirectional control send stream.
+        let send_stream = session.open_uni().await?;
+        let mut sender = Writer::new(send_stream);
 
-        // TODO SLG - make configurable?
         let mut params = KeyValuePairs::default();
-        params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
 
-        // Only send PATH in CLIENT_SETUP for raw QUIC connections.
-        // For WebTransport, the path is already carried in the HTTP/3 CONNECT URL.
-        if let Some(ref path) = path {
-            if transport == Transport::RawQuic {
-                params.set_bytesvalue(setup::ParameterType::Path.into(), path.as_bytes().to_vec());
+        if transport == Transport::RawQuic {
+            // Draft-16 §9.3.1.1: send AUTHORITY for native QUIC.
+            if let Some(host) = url.host_str() {
+                let authority = if let Some(port) = url.port() {
+                    format!("{}:{}", host, port)
+                } else {
+                    host.to_string()
+                };
+                params.set_bytesvalue(
+                    setup::ParameterType::Authority.into(),
+                    authority.into_bytes(),
+                );
+            }
+
+            // Draft-16 §9.3.1.2: send PATH (path + optional query) for native QUIC.
+            let path_and_query = match url.query() {
+                Some(q) => format!("{}?{}", url_path, q),
+                None => url_path.to_string(),
+            };
+            if !path_and_query.is_empty() && path_and_query != "/" {
+                params.set_bytesvalue(
+                    setup::ParameterType::Path.into(),
+                    path_and_query.into_bytes(),
+                );
             }
         }
 
-        let client = setup::Client {
-            versions: versions.clone(),
-            params,
-        };
+        // The MAX_REQUEST_ID we advertise to the server.
+        // TODO(itzmanish): make configurable.
+        let our_max_request_id: u64 = 100;
+        params.set_intvalue(
+            setup::ParameterType::MaxRequestId.into(),
+            our_max_request_id,
+        );
+
+        let client = setup::Setup { params };
 
         tracing::debug!(
             target: "moq_transport::control",
             direction = "sent",
-            msg_type = "CLIENT_SETUP",
-            versions = ?client.versions,
+            msg_type = "SETUP",
             ?transport,
             path = path.as_deref(),
             "MoQT control message"
         );
         sender.encode(&client).await?;
 
-        // TODO: emit client_setup_created event when we add that
 
-        let server: setup::Server = recver.decode().await?;
+        // Accept the peer's unidirectional control stream.
+        let recv_stream = session.accept_uni().await?;
+        let mut recver = Reader::new(recv_stream);
+        let server: setup::Setup = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
-            msg_type = "SERVER_SETUP",
-            version = ?server.version,
+            msg_type = "SETUP (recv)",
             "MoQT control message"
         );
 
-        // TODO: emit server_setup_parsed event
-
-        // We are the client, so the first request id is 0
-        let session = Session::new(session, sender, recver, 0, mlog, transport, path);
+        let peer_max = max_request_id_from_params(&server.params);
+        // Client sends even IDs (0); peer server sends odd IDs (1).
+        let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
+        let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
-    /// Accepts an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for
-    /// MOQT control messaging.  Performs SETUP messaging and version negotiation.
+    /// Accept an inbound server connection.
+    ///
+    /// Opens a unidirectional control stream and accepts the peer.s, decodes SETUP,
+    /// sends SETUP with parameters only.  Version is already agreed
+    /// via ALPN before this is called.
     pub async fn accept(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
-        let mut mlog = mlog_path.and_then(|path| {
-            mlog::MlogWriter::new(path)
+        let mut mlog = mlog_path.and_then(|p| {
+            mlog::MlogWriter::new(p)
                 .map_err(|e| tracing::warn!("Failed to create mlog: {}", e))
                 .ok()
         });
-        let control = session.accept_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
 
-        let client: setup::Client = recver.decode().await?;
+        // Open our unidirectional control send stream.
+        let send_stream = session.open_uni().await?;
+        let mut sender = Writer::new(send_stream);
+
+        // Accept the peer's unidirectional control stream.
+        let recv_stream = session.accept_uni().await?;
+        let mut recver = Reader::new(recv_stream);
+
+        let client: setup::Setup = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
-            msg_type = "CLIENT_SETUP",
-            versions = ?client.versions,
+            msg_type = "SETUP",
             "MoQT control message"
         );
 
-        // Extract WebTransport URL path from the underlying session.
-        // For WebTransport connections, this comes from the HTTP/3 CONNECT :path.
-        // For raw QUIC, this is the placeholder URL ("moqt://localhost") and has no meaningful path.
+        // For WebTransport the path arrives in the HTTP/3 CONNECT :path.
+        // For raw QUIC the PATH setup parameter carries it instead.
         let wt_url_path = session.url().path();
         let wt_path = Self::normalize_connection_path(wt_url_path)?;
 
-        // Extract CLIENT_SETUP PATH parameter (key 0x1, BytesValue).
-        // Used for raw QUIC connections where there's no HTTP CONNECT URL.
         let client_setup_path = if wt_path.is_none() {
             Self::decode_client_setup_path(&client.params)?
         } else {
             None
         };
 
-        // Combine: WebTransport URL path takes precedence over CLIENT_SETUP PATH.
-        // WebTransport connections always have the path in the CONNECT URL.
-        // Raw QUIC connections only have CLIENT_SETUP PATH.
         let connection_path = wt_path.or(client_setup_path);
 
         if connection_path.is_some() {
@@ -652,55 +603,49 @@ impl Session {
             );
         }
 
-        // Emit mlog event for CLIENT_SETUP parsed
         if let Some(ref mut mlog) = mlog {
             let event = mlog::events::client_setup_parsed(mlog.elapsed_ms(), 0, &client);
             let _ = mlog.add_event(event);
         }
 
-        let server_versions = setup::Versions(vec![setup::Version::DRAFT_14]);
+        let peer_max = max_request_id_from_params(&client.params);
 
-        if let Some(largest_common_version) =
-            Self::largest_common(&server_versions, &client.versions)
-        {
-            // TODO SLG - make configurable?
-            let mut params = KeyValuePairs::default();
-            params.set_intvalue(setup::ParameterType::MaxRequestId.into(), 100);
+        // The MAX_REQUEST_ID we advertise to the client.
+        // TODO(itzmanish): make configurable.
+        let our_max_request_id: u64 = 100;
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(
+            setup::ParameterType::MaxRequestId.into(),
+            our_max_request_id,
+        );
 
-            let server = setup::Server {
-                version: largest_common_version,
-                params,
-            };
+        let server = setup::Setup { params };
 
-            tracing::debug!(
-                target: "moq_transport::control",
-                direction = "sent",
-                msg_type = "SERVER_SETUP",
-                version = ?server.version,
-                "MoQT control message"
-            );
+        tracing::debug!(
+            target: "moq_transport::control",
+            direction = "sent",
+            msg_type = "SETUP (recv)",
+            "MoQT control message"
+        );
 
-            // Emit mlog event for SERVER_SETUP created
-            if let Some(ref mut mlog) = mlog {
-                let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
-                let _ = mlog.add_event(event);
-            }
-
-            sender.encode(&server).await?;
-
-            // We are the server, so the first request id is 1
-            Ok(Session::new(
-                session,
-                sender,
-                recver,
-                1,
-                mlog,
-                transport,
-                connection_path,
-            ))
-        } else {
-            Err(SessionError::Version(client.versions, server_versions))
+        if let Some(ref mut mlog) = mlog {
+            let event = mlog::events::server_setup_created(mlog.elapsed_ms(), 0, &server);
+            let _ = mlog.add_event(event);
         }
+
+        sender.encode(&server).await?;
+
+        // Server sends odd IDs (1); peer client sends even IDs (0).
+        let request_id = RequestId::new(1, peer_max, our_max_request_id, 0);
+        Ok(Session::new(
+            session,
+            sender,
+            recver,
+            mlog,
+            transport,
+            connection_path,
+            request_id,
+        ))
     }
 
     /// Run Tasks for the session, including sending of control messages, receiving and processing
@@ -708,7 +653,7 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone()) => res,
+            res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
@@ -739,21 +684,12 @@ impl Session {
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_created(time, stream_id, m))
                         }
-                        Message::SubscribeError(m) => {
-                            Some(mlog::events::subscribe_error_created(time, stream_id, m))
-                        }
                         Message::Unsubscribe(m) => {
                             Some(mlog::events::unsubscribe_created(time, stream_id, m))
                         }
                         Message::PublishNamespace(m) => {
                             Some(mlog::events::publish_namespace_created(time, stream_id, m))
                         }
-                        Message::PublishNamespaceOk(m) => Some(
-                            mlog::events::publish_namespace_ok_created(time, stream_id, m),
-                        ),
-                        Message::PublishNamespaceError(m) => Some(
-                            mlog::events::publish_namespace_error_created(time, stream_id, m),
-                        ),
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_created(time, stream_id, m))
                         }
@@ -775,14 +711,19 @@ impl Session {
     /// Receives inbound messages from the control stream reader/receiver.  Analyzes if the message
     /// is to be handled by Subscriber or Publisher logic and calls recv_message on either the
     /// Publisher or Subscriber.
-    /// Note:  Should also be handling messages common to both roles, ie: GOAWAY, MAX_REQUEST_ID and
-    ///        REQUESTS_BLOCKED
+    /// Receives and dispatches control messages.
+    /// Handles session-level messages (GOAWAY, MAX_REQUEST_ID, REQUESTS_BLOCKED)
+    /// directly and routes role-specific messages to Publisher or Subscriber.
     async fn run_recv(
         mut recver: Reader,
         mut publisher: Option<Publisher>,
         mut subscriber: Option<Subscriber>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        request_id: RequestId,
+        _outgoing: Queue<Message>,
     ) -> Result<(), SessionError> {
+        let mut goaway_received = false;
+
         loop {
             let msg: message::Message = recver.decode().await?;
 
@@ -803,21 +744,12 @@ impl Session {
                         Message::SubscribeOk(m) => {
                             Some(mlog::events::subscribe_ok_parsed(time, stream_id, m))
                         }
-                        Message::SubscribeError(m) => {
-                            Some(mlog::events::subscribe_error_parsed(time, stream_id, m))
-                        }
                         Message::Unsubscribe(m) => {
                             Some(mlog::events::unsubscribe_parsed(time, stream_id, m))
                         }
                         Message::PublishNamespace(m) => {
                             Some(mlog::events::publish_namespace_parsed(time, stream_id, m))
                         }
-                        Message::PublishNamespaceOk(m) => Some(
-                            mlog::events::publish_namespace_ok_parsed(time, stream_id, m),
-                        ),
-                        Message::PublishNamespaceError(m) => Some(
-                            mlog::events::publish_namespace_error_parsed(time, stream_id, m),
-                        ),
                         Message::GoAway(m) => {
                             Some(mlog::events::go_away_parsed(time, stream_id, m))
                         }
@@ -828,6 +760,10 @@ impl Session {
                         let _ = mlog_guard.add_event(event);
                     }
                 }
+            }
+
+            if let Some(id) = msg.sequenced_request_id() {
+                request_id.validate_incoming(id)?;
             }
 
             let msg = match TryInto::<message::Publisher>::try_into(msg) {
@@ -852,12 +788,48 @@ impl Session {
                 Err(msg) => msg,
             };
 
-            // TODO GOAWAY, MAX_REQUEST_ID, REQUESTS_BLOCKED
-            tracing::warn!("Unimplemented message type received: {:?}", msg);
-            return Err(SessionError::unimplemented(&format!(
-                "message type {:?}",
-                msg
-            )));
+            // Session-level messages handled here (not role-specific).
+            match msg {
+                Message::GoAway(ref m) => {
+                    // Draft-16 §9.4: receiving a second GOAWAY is PROTOCOL_VIOLATION.
+                    if goaway_received {
+                        return Err(SessionError::ProtocolViolation(
+                            "received multiple GOAWAY messages".to_string(),
+                        ));
+                    }
+                    goaway_received = true;
+                    tracing::info!(
+                        target: "moq_transport::control",
+                        new_uri = %m.uri.0,
+                        "received GOAWAY"
+                    );
+                    // TODO(itzmanish): trigger session migration.
+                }
+                Message::MaxRequestId(ref m) => {
+                    request_id.apply_max_request_id(m)?;
+                    tracing::debug!(
+                        target: "moq_transport::control",
+                        max_request_id = m.request_id,
+                        "received MAX_REQUEST_ID"
+                    );
+                }
+                Message::RequestsBlocked(ref m) => {
+                    tracing::debug!(
+                        target: "moq_transport::control",
+                        max_request_id = m.max_request_id,
+                        "received REQUESTS_BLOCKED"
+                    );
+                    // REQUESTS_BLOCKED tells us the peer's send budget is exhausted.
+                    request_id.handle_requests_blocked(m)?;
+                }
+                other => {
+                    tracing::warn!(msg_type = other.name(), "received unhandled message type");
+                    return Err(SessionError::unimplemented(&format!(
+                        "message type {}",
+                        other.name()
+                    )));
+                }
+            }
         }
     }
 

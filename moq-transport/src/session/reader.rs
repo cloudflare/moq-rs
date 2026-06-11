@@ -38,7 +38,7 @@ impl Reader {
                 Ok(msg) => {
                     let consumed = cursor.position() as usize;
                     self.buffer.advance(consumed);
-                    tracing::debug!(
+                    tracing::trace!(
                         "[READER] decode: successfully decoded {} (consumed={} bytes, buffer_remaining={})",
                         std::any::type_name::<T>(),
                         consumed,
