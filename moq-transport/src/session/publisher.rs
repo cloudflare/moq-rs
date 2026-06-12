@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::{
-    collections::{hash_map, HashMap},
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
@@ -96,26 +96,113 @@ impl Publisher {
         Ok((session, publisher))
     }
 
+    /// Decode a response message from a bidi request stream (draft-18).
+    /// Response messages omit the Request ID; we inject the known ID.
+    async fn decode_bidi_response(
+        reader: &mut super::Reader,
+        request_id: u64,
+    ) -> Result<Message, SessionError> {
+        use crate::coding::{Decode, DecodeError, ReasonPhrase};
+
+        let msg_type: u64 = reader.decode().await?;
+        let msg_len: u16 = reader.decode().await?;
+        let len = msg_len as usize;
+
+        let mut payload = bytes::BytesMut::new();
+        while payload.len() < len {
+            let remaining = len - payload.len();
+            match reader.read_chunk(remaining).await? {
+                Some(chunk) => payload.extend_from_slice(&chunk),
+                None => return Err(DecodeError::More(remaining).into()),
+            }
+        }
+        let mut buf = &payload[..];
+
+        match msg_type {
+            0x5 => {
+                let error_code = u64::decode(&mut buf)?;
+                let retry_interval = u64::decode(&mut buf)?;
+                let reason = ReasonPhrase::decode(&mut buf)?;
+                Ok(Message::RequestError(message::RequestError {
+                    id: request_id,
+                    error_code,
+                    retry_interval,
+                    reason,
+                }))
+            }
+            0x7 => {
+                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                Ok(Message::RequestOk(message::RequestOk {
+                    id: request_id,
+                    params,
+                }))
+            }
+            other => {
+                tracing::warn!(msg_type = other, "unexpected bidi response type");
+                Err(SessionError::unimplemented(&format!(
+                    "bidi response 0x{:x}",
+                    other
+                )))
+            }
+        }
+    }
+
     /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided
     /// [serve::TracksReader].  Blocks until the namespace is unannounced or an error occurs.
+    ///
+    /// Draft-18: sends PUBLISH_NAMESPACE on a new bidi request stream and reads
+    /// responses from the same stream.
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
-        let publish_ns = match self
-            .publish_namespaces
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .entry(tracks.namespace.clone())
-        {
-            // Duplicate PUBLISH_NAMESPACE for the same namespace is a protocol error.
-            hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
+        // Phase 1: allocate under lock, release before any await.
+        let (publish_ns, wire_msg, request_id) = {
+            let mut namespaces = self
+                .publish_namespaces
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
 
-            hash_map::Entry::Vacant(entry) => {
-                let request_id = self.request_id.allocate()?;
-                let (send, recv) =
-                    PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
-                entry.insert(recv);
-                send
+            if namespaces.contains_key(&tracks.namespace) {
+                return Err(ServeError::Duplicate.into());
             }
+
+            let request_id = self.request_id.allocate()?;
+            let (send, recv) = PublishNamespace::new_without_send(
+                self.clone(),
+                request_id,
+                tracks.namespace.clone(),
+            );
+            namespaces.insert(tracks.namespace.clone(), recv);
+            let wire_msg: Message = send.wire_message().into();
+            (send, wire_msg, request_id)
         };
+        // Lock released here.
+
+        // Phase 2: open bidi stream and send (async, no lock held).
+        let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
+        let mut writer = super::Writer::new(send_stream);
+        writer.encode(&wire_msg).await?;
+
+        // Spawn a reader task for responses on this bidi stream.
+        // Draft-18: responses omit Request ID (the stream identity provides it).
+        let mut this = self.clone();
+        let bidi_request_id = request_id;
+        tokio::spawn(async move {
+            let mut reader = super::Reader::new(recv_stream);
+            loop {
+                match Self::decode_bidi_response(&mut reader, bidi_request_id).await {
+                    Ok(msg) => {
+                        if let Ok(sub_msg) = TryInto::<message::Subscriber>::try_into(msg) {
+                            if let Err(e) = this.recv_message(sub_msg) {
+                                tracing::warn!(error = %e, "error handling bidi response");
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let publish_ns = publish_ns;
 
         let mut subscribe_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();

@@ -174,11 +174,7 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
-    pub(super) fn new(
-        mut subscriber: Subscriber,
-        request_id: u64,
-        track: TrackWriter,
-    ) -> (Subscribe, SubscribeRecv) {
+    fn build_info(request_id: u64, track: &TrackWriter) -> (message::Subscribe, SubscribeInfo) {
         let subscribe_message = message::Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
@@ -202,9 +198,45 @@ impl Subscribe {
                 track_status: false,
             }
         });
+        (subscribe_message, info)
+    }
 
+    pub(super) fn new(
+        mut subscriber: Subscriber,
+        request_id: u64,
+        track: TrackWriter,
+    ) -> (Subscribe, SubscribeRecv) {
+        let (subscribe_message, info) = Self::build_info(request_id, &track);
         subscriber.send_message(subscribe_message);
+        Self::from_parts(subscriber, info, track)
+    }
 
+    /// Like `new`, but does NOT send the message on the control stream.
+    /// The caller is responsible for sending via a bidi request stream (draft-18).
+    pub(super) fn new_without_send(
+        subscriber: Subscriber,
+        request_id: u64,
+        track: TrackWriter,
+    ) -> (Subscribe, SubscribeRecv) {
+        let (_msg, info) = Self::build_info(request_id, &track);
+        Self::from_parts(subscriber, info, track)
+    }
+
+    /// Return the wire message to send on the request stream.
+    pub(super) fn wire_message(&self) -> message::Subscribe {
+        message::Subscribe {
+            id: self.info.id,
+            track_namespace: self.info.track_namespace.clone(),
+            track_name: self.info.track_name.clone(),
+            params: self.info.params.clone(),
+        }
+    }
+
+    fn from_parts(
+        subscriber: Subscriber,
+        info: SubscribeInfo,
+        track: TrackWriter,
+    ) -> (Subscribe, SubscribeRecv) {
         let (send, recv) = State::default().split();
 
         let send = Subscribe {

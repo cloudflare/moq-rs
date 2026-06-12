@@ -75,6 +75,37 @@ impl PublishNamespace {
             params: Default::default(),
         });
 
+        Self::from_parts(publisher, info, request_id)
+    }
+
+    /// Like `new`, but does NOT send the message on the control stream.
+    /// The caller sends via a bidi request stream (draft-18).
+    pub(super) fn new_without_send(
+        publisher: Publisher,
+        request_id: u64,
+        namespace: TrackNamespace,
+    ) -> (PublishNamespace, PublishNamespaceRecv) {
+        let info = PublishNamespaceInfo {
+            request_id,
+            namespace: namespace.clone(),
+        };
+        Self::from_parts(publisher, info, request_id)
+    }
+
+    /// Return the wire message to send on the request stream.
+    pub(super) fn wire_message(&self) -> message::PublishNamespace {
+        message::PublishNamespace {
+            id: self.info.request_id,
+            track_namespace: self.info.namespace.clone(),
+            params: Default::default(),
+        }
+    }
+
+    fn from_parts(
+        publisher: Publisher,
+        info: PublishNamespaceInfo,
+        request_id: u64,
+    ) -> (PublishNamespace, PublishNamespaceRecv) {
         let (send, recv) = State::default().split();
 
         let send = Self {

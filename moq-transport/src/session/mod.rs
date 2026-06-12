@@ -417,6 +417,7 @@ impl Session {
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
+            webtransport.clone(),
             mlog_shared.clone(),
             request_id.clone(),
         ));
