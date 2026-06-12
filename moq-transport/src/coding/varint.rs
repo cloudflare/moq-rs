@@ -98,7 +98,6 @@ impl From<u64> for VarInt {
     }
 }
 
-
 impl TryFrom<u128> for VarInt {
     type Error = BoundsExceeded;
 
@@ -171,15 +170,25 @@ impl fmt::Display for VarInt {
 /// Determine the minimal number of bytes needed to encode `x`.
 #[inline]
 fn encoded_size(x: u64) -> usize {
-    if x <= 0x7F { 1 }
-    else if x <= 0x3FFF { 2 }
-    else if x <= 0x1F_FFFF { 3 }
-    else if x <= 0x0FFF_FFFF { 4 }
-    else if x <= 0x07_FFFF_FFFF { 5 }
-    else if x <= 0x03FF_FFFF_FFFF { 6 }
-    else if x <= 0x01_FFFF_FFFF_FFFF { 7 }
-    else if x <= 0x00FF_FFFF_FFFF_FFFF { 8 }
-    else { 9 }
+    if x <= 0x7F {
+        1
+    } else if x <= 0x3FFF {
+        2
+    } else if x <= 0x1F_FFFF {
+        3
+    } else if x <= 0x0FFF_FFFF {
+        4
+    } else if x <= 0x07_FFFF_FFFF {
+        5
+    } else if x <= 0x03FF_FFFF_FFFF {
+        6
+    } else if x <= 0x01_FFFF_FFFF_FFFF {
+        7
+    } else if x <= 0x00FF_FFFF_FFFF_FFFF {
+        8
+    } else {
+        9
+    }
 }
 
 impl Decode for VarInt {
@@ -314,13 +323,21 @@ mod tests {
     // --- Test vectors from draft-ietf-moq-transport-18 Section 1.4.1 ---
 
     #[test]
-    fn spec_37() { encode_check(37, &[0x25]); decode_check(&[0x25], 37); }
+    fn spec_37() {
+        encode_check(37, &[0x25]);
+        decode_check(&[0x25], 37);
+    }
 
     #[test]
-    fn spec_37_nonminimal() { decode_check(&[0x80, 0x25], 37); }
+    fn spec_37_nonminimal() {
+        decode_check(&[0x80, 0x25], 37);
+    }
 
     #[test]
-    fn spec_15293() { encode_check(15293, &[0xBB, 0xBD]); decode_check(&[0xBB, 0xBD], 15293); }
+    fn spec_15293() {
+        encode_check(15293, &[0xBB, 0xBD]);
+        decode_check(&[0xBB, 0xBD], 15293);
+    }
 
     #[test]
     fn spec_226442877() {
@@ -342,55 +359,105 @@ mod tests {
 
     #[test]
     fn spec_70423237261249041() {
-        encode_check(70423237261249041, &[0xFE, 0xFA, 0x31, 0x8F, 0xA8, 0xE3, 0xCA, 0x11]);
-        decode_check(&[0xFE, 0xFA, 0x31, 0x8F, 0xA8, 0xE3, 0xCA, 0x11], 70423237261249041);
+        encode_check(
+            70423237261249041,
+            &[0xFE, 0xFA, 0x31, 0x8F, 0xA8, 0xE3, 0xCA, 0x11],
+        );
+        decode_check(
+            &[0xFE, 0xFA, 0x31, 0x8F, 0xA8, 0xE3, 0xCA, 0x11],
+            70423237261249041,
+        );
     }
 
     #[test]
     fn spec_u64_max() {
-        encode_check(u64::MAX, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-        decode_check(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], u64::MAX);
+        encode_check(
+            u64::MAX,
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        );
+        decode_check(
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            u64::MAX,
+        );
     }
 
     // --- Boundary values ---
 
     #[test]
-    fn boundary_1byte() { round_trip(0); round_trip(0x7F); encode_check(0, &[0x00]); encode_check(0x7F, &[0x7F]); }
-
-    #[test]
-    fn boundary_2byte() { round_trip(0x80); round_trip(0x3FFF); encode_check(0x80, &[0x80, 0x80]); }
-
-    #[test]
-    fn boundary_3to8() {
-        round_trip(0x4000); round_trip(0x1F_FFFF);
-        round_trip(0x20_0000); round_trip(0x0FFF_FFFF);
-        round_trip(0x1000_0000); round_trip(0x07_FFFF_FFFF);
-        round_trip(0x08_0000_0000); round_trip(0x03FF_FFFF_FFFF);
-        round_trip(0x0400_0000_0000); round_trip(0x01_FFFF_FFFF_FFFF);
-        round_trip(0x02_0000_0000_0000); round_trip(0x00FF_FFFF_FFFF_FFFF);
+    fn boundary_1byte() {
+        round_trip(0);
+        round_trip(0x7F);
+        encode_check(0, &[0x00]);
+        encode_check(0x7F, &[0x7F]);
     }
 
     #[test]
-    fn boundary_9byte() { round_trip(0x0100_0000_0000_0000); round_trip(u64::MAX); round_trip(u64::MAX - 1); }
+    fn boundary_2byte() {
+        round_trip(0x80);
+        round_trip(0x3FFF);
+        encode_check(0x80, &[0x80, 0x80]);
+    }
 
     #[test]
-    fn round_trip_small() { for i in 0..=200 { round_trip(i); } }
+    fn boundary_3to8() {
+        round_trip(0x4000);
+        round_trip(0x1F_FFFF);
+        round_trip(0x20_0000);
+        round_trip(0x0FFF_FFFF);
+        round_trip(0x1000_0000);
+        round_trip(0x07_FFFF_FFFF);
+        round_trip(0x08_0000_0000);
+        round_trip(0x03FF_FFFF_FFFF);
+        round_trip(0x0400_0000_0000);
+        round_trip(0x01_FFFF_FFFF_FFFF);
+        round_trip(0x02_0000_0000_0000);
+        round_trip(0x00FF_FFFF_FFFF_FFFF);
+    }
 
     #[test]
-    fn round_trip_large() { round_trip(1_000_000); round_trip(1_000_000_000); round_trip(u64::MAX / 2); }
+    fn boundary_9byte() {
+        round_trip(0x0100_0000_0000_0000);
+        round_trip(u64::MAX);
+        round_trip(u64::MAX - 1);
+    }
 
     #[test]
-    fn nonminimal_zero() { decode_check(&[0x80, 0x00], 0); }
+    fn round_trip_small() {
+        for i in 0..=200 {
+            round_trip(i);
+        }
+    }
 
     #[test]
-    fn nonminimal_one() { decode_check(&[0xC0, 0x00, 0x01], 1); }
+    fn round_trip_large() {
+        round_trip(1_000_000);
+        round_trip(1_000_000_000);
+        round_trip(u64::MAX / 2);
+    }
 
     #[test]
-    fn setup_stream_type_0x2f00() { encode_check(0x2F00, &[0xAF, 0x00]); round_trip(0x2F00); }
+    fn nonminimal_zero() {
+        decode_check(&[0x80, 0x00], 0);
+    }
 
     #[test]
-    fn from_u64_always_succeeds() { assert_eq!(VarInt::try_from(u64::MAX).unwrap(), VarInt::MAX); }
+    fn nonminimal_one() {
+        decode_check(&[0xC0, 0x00, 0x01], 1);
+    }
 
     #[test]
-    fn max_is_u64_max() { assert_eq!(VarInt::MAX.into_inner(), u64::MAX); }
+    fn setup_stream_type_0x2f00() {
+        encode_check(0x2F00, &[0xAF, 0x00]);
+        round_trip(0x2F00);
+    }
+
+    #[test]
+    fn from_u64_always_succeeds() {
+        assert_eq!(VarInt::try_from(u64::MAX).unwrap(), VarInt::MAX);
+    }
+
+    #[test]
+    fn max_is_u64_max() {
+        assert_eq!(VarInt::MAX.into_inner(), u64::MAX);
+    }
 }

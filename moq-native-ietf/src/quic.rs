@@ -431,8 +431,8 @@ impl Server {
             // Reject if no mutually-supported version exists.
             let selected = moq_transport::setup::negotiate_version(&request.protocols)
                 .context("no mutually supported MoQT version in WT-Available-Protocols")?;
-            let response = web_transport_quinn::proto::ConnectResponse::OK
-                .with_protocol(selected.to_string());
+            let response =
+                web_transport_quinn::proto::ConnectResponse::OK.with_protocol(selected.to_string());
 
             // Accept the CONNECT request.
             let session = request
@@ -440,7 +440,10 @@ impl Server {
                 .await
                 .context("failed to respond to WebTransport request")?;
             (session, Transport::WebTransport)
-        } else if moq_transport::setup::SUPPORTED_ALPNS.iter().any(|v| v.as_bytes() == alpn_bytes) {
+        } else if moq_transport::setup::SUPPORTED_ALPNS
+            .iter()
+            .any(|v| v.as_bytes() == alpn_bytes)
+        {
             // Raw QUIC mode — create a "fake" WebTransport session with no H3 framing.
             let request = url::Url::parse("moqt://localhost").unwrap();
             let session = web_transport_quinn::Session::raw(

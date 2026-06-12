@@ -137,7 +137,7 @@ mod tests {
 
         let mut params = KeyValuePairs::default();
         params.set_bytesvalue(ParameterType::Path.into(), b"/test".to_vec());
-        params.set_intvalue(ParameterType::MaxRequestId.into(), 42);
+        params.set_intvalue(ParameterType::MaxAuthTokenCacheSize.into(), 42);
 
         let setup = Setup { params };
         setup.encode(&mut buf).unwrap();
@@ -166,8 +166,11 @@ mod tests {
 
         let mut params = KeyValuePairs::default();
         params.set_bytesvalue(ParameterType::Path.into(), b"/live/stream".to_vec());
-        params.set_intvalue(ParameterType::MaxRequestId.into(), 1000);
-        params.set_bytesvalue(ParameterType::Authority.into(), b"relay.example.com".to_vec());
+        params.set_intvalue(ParameterType::MaxAuthTokenCacheSize.into(), 1000);
+        params.set_bytesvalue(
+            ParameterType::Authority.into(),
+            b"relay.example.com".to_vec(),
+        );
 
         let setup = Setup { params };
         setup.encode(&mut buf).unwrap();

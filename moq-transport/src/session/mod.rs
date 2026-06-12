@@ -18,7 +18,7 @@ pub use error::*;
 pub use publish_namespace::*;
 pub use published_namespace::*;
 pub use publisher::*;
-pub use request_id::{RequestId, RequestIdAllocation};
+pub use request_id::RequestId;
 pub use subscribe::*;
 pub use subscribed::*;
 pub use subscriber::*;
@@ -28,7 +28,6 @@ use reader::*;
 use writer::*;
 
 use futures::{stream::FuturesUnordered, StreamExt};
-use request_id::max_request_id_from_params;
 use std::sync::{Arc, Mutex};
 
 use crate::coding::{KeyValuePairs, Value};
@@ -363,24 +362,6 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::MaxRequestId(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "MAX_REQUEST_ID",
-                    request_id = m.request_id,
-                    "MoQT control message"
-                );
-            }
-            Message::RequestsBlocked(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "REQUESTS_BLOCKED",
-                    max_request_id = m.max_request_id,
-                    "MoQT control message"
-                );
-            }
             Message::RequestOk(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
@@ -512,14 +493,6 @@ impl Session {
             }
         }
 
-        // The MAX_REQUEST_ID we advertise to the server.
-        // TODO(itzmanish): make configurable.
-        let our_max_request_id: u64 = 100;
-        params.set_intvalue(
-            setup::ParameterType::MaxRequestId.into(),
-            our_max_request_id,
-        );
-
         let client = setup::Setup { params };
 
         tracing::debug!(
@@ -532,11 +505,10 @@ impl Session {
         );
         sender.encode(&client).await?;
 
-
         // Accept the peer's unidirectional control stream.
         let recv_stream = session.accept_uni().await?;
         let mut recver = Reader::new(recv_stream);
-        let server: setup::Setup = recver.decode().await?;
+        let _server: setup::Setup = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
@@ -544,9 +516,8 @@ impl Session {
             "MoQT control message"
         );
 
-        let peer_max = max_request_id_from_params(&server.params);
         // Client sends even IDs (0); peer server sends odd IDs (1).
-        let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
+        let request_id = RequestId::new(0, 1);
         let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
         Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
@@ -608,16 +579,7 @@ impl Session {
             let _ = mlog.add_event(event);
         }
 
-        let peer_max = max_request_id_from_params(&client.params);
-
-        // The MAX_REQUEST_ID we advertise to the client.
-        // TODO(itzmanish): make configurable.
-        let our_max_request_id: u64 = 100;
-        let mut params = KeyValuePairs::default();
-        params.set_intvalue(
-            setup::ParameterType::MaxRequestId.into(),
-            our_max_request_id,
-        );
+        let params = KeyValuePairs::default();
 
         let server = setup::Setup { params };
 
@@ -636,7 +598,7 @@ impl Session {
         sender.encode(&server).await?;
 
         // Server sends odd IDs (1); peer client sends even IDs (0).
-        let request_id = RequestId::new(1, peer_max, our_max_request_id, 0);
+        let request_id = RequestId::new(1, 0);
         Ok(Session::new(
             session,
             sender,
@@ -712,8 +674,8 @@ impl Session {
     /// is to be handled by Subscriber or Publisher logic and calls recv_message on either the
     /// Publisher or Subscriber.
     /// Receives and dispatches control messages.
-    /// Handles session-level messages (GOAWAY, MAX_REQUEST_ID, REQUESTS_BLOCKED)
-    /// directly and routes role-specific messages to Publisher or Subscriber.
+    /// Handles session-level messages (GOAWAY) directly and routes
+    /// role-specific messages to Publisher or Subscriber.
     async fn run_recv(
         mut recver: Reader,
         mut publisher: Option<Publisher>,
@@ -804,23 +766,6 @@ impl Session {
                         "received GOAWAY"
                     );
                     // TODO(itzmanish): trigger session migration.
-                }
-                Message::MaxRequestId(ref m) => {
-                    request_id.apply_max_request_id(m)?;
-                    tracing::debug!(
-                        target: "moq_transport::control",
-                        max_request_id = m.request_id,
-                        "received MAX_REQUEST_ID"
-                    );
-                }
-                Message::RequestsBlocked(ref m) => {
-                    tracing::debug!(
-                        target: "moq_transport::control",
-                        max_request_id = m.max_request_id,
-                        "received REQUESTS_BLOCKED"
-                    );
-                    // REQUESTS_BLOCKED tells us the peer's send budget is exhausted.
-                    request_id.handle_requests_blocked(m)?;
                 }
                 other => {
                     tracing::warn!(msg_type = other.name(), "received unhandled message type");

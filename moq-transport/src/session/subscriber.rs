@@ -22,8 +22,8 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session,
-    SessionError, Subscribe, SubscribeRecv,
+    PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, Session, SessionError,
+    Subscribe, SubscribeRecv,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -138,20 +138,9 @@ impl Subscriber {
         self.send_message(msg);
     }
 
-    /// Allocate the next outbound request ID, enforcing the peer-advertised maximum.
-    ///
-    /// Returns `Err(TooManyRequests)` if no budget remains and also sends
-    /// REQUESTS_BLOCKED if not already sent for this limit.
+    /// Allocate the next outbound request ID.
     fn get_next_request_id(&mut self) -> Result<u64, SessionError> {
-        match self.request_id.allocate()? {
-            RequestIdAllocation::Allocated(id) => Ok(id),
-            blocked @ RequestIdAllocation::Blocked { .. } => {
-                if let Some(msg) = blocked.requests_blocked() {
-                    let _ = self.outgoing.push(msg.into());
-                }
-                Err(SessionError::TooManyRequests)
-            }
-        }
+        self.request_id.allocate()
     }
 
     pub fn track_status(
@@ -375,7 +364,8 @@ impl Subscriber {
         // Route to a matching subscribe if present.
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
             self.log_request_error_parsed("subscribe", msg);
-            subscribe.error(ServeError::Closed(msg.error_code))?;
+            let err = Self::request_error_to_serve_error(msg);
+            subscribe.error(err)?;
         } else {
             self.log_request_error_parsed("unknown", msg);
         }
@@ -389,6 +379,25 @@ impl Subscriber {
             "received REQUEST_ERROR"
         );
         Ok(())
+    }
+
+    /// Map a REQUEST_ERROR to a semantic ServeError so callers see
+    /// meaningful variants (e.g. NotFound) instead of opaque error codes.
+    fn request_error_to_serve_error(msg: &message::RequestError) -> ServeError {
+        use message::RequestErrorCode;
+        match msg.error_code {
+            c if c == RequestErrorCode::DoesNotExist as u64 => {
+                ServeError::not_found_ctx(msg.reason.0.clone())
+            }
+            c if c == RequestErrorCode::InternalError as u64 => {
+                ServeError::internal_ctx(msg.reason.0.clone())
+            }
+            c if c == RequestErrorCode::DuplicateSubscription as u64 => ServeError::Duplicate,
+            c if c == RequestErrorCode::NotSupported as u64 => {
+                ServeError::NotImplemented(msg.reason.0.clone())
+            }
+            code => ServeError::Closed(code),
+        }
     }
 
     fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishedNamespaceRecv> {
@@ -883,7 +892,7 @@ mod tests {
     use crate::{message, serve::Track};
 
     fn subscriber() -> Subscriber {
-        let request_id = RequestId::new(0, 100, 100, 0);
+        let request_id = RequestId::new(0, 1);
         Subscriber::new(Queue::default(), None, request_id)
     }
 

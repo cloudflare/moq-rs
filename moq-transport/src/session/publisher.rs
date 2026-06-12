@@ -19,8 +19,8 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    PublishNamespace, PublishNamespaceRecv, RequestId, RequestIdAllocation, Session, SessionError,
-    Subscribed, SubscribedRecv, TrackStatusRequested,
+    PublishNamespace, PublishNamespaceRecv, RequestId, Session, SessionError, Subscribed,
+    SubscribedRecv, TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -109,16 +109,7 @@ impl Publisher {
             hash_map::Entry::Occupied(_) => return Err(ServeError::Duplicate.into()),
 
             hash_map::Entry::Vacant(entry) => {
-                // Allocate a request ID, enforcing the peer-advertised maximum.
-                let request_id = match self.request_id.allocate()? {
-                    RequestIdAllocation::Allocated(id) => id,
-                    blocked @ RequestIdAllocation::Blocked { .. } => {
-                        if let Some(msg) = blocked.requests_blocked() {
-                            let _ = self.outgoing.push(msg.into());
-                        }
-                        return Err(SessionError::TooManyRequests);
-                    }
-                };
+                let request_id = self.request_id.allocate()?;
                 let (send, recv) =
                     PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
                 entry.insert(recv);

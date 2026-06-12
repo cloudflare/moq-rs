@@ -25,7 +25,7 @@ mod fetch_type;
 mod filter_type;
 mod go_away;
 mod group_order;
-mod max_request_id;
+
 mod namespace;
 mod params;
 mod pubilsh_namespace_done;
@@ -38,7 +38,7 @@ mod publisher;
 mod request_error;
 mod request_ok;
 mod request_update;
-mod requests_blocked;
+
 mod subscribe;
 mod subscribe_namespace;
 mod subscribe_ok;
@@ -53,7 +53,7 @@ pub use fetch_type::*;
 pub use filter_type::*;
 pub use go_away::*;
 pub use group_order::*;
-pub use max_request_id::*;
+
 pub use namespace::*;
 pub use params::*;
 pub use pubilsh_namespace_done::*;
@@ -66,7 +66,7 @@ pub use publisher::*;
 pub use request_error::*;
 pub use request_ok::*;
 pub use request_update::*;
-pub use requests_blocked::*;
+
 pub use subscribe::*;
 pub use subscribe_namespace::*;
 pub use subscribe_ok::*;
@@ -224,8 +224,6 @@ message_types! {
 
     // ── Session management ────────────────────────────────────────────────────
     GoAway          = 0x10,
-    MaxRequestId    = 0x15,
-    RequestsBlocked = 0x1a,
 }
 
 #[cfg(test)]

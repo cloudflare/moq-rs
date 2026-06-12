@@ -9,8 +9,7 @@
 // - RequestUpdate (parsed/created)
 // - Fetch, FetchOk, FetchCancel (parsed/created)
 // - Publish, PublishOk, PublishDone (parsed/created)
-// - MaxRequestId (parsed/created)
-// - RequestsBlocked (parsed/created)
+// Note: MaxRequestId/RequestsBlocked removed in draft-18 (#1471)
 //
 // TODO: Unimplemented data plane events (from draft-pardue-moq-qlog-moq-events):
 // - stream_type_set (when stream type becomes known)
