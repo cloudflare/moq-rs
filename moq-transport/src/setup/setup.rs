@@ -137,6 +137,8 @@ mod tests {
 
         let mut params = KeyValuePairs::default();
         params.set_bytesvalue(ParameterType::Path.into(), b"/test".to_vec());
+        // MaxAuthTokenCacheSize used as a representative non-trivial parameter
+        // (MaxRequestId was removed in draft-18 §A.1; any valid parameter type works here).
         params.set_intvalue(ParameterType::MaxAuthTokenCacheSize.into(), 42);
 
         let setup = Setup { params };
@@ -166,6 +168,7 @@ mod tests {
 
         let mut params = KeyValuePairs::default();
         params.set_bytesvalue(ParameterType::Path.into(), b"/live/stream".to_vec());
+        // MaxAuthTokenCacheSize as stand-in (MaxRequestId removed in draft-18 §A.1).
         params.set_intvalue(ParameterType::MaxAuthTokenCacheSize.into(), 1000);
         params.set_bytesvalue(
             ParameterType::Authority.into(),

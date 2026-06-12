@@ -81,6 +81,16 @@ use std::fmt;
 // Use a macro to generate the Message enum and its encode/decode impls.
 macro_rules! message_types {
     {$($name:ident = $val:expr,)*} => {
+        /// Wire type IDs for control messages (draft-18 Table 5).
+        ///
+        /// These are the `u64` values used in the `Message Type` field on
+        /// the wire. Use these constants instead of hardcoded hex literals
+        /// when matching or constructing message frames.
+        #[allow(non_upper_case_globals)]
+        pub mod wire_id {
+            $(pub const $name: u64 = $val;)*
+        }
+
         /// All supported control message types.
         #[derive(Clone)]
         pub enum Message {
@@ -164,6 +174,23 @@ macro_rules! message_types {
                     Self::SubscribeNamespace(m) => Some(m.id),
                     Self::Publish(m) => Some(m.id),
                     Self::PublishNamespace(m) => Some(m.id),
+                    _ => None,
+                }
+            }
+
+            /// Return the target request ID for response/follow-up messages sent
+            /// back on a bidi stream (draft-18). Returns `None` for request-initiating
+            /// messages and session-level messages.
+            pub fn response_target_id(&self) -> Option<u64> {
+                match self {
+                    Self::RequestOk(m) => Some(m.id),
+                    Self::RequestError(m) => Some(m.id),
+                    Self::SubscribeOk(m) => Some(m.id),
+                    Self::PublishDone(m) => Some(m.id),
+                    Self::PublishNamespaceDone(m) => Some(m.id),
+                    Self::Unsubscribe(m) => Some(m.id),
+                    Self::PublishOk(m) => Some(m.id),
+                    Self::FetchOk(m) => Some(m.id),
                     _ => None,
                 }
             }

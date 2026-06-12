@@ -201,19 +201,9 @@ impl Subscribe {
         (subscribe_message, info)
     }
 
+    /// Create a Subscribe without sending on the control stream.
+    /// The caller sends via a bidi request stream (draft-18).
     pub(super) fn new(
-        mut subscriber: Subscriber,
-        request_id: u64,
-        track: TrackWriter,
-    ) -> (Subscribe, SubscribeRecv) {
-        let (subscribe_message, info) = Self::build_info(request_id, &track);
-        subscriber.send_message(subscribe_message);
-        Self::from_parts(subscriber, info, track)
-    }
-
-    /// Like `new`, but does NOT send the message on the control stream.
-    /// The caller is responsible for sending via a bidi request stream (draft-18).
-    pub(super) fn new_without_send(
         subscriber: Subscriber,
         request_id: u64,
         track: TrackWriter,

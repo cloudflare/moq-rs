@@ -59,28 +59,9 @@ pub struct PublishNamespace {
 }
 
 impl PublishNamespace {
-    pub(super) fn new(
-        mut publisher: Publisher,
-        request_id: u64,
-        namespace: TrackNamespace,
-    ) -> (PublishNamespace, PublishNamespaceRecv) {
-        let info = PublishNamespaceInfo {
-            request_id,
-            namespace: namespace.clone(),
-        };
-
-        publisher.send_message(message::PublishNamespace {
-            id: request_id,
-            track_namespace: namespace.clone(),
-            params: Default::default(),
-        });
-
-        Self::from_parts(publisher, info, request_id)
-    }
-
-    /// Like `new`, but does NOT send the message on the control stream.
+    /// Create a PublishNamespace without sending on the control stream.
     /// The caller sends via a bidi request stream (draft-18).
-    pub(super) fn new_without_send(
+    pub(super) fn new(
         publisher: Publisher,
         request_id: u64,
         namespace: TrackNamespace,

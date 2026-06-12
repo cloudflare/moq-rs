@@ -118,7 +118,7 @@ The test cases implemented here correspond to the specifications in [moq-interop
 | `publish-namespace-subscribe` | MoQT §5.1, §6.2, §9.7-9.8, §9.23-9.24 |
 | `subscribe-before-publish-namespace` | MoQT §5.1, §6.2 |
 
-Protocol references are to [draft-ietf-moq-transport-16](https://www.ietf.org/archive/id/draft-ietf-moq-transport-16.html).
+Protocol references are to [draft-ietf-moq-transport-18](https://www.ietf.org/archive/id/draft-ietf-moq-transport-18.html).
 
 ## Design Goals
 

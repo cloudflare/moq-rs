@@ -28,14 +28,25 @@ use reader::*;
 use writer::*;
 
 use futures::{stream::FuturesUnordered, StreamExt};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::coding::{KeyValuePairs, Value};
+use crate::coding::{Encode, KeyValuePairs, Value};
 use crate::message::Message;
 use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
+
+/// Registry mapping bidi-request IDs to a channel for forwarding responses.
+/// When `run_send` pops a response message from the outgoing queue, it checks
+/// this map: if the response's target request ID has a registered sender, the
+/// response is forwarded to the bidi handler task that owns the Writer.
+type BidiResponseMap = Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Message>>>>;
+
+/// Channel for spawned bidi response reader tasks. Publisher/Subscriber
+/// send handles here; Session::run collects and polls them.
+type BidiTaskSender = tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>;
 
 /// The transport protocol negotiated for this MoQT connection.
 ///
@@ -87,6 +98,13 @@ pub struct Session {
     /// (takes precedence) or the SETUP PATH parameter (key 0x1).
     /// For outgoing connections: auto-extracted from the session URL in connect().
     connection_path: Option<String>,
+
+    /// Receiver for spawned bidi reader task handles.
+    /// Polled by Session::run; dropping FuturesUnordered aborts all tasks.
+    bidi_task_rx: tokio::sync::mpsc::UnboundedReceiver<tokio::task::JoinHandle<()>>,
+
+    /// Maps bidi-request IDs to their response stream writers (draft-18).
+    bidi_response_map: BidiResponseMap,
 }
 
 impl Session {
@@ -409,17 +427,22 @@ impl Session {
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
 
+        let (bidi_task_tx, bidi_task_rx) =
+            tokio::sync::mpsc::unbounded_channel::<tokio::task::JoinHandle<()>>();
+
         let publisher = Some(Publisher::new(
             outgoing.0.clone(),
             webtransport.clone(),
             mlog_shared.clone(),
             request_id.clone(),
+            bidi_task_tx.clone(),
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
             webtransport.clone(),
             mlog_shared.clone(),
             request_id.clone(),
+            bidi_task_tx,
         ));
 
         let session = Self {
@@ -433,6 +456,8 @@ impl Session {
             mlog: mlog_shared,
             transport,
             connection_path,
+            bidi_task_rx,
+            bidi_response_map: Arc::new(Mutex::new(HashMap::new())),
         };
 
         (session, publisher, subscriber)
@@ -615,66 +640,424 @@ impl Session {
     /// inbound control messages, receiving and processing new inbound uni-directional QUIC streams,
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
-        tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
-            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
+        let mut bidi_task_rx = self.bidi_task_rx;
+        let mut reader_tasks = FuturesUnordered::new();
+
+        let result = tokio::select! {
+            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
+            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone(), self.bidi_response_map.clone()) => res,
+            res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
-        }
+            // Collect bidi reader task handles and poll them to completion.
+            // Dropping FuturesUnordered on session exit aborts all remaining tasks.
+            () = async {
+                loop {
+                    tokio::select! {
+                        handle = bidi_task_rx.recv() => {
+                            match handle {
+                                Some(h) => reader_tasks.push(h),
+                                None => break, // all senders dropped
+                            }
+                        }
+                        Some(_) = reader_tasks.next() => {}
+                    }
+                }
+            } => Ok(()),
+        };
+
+        // Dropping reader_tasks (FuturesUnordered<JoinHandle>) aborts all
+        // spawned bidi reader tasks — no explicit abort loop needed.
+        drop(reader_tasks);
+
+        result
     }
 
-    /// Processes the outgoing control message queue, and sends queued messages on the control stream sender/writer.
+    /// Processes the outgoing control message queue. Response messages targeting
+    /// a bidi request stream are redirected there (draft-18); everything else
+    /// goes to the control stream.
     async fn run_send(
         mut sender: Writer,
         mut outgoing: Queue<message::Message>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        bidi_response_map: BidiResponseMap,
     ) -> Result<(), SessionError> {
         while let Some(msg) = outgoing.pop().await {
-            // Emit structured tracing log for sent control messages
             Self::log_control_message(&msg, "sent");
 
-            // Emit mlog event for sent control messages
             if let Some(ref mlog) = mlog {
                 if let Ok(mut mlog_guard) = mlog.lock() {
                     let time = mlog_guard.elapsed_ms();
-                    let stream_id = 0; // Control stream is always stream 0
-
-                    // Emit events based on message type
+                    // Draft-18: Subscribe and PublishNamespace travel on bidi
+                    // request streams, not the control stream. Use the request
+                    // ID as the stream identifier for mlog; only GoAway still
+                    // uses stream 0 (control).
                     let event = match &msg {
                         Message::Subscribe(m) => {
-                            Some(mlog::events::subscribe_created(time, stream_id, m))
+                            Some(mlog::events::subscribe_created(time, m.id, m))
                         }
                         Message::SubscribeOk(m) => {
-                            Some(mlog::events::subscribe_ok_created(time, stream_id, m))
+                            Some(mlog::events::subscribe_ok_created(time, m.id, m))
                         }
                         Message::Unsubscribe(m) => {
-                            Some(mlog::events::unsubscribe_created(time, stream_id, m))
+                            Some(mlog::events::unsubscribe_created(time, m.id, m))
                         }
                         Message::PublishNamespace(m) => {
-                            Some(mlog::events::publish_namespace_created(time, stream_id, m))
+                            Some(mlog::events::publish_namespace_created(time, m.id, m))
                         }
-                        Message::GoAway(m) => {
-                            Some(mlog::events::go_away_created(time, stream_id, m))
-                        }
-                        _ => None, // TODO: Add other message types
+                        Message::GoAway(m) => Some(mlog::events::go_away_created(time, 0, m)),
+                        _ => None,
                     };
-
                     if let Some(event) = event {
                         let _ = mlog_guard.add_event(event);
                     }
                 }
             }
 
+            // Draft-18: response messages with a target request ID belong on
+            // the bidi stream, never the control stream.
+            if let Some(target_id) = msg.response_target_id() {
+                let tx_opt = bidi_response_map
+                    .lock()
+                    .map_err(|_| SessionError::Internal)?
+                    .get(&target_id)
+                    .cloned();
+                if let Some(tx) = tx_opt {
+                    if tx.send(msg).is_err() {
+                        tracing::warn!(target_id, "bidi response channel closed, dropping message");
+                    }
+                } else {
+                    tracing::warn!(
+                        target_id,
+                        "bidi response map entry gone, dropping late response"
+                    );
+                }
+                continue; // never fall through to control stream for bidi-only messages
+            }
+
+            // Only control-stream messages (no response_target_id) reach here.
             sender.encode(&msg).await?;
         }
 
         Ok(())
     }
 
-    /// Receives inbound messages from the control stream reader/receiver.  Analyzes if the message
-    /// is to be handled by Subscriber or Publisher logic and calls recv_message on either the
-    /// Publisher or Subscriber.
-    /// Receives and dispatches control messages.
+    /// Accept incoming bidirectional request streams (draft-18 §10).
+    /// Each peer-initiated bidi stream carries one request message followed
+    /// by responses/follow-ups on the same stream.
+    /// Maximum number of bidi request handler tasks running concurrently.
+    /// Provides back-pressure when a peer opens many streams at once.
+    const MAX_CONCURRENT_BIDI_STREAMS: usize = 128;
+
+    async fn run_bidi_requests(
+        webtransport: web_transport::Session,
+        publisher: Option<Publisher>,
+        subscriber: Option<Subscriber>,
+        request_id: RequestId,
+        bidi_response_map: BidiResponseMap,
+    ) -> Result<(), SessionError> {
+        let mut tasks = FuturesUnordered::new();
+
+        loop {
+            tokio::select! {
+                res = webtransport.accept_bi(), if tasks.len() < Self::MAX_CONCURRENT_BIDI_STREAMS => {
+                    let (send_stream, recv_stream) = res?;
+                    let mut pub_clone = publisher.clone();
+                    let mut sub_clone = subscriber.clone();
+                    let rid = request_id.clone();
+                    let map = bidi_response_map.clone();
+
+                    tasks.push(async move {
+                        if let Err(e) = Self::handle_bidi_request(
+                            send_stream, recv_stream,
+                            &mut pub_clone, &mut sub_clone, &rid, &map,
+                        ).await {
+                            tracing::debug!(error = %e, "bidi request stream ended");
+                        }
+                    });
+                }
+                Some(()) = tasks.next() => {}
+            }
+        }
+    }
+
+    /// Handle a single bidi request stream: decode the request, dispatch
+    /// to handlers, then wait for responses and write them back on the
+    /// same stream (without Request ID, per draft-18).
+    async fn handle_bidi_request(
+        send_stream: web_transport::SendStream,
+        recv_stream: web_transport::RecvStream,
+        publisher: &mut Option<Publisher>,
+        subscriber: &mut Option<Subscriber>,
+        request_id: &RequestId,
+        bidi_response_map: &BidiResponseMap,
+    ) -> Result<(), SessionError> {
+        let mut reader = Reader::new(recv_stream);
+        let mut writer = Writer::new(send_stream);
+
+        // Read the first (request) message from the bidi stream.
+        let msg: Message = reader.decode().await?;
+
+        let req_id = msg.sequenced_request_id();
+
+        // Validate request ID sequencing and register a response channel.
+        let mut rx = if let Some(id) = req_id {
+            request_id.validate_incoming(id)?;
+
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+            bidi_response_map
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .insert(id, tx);
+            Some(rx)
+        } else {
+            None
+        };
+
+        // Dispatch to the appropriate role handler (same as run_recv).
+        // Capture the result so cleanup runs unconditionally on error.
+        let dispatch_result = (|| -> Result<(), SessionError> {
+            let msg = match TryInto::<message::Publisher>::try_into(msg) {
+                Ok(msg) => {
+                    subscriber
+                        .as_mut()
+                        .ok_or(SessionError::RoleViolation)?
+                        .recv_message(msg)?;
+                    return Ok(());
+                }
+                Err(msg) => msg,
+            };
+            match TryInto::<message::Subscriber>::try_into(msg) {
+                Ok(msg) => {
+                    publisher
+                        .as_mut()
+                        .ok_or(SessionError::RoleViolation)?
+                        .recv_message(msg)?;
+                }
+                Err(msg) => {
+                    tracing::warn!(
+                        msg_type = msg.name(),
+                        "unexpected message on bidi request stream"
+                    );
+                }
+            }
+            Ok(())
+        })();
+
+        // Wait for responses only if dispatch succeeded; otherwise the
+        // handlers didn't register anything to respond to.
+        if dispatch_result.is_ok() {
+            if let Some(ref mut rx) = rx {
+                while let Some(response) = rx.recv().await {
+                    let is_terminal = matches!(
+                        response,
+                        Message::RequestError(_)
+                            | Message::PublishDone(_)
+                            | Message::PublishNamespaceDone(_)
+                            | Message::Unsubscribe(_)
+                    );
+                    if let Err(e) = Self::encode_bidi_response(&mut writer, &response).await {
+                        tracing::warn!(error = %e, "failed to write bidi response");
+                        break;
+                    }
+                    if is_terminal {
+                        // Give Quinn's connection driver a scheduling
+                        // opportunity to transmit the STREAM data before
+                        // the Writer is dropped (which sends FIN).
+                        tokio::time::sleep(std::time::Duration::ZERO).await;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Always clean up — runs on both success and error paths.
+        if let Some(id) = req_id {
+            if let Ok(mut map) = bidi_response_map.lock() {
+                map.remove(&id);
+            }
+        }
+
+        // Explicitly finish the stream and yield for Quinn to flush.
+        writer.finish();
+        tokio::task::yield_now().await;
+
+        dispatch_result
+    }
+
+    /// Encode a response message to a bidi stream, omitting the Request ID
+    /// field per draft-18 (the stream identity provides the association).
+    /// Build the wire frame for a bidi response message (type + length +
+    /// payload with Request ID omitted). Separated from the async writer
+    /// so tests can verify the encoding without a QUIC stream.
+    fn encode_bidi_response_frame(msg: &Message) -> Result<bytes::BytesMut, SessionError> {
+        use bytes::BufMut;
+
+        // Encode the payload (all fields EXCEPT Request ID, which is
+        // implicit from the bidi stream identity in draft-18).
+        let mut payload = bytes::BytesMut::new();
+        match msg {
+            Message::RequestOk(m) => {
+                m.params.encode(&mut payload)?;
+            }
+            Message::RequestError(m) => {
+                m.error_code.encode(&mut payload)?;
+                m.retry_interval.encode(&mut payload)?;
+                m.reason.encode(&mut payload)?;
+            }
+            Message::SubscribeOk(m) => {
+                m.track_alias.encode(&mut payload)?;
+                m.params.encode(&mut payload)?;
+                m.track_extensions.encode(&mut payload)?;
+            }
+            Message::PublishDone(m) => {
+                m.status_code.encode(&mut payload)?;
+                m.stream_count.encode(&mut payload)?;
+                m.reason.encode(&mut payload)?;
+            }
+            // id-only messages: payload is empty (id omitted on bidi).
+            Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {}
+            Message::PublishOk(m) => {
+                m.params.encode(&mut payload)?;
+            }
+            Message::FetchOk(m) => {
+                m.end_of_track.encode(&mut payload)?;
+                m.end_location.encode(&mut payload)?;
+                m.params.encode(&mut payload)?;
+                m.track_extensions.encode(&mut payload)?;
+            }
+            other => {
+                tracing::warn!(
+                    msg_type = other.name(),
+                    "unexpected message type in encode_bidi_response — not a bidi response message"
+                );
+                return Err(SessionError::Internal);
+            }
+        };
+
+        let msg_type = msg.id();
+
+        if payload.len() > u16::MAX as usize {
+            return Err(crate::coding::EncodeError::MsgBoundsExceeded.into());
+        }
+        let mut frame = bytes::BytesMut::new();
+        msg_type.encode(&mut frame)?;
+        (payload.len() as u16).encode(&mut frame)?;
+        frame.put(payload);
+        Ok(frame)
+    }
+
+    async fn encode_bidi_response(writer: &mut Writer, msg: &Message) -> Result<(), SessionError> {
+        let frame = Self::encode_bidi_response_frame(msg)?;
+        writer.write(&frame).await?;
+        Ok(())
+    }
+
+    /// Decode a response message from a bidi request stream (draft-18).
+    ///
+    /// Response messages omit the Request ID field — the stream identity
+    /// provides the association. The caller supplies the known `request_id`
+    /// which is injected into the decoded `Message`.
+    pub(super) async fn decode_bidi_response(
+        reader: &mut Reader,
+        request_id: u64,
+    ) -> Result<Message, SessionError> {
+        use crate::coding::{Decode, DecodeError, ReasonPhrase};
+
+        let msg_type: u64 = reader.decode().await?;
+        let msg_len: u16 = reader.decode().await?;
+        let len = msg_len as usize;
+
+        let mut payload = bytes::BytesMut::new();
+        while payload.len() < len {
+            let remaining = len - payload.len();
+            match reader.read_chunk(remaining).await? {
+                Some(chunk) => payload.extend_from_slice(&chunk),
+                None => return Err(DecodeError::More(remaining).into()),
+            }
+        }
+        let mut buf = &payload[..];
+
+        use message::wire_id;
+
+        match msg_type {
+            wire_id::RequestError => {
+                let error_code = u64::decode(&mut buf)?;
+                let retry_interval = u64::decode(&mut buf)?;
+                let reason = ReasonPhrase::decode(&mut buf)?;
+                Ok(Message::RequestError(message::RequestError {
+                    id: request_id,
+                    error_code,
+                    retry_interval,
+                    reason,
+                }))
+            }
+            wire_id::RequestOk => {
+                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                Ok(Message::RequestOk(message::RequestOk {
+                    id: request_id,
+                    params,
+                }))
+            }
+            wire_id::SubscribeOk => {
+                let track_alias = u64::decode(&mut buf)?;
+                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                let track_extensions = message::TrackExtensions::decode(&mut buf)?;
+                Ok(Message::SubscribeOk(message::SubscribeOk {
+                    id: request_id,
+                    track_alias,
+                    params,
+                    track_extensions,
+                }))
+            }
+            wire_id::PublishNamespaceDone => Ok(Message::PublishNamespaceDone(
+                message::PublishNamespaceDone { id: request_id },
+            )),
+            wire_id::PublishDone => {
+                let status_code = u64::decode(&mut buf)?;
+                let stream_count = u64::decode(&mut buf)?;
+                let reason = ReasonPhrase::decode(&mut buf)?;
+                Ok(Message::PublishDone(message::PublishDone {
+                    id: request_id,
+                    status_code,
+                    stream_count,
+                    reason,
+                }))
+            }
+            wire_id::Unsubscribe => Ok(Message::Unsubscribe(message::Unsubscribe {
+                id: request_id,
+            })),
+            wire_id::PublishOk => {
+                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                Ok(Message::PublishOk(message::PublishOk {
+                    id: request_id,
+                    params,
+                }))
+            }
+            wire_id::FetchOk => {
+                let end_of_track = bool::decode(&mut buf)?;
+                let end_location = crate::coding::Location::decode(&mut buf)?;
+                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                let track_extensions = message::TrackExtensions::decode(&mut buf)?;
+                Ok(Message::FetchOk(message::FetchOk {
+                    id: request_id,
+                    end_of_track,
+                    end_location,
+                    params,
+                    track_extensions,
+                }))
+            }
+            other => {
+                tracing::warn!(msg_type = other, "unexpected bidi response message type");
+                Err(SessionError::unimplemented(&format!(
+                    "bidi response type 0x{:x}",
+                    other
+                )))
+            }
+        }
+    }
+
+    /// Receives inbound messages from the control stream reader/receiver.
     /// Handles session-level messages (GOAWAY) directly and routes
     /// role-specific messages to Publisher or Subscriber.
     async fn run_recv(
@@ -893,5 +1276,130 @@ mod tests {
         // Exactly at the limit (1024 total including leading slash)
         let path = format!("/{}", "a".repeat(Session::MAX_CONNECTION_PATH_LEN - 1));
         assert!(Session::normalize_connection_path(&path).is_ok());
+    }
+
+    // ========================================================================
+    // encode_bidi_response — verify wire format (no Request ID)
+    // ========================================================================
+
+    /// Helper: calls the production `encode_bidi_response_frame` and
+    /// returns the raw bytes. No duplicate encoding logic.
+    fn encode_bidi_response_bytes(msg: &Message) -> Vec<u8> {
+        Session::encode_bidi_response_frame(msg).unwrap().to_vec()
+    }
+
+    #[test]
+    fn encode_bidi_request_ok_omits_request_id() {
+        use message::wire_id;
+        let msg = Message::RequestOk(message::RequestOk {
+            id: 42, // should NOT appear on the wire
+            params: crate::coding::KeyValuePairs::default(),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        // type (1 byte) + length 0x0001 (2 bytes) + params_count=0 (1 byte) = 4 bytes
+        assert_eq!(bytes[0], wire_id::RequestOk as u8);
+        assert_eq!(bytes.len(), 4);
+    }
+
+    #[test]
+    fn encode_bidi_request_error_omits_request_id() {
+        use message::wire_id;
+        let msg = Message::RequestError(message::RequestError {
+            id: 99, // should NOT appear on the wire
+            error_code: 0x10,
+            retry_interval: 0,
+            reason: crate::coding::ReasonPhrase("nf".to_string()),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        assert_eq!(bytes[0], wire_id::RequestError as u8);
+        // No 99 (0x63) anywhere in the output
+        assert!(
+            !bytes.contains(&99),
+            "Request ID must not appear in bidi encoding"
+        );
+    }
+
+    #[test]
+    fn response_target_id_covers_responses_only() {
+        // Response messages should return Some(id)
+        assert!(Message::RequestOk(message::RequestOk {
+            id: 1,
+            params: Default::default(),
+        })
+        .response_target_id()
+        .is_some());
+        assert!(Message::RequestError(message::RequestError {
+            id: 1,
+            error_code: 0,
+            retry_interval: 0,
+            reason: Default::default(),
+        })
+        .response_target_id()
+        .is_some());
+
+        // Request messages should return None
+        assert!(Message::Subscribe(message::Subscribe {
+            id: 1,
+            track_namespace: crate::coding::TrackNamespace::from_utf8_path("t"),
+            track_name: "n".into(),
+            params: Default::default(),
+        })
+        .response_target_id()
+        .is_none());
+        assert!(Message::GoAway(message::GoAway {
+            uri: crate::coding::SessionUri(String::new()),
+        })
+        .response_target_id()
+        .is_none());
+    }
+
+    #[test]
+    fn encode_bidi_publish_done_omits_request_id() {
+        use message::wire_id;
+        let msg = Message::PublishDone(message::PublishDone {
+            id: 77,
+            status_code: 0,
+            stream_count: 3,
+            reason: crate::coding::ReasonPhrase("done".to_string()),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        assert_eq!(bytes[0], wire_id::PublishDone as u8);
+        assert!(
+            !bytes.contains(&77),
+            "Request ID must not appear in bidi encoding"
+        );
+    }
+
+    #[test]
+    fn encode_bidi_publish_ok_omits_request_id() {
+        use message::wire_id;
+        let msg = Message::PublishOk(message::PublishOk {
+            id: 55,
+            params: crate::coding::KeyValuePairs::default(),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        assert_eq!(bytes[0], wire_id::PublishOk as u8);
+        assert!(
+            !bytes.contains(&55),
+            "Request ID must not appear in bidi encoding"
+        );
+    }
+
+    #[test]
+    fn encode_bidi_fetch_ok_omits_request_id() {
+        use message::wire_id;
+        let msg = Message::FetchOk(message::FetchOk {
+            id: 88,
+            end_of_track: true,
+            end_location: crate::coding::Location::new(5, 10),
+            params: crate::coding::KeyValuePairs::default(),
+            track_extensions: Default::default(),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        assert_eq!(bytes[0], wire_id::FetchOk as u8);
+        assert!(
+            !bytes.contains(&88),
+            "Request ID must not appear in bidi encoding"
+        );
     }
 }

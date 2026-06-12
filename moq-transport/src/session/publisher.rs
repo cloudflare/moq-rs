@@ -58,6 +58,9 @@ pub struct Publisher {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Channel for sending spawned bidi reader task handles to Session::run.
+    bidi_task_tx: super::BidiTaskSender,
 }
 
 impl Publisher {
@@ -66,6 +69,7 @@ impl Publisher {
         webtransport: web_transport::Session,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
+        bidi_task_tx: super::BidiTaskSender,
     ) -> Self {
         Self {
             webtransport,
@@ -77,6 +81,7 @@ impl Publisher {
             outgoing,
             request_id,
             mlog,
+            bidi_task_tx,
         }
     }
 
@@ -94,57 +99,6 @@ impl Publisher {
     ) -> Result<(Session, Publisher), SessionError> {
         let (session, publisher, _) = Session::connect(session, None, transport).await?;
         Ok((session, publisher))
-    }
-
-    /// Decode a response message from a bidi request stream (draft-18).
-    /// Response messages omit the Request ID; we inject the known ID.
-    async fn decode_bidi_response(
-        reader: &mut super::Reader,
-        request_id: u64,
-    ) -> Result<Message, SessionError> {
-        use crate::coding::{Decode, DecodeError, ReasonPhrase};
-
-        let msg_type: u64 = reader.decode().await?;
-        let msg_len: u16 = reader.decode().await?;
-        let len = msg_len as usize;
-
-        let mut payload = bytes::BytesMut::new();
-        while payload.len() < len {
-            let remaining = len - payload.len();
-            match reader.read_chunk(remaining).await? {
-                Some(chunk) => payload.extend_from_slice(&chunk),
-                None => return Err(DecodeError::More(remaining).into()),
-            }
-        }
-        let mut buf = &payload[..];
-
-        match msg_type {
-            0x5 => {
-                let error_code = u64::decode(&mut buf)?;
-                let retry_interval = u64::decode(&mut buf)?;
-                let reason = ReasonPhrase::decode(&mut buf)?;
-                Ok(Message::RequestError(message::RequestError {
-                    id: request_id,
-                    error_code,
-                    retry_interval,
-                    reason,
-                }))
-            }
-            0x7 => {
-                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
-                Ok(Message::RequestOk(message::RequestOk {
-                    id: request_id,
-                    params,
-                }))
-            }
-            other => {
-                tracing::warn!(msg_type = other, "unexpected bidi response type");
-                Err(SessionError::unimplemented(&format!(
-                    "bidi response 0x{:x}",
-                    other
-                )))
-            }
-        }
     }
 
     /// Send a PUBLISH_NAMESPACE for a namespace and serve tracks using the provided
@@ -165,11 +119,8 @@ impl Publisher {
             }
 
             let request_id = self.request_id.allocate()?;
-            let (send, recv) = PublishNamespace::new_without_send(
-                self.clone(),
-                request_id,
-                tracks.namespace.clone(),
-            );
+            let (send, recv) =
+                PublishNamespace::new(self.clone(), request_id, tracks.namespace.clone());
             namespaces.insert(tracks.namespace.clone(), recv);
             let wire_msg: Message = send.wire_message().into();
             (send, wire_msg, request_id)
@@ -177,18 +128,33 @@ impl Publisher {
         // Lock released here.
 
         // Phase 2: open bidi stream and send (async, no lock held).
-        let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
+        // If open_bi fails, remove the entry we inserted in Phase 1.
+        let (send_stream, recv_stream) = match self.webtransport.open_bi().await {
+            Ok(streams) => streams,
+            Err(e) => {
+                if let Ok(mut ns) = self.publish_namespaces.lock() {
+                    ns.remove(&tracks.namespace);
+                }
+                return Err(e.into());
+            }
+        };
         let mut writer = super::Writer::new(send_stream);
-        writer.encode(&wire_msg).await?;
+        if let Err(e) = writer.encode(&wire_msg).await {
+            if let Ok(mut ns) = self.publish_namespaces.lock() {
+                ns.remove(&tracks.namespace);
+            }
+            return Err(e.into());
+        }
 
         // Spawn a reader task for responses on this bidi stream.
         // Draft-18: responses omit Request ID (the stream identity provides it).
+        // Handle is sent to Session::run via bidi_task_tx; dropped on session exit.
         let mut this = self.clone();
         let bidi_request_id = request_id;
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut reader = super::Reader::new(recv_stream);
             loop {
-                match Self::decode_bidi_response(&mut reader, bidi_request_id).await {
+                match Session::decode_bidi_response(&mut reader, bidi_request_id).await {
                     Ok(msg) => {
                         if let Ok(sub_msg) = TryInto::<message::Subscriber>::try_into(msg) {
                             if let Err(e) = this.recv_message(sub_msg) {
@@ -197,12 +163,14 @@ impl Publisher {
                             }
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::debug!(error = %e, bidi_request_id, "bidi response reader ended");
+                        break;
+                    }
                 }
             }
         });
-
-        let publish_ns = publish_ns;
+        let _ = self.bidi_task_tx.send(handle);
 
         let mut subscribe_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();

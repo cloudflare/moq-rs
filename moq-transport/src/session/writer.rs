@@ -89,4 +89,9 @@ impl Writer {
 
         Ok(())
     }
+
+    /// Signal that no more data will be written (sends QUIC FIN).
+    pub fn finish(&mut self) {
+        let _ = self.stream.finish();
+    }
 }

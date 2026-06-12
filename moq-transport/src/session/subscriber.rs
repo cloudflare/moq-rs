@@ -64,6 +64,9 @@ pub struct Subscriber {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Channel for sending spawned bidi reader task handles to Session::run.
+    bidi_task_tx: super::BidiTaskSender,
 }
 
 impl Subscriber {
@@ -72,6 +75,7 @@ impl Subscriber {
         webtransport: web_transport::Session,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
+        bidi_task_tx: super::BidiTaskSender,
     ) -> Self {
         Self {
             published_namespaces: Default::default(),
@@ -83,6 +87,7 @@ impl Subscriber {
             request_id,
             mlog,
             subscribe_alias_notify: Arc::new(Notify::new()),
+            bidi_task_tx,
         }
     }
 
@@ -157,84 +162,7 @@ impl Subscriber {
         Ok(Reader::new(recv_stream))
     }
 
-    /// Decode a response message from a bidi request stream.
-    ///
-    /// Draft-18: response messages (REQUEST_OK, REQUEST_ERROR, SUBSCRIBE_OK, etc.)
-    /// on bidi streams omit the Request ID field. We decode the message type and
-    /// length-bounded payload, then deserialize without expecting a Request ID.
-    async fn decode_bidi_response(
-        reader: &mut Reader,
-        request_id: u64,
-    ) -> Result<Message, SessionError> {
-        use crate::coding::{Decode, DecodeError, ReasonPhrase};
-
-        // Read message type (varint) and length (u16).
-        let msg_type: u64 = reader.decode().await?;
-        let msg_len: u16 = reader.decode().await?;
-        let len = msg_len as usize;
-
-        // Ensure the reader buffer has at least `len` bytes.
-        // Re-use the Decode mechanism: decode a fixed-size byte blob.
-        // Accumulate bytes by reading raw varints byte-by-byte.
-        // Simplest: decode a dummy type that reads exactly `len` bytes.
-        // Actually, use a loop on read_chunk to fill a local buffer.
-        let mut payload = bytes::BytesMut::new();
-        while payload.len() < len {
-            let remaining = len - payload.len();
-            match reader.read_chunk(remaining).await? {
-                Some(chunk) => payload.extend_from_slice(&chunk),
-                None => {
-                    return Err(DecodeError::More(remaining).into());
-                }
-            }
-        }
-        let mut buf = &payload[..];
-
-        match msg_type {
-            0x5 => {
-                // REQUEST_ERROR: Error Code + Retry Interval + Reason (no Request ID)
-                let error_code = u64::decode(&mut buf)?;
-                let retry_interval = u64::decode(&mut buf)?;
-                let reason = ReasonPhrase::decode(&mut buf)?;
-                Ok(Message::RequestError(message::RequestError {
-                    id: request_id,
-                    error_code,
-                    retry_interval,
-                    reason,
-                }))
-            }
-            0x7 => {
-                // REQUEST_OK: Number of Parameters + Parameters + Track Properties
-                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
-                Ok(Message::RequestOk(message::RequestOk {
-                    id: request_id,
-                    params,
-                }))
-            }
-            0x4 => {
-                // SUBSCRIBE_OK: Track Alias + Parameters + Track Properties
-                let track_alias = u64::decode(&mut buf)?;
-                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
-                Ok(Message::SubscribeOk(message::SubscribeOk {
-                    id: request_id,
-                    track_alias,
-                    params,
-                    track_extensions: Default::default(),
-                }))
-            }
-            other => {
-                tracing::warn!(
-                    msg_type = other,
-                    "unexpected message type on bidi response stream"
-                );
-                Err(SessionError::unimplemented(&format!(
-                    "bidi response message type 0x{:x}",
-                    other
-                )))
-            }
-        }
-    }
-
+    /// Send a TRACK_STATUS request for a track.
     pub fn track_status(
         &mut self,
         track_namespace: &TrackNamespace,
@@ -273,13 +201,11 @@ impl Subscriber {
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
-        let (send, recv) = Subscribe::new_without_send(self.clone(), request_id, track);
-        self.subscribes
-            .lock()
-            .map_err(|_| ServeError::internal_ctx("subscribe lock poisoned"))?
-            .insert(request_id, recv);
+        let (send, recv) = Subscribe::new(self.clone(), request_id, track);
 
-        // Open a bidi stream and send the SUBSCRIBE message.
+        // Open a bidi stream and send the SUBSCRIBE message BEFORE
+        // registering in the subscribes map — avoids a leaked entry if
+        // open_request_stream fails.
         let subscribe_msg: Message = send.wire_message().into();
         let mut response_reader = self
             .open_request_stream(&subscribe_msg)
@@ -288,13 +214,23 @@ impl Subscriber {
                 ServeError::internal_ctx(format!("failed to open request stream: {}", e))
             })?;
 
-        // Spawn a task to read responses from the bidi stream.
-        // Draft-18: responses on bidi streams omit the Request ID field
-        // (the stream identity already associates them with the request).
+        self.subscribes
+            .lock()
+            .map_err(|_| {
+                tracing::warn!(
+                    request_id,
+                    "subscribes lock poisoned after bidi stream open; stream will be dropped"
+                );
+                ServeError::internal_ctx("subscribe lock poisoned")
+            })?
+            .insert(request_id, recv);
+
+        // Spawn a reader task for bidi stream responses (draft-18).
+        // Handle is sent to Session::run via bidi_task_tx; dropped on session exit.
         let mut subscriber_clone = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
-                match Self::decode_bidi_response(&mut response_reader, request_id).await {
+                match Session::decode_bidi_response(&mut response_reader, request_id).await {
                     Ok(msg) => {
                         if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
                             if let Err(e) = subscriber_clone.recv_message(pub_msg) {
@@ -303,10 +239,14 @@ impl Subscriber {
                             }
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::debug!(error = %e, request_id, "bidi response reader ended");
+                        break;
+                    }
                 }
             }
         });
+        let _ = self.bidi_task_tx.send(handle);
 
         send.ok().await?;
         Ok(send)
@@ -1009,27 +949,19 @@ impl Subscriber {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::task::Poll;
-
-    use super::*;
-    use crate::{message, serve::Track};
-
-    // These tests exercised subscribe state cleanup. Since subscribe_open()
-    // now opens a bidi stream (draft-18) which requires a real QUIC connection,
-    // they are marked #[ignore] for unit testing. The state management paths
-    // are still exercised by the relay's server-side code and integration tests.
-
-    #[tokio::test]
-    #[ignore = "subscribe_open now requires a real QUIC connection (draft-18 bidi streams)"]
-    async fn subscribe_open_cleans_up_when_cancelled_before_ok() {}
-
-    #[tokio::test]
-    #[ignore = "subscribe_open now requires a real QUIC connection (draft-18 bidi streams)"]
-    async fn dropping_open_subscribe_removes_recv_state() {
-        // Previously tested: receiving SubscribeOk routes correctly, dropping
-        // Subscribe removes recv state. Still correct — the Subscribe/SubscribeRecv
-        // state machine is unchanged; only the transport for sending is different.
-    }
-}
+// TODO: Subscriber unit tests (`dropping_subscribe_removes_recv_state`,
+// `remove_subscribe_clears_alias_map`) were removed because constructing
+// a `Subscriber` requires a `web_transport::Session`, which in turn
+// requires a live Quinn QUIC connection (there is no `Default` or
+// mock constructor on `web_transport::Session` — it wraps
+// `web_transport_quinn::Session` which holds a `quinn::Connection`).
+// The tests verified that `Subscribe::Drop` removes the subscribes-map
+// entry, and that `remove_subscribe` clears both `subscribes` and
+// `subscribe_alias_map`. To restore them, either:
+//   1. Add a `#[cfg(test)] pub fn stub(url: Url) -> Session` constructor
+//      to `web_transport` (upstream crate) that creates a disconnected
+//      session, or
+//   2. Move these tests into an integration test that can spin up a
+//      full Quinn loopback (moq-transport already depends on quinn
+//      transitively, but the TLS ceremony requires `rustls` + `rcgen`
+//      as direct dev-deps, which we want to avoid).
