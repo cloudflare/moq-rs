@@ -59,7 +59,8 @@ pub struct Publisher {
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 
-    /// Channel for sending spawned bidi reader task handles to Session::run.
+    /// Channel for sending bidi reader futures to `Session::run`, which polls
+    /// them cooperatively under structured concurrency (no task is spawned).
     bidi_task_tx: super::BidiTaskSender,
 }
 
@@ -105,7 +106,8 @@ impl Publisher {
     /// [serve::TracksReader].  Blocks until the namespace is unannounced or an error occurs.
     ///
     /// Draft-18: sends PUBLISH_NAMESPACE on a new bidi request stream and reads
-    /// responses from the same stream.
+    /// responses from the same stream. Requires `Session::run` to be driven
+    /// concurrently, since `run` polls the bidi response reader.
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
         // Phase 1: allocate under lock, release before any await.
         let (publish_ns, wire_msg, request_id) = {

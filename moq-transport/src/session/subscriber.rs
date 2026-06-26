@@ -65,7 +65,8 @@ pub struct Subscriber {
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
 
-    /// Channel for sending spawned bidi reader task handles to Session::run.
+    /// Channel for sending bidi reader futures to `Session::run`, which polls
+    /// them cooperatively under structured concurrency (no task is spawned).
     bidi_task_tx: super::BidiTaskSender,
 }
 
@@ -194,6 +195,10 @@ impl Subscriber {
     ///
     /// Draft-18: sends SUBSCRIBE on a new bidi request stream and reads
     /// the response (REQUEST_OK / REQUEST_ERROR) from the same stream.
+    ///
+    /// The caller must drive `Session::run` concurrently: the bidi response
+    /// reader is polled by `run`, so the returned acknowledgement only
+    /// resolves while `run` is being polled.
     pub async fn subscribe_open(
         &mut self,
         track: serve::TrackWriter,
