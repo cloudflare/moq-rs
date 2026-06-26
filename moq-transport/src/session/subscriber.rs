@@ -269,6 +269,13 @@ impl Subscriber {
             }
         }));
 
+        // Cleanly finish (FIN) the request stream's send side now that the
+        // SUBSCRIBE has been flushed; we never write again on this stream.
+        // Placed before `send.ok().await?` so the FIN is sent on every exit
+        // path that holds the writer — both the happy path and a failed ack —
+        // rather than letting the drop emit RESET_STREAM(0).
+        request_writer.finish();
+
         send.ok().await?;
         Ok(send)
     }

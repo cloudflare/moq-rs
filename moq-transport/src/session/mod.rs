@@ -759,6 +759,24 @@ impl Session {
     /// Provides back-pressure when a peer opens many streams at once.
     const MAX_CONCURRENT_BIDI_STREAMS: usize = 128;
 
+    /// Upper bound on how long a bidi request handler waits, applied to two
+    /// phases only: (a) the initial request read, and (b) the response phase of
+    /// one-shot request types (TRACK_STATUS, REQUEST_UPDATE).
+    ///
+    /// Long-lived request types (SUBSCRIBE, PUBLISH_NAMESPACE, PUBLISH,
+    /// SUBSCRIBE_NAMESPACE, FETCH) intentionally keep their bidi stream open
+    /// until an explicit terminal message, so they are deliberately NOT bounded
+    /// here — bounding them would break the protocol. For those, the QUIC
+    /// connection idle timeout (configured by the transport layer; e.g.
+    /// moq-native-ietf sets 10s) reclaims a slot held by a dead peer.
+    ///
+    /// This timeout closes the remaining gap: an *alive but misbehaving* peer
+    /// that keeps the connection alive (so the QUIC idle timeout never fires)
+    /// could otherwise pin a `MAX_CONCURRENT_BIDI_STREAMS` slot forever by
+    /// opening a stream and never sending a complete request, or by stalling a
+    /// one-shot request after it is accepted. Both are bounded below.
+    const BIDI_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     async fn run_bidi_requests(
         webtransport: web_transport::Session,
         publisher: Option<Publisher>,
@@ -805,8 +823,23 @@ impl Session {
         let mut reader = Reader::new(recv_stream);
         let mut writer = Writer::new(send_stream);
 
-        // Read the first (request) message from the bidi stream.
-        let msg: Message = reader.decode().await?;
+        // Read the first (request) message from the bidi stream. Bound this so a
+        // peer that opens a bidi stream but never sends a complete request
+        // cannot pin a concurrency slot indefinitely.
+        let msg: Message =
+            match tokio::time::timeout(Self::BIDI_REQUEST_TIMEOUT, reader.decode()).await {
+                Ok(decoded) => decoded?,
+                Err(_) => {
+                    tracing::debug!("bidi request read timed out; reclaiming slot");
+                    return Ok(());
+                }
+            };
+
+        // Classify the request. One-shot request/response flows are bounded in
+        // the response phase below; long-lived flows (SUBSCRIBE, PUBLISH,
+        // PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, FETCH) may legitimately stay
+        // open until an explicit terminal message and are therefore not bounded.
+        let bounded_response = matches!(&msg, Message::TrackStatus(_) | Message::RequestUpdate(_));
 
         let req_id = msg.sequenced_request_id();
 
@@ -858,25 +891,44 @@ impl Session {
         // handlers didn't register anything to respond to.
         if dispatch_result.is_ok() {
             if let Some(ref mut rx) = rx {
-                while let Some(response) = rx.recv().await {
-                    let is_terminal = matches!(
-                        response,
-                        Message::RequestError(_)
-                            | Message::PublishDone(_)
-                            | Message::PublishNamespaceDone(_)
-                            | Message::Unsubscribe(_)
-                    );
-                    if let Err(e) = Self::encode_bidi_response(&mut writer, &response).await {
-                        tracing::warn!(error = %e, "failed to write bidi response");
-                        break;
+                let pump = async {
+                    while let Some(response) = rx.recv().await {
+                        let is_terminal = matches!(
+                            response,
+                            Message::RequestError(_)
+                                | Message::PublishDone(_)
+                                | Message::PublishNamespaceDone(_)
+                                | Message::Unsubscribe(_)
+                        );
+                        if let Err(e) = Self::encode_bidi_response(&mut writer, &response).await {
+                            tracing::warn!(error = %e, "failed to write bidi response");
+                            break;
+                        }
+                        if is_terminal {
+                            // Give Quinn's connection driver a scheduling
+                            // opportunity to transmit the STREAM data before
+                            // the Writer is dropped (which sends FIN).
+                            tokio::time::sleep(std::time::Duration::ZERO).await;
+                            break;
+                        }
                     }
-                    if is_terminal {
-                        // Give Quinn's connection driver a scheduling
-                        // opportunity to transmit the STREAM data before
-                        // the Writer is dropped (which sends FIN).
-                        tokio::time::sleep(std::time::Duration::ZERO).await;
-                        break;
+                };
+
+                // One-shot requests are bounded so a stalled peer cannot pin a
+                // slot after the request is accepted. Long-lived requests wait
+                // as long as needed; the QUIC idle timeout backstops a dead peer.
+                if bounded_response {
+                    if tokio::time::timeout(Self::BIDI_REQUEST_TIMEOUT, pump)
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!(
+                            ?req_id,
+                            "one-shot bidi request timed out awaiting response; reclaiming slot"
+                        );
                     }
+                } else {
+                    pump.await;
                 }
             }
         }
