@@ -35,3 +35,6 @@ serde_with = "3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Loopback web_transport::Session for session-cleanup unit tests.
+rcgen = "0.13"
+url = "2"

@@ -155,12 +155,20 @@ impl Subscriber {
     }
 
     /// Open a bidirectional request stream (draft-18 §10), send a request
-    /// message, and return a Reader for reading the response on the same stream.
-    async fn open_request_stream(&self, msg: &message::Message) -> Result<Reader, SessionError> {
+    /// message, and return the request stream's Writer (send side) together
+    /// with a Reader for the response on the same stream.
+    ///
+    /// The Writer is returned (not dropped here) so the caller can keep the
+    /// send side open and explicitly finish it on error paths, mirroring
+    /// publisher.rs which holds its request writer in scope.
+    async fn open_request_stream(
+        &self,
+        msg: &message::Message,
+    ) -> Result<(Writer, Reader), SessionError> {
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
         let mut writer = Writer::new(send_stream);
         writer.encode(msg).await?;
-        Ok(Reader::new(recv_stream))
+        Ok((writer, Reader::new(recv_stream)))
     }
 
     /// Send a TRACK_STATUS request for a track.
@@ -211,25 +219,32 @@ impl Subscriber {
         // Open a bidi stream and send the SUBSCRIBE message BEFORE
         // registering in the subscribes map — avoids a leaked entry if
         // open_request_stream fails. The wire message is the one built by
-        // Subscribe::new, so it is not reconstructed here.
+        // Subscribe::new, so it is not reconstructed here. The request writer
+        // (send side) is held here so error paths can finish it explicitly.
         let subscribe_msg: Message = subscribe.into();
-        let mut response_reader = self
+        let (mut request_writer, mut response_reader) = self
             .open_request_stream(&subscribe_msg)
             .await
             .map_err(|e| {
                 ServeError::internal_ctx(format!("failed to open request stream: {}", e))
             })?;
 
-        self.subscribes
-            .lock()
-            .map_err(|_| {
+        // Register the response state. If the lock is poisoned after the stream
+        // is open, cleanly finish the send side (FIN) before bailing instead of
+        // silently dropping it — mirrors the publisher.rs error-path handling.
+        match self.subscribes.lock() {
+            Ok(mut subscribes) => {
+                subscribes.insert(request_id, recv);
+            }
+            Err(_) => {
                 tracing::warn!(
                     request_id,
-                    "subscribes lock poisoned after bidi stream open; stream will be dropped"
+                    "subscribes lock poisoned after bidi stream open; finishing stream"
                 );
-                ServeError::internal_ctx("subscribe lock poisoned")
-            })?
-            .insert(request_id, recv);
+                request_writer.finish();
+                return Err(ServeError::internal_ctx("subscribe lock poisoned"));
+            }
+        }
 
         // Hand a reader future for bidi stream responses (draft-18) to
         // Session::run, which polls it cooperatively (structured concurrency).
@@ -955,19 +970,157 @@ impl Subscriber {
     }
 }
 
-// TODO: Subscriber unit tests (`dropping_subscribe_removes_recv_state`,
-// `remove_subscribe_clears_alias_map`) were removed because constructing
-// a `Subscriber` requires a `web_transport::Session`, which in turn
-// requires a live Quinn QUIC connection (there is no `Default` or
-// mock constructor on `web_transport::Session` — it wraps
-// `web_transport_quinn::Session` which holds a `quinn::Connection`).
-// The tests verified that `Subscribe::Drop` removes the subscribes-map
-// entry, and that `remove_subscribe` clears both `subscribes` and
-// `subscribe_alias_map`. To restore them, either:
-//   1. Add a `#[cfg(test)] pub fn stub(url: Url) -> Session` constructor
-//      to `web_transport` (upstream crate) that creates a disconnected
-//      session, or
-//   2. Move these tests into an integration test that can spin up a
-//      full Quinn loopback (moq-transport already depends on quinn
-//      transitively, but the TLS ceremony requires `rustls` + `rcgen`
-//      as direct dev-deps, which we want to avoid).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Establish a real `web_transport::Session` over an in-process QUIC
+    /// loopback so we can construct a `Subscriber` and exercise the actual
+    /// cleanup paths (`Subscribe::Drop` and `Subscriber::remove_subscribe`).
+    ///
+    /// The session is never dialed by these tests — the cleanup logic only
+    /// touches the in-memory maps and the outgoing queue — but `Subscriber`
+    /// holds a concrete `web_transport::Session`, so a live connection is the
+    /// only honest way to build one. The accepted server side is parked for
+    /// the lifetime of the test to keep the client session established.
+    async fn loopback_session() -> web_transport::Session {
+        use web_transport::quinn::{ClientBuilder, ServerBuilder};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed certificate");
+        let cert_der = cert.cert.der().clone();
+        let key = cert
+            .key_pair
+            .serialize_der()
+            .try_into()
+            .expect("serialize private key");
+
+        let mut server = ServerBuilder::new()
+            .with_addr("127.0.0.1:0".parse().expect("server addr"))
+            .with_certificate(vec![cert_der], key)
+            .expect("build loopback server");
+        let addr = server.local_addr().expect("server local addr");
+
+        tokio::spawn(async move {
+            if let Some(request) = server.accept().await {
+                if let Ok(session) = request.ok().await {
+                    // Park: hold the server session open so the client side
+                    // stays established for the duration of the test.
+                    std::future::pending::<()>().await;
+                    drop(session);
+                }
+            }
+        });
+
+        let client = ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()
+            .expect("build loopback client");
+        let url = url::Url::parse(&format!("https://127.0.0.1:{}/", addr.port()))
+            .expect("parse loopback url");
+
+        client
+            .connect(url)
+            .await
+            .expect("connect loopback session")
+            .into()
+    }
+
+    fn test_subscriber(session: web_transport::Session) -> Subscriber {
+        let outgoing = Queue::default().split().0;
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        Subscriber::new(outgoing, session, None, RequestId::new(0, 1), bidi_task_tx)
+    }
+
+    fn test_track(name: &str) -> serve::TrackWriter {
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test/ns"), name).produce();
+        writer
+    }
+
+    /// `Subscribe::drop` must remove the request's entry from the subscribes map
+    /// (the real Drop impl calls `Subscriber::remove_subscribe`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_subscribe_removes_recv_state() {
+        let subscriber = test_subscriber(loopback_session().await);
+        let request_id = 4;
+
+        let (subscribe, recv, _msg) =
+            Subscribe::new(subscriber.clone(), request_id, test_track("video"));
+        // Mimic subscribe_open: register the recv state under the request id.
+        subscriber
+            .subscribes
+            .lock()
+            .unwrap()
+            .insert(request_id, recv);
+        assert!(
+            subscriber
+                .subscribes
+                .lock()
+                .unwrap()
+                .contains_key(&request_id),
+            "precondition: subscribe should be registered"
+        );
+
+        drop(subscribe);
+
+        assert!(
+            !subscriber
+                .subscribes
+                .lock()
+                .unwrap()
+                .contains_key(&request_id),
+            "Subscribe::drop should remove the subscribes-map entry"
+        );
+    }
+
+    /// `remove_subscribe` must clear both `subscribes` and `subscribe_alias_map`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_subscribe_clears_alias_map() {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        let request_id = 6;
+        let track_alias = 42;
+
+        let (subscribe, mut recv, _msg) =
+            Subscribe::new(subscriber.clone(), request_id, test_track("audio"));
+        // Record the track alias while the Subscribe (the state's send half) is
+        // still alive, so the recv state accepts the mutation. Then drop the
+        // handle — its Drop runs against the still-empty map (a no-op) — and
+        // drive remove_subscribe directly via the registered recv state.
+        recv.ok(track_alias).unwrap();
+        drop(subscribe);
+        subscriber
+            .subscribes
+            .lock()
+            .unwrap()
+            .insert(request_id, recv);
+        subscriber
+            .subscribe_alias_map
+            .lock()
+            .unwrap()
+            .insert(track_alias, request_id);
+
+        let removed = subscriber.remove_subscribe(request_id);
+
+        assert!(
+            removed.is_some(),
+            "remove_subscribe should return the removed recv state"
+        );
+        assert!(
+            !subscriber
+                .subscribes
+                .lock()
+                .unwrap()
+                .contains_key(&request_id),
+            "remove_subscribe should clear the subscribes map"
+        );
+        assert!(
+            !subscriber
+                .subscribe_alias_map
+                .lock()
+                .unwrap()
+                .contains_key(&track_alias),
+            "remove_subscribe should clear the subscribe_alias_map"
+        );
+    }
+}
