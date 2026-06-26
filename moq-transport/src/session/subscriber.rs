@@ -1003,11 +1003,11 @@ mod tests {
 
         tokio::spawn(async move {
             if let Some(request) = server.accept().await {
-                if let Ok(session) = request.ok().await {
-                    // Park: hold the server session open so the client side
-                    // stays established for the duration of the test.
+                // Hold the accepted server session open for the lifetime of the
+                // test so the client side stays established; the spawned task is
+                // cancelled at runtime shutdown when the test returns.
+                if let Ok(_session) = request.ok().await {
                     std::future::pending::<()>().await;
-                    drop(session);
                 }
             }
         });
