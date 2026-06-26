@@ -201,25 +201,18 @@ impl Subscribe {
         (subscribe_message, info)
     }
 
-    /// Create a Subscribe without sending on the control stream.
-    /// The caller sends via a bidi request stream (draft-18).
+    /// Create a Subscribe without sending on the control stream, returning the
+    /// wire message to send on the bidi request stream (draft-18) alongside it.
+    /// The message is the one already built by `build_info`, so it is never
+    /// constructed twice.
     pub(super) fn new(
         subscriber: Subscriber,
         request_id: u64,
         track: TrackWriter,
-    ) -> (Subscribe, SubscribeRecv) {
-        let (_msg, info) = Self::build_info(request_id, &track);
-        Self::from_parts(subscriber, info, track)
-    }
-
-    /// Return the wire message to send on the request stream.
-    pub(super) fn wire_message(&self) -> message::Subscribe {
-        message::Subscribe {
-            id: self.info.id,
-            track_namespace: self.info.track_namespace.clone(),
-            track_name: self.info.track_name.clone(),
-            params: self.info.params.clone(),
-        }
+    ) -> (Subscribe, SubscribeRecv, message::Subscribe) {
+        let (msg, info) = Self::build_info(request_id, &track);
+        let (send, recv) = Self::from_parts(subscriber, info, track);
+        (send, recv, msg)
     }
 
     fn from_parts(

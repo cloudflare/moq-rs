@@ -146,12 +146,13 @@ impl Publisher {
             return Err(e.into());
         }
 
-        // Spawn a reader task for responses on this bidi stream.
+        // Hand a reader future for responses on this bidi stream to
+        // Session::run, which polls it cooperatively (structured concurrency).
         // Draft-18: responses omit Request ID (the stream identity provides it).
-        // Handle is sent to Session::run via bidi_task_tx; dropped on session exit.
+        // No task is spawned; the future is dropped/cancelled on session exit.
         let mut this = self.clone();
         let bidi_request_id = request_id;
-        let handle = tokio::spawn(async move {
+        let _ = self.bidi_task_tx.send(Box::pin(async move {
             let mut reader = super::Reader::new(recv_stream);
             loop {
                 match Session::decode_bidi_response(&mut reader, bidi_request_id).await {
@@ -169,8 +170,7 @@ impl Publisher {
                     }
                 }
             }
-        });
-        let _ = self.bidi_task_tx.send(handle);
+        }));
 
         let mut subscribe_tasks = FuturesUnordered::new();
         let mut status_tasks = FuturesUnordered::new();

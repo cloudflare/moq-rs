@@ -201,12 +201,13 @@ impl Subscriber {
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
-        let (send, recv) = Subscribe::new(self.clone(), request_id, track);
+        let (send, recv, subscribe) = Subscribe::new(self.clone(), request_id, track);
 
         // Open a bidi stream and send the SUBSCRIBE message BEFORE
         // registering in the subscribes map — avoids a leaked entry if
-        // open_request_stream fails.
-        let subscribe_msg: Message = send.wire_message().into();
+        // open_request_stream fails. The wire message is the one built by
+        // Subscribe::new, so it is not reconstructed here.
+        let subscribe_msg: Message = subscribe.into();
         let mut response_reader = self
             .open_request_stream(&subscribe_msg)
             .await
@@ -225,10 +226,11 @@ impl Subscriber {
             })?
             .insert(request_id, recv);
 
-        // Spawn a reader task for bidi stream responses (draft-18).
-        // Handle is sent to Session::run via bidi_task_tx; dropped on session exit.
+        // Hand a reader future for bidi stream responses (draft-18) to
+        // Session::run, which polls it cooperatively (structured concurrency).
+        // No task is spawned; the future is dropped/cancelled on session exit.
         let mut subscriber_clone = self.clone();
-        let handle = tokio::spawn(async move {
+        let _ = self.bidi_task_tx.send(Box::pin(async move {
             loop {
                 match Session::decode_bidi_response(&mut response_reader, request_id).await {
                     Ok(msg) => {
@@ -245,8 +247,7 @@ impl Subscriber {
                     }
                 }
             }
-        });
-        let _ = self.bidi_task_tx.send(handle);
+        }));
 
         send.ok().await?;
         Ok(send)

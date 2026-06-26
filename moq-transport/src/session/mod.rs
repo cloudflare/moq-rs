@@ -29,6 +29,8 @@ use writer::*;
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use crate::coding::{Encode, KeyValuePairs, Value};
@@ -44,9 +46,15 @@ use std::path::PathBuf;
 /// response is forwarded to the bidi handler task that owns the Writer.
 type BidiResponseMap = Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Message>>>>;
 
-/// Channel for spawned bidi response reader tasks. Publisher/Subscriber
-/// send handles here; Session::run collects and polls them.
-type BidiTaskSender = tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>;
+/// A bidi response reader future handed from Publisher/Subscriber to
+/// `Session::run`. Boxed so the publisher and subscriber reader loops can
+/// share one channel and one `FuturesUnordered` type.
+type BidiReaderFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Channel for bidi response reader futures. Publisher/Subscriber send boxed
+/// futures here; `Session::run` polls them cooperatively under structured
+/// concurrency — no task is spawned, so a reader cannot outlive the session.
+type BidiTaskSender = tokio::sync::mpsc::UnboundedSender<BidiReaderFuture>;
 
 /// The transport protocol negotiated for this MoQT connection.
 ///
@@ -99,9 +107,9 @@ pub struct Session {
     /// For outgoing connections: auto-extracted from the session URL in connect().
     connection_path: Option<String>,
 
-    /// Receiver for spawned bidi reader task handles.
-    /// Polled by Session::run; dropping FuturesUnordered aborts all tasks.
-    bidi_task_rx: tokio::sync::mpsc::UnboundedReceiver<tokio::task::JoinHandle<()>>,
+    /// Receiver for bidi reader futures.
+    /// Polled by Session::run; dropping FuturesUnordered cancels all in-flight futures.
+    bidi_task_rx: tokio::sync::mpsc::UnboundedReceiver<BidiReaderFuture>,
 
     /// Maps bidi-request IDs to their response stream writers (draft-18).
     bidi_response_map: BidiResponseMap,
@@ -428,7 +436,7 @@ impl Session {
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
 
         let (bidi_task_tx, bidi_task_rx) =
-            tokio::sync::mpsc::unbounded_channel::<tokio::task::JoinHandle<()>>();
+            tokio::sync::mpsc::unbounded_channel::<BidiReaderFuture>();
 
         let publisher = Some(Publisher::new(
             outgoing.0.clone(),
@@ -641,7 +649,7 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         let mut bidi_task_rx = self.bidi_task_rx;
-        let mut reader_tasks = FuturesUnordered::new();
+        let mut reader_tasks: FuturesUnordered<BidiReaderFuture> = FuturesUnordered::new();
 
         let result = tokio::select! {
             res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
@@ -649,14 +657,15 @@ impl Session {
             res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
-            // Collect bidi reader task handles and poll them to completion.
-            // Dropping FuturesUnordered on session exit aborts all remaining tasks.
+            // Collect bidi reader futures and poll them cooperatively as part of
+            // this select. They progress only while run() is polled, so they
+            // cannot outlive the session (true structured concurrency).
             () = async {
                 loop {
                     tokio::select! {
-                        handle = bidi_task_rx.recv() => {
-                            match handle {
-                                Some(h) => reader_tasks.push(h),
+                        fut = bidi_task_rx.recv() => {
+                            match fut {
+                                Some(f) => reader_tasks.push(f),
                                 None => break, // all senders dropped
                             }
                         }
@@ -666,8 +675,9 @@ impl Session {
             } => Ok(()),
         };
 
-        // Dropping reader_tasks (FuturesUnordered<JoinHandle>) aborts all
-        // spawned bidi reader tasks — no explicit abort loop needed.
+        // Dropping reader_tasks (FuturesUnordered<BidiReaderFuture>) drops every
+        // in-flight reader future, cancelling them — no task abort needed since
+        // nothing was ever spawned onto the runtime.
         drop(reader_tasks);
 
         result
