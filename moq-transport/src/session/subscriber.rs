@@ -1019,9 +1019,10 @@ mod tests {
         let url = url::Url::parse(&format!("https://127.0.0.1:{}/", addr.port()))
             .expect("parse loopback url");
 
-        client
-            .connect(url)
+        // Fail fast rather than hang CI if the loopback handshake ever stalls.
+        tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(url))
             .await
+            .expect("loopback connect timed out")
             .expect("connect loopback session")
             .into()
     }
