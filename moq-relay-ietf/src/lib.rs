@@ -42,6 +42,26 @@ mod remote;
 mod session;
 mod web;
 
+/// How long the relay keeps a warm upstream subscription alive after its last
+/// downstream subscriber leaves, before tearing it down.
+///
+/// A relay deduplicates many downstream subscribers onto a single upstream
+/// subscription. When the last downstream subscriber unsubscribes we do NOT tear
+/// the upstream subscription down immediately: a brief linger lets an instant
+/// late-joiner (a page reload, a player reconnect, a channel flip back) reattach
+/// to the still-warm subscription instead of paying for a fresh upstream
+/// SUBSCRIBE and the startup latency that comes with it (waiting for the next
+/// group / keyframe).
+///
+/// Once the linger elapses with no downstream interest, the upstream `Subscribe`
+/// handle is dropped — which is the only place the transport crate emits an
+/// UNSUBSCRIBE — and the dedup cache entry is evicted so a future subscriber
+/// starts a fresh upstream subscription.
+///
+/// Chosen at 3s: long enough to absorb brief gaps and reconnects, short enough
+/// that a publisher isn't served (and billed) for long after nobody is watching.
+pub const WARM_CACHE_LINGER: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub use api::*;
 pub use consumer::*;
 pub use coordinator::*;

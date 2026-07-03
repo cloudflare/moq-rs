@@ -20,7 +20,7 @@ use crate::watch::State;
 
 use super::{
     Datagrams, DatagramsReader, DatagramsWriter, ObjectsWriter, ServeError, Stream, StreamReader,
-    StreamWriter, Subgroups, SubgroupsReader, SubgroupsWriter,
+    StreamWriter, Subgroups, SubgroupsReader, SubgroupsWriter, TrackInterestGuard,
 };
 use crate::coding::{Location, TrackNamespace};
 use paste::paste;
@@ -184,11 +184,34 @@ impl Deref for TrackWriter {
 pub struct TrackReader {
     state: State<TrackState>,
     pub info: Arc<Track>,
+
+    /// Optional downstream-interest guard.
+    ///
+    /// Set by the relay dedup layer (via [`TrackReader::with_interest`]) on the
+    /// reader handed to each downstream subscriber, so the upstream-subscribe
+    /// task can tell when the last subscriber for a deduplicated track goes away.
+    /// It is `None` for the raw reader produced by [`Track::produce`] and for the
+    /// clone the dedup cache pins (which must not count as interest).
+    interest: Option<TrackInterestGuard>,
 }
 
 impl TrackReader {
     fn new(state: State<TrackState>, info: Arc<Track>) -> Self {
-        Self { state, info }
+        Self {
+            state,
+            info,
+            interest: None,
+        }
+    }
+
+    /// Attach a downstream-interest guard to this reader handle.
+    ///
+    /// Used by the relay dedup layer to count live downstream subscribers for a
+    /// deduplicated track. The guard increments the shared interest counter on
+    /// creation/clone and decrements it on drop.
+    pub fn with_interest(mut self, interest: TrackInterestGuard) -> Self {
+        self.interest = Some(interest);
+        self
     }
 
     /// Get the current mode of the track, waiting if necessary.
