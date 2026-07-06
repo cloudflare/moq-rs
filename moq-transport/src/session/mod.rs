@@ -57,6 +57,23 @@ pub enum Transport {
     RawQuic,
 }
 
+const DEFAULT_MAX_REQUEST_ID: u64 = 100;
+
+/// Session-level protocol limits advertised during setup.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SessionConfig {
+    /// Maximum request ID plus one that we advertise to the peer.
+    pub max_request_id: u64,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            max_request_id: DEFAULT_MAX_REQUEST_ID,
+        }
+    }
+}
+
 /// Session object for managing all communications in a single QUIC connection.
 #[must_use = "run() must be called"]
 pub struct Session {
@@ -92,6 +109,15 @@ pub struct Session {
 
 impl Session {
     const MAX_CONNECTION_PATH_LEN: usize = 1024;
+
+    fn log_peer_max_request_id(peer_max: u64) {
+        if peer_max == 0 {
+            tracing::warn!(
+                target: "moq_transport::control",
+                "peer MAX_REQUEST_ID is 0; outbound requests are disabled until MAX_REQUEST_ID increases"
+            );
+        }
+    }
 
     /// Normalize and validate a connection path.
     ///
@@ -469,6 +495,16 @@ impl Session {
         mlog_path: Option<PathBuf>,
         transport: Transport,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_config(session, mlog_path, transport, SessionConfig::default()).await
+    }
+
+    /// Create an outbound/client QUIC connection with explicit session configuration.
+    pub async fn connect_with_config(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let url = session.url().clone();
         let url_path = url.path();
         let path = Self::normalize_connection_path(url_path)?;
@@ -513,8 +549,7 @@ impl Session {
         }
 
         // The MAX_REQUEST_ID we advertise to the server.
-        // TODO(itzmanish): make configurable.
-        let our_max_request_id: u64 = 100;
+        let our_max_request_id = config.max_request_id;
         params.set_intvalue(
             setup::ParameterType::MaxRequestId.into(),
             our_max_request_id,
@@ -541,10 +576,13 @@ impl Session {
         );
 
         let peer_max = max_request_id_from_params(&server.params);
+        Self::log_peer_max_request_id(peer_max);
         // Client sends even IDs (0); peer server sends odd IDs (1).
         let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
         let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
-        Ok((session.0, session.1.unwrap(), session.2.unwrap()))
+        let publisher = session.1.ok_or(SessionError::Internal)?;
+        let subscriber = session.2.ok_or(SessionError::Internal)?;
+        Ok((session.0, publisher, subscriber))
     }
 
     /// Accept an inbound server connection.
@@ -556,6 +594,16 @@ impl Session {
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
+    ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
+        Self::accept_with_config(session, mlog_path, transport, SessionConfig::default()).await
+    }
+
+    /// Accept an inbound server connection with explicit session configuration.
+    pub async fn accept_with_config(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        config: SessionConfig,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|p| {
             mlog::MlogWriter::new(p)
@@ -601,10 +649,10 @@ impl Session {
         }
 
         let peer_max = max_request_id_from_params(&client.params);
+        Self::log_peer_max_request_id(peer_max);
 
         // The MAX_REQUEST_ID we advertise to the client.
-        // TODO(itzmanish): make configurable.
-        let our_max_request_id: u64 = 100;
+        let our_max_request_id = config.max_request_id;
         let mut params = KeyValuePairs::default();
         params.set_intvalue(
             setup::ParameterType::MaxRequestId.into(),

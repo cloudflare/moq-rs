@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{hash_map, HashMap, HashSet},
     io,
     sync::{Arc, Mutex},
     time::Duration,
@@ -23,7 +23,7 @@ use crate::watch::Queue;
 
 use super::{
     PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session,
-    SessionError, Subscribe, SubscribeRecv,
+    SessionConfig, SessionError, Subscribe, SubscribeRecv,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -40,6 +40,9 @@ pub struct Subscriber {
 
     /// The currently active outbound subscribes, keyed by request id.
     subscribes: Arc<Mutex<HashMap<u64, SubscribeRecv>>>,
+
+    /// Outbound TRACK_STATUS requests awaiting a shared REQUEST_OK / REQUEST_ERROR response.
+    track_statuses: Arc<Mutex<HashSet<u64>>>,
 
     /// Map of track alias to subscription id for quick lookup when receiving streams/datagrams.
     subscribe_alias_map: Arc<Mutex<HashMap<u64, u64>>>,
@@ -73,6 +76,7 @@ impl Subscriber {
             published_namespaces: Default::default(),
             published_namespace_queue: Default::default(),
             subscribes: Default::default(),
+            track_statuses: Default::default(),
             subscribe_alias_map: Default::default(),
             outgoing,
             request_id,
@@ -86,8 +90,18 @@ impl Subscriber {
         session: web_transport::Session,
         transport: super::Transport,
     ) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::accept(session, None, transport).await?;
-        Ok((session, subscriber.unwrap()))
+        Self::accept_with_config(session, transport, SessionConfig::default()).await
+    }
+
+    pub async fn accept_with_config(
+        session: web_transport::Session,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) =
+            Session::accept_with_config(session, None, transport, config).await?;
+        let subscriber = subscriber.ok_or(SessionError::Internal)?;
+        Ok((session, subscriber))
     }
 
     /// Create an outbound/client QUIC connection, by opening a bi-directional QUIC stream for control messages.
@@ -95,7 +109,16 @@ impl Subscriber {
         session: web_transport::Session,
         transport: super::Transport,
     ) -> Result<(Session, Self), SessionError> {
-        let (session, _, subscriber) = Session::connect(session, None, transport).await?;
+        Self::connect_with_config(session, transport, SessionConfig::default()).await
+    }
+
+    pub async fn connect_with_config(
+        session: web_transport::Session,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Self), SessionError> {
+        let (session, _, subscriber) =
+            Session::connect_with_config(session, None, transport, config).await?;
         Ok((session, subscriber))
     }
 
@@ -166,6 +189,12 @@ impl Subscriber {
                 return;
             }
         };
+        if let Ok(mut track_statuses) = self.track_statuses.lock() {
+            track_statuses.insert(id);
+        } else {
+            tracing::warn!("could not track outbound TRACK_STATUS: lock poisoned");
+            return;
+        }
         self.send_message(message::TrackStatus {
             id,
             track_namespace: track_namespace.clone(),
@@ -352,17 +381,22 @@ impl Subscriber {
     /// Handle REQUEST_OK from the publisher.
     ///
     /// REQUEST_OK is the shared positive response for REQUEST_UPDATE, TRACK_STATUS,
-    /// SUBSCRIBE_NAMESPACE, and PUBLISH_NAMESPACE.  SUBSCRIBE uses its own dedicated
+    /// SUBSCRIBE_NAMESPACE, and PUBLISH_NAMESPACE. SUBSCRIBE uses its own dedicated
     /// SUBSCRIBE_OK message (§9.10) and does not come through this handler.
-    /// Full routing for the other request types is wired up (TODO itzmanish).
     fn recv_request_ok(&mut self, msg: &message::RequestOk) -> Result<(), SessionError> {
-        self.log_request_ok_parsed("unknown", msg);
+        let request_kind = if self.drop_track_status(msg.id)? {
+            "track_status"
+        } else {
+            "unknown"
+        };
+
+        self.log_request_ok_parsed(request_kind, msg);
         tracing::debug!(
             target: "moq_transport::control",
             request_id = msg.id,
+            request_kind,
             "received REQUEST_OK"
         );
-        // TODO(itzmanish): route to the correct pending request type by ID.
         Ok(())
     }
 
@@ -376,6 +410,8 @@ impl Subscriber {
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
             self.log_request_error_parsed("subscribe", msg);
             subscribe.error(ServeError::Closed(msg.error_code))?;
+        } else if self.drop_track_status(msg.id)? {
+            self.log_request_error_parsed("track_status", msg);
         } else {
             self.log_request_error_parsed("unknown", msg);
         }
@@ -389,6 +425,14 @@ impl Subscriber {
             "received REQUEST_ERROR"
         );
         Ok(())
+    }
+
+    fn drop_track_status(&mut self, id: u64) -> Result<bool, SessionError> {
+        Ok(self
+            .track_statuses
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .remove(&id))
     }
 
     fn drop_publish_namespace(&mut self, id: u64) -> Option<PublishedNamespaceRecv> {
@@ -482,26 +526,30 @@ impl Subscriber {
             return Err(SessionError::unimplemented("non-SUBGROUP stream types"));
         }
 
+        let subgroup_header = stream_header
+            .subgroup_header
+            .ok_or(SessionError::Internal)?;
+
         // Log subgroup header parsed/received
-        if let Some(ref subgroup_header) = stream_header.subgroup_header {
-            if let Some(ref mlog) = self.mlog {
-                if let Ok(mut mlog_guard) = mlog.lock() {
-                    let time = mlog_guard.elapsed_ms();
-                    let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
-                    let event = mlog::subgroup_header_parsed(time, stream_id, subgroup_header);
-                    let _ = mlog_guard.add_event(event);
-                }
+        if let Some(ref mlog) = self.mlog {
+            if let Ok(mut mlog_guard) = mlog.lock() {
+                let time = mlog_guard.elapsed_ms();
+                let stream_id = 0; // TODO: Placeholder, need actual QUIC stream ID
+                let event = mlog::subgroup_header_parsed(time, stream_id, &subgroup_header);
+                let _ = mlog_guard.add_event(event);
             }
         }
 
-        let track_alias = stream_header.subgroup_header.as_ref().unwrap().track_alias;
+        let track_alias = subgroup_header.track_alias;
         tracing::trace!(
             "[SUBSCRIBER] recv_stream: stream for subscription track_alias={}",
             track_alias
         );
 
         let mlog = self.mlog.clone();
-        let res = self.recv_stream_inner(reader, stream_header, mlog).await;
+        let res = self
+            .recv_stream_inner(reader, stream_header.header_type, subgroup_header, mlog)
+            .await;
         if let Err(SessionError::Serve(err)) = &res {
             tracing::warn!(
                 "[SUBSCRIBER] recv_stream: stream processing error for track_alias={}: {:?}",
@@ -524,10 +572,11 @@ impl Subscriber {
     async fn recv_stream_inner(
         &mut self,
         reader: Reader,
-        stream_header: data::StreamHeader,
+        stream_header_type: data::StreamHeaderType,
+        subgroup_header: data::SubgroupHeader,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
-        let track_alias = stream_header.subgroup_header.as_ref().unwrap().track_alias;
+        let track_alias = subgroup_header.track_alias;
         tracing::trace!(
             "[SUBSCRIBER] recv_stream_inner: processing stream for track_alias={}",
             track_alias
@@ -545,8 +594,8 @@ impl Subscriber {
 
         tracing::trace!("[SUBSCRIBER] recv_stream_inner: receiving subgroup data");
         self.recv_subgroup(
-            stream_header.header_type,
-            stream_header.subgroup_header.unwrap(),
+            stream_header_type,
+            subgroup_header,
             subscribe_id,
             reader,
             mlog,
@@ -885,6 +934,44 @@ mod tests {
     fn subscriber() -> Subscriber {
         let request_id = RequestId::new(0, 100, 100, 0);
         Subscriber::new(Queue::default(), None, request_id)
+    }
+
+    #[test]
+    fn request_ok_routes_to_pending_track_status() {
+        let mut subscriber = subscriber();
+        let namespace = TrackNamespace::from_utf8_path("test");
+
+        subscriber.track_status(&namespace, "0.mp4");
+        assert!(subscriber.track_statuses.lock().unwrap().contains(&0));
+
+        subscriber
+            .recv_request_ok(&message::RequestOk {
+                id: 0,
+                params: Default::default(),
+            })
+            .unwrap();
+
+        assert!(subscriber.track_statuses.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_error_routes_to_pending_track_status() {
+        let mut subscriber = subscriber();
+        let namespace = TrackNamespace::from_utf8_path("test");
+
+        subscriber.track_status(&namespace, "0.mp4");
+        assert!(subscriber.track_statuses.lock().unwrap().contains(&0));
+
+        subscriber
+            .recv_request_error(&message::RequestError {
+                id: 0,
+                error_code: message::RequestErrorCode::DoesNotExist as u64,
+                retry_interval: 0,
+                reason: crate::coding::ReasonPhrase("not found".to_string()),
+            })
+            .unwrap();
+
+        assert!(subscriber.track_statuses.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

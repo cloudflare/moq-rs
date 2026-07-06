@@ -19,8 +19,8 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    PublishNamespace, PublishNamespaceRecv, RequestId, RequestIdAllocation, Session, SessionError,
-    Subscribed, SubscribedRecv, TrackStatusRequested,
+    PublishNamespace, PublishNamespaceRecv, RequestId, RequestIdAllocation, Session, SessionConfig,
+    SessionError, Subscribed, SubscribedRecv, TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -84,15 +84,34 @@ impl Publisher {
         session: web_transport::Session,
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::accept(session, None, transport).await?;
-        Ok((session, publisher.unwrap()))
+        Self::accept_with_config(session, transport, SessionConfig::default()).await
+    }
+
+    pub async fn accept_with_config(
+        session: web_transport::Session,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher), SessionError> {
+        let (session, publisher, _) =
+            Session::accept_with_config(session, None, transport, config).await?;
+        let publisher = publisher.ok_or(SessionError::Internal)?;
+        Ok((session, publisher))
     }
 
     pub async fn connect(
         session: web_transport::Session,
         transport: super::Transport,
     ) -> Result<(Session, Publisher), SessionError> {
-        let (session, publisher, _) = Session::connect(session, None, transport).await?;
+        Self::connect_with_config(session, transport, SessionConfig::default()).await
+    }
+
+    pub async fn connect_with_config(
+        session: web_transport::Session,
+        transport: super::Transport,
+        config: SessionConfig,
+    ) -> Result<(Session, Publisher), SessionError> {
+        let (session, publisher, _) =
+            Session::connect_with_config(session, None, transport, config).await?;
         Ok((session, publisher))
     }
 

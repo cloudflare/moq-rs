@@ -99,8 +99,8 @@ impl Encode for ExtensionHeaders {
         // the length prefix.
         let mut tmp = bytes::BytesMut::new();
 
-        if self.0.len() == 1 {
-            self.0[0].encode_with_prev(&mut tmp, 0)?;
+        if let [kvp] = self.0.as_slice() {
+            kvp.encode_with_prev(&mut tmp, 0)?;
         } else {
             // Sort by ascending key so deltas are always non-negative.
             let mut sorted: Vec<&KeyValuePair> = self.0.iter().collect();

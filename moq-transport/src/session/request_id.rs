@@ -190,6 +190,7 @@ pub fn max_request_id_from_params(params: &KeyValuePairs) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup::ParameterType;
 
     fn client_ids(peer_max: u64, our_max: u64) -> RequestId {
         // local client sends even, peer server sends odd
@@ -199,6 +200,21 @@ mod tests {
     fn server_ids(peer_max: u64, our_max: u64) -> RequestId {
         // local server sends odd, peer client sends even
         RequestId::new(1, peer_max, our_max, 0)
+    }
+
+    #[test]
+    fn max_request_id_from_params_uses_draft_default_zero() {
+        let params = KeyValuePairs::default();
+
+        assert_eq!(max_request_id_from_params(&params), 0);
+    }
+
+    #[test]
+    fn max_request_id_from_params_reads_setup_value() {
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(ParameterType::MaxRequestId.into(), 42);
+
+        assert_eq!(max_request_id_from_params(&params), 42);
     }
 
     #[test]
