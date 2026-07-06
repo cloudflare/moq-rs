@@ -387,7 +387,12 @@ mod tests {
         crate::session::Subscriber,
     ) {
         let rid = RequestId::new(0, 100, 100, 0);
-        let subscriber = crate::session::Subscriber::new(Queue::default(), None, rid);
+        let subscriber = crate::session::Subscriber::new(
+            Queue::default(),
+            None,
+            rid,
+            crate::session::PendingRequests::default(),
+        );
         let (writer, reader) =
             Track::new(TrackNamespace::from_utf8_path("test"), "0.mp4").produce();
         let (pr, recv) = PublishReceivedRecv::produce(

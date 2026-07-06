@@ -4,9 +4,8 @@
 //! Outbound PUBLISH handling: a publisher sends PUBLISH, receives PUBLISH_OK
 //! or REQUEST_ERROR, serves Objects, and terminates with PUBLISH_DONE.
 //!
-//! The data-plane serving path is intentionally reused from `Subscribed` via
-//! `Subscribed::new_for_publish`; this keeps PUBLISH serving and SUBSCRIBE
-//! serving on the same subgroup/datagram implementation.
+//! The data-plane serving path is shared with SUBSCRIBE serving through
+//! `ObjectForwarder`; PUBLISH-specific state stays in `Published`.
 
 use std::ops;
 
@@ -17,7 +16,7 @@ use crate::{
     watch::State,
 };
 
-use super::{Publisher, SessionError, Subscribed};
+use super::{DeliveryFilter, ObjectForwarder, Publisher, SessionError};
 
 #[derive(Debug, Clone)]
 pub struct PublishedInfo {
@@ -49,8 +48,8 @@ impl PublishedState {
 /// Outbound PUBLISH created by [`Publisher::publish`].
 ///
 /// Dropping without calling [`serve`] sends PUBLISH_DONE with a generic
-/// terminal status. Calling [`serve`] delegates to `Subscribed::serve`, whose
-/// Drop sends PUBLISH_DONE after the data-plane loop has stopped.
+/// terminal status. Calling [`serve`] runs the shared object forwarder; dropping
+/// after the data-plane loop has stopped sends PUBLISH_DONE from this handle.
 #[must_use = "serve or drop to send PUBLISH_DONE"]
 pub struct Published {
     publisher: Publisher,
@@ -120,28 +119,40 @@ impl Published {
 
         let forward = self.state.lock().forward;
         if !forward {
-            self.closed().await?;
+            let res = self.closed().await;
             self.served = true;
-            return Ok(());
+            return match res {
+                Ok(()) | Err(ServeError::Cancel) => Ok(()),
+                Err(err) => Err(err.into()),
+            };
         }
 
         let track = self.track.take().ok_or(SessionError::Internal)?;
-        let (subscribed, _recv) = Subscribed::new_for_publish(
-            self.publisher.clone(),
-            self.info.id,
-            self.info.track_alias,
-            self.info.track_namespace.clone(),
-            self.info.track_name.clone(),
+        let (mut forwarder, recv) =
+            ObjectForwarder::new(self.publisher.clone(), self.info.track_alias, None);
+        self.publisher
+            .register_published_subscription(self.info.id, recv)?;
+
+        let largest_location = track.largest_location();
+        forwarder.set_largest_location(largest_location)?;
+        let delivery_filter = DeliveryFilter {
             forward,
-            None,
-        );
+            start_location: None,
+            end_group_id: None,
+        };
 
         self.served = true;
-        subscribed.serve(track).await
+        match forwarder.serve(track, delivery_filter).await {
+            Err(SessionError::Serve(ServeError::Cancel)) => Ok(()),
+            res => res,
+        }
     }
 
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
-        let state = self.state.lock();
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| ServeError::internal_ctx("published state lock poisoned"))?;
         state.closed.clone()?;
 
         let mut state = state.into_mut().ok_or(ServeError::Done)?;
@@ -165,7 +176,16 @@ impl Drop for Published {
             return;
         }
 
-        let state = self.state.lock();
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(()) => {
+                tracing::error!(
+                    request_id = self.info.id,
+                    "published state lock poisoned while dropping PUBLISH"
+                );
+                return;
+            }
+        };
         // If the subscriber rejected the PUBLISH with REQUEST_ERROR before it
         // became established, the request is already terminal (§5.1). Do not
         // send a second terminal message.
@@ -181,12 +201,21 @@ impl Drop for Published {
             .unwrap_or(ServeError::Done);
         drop(state);
 
-        self.publisher.send_message(message::PublishDone {
-            id: self.info.id,
-            status_code: publish_done_code(&err),
-            stream_count: 0,
-            reason: ReasonPhrase("publish ended".to_string()),
-        });
+        if self
+            .publisher
+            .try_send_message(message::PublishDone {
+                id: self.info.id,
+                status_code: publish_done_code(&err),
+                stream_count: 0,
+                reason: ReasonPhrase("publish ended".to_string()),
+            })
+            .is_err()
+        {
+            tracing::error!(
+                request_id = self.info.id,
+                "failed to enqueue PUBLISH_DONE while dropping PUBLISH"
+            );
+        }
     }
 }
 
@@ -220,6 +249,10 @@ impl PublishedRecv {
             state.closed = Err(err);
         }
         Ok(())
+    }
+
+    pub fn recv_unsubscribe(&mut self) -> Result<(), ServeError> {
+        self.recv_error(ServeError::Cancel)
     }
 }
 

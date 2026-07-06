@@ -7,11 +7,14 @@ use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     message::RequestErrorCode,
-    serve::{FullTrackName, ServeError, Tracks},
+    serve::{ServeError, Tracks},
     session::{PublishReceived, PublishedNamespace, SessionError, Subscriber},
 };
+use tokio::sync::Semaphore;
 
 use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer};
+
+const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
 
 /// Consumer of tracks from a remote Publisher
 #[derive(Clone)]
@@ -24,6 +27,7 @@ pub struct Consumer {
     /// Produced by `Coordinator::resolve_scope()` from the connection path.
     /// Passed to coordinator register/lookup calls to isolate namespaces.
     scope: Option<String>,
+    publish_track_permits: Arc<Semaphore>,
 }
 
 impl Consumer {
@@ -40,6 +44,7 @@ impl Consumer {
             coordinator,
             forward,
             scope,
+            publish_track_permits: Arc::new(Semaphore::new(MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION)),
         }
     }
 
@@ -47,10 +52,10 @@ impl Consumer {
     pub async fn run(self) -> Result<(), SessionError> {
         let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
             FuturesUnordered::new();
+        let mut namespace_subscriber = self.subscriber.clone();
+        let mut publish_subscriber = self.subscriber.clone();
 
         loop {
-            let mut namespace_subscriber = self.subscriber.clone();
-            let mut publish_subscriber = self.subscriber.clone();
             tokio::select! {
                 Some(published_ns) = namespace_subscriber.published_namespace() => {
                     metrics::counter!("moq_relay_publishers_total").increment(1);
@@ -208,24 +213,18 @@ impl Consumer {
 
     /// Serve an inbound PUBLISH for one exact track.
     async fn serve_track(mut self, mut publish: PublishReceived) -> Result<(), anyhow::Error> {
-        let namespace = publish.namespace().clone();
-        let track_name = publish.name().clone();
-        let full_name = FullTrackName {
-            namespace: namespace.clone(),
-            name: track_name.clone(),
+        let _publish_permit = match self.publish_track_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                metrics::counter!("moq_relay_publish_errors_total", "phase" => "session_limit")
+                    .increment(1);
+                publish.close(ServeError::Closed(RequestErrorCode::Uninterested as u64));
+                return Err(ServeError::Cancel.into());
+            }
         };
 
-        // First-cut multi-publisher policy: reject a second publisher for the
-        // same exact scoped Full Track Name. draft-16 §8.3 allows multiple
-        // publishers, but deduplication is follow-up work.
-        if self
-            .locals
-            .retrieve_track(self.scope.as_deref(), &full_name)
-            .is_some()
-        {
-            publish.close(ServeError::Closed(RequestErrorCode::Uninterested as u64));
-            return Err(ServeError::Duplicate.into());
-        }
+        let namespace = publish.namespace().clone();
+        let track_name = publish.name().clone();
 
         // Take the reader first, then follow the same order as PUBLISH_NAMESPACE:
         // local registration → coordinator registration → PUBLISH_OK.
@@ -247,6 +246,13 @@ impl Consumer {
             Err(err) => {
                 metrics::counter!("moq_relay_publish_errors_total", "phase" => "local_register")
                     .increment(1);
+                if err
+                    .downcast_ref::<ServeError>()
+                    .is_some_and(|err| matches!(err, ServeError::Duplicate))
+                {
+                    publish.close(ServeError::Duplicate);
+                    return Err(ServeError::Duplicate.into());
+                }
                 return Err(err);
             }
         };

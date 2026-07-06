@@ -76,6 +76,15 @@ impl<T> State<T> {
         }
     }
 
+    pub fn try_lock(&self) -> Result<StateRef<'_, T>, ()> {
+        let lock = self.state.lock().map_err(|_| ())?;
+        Ok(StateRef {
+            state: self.state.clone(),
+            drop: self.drop.clone(),
+            lock,
+        })
+    }
+
     pub fn lock_mut(&self) -> Option<StateMut<'_, T>> {
         let lock = self.state.lock().unwrap();
         lock.dropped?;
@@ -83,6 +92,18 @@ impl<T> State<T> {
             lock,
             _drop: self.drop.clone(),
         })
+    }
+
+    pub fn try_lock_mut(&self) -> Result<Option<StateMut<'_, T>>, ()> {
+        let lock = self.state.lock().map_err(|_| ())?;
+        if lock.dropped.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(StateMut {
+            lock,
+            _drop: self.drop.clone(),
+        }))
     }
 
     pub fn downgrade(&self) -> StateWeak<T> {
@@ -251,7 +272,10 @@ struct StateDrop<T> {
 
 impl<T> Drop for StateDrop<T> {
     fn drop(&mut self) {
-        let mut state = self.state.lock().unwrap();
+        let Ok(mut state) = self.state.lock() else {
+            tracing::error!("watch state lock poisoned while dropping state");
+            return;
+        };
         state.dropped = None;
         state.notify();
     }

@@ -21,6 +21,20 @@ impl<T> Queue<T> {
         Ok(())
     }
 
+    /// Push an item without panicking if the queue lock is poisoned.
+    pub fn try_push(&mut self, item: T) -> Result<(), T> {
+        match self.state.try_lock_mut() {
+            Ok(Some(mut state)) => state.push_back((item, None)),
+            Ok(None) => return Err(item),
+            Err(()) => {
+                tracing::error!("queue lock poisoned while pushing item");
+                return Err(item);
+            }
+        };
+
+        Ok(())
+    }
+
     /// Pop an item from the queue, waiting if necessary.
     pub async fn pop(&mut self) -> Option<T> {
         loop {

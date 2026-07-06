@@ -175,7 +175,7 @@ pub struct Subscribe {
 
 impl Subscribe {
     pub(super) fn new(
-        mut subscriber: Subscriber,
+        subscriber: Subscriber,
         request_id: u64,
         track: TrackWriter,
     ) -> (Subscribe, SubscribeRecv) {
@@ -203,8 +203,6 @@ impl Subscribe {
             }
         });
 
-        subscriber.send_message(subscribe_message);
-
         let (send, recv) = State::default().split();
 
         let send = Subscribe {
@@ -219,6 +217,15 @@ impl Subscribe {
         };
 
         (send, recv)
+    }
+
+    pub(super) fn send_request(&mut self) {
+        self.subscriber.send_message(message::Subscribe {
+            id: self.info.id,
+            track_namespace: self.info.track_namespace.clone(),
+            track_name: self.info.track_name.clone(),
+            params: self.info.params.clone(),
+        });
     }
 
     pub async fn closed(&self) -> Result<(), ServeError> {
@@ -290,11 +297,6 @@ impl SubscribeRecv {
         }
 
         Ok(())
-    }
-
-    pub fn track_alias(&self) -> Option<u64> {
-        let state = self.state.lock();
-        state.track_alias
     }
 
     pub fn error(mut self, err: ServeError) -> Result<(), ServeError> {

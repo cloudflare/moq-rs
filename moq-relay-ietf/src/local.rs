@@ -24,9 +24,11 @@ type ScopeKey = String;
 /// The scope key used for unscoped (global) registrations.
 const UNSCOPED: &str = "";
 
+const NAMESPACE_REQUEST_CHANNEL_CAPACITY: usize = 1024;
+
 #[derive(Clone)]
 struct NamespaceSource {
-    requests: mpsc::UnboundedSender<TrackWriter>,
+    requests: mpsc::Sender<TrackWriter>,
 }
 
 /// Relay-local registry.
@@ -67,12 +69,9 @@ impl Locals {
         &mut self,
         scope: Option<&str>,
         namespace: TrackNamespace,
-    ) -> anyhow::Result<(
-        LocalNamespaceRegistration,
-        mpsc::UnboundedReceiver<TrackWriter>,
-    )> {
+    ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackWriter>)> {
         let scope_key = scope.unwrap_or(UNSCOPED).to_string();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(NAMESPACE_REQUEST_CHANNEL_CAPACITY);
 
         let mut namespaces = self
             .namespaces
@@ -134,27 +133,6 @@ impl Locals {
             full_name,
             _gauge_guard: GaugeGuard::new("moq_relay_active_published_tracks"),
         })
-    }
-
-    async fn insert_track(
-        &mut self,
-        scope: Option<&str>,
-        full_name: FullTrackName,
-        track: TrackReader,
-    ) -> anyhow::Result<()> {
-        let scope_key = scope.unwrap_or(UNSCOPED).to_string();
-        let mut tracks = self
-            .tracks
-            .lock()
-            .map_err(|_| ServeError::internal_ctx("locals track registry lock poisoned"))?;
-        let bucket = tracks.entry(scope_key).or_default();
-        match bucket.entry(full_name) {
-            hash_map::Entry::Vacant(entry) => {
-                entry.insert(track);
-                Ok(())
-            }
-            hash_map::Entry::Occupied(_) => Err(ServeError::Duplicate.into()),
-        }
     }
 
     /// Retrieve one actual media track by exact Full Track Name.
@@ -226,11 +204,26 @@ impl Locals {
         let source = self.route_namespace(scope, &namespace)?;
 
         let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
-        self.insert_track(scope, full_name.clone(), reader.clone())
-            .await
-            .ok()?;
+        let reader = {
+            let scope_key = scope.unwrap_or(UNSCOPED).to_string();
+            let mut tracks = self.tracks.lock().ok()?;
+            let bucket = tracks.entry(scope_key).or_default();
+            match bucket.entry(full_name.clone()) {
+                hash_map::Entry::Vacant(entry) => {
+                    entry.insert(reader.clone());
+                    reader
+                }
+                hash_map::Entry::Occupied(mut entry) => {
+                    if !entry.get().is_closed() {
+                        return Some(entry.get().clone());
+                    }
+                    entry.insert(reader.clone());
+                    reader
+                }
+            }
+        };
 
-        if source.requests.send(writer).is_err() {
+        if source.requests.send(writer).await.is_err() {
             if let Ok(mut tracks) = self.tracks.lock() {
                 if let Some(bucket) = tracks.get_mut(scope.unwrap_or(UNSCOPED)) {
                     bucket.remove(&full_name);
@@ -376,6 +369,41 @@ mod tests {
         assert!(
             no_second_request.is_err(),
             "cache hit should not request again"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_get_or_request_track_deduplicates_request() {
+        let mut locals = Locals::new();
+        let namespace = ns("room/123");
+        let (_registration, mut requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace source should register");
+
+        let mut first = locals.clone();
+        let mut second = locals.clone();
+        let (first_reader, second_reader) = tokio::join!(
+            first.get_or_request_track(None, namespace.clone(), "video"),
+            second.get_or_request_track(None, namespace.clone(), "video"),
+        );
+
+        let first_reader = first_reader.expect("first request should get a reader");
+        let second_reader = second_reader.expect("second request should get cached reader");
+        assert_eq!(first_reader.namespace, namespace);
+        assert_eq!(second_reader.namespace, namespace);
+        assert_eq!(first_reader.name, TrackName::from("video"));
+        assert_eq!(second_reader.name, TrackName::from("video"));
+
+        requests
+            .recv()
+            .await
+            .expect("source should receive one TrackWriter");
+        let no_second_request =
+            tokio::time::timeout(std::time::Duration::from_millis(50), requests.recv()).await;
+        assert!(
+            no_second_request.is_err(),
+            "concurrent misses should be deduplicated"
         );
     }
 

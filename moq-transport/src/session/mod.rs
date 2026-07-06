@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod error;
+mod pending_requests;
 mod publish_namespace;
 mod publish_received;
 mod published;
@@ -17,6 +18,7 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
+pub(crate) use pending_requests::{PendingRequest, PendingRequests, PendingResponse};
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
 pub(crate) use publish_received::PublishReceivedRecv;
@@ -98,6 +100,9 @@ pub struct Session {
     /// Session-level request ID manager.
     /// Publisher and Subscriber share one outbound request ID sequence.
     request_id: RequestId,
+
+    /// Outbound requests that are waiting for a terminal response.
+    pending_requests: PendingRequests,
 
     /// Optional mlog writer for MoQ Transport events
     /// Wrapped in Arc<Mutex<>> to share across send/recv tasks when enabled
@@ -456,6 +461,7 @@ impl Session {
         request_id: RequestId,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let outgoing = Queue::default().split();
+        let pending_requests = PendingRequests::default();
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
@@ -465,11 +471,13 @@ impl Session {
             webtransport.clone(),
             mlog_shared.clone(),
             request_id.clone(),
+            pending_requests.clone(),
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
             mlog_shared.clone(),
             request_id.clone(),
+            pending_requests.clone(),
         ));
 
         let session = Self {
@@ -480,6 +488,7 @@ impl Session {
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
             request_id,
+            pending_requests,
             mlog: mlog_shared,
             transport,
             connection_path,
@@ -699,10 +708,11 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher, self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
+            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
             res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
-            res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
+            res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
+            res = Self::run_pending_timeouts(self.publisher, self.subscriber, self.pending_requests) => res,
         }
     }
 
@@ -766,7 +776,7 @@ impl Session {
         mut subscriber: Option<Subscriber>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
-        _outgoing: Queue<Message>,
+        pending_requests: PendingRequests,
     ) -> Result<(), SessionError> {
         let mut goaway_received = false;
 
@@ -811,6 +821,31 @@ impl Session {
             if let Some(id) = msg.sequenced_request_id() {
                 request_id.validate_incoming(id)?;
             }
+
+            let msg = match msg {
+                Message::RequestOk(msg) => {
+                    Self::recv_request_ok(&pending_requests, &mut publisher, msg)?;
+                    continue;
+                }
+                Message::RequestError(msg) => {
+                    Self::recv_request_error(
+                        &pending_requests,
+                        &mut publisher,
+                        &mut subscriber,
+                        msg,
+                    )?;
+                    continue;
+                }
+                Message::PublishOk(msg) => {
+                    Self::recv_publish_ok(&pending_requests, &mut publisher, msg)?;
+                    continue;
+                }
+                Message::SubscribeOk(msg) => {
+                    Self::recv_subscribe_ok(&pending_requests, &mut subscriber, msg)?;
+                    continue;
+                }
+                msg => msg,
+            };
 
             let msg = match TryInto::<message::Publisher>::try_into(msg) {
                 Ok(msg) => {
@@ -874,6 +909,143 @@ impl Session {
                         "message type {}",
                         other.name()
                     )));
+                }
+            }
+        }
+    }
+
+    fn recv_request_ok(
+        pending_requests: &PendingRequests,
+        publisher: &mut Option<Publisher>,
+        msg: message::RequestOk,
+    ) -> Result<(), SessionError> {
+        match pending_requests.complete(msg.id, PendingResponse::RequestOk)? {
+            Some(PendingRequest::PublishNamespace) => publisher
+                .as_mut()
+                .ok_or(SessionError::RoleViolation)?
+                .recv_request_ok(msg),
+            Some(request) => Err(SessionError::ProtocolViolation(format!(
+                "REQUEST_OK completed unexpected {:?} request {}",
+                request, msg.id
+            ))),
+            None => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received REQUEST_OK for unknown outbound request — ignoring"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn recv_request_error(
+        pending_requests: &PendingRequests,
+        publisher: &mut Option<Publisher>,
+        subscriber: &mut Option<Subscriber>,
+        msg: message::RequestError,
+    ) -> Result<(), SessionError> {
+        match pending_requests.complete(msg.id, PendingResponse::RequestError)? {
+            Some(PendingRequest::PublishNamespace | PendingRequest::Publish) => publisher
+                .as_mut()
+                .ok_or(SessionError::RoleViolation)?
+                .recv_request_error(msg),
+            Some(PendingRequest::Subscribe) => subscriber
+                .as_mut()
+                .ok_or(SessionError::RoleViolation)?
+                .recv_request_error(&msg),
+            None => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    error_code = msg.error_code,
+                    retry_interval = msg.retry_interval,
+                    reason = %msg.reason.0,
+                    "received REQUEST_ERROR for unknown outbound request — ignoring"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn recv_publish_ok(
+        pending_requests: &PendingRequests,
+        publisher: &mut Option<Publisher>,
+        msg: message::PublishOk,
+    ) -> Result<(), SessionError> {
+        match pending_requests.complete(msg.id, PendingResponse::PublishOk)? {
+            Some(PendingRequest::Publish) => publisher
+                .as_mut()
+                .ok_or(SessionError::RoleViolation)?
+                .recv_publish_ok(msg),
+            Some(request) => Err(SessionError::ProtocolViolation(format!(
+                "PUBLISH_OK completed unexpected {:?} request {}",
+                request, msg.id
+            ))),
+            None => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received PUBLISH_OK for unknown outbound request — ignoring"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn recv_subscribe_ok(
+        pending_requests: &PendingRequests,
+        subscriber: &mut Option<Subscriber>,
+        msg: message::SubscribeOk,
+    ) -> Result<(), SessionError> {
+        match pending_requests.complete(msg.id, PendingResponse::SubscribeOk)? {
+            Some(PendingRequest::Subscribe) => subscriber
+                .as_mut()
+                .ok_or(SessionError::RoleViolation)?
+                .recv_subscribe_ok(&msg),
+            Some(request) => Err(SessionError::ProtocolViolation(format!(
+                "SUBSCRIBE_OK completed unexpected {:?} request {}",
+                request, msg.id
+            ))),
+            None => subscriber
+                .as_mut()
+                .ok_or(SessionError::RoleViolation)?
+                .recv_subscribe_ok(&msg),
+        }
+    }
+
+    async fn run_pending_timeouts(
+        mut publisher: Option<Publisher>,
+        mut subscriber: Option<Subscriber>,
+        pending_requests: PendingRequests,
+    ) -> Result<(), SessionError> {
+        loop {
+            let Some(deadline) = pending_requests.next_deadline()? else {
+                pending_requests.changed().await;
+                continue;
+            };
+
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {},
+                _ = pending_requests.changed() => continue,
+            }
+
+            for (id, request) in pending_requests.expire()? {
+                tracing::warn!(
+                    target: "moq_transport::control",
+                    request_id = id,
+                    request = ?request,
+                    "outbound request timed out waiting for response"
+                );
+                match request {
+                    PendingRequest::PublishNamespace | PendingRequest::Publish => publisher
+                        .as_mut()
+                        .ok_or(SessionError::RoleViolation)?
+                        .recv_request_timeout(id, request)?,
+                    PendingRequest::Subscribe => subscriber
+                        .as_mut()
+                        .ok_or(SessionError::RoleViolation)?
+                        .recv_request_timeout(id, request)?,
                 }
             }
         }

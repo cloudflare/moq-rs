@@ -60,7 +60,7 @@ pub struct PublishNamespace {
 
 impl PublishNamespace {
     pub(super) fn new(
-        mut publisher: Publisher,
+        publisher: Publisher,
         request_id: u64,
         namespace: TrackNamespace,
     ) -> (PublishNamespace, PublishNamespaceRecv) {
@@ -68,12 +68,6 @@ impl PublishNamespace {
             request_id,
             namespace: namespace.clone(),
         };
-
-        publisher.send_message(message::PublishNamespace {
-            id: request_id,
-            track_namespace: namespace.clone(),
-            params: Default::default(),
-        });
 
         let (send, recv) = State::default().split();
 
@@ -88,6 +82,14 @@ impl PublishNamespace {
         };
 
         (send, recv)
+    }
+
+    pub(super) fn send_request(&mut self) {
+        self.publisher.send_message(message::PublishNamespace {
+            id: self.info.request_id,
+            track_namespace: self.info.namespace.clone(),
+            params: Default::default(),
+        });
     }
 
     /// Wait until the namespace publish is closed (error or peer disconnect).
