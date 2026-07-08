@@ -43,6 +43,18 @@ pub enum EncodeError {
 
     #[error("field '{0}' too large")]
     FieldBoundsExceeded(String),
+
+    /// KVP keys must be in non-decreasing order during encode.
+    #[error("key-value-pair keys must be non-decreasing")]
+    KvpKeyOrder,
+
+    /// Bytes-typed KVP value exceeds maximum length of 2^16-1.
+    #[error("key-value-pair bytes value too long")]
+    KeyValuePairLengthExceeded,
+
+    /// A namespace field had zero length (draft-16 §2.4.1 PROTOCOL_VIOLATION).
+    #[error("namespace field must not be empty")]
+    EmptyNamespaceField,
 }
 
 impl From<io::Error> for EncodeError {

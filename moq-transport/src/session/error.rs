@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::{coding, serve, setup};
+use crate::{coding, serve};
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum SessionError {
@@ -14,10 +14,6 @@ pub enum SessionError {
 
     #[error("decode error: {0}")]
     Decode(#[from] coding::DecodeError),
-
-    // TODO move to a ConnectError
-    #[error("unsupported versions: client={0:?} server={1:?}")]
-    Version(setup::Versions, setup::Versions),
 
     /// TODO SLG - eventually remove or morph into error for incorrect control message for publisher/subscriber
     /// The role negiotiated in the handshake was violated. For example, a publisher sent a SUBSCRIBE, or a subscriber sent an OBJECT.
@@ -43,6 +39,18 @@ pub enum SessionError {
 
     #[error("invalid connection path: {0}")]
     InvalidPath(String),
+
+    /// Draft-16 §3.4 INVALID_REQUEST_ID (0x4): peer used an invalid request ID.
+    #[error("invalid request ID")]
+    InvalidRequestId,
+
+    /// Draft-16 §3.4 TOO_MANY_REQUESTS (0x7): request ID meets or exceeds the maximum.
+    #[error("too many requests")]
+    TooManyRequests,
+
+    /// Draft-16 §3.4 PROTOCOL_VIOLATION (0x3): peer violated a MUST rule.
+    #[error("protocol violation: {0}")]
+    ProtocolViolation(String),
 }
 
 // Session Termination Error Codes from draft-ietf-moq-transport-14 Section 13.1.1
@@ -58,14 +66,18 @@ impl SessionError {
             Self::Encode(_) => 0x1,
             Self::BoundsExceeded(_) => 0x1,
             Self::Internal => 0x1,
-            // VERSION_NEGOTIATION_FAILED (0x15)
-            Self::Version(..) => 0x15,
             // PROTOCOL_VIOLATION (0x3) - Malformed messages
             Self::Decode(_) => 0x3,
             Self::WrongSize => 0x3,
             Self::InvalidPath(_) => 0x3,
             // DUPLICATE_TRACK_ALIAS (0x5)
             Self::Duplicate => 0x5,
+            // INVALID_REQUEST_ID (0x4)
+            Self::InvalidRequestId => 0x4,
+            // TOO_MANY_REQUESTS (0x7)
+            Self::TooManyRequests => 0x7,
+            // PROTOCOL_VIOLATION (0x3)
+            Self::ProtocolViolation(_) => 0x3,
             // Delegate to ServeError for per-request error codes
             Self::Serve(err) => err.code(),
         }

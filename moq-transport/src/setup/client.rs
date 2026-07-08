@@ -2,64 +2,57 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::Versions;
-use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
+//! CLIENT_SETUP message (draft-ietf-moq-transport-16 §9.3).
+//!
+//! From draft-16, version negotiation is performed via ALPN only.  The
+//! CLIENT_SETUP and SERVER_SETUP payloads carry setup parameters only;
+//! they no longer contain a version list.
 
-/// Sent by the client to setup the session.
-/// This CLIENT_SETUP message is used by moq-transport draft versions 11 and later.
-/// Id = 0x20 vs 0x40 for versions <= 10.
+use crate::coding::{Decode, DecodeError, Encode, EncodeError, KeyValuePairs};
+use bytes::Buf as _;
+
+/// Sent by the client to set up the session.
+///
+/// Message Type = 0x20 (unchanged from draft-11+).
+/// The payload contains only setup parameters; version is agreed via ALPN.
 #[derive(Debug)]
 pub struct Client {
-    /// The list of supported versions in preferred order.
-    pub versions: Versions,
-
-    /// Setup Parameters, ie: PATH, MAX_REQUEST_ID,
-    /// MAX_AUTH_TOKEN_CACHE_SIZE, AUTHORIZATION_TOKEN, etc.
+    /// Setup parameters (PATH, AUTHORITY, MAX_REQUEST_ID,
+    /// MAX_AUTH_TOKEN_CACHE_SIZE, AUTHORIZATION_TOKEN, MOQT_IMPLEMENTATION, …).
     pub params: KeyValuePairs,
 }
 
 impl Decode for Client {
-    /// Decode a client setup message.
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let typ = u64::decode(r)?;
         if typ != 0x20 {
-            // CLIENT_SETUP message ID for draft versions 11 and later
             return Err(DecodeError::InvalidMessage(typ));
         }
 
-        let _len = u16::decode(r)?;
-        // TODO: Check the length of the message.
+        let len = u16::decode(r)? as usize;
+        <u64 as Decode>::decode_remaining(r, len)?;
+        let mut payload = r.copy_to_bytes(len);
 
-        let versions = Versions::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode(&mut payload)?;
+        if payload.has_remaining() {
+            return Err(DecodeError::InvalidMessage(typ));
+        }
 
-        Ok(Self { versions, params })
+        Ok(Self { params })
     }
 }
 
 impl Encode for Client {
-    /// Encode a server setup message.
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        (0x20_u64).encode(w)?; // CLIENT_SETUP message ID for draft versions 11 and later
+        (0x20_u64).encode(w)?;
 
-        // Find out the length of the message
-        // by encoding it into a buffer and then encoding the length.
-        // This is a bit wasteful, but it's the only way to know the length.
-        // TODO SLG - perhaps we can store the position of the Length field in the BufMut and
-        //       write the length later, to avoid the copy of the message bytes?
         let mut buf = Vec::new();
+        self.params.encode(&mut buf)?;
 
-        self.versions.encode(&mut buf).unwrap();
-        self.params.encode(&mut buf).unwrap();
-
-        // Make sure buf.len() <= u16::MAX
         if buf.len() > u16::MAX as usize {
             return Err(EncodeError::MsgBoundsExceeded);
         }
         (buf.len() as u16).encode(w)?;
-
-        // At least don't encode the message twice.
-        // Instead, write the buffer directly to the writer.
         Self::encode_remaining(w, buf.len())?;
         w.put_slice(&buf);
 
@@ -74,32 +67,73 @@ mod tests {
     use bytes::BytesMut;
 
     #[test]
-    fn encode_decode() {
+    fn encode_decode_params_only() {
         let mut buf = BytesMut::new();
 
         let mut params = KeyValuePairs::default();
-        params.set_bytesvalue(ParameterType::Path.into(), "testpath".as_bytes().to_vec());
+        // PATH is odd key (0x01) → bytes value; delta from 0 = 1
+        params.set_bytesvalue(ParameterType::Path.into(), b"testpath".to_vec());
+        // MAX_REQUEST_ID is even key (0x02) → int value; delta from 1 = 1
+        params.set_intvalue(ParameterType::MaxRequestId.into(), 100);
 
+        let client = Client { params };
+        client.encode(&mut buf).unwrap();
+
+        // Wire layout:
+        //   0x20          type
+        //   len (2B)      16-bit length of payload
+        //   payload:
+        //     0x02        count = 2 params (varint)
+        //     0x01        delta=1 → abs_type=1 (PATH, odd→bytes)
+        //     0x08        length=8
+        //     "testpath"
+        //     0x01        delta=1 → abs_type=2 (MAX_REQUEST_ID, even→int)
+        //     0x40 0x64   value=100 (2-byte varint, 100 ≥ 64)
+        let bytes = buf.to_vec();
+        assert_eq!(bytes[0], 0x20); // type
+        let payload_len = u16::from_be_bytes([bytes[1], bytes[2]]) as usize;
+        assert_eq!(bytes.len(), 3 + payload_len);
+
+        let decoded = Client::decode(&mut buf).unwrap();
+        assert_eq!(decoded.params, client.params);
+    }
+
+    #[test]
+    fn encode_decode_no_params() {
+        let mut buf = BytesMut::new();
         let client = Client {
-            versions: [Version::DRAFT_13].into(),
-            params,
+            params: KeyValuePairs::default(),
         };
         client.encode(&mut buf).unwrap();
 
-        #[rustfmt::skip]
-        assert_eq!(
-            buf.to_vec(),
-            vec![
-                0x20, // Type
-                0x00, 0x14, // Length
-                0x01, // 1 Version
-                0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0D, // Version DRAFT_13 (0xff00000D)
-                0x01, // 1 Param
-                0x01, 0x08, 0x74, 0x65, 0x73, 0x74, 0x70, 0x61, 0x74, 0x68, // Key=1 (Path), Value="testpath"
-            ]
-        );
+        // Wire: 0x20, 0x00 0x01 (length=1), 0x00 (count=0)
+        assert_eq!(buf[0], 0x20);
+        let payload_len = u16::from_be_bytes([buf[1], buf[2]]) as usize;
+        assert_eq!(payload_len, 1); // just the count varint (0x00)
+
         let decoded = Client::decode(&mut buf).unwrap();
-        assert_eq!(decoded.versions, client.versions);
-        assert_eq!(decoded.params, client.params);
+        assert!(decoded.params.0.is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_overlong_payload() {
+        let mut buf = BytesMut::new();
+        let client = Client {
+            params: KeyValuePairs::default(),
+        };
+        client.encode(&mut buf).unwrap();
+        buf[2] += 1;
+        buf.extend_from_slice(&[0x00]);
+
+        assert!(matches!(
+            Client::decode(&mut buf).unwrap_err(),
+            DecodeError::InvalidMessage(0x20)
+        ));
+    }
+
+    /// Confirm DRAFT_16 version constant is defined and has the right value.
+    #[test]
+    fn draft_16_version_constant() {
+        assert_eq!(Version::DRAFT_16.0, 0xff000010);
     }
 }

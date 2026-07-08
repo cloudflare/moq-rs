@@ -13,7 +13,7 @@ pub enum FetchType {
 
 impl Encode for FetchType {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
-        let val = *self as u8;
+        let val = *self as u64;
         val.encode(w)?;
         Ok(())
     }
@@ -21,7 +21,7 @@ impl Encode for FetchType {
 
 impl Decode for FetchType {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        match u8::decode(r)? {
+        match u64::decode(r)? {
             0x1 => Ok(Self::Standalone),
             0x2 => Ok(Self::RelativeJoining),
             0x3 => Ok(Self::AbsoluteJoining),

@@ -17,7 +17,7 @@ categories = ["multimedia", "network-programming", "web-programming"]
 [dependencies]
 moq-transport = { path = "../moq-transport", version = "0.14" }
 web-transport = { workspace = true }
-web-transport-quinn = { version = "0.11", default-features = false, features = ["ring"] }
+web-transport-quinn = { version = "0.11.8", default-features = false, features = ["ring"] }
 
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"

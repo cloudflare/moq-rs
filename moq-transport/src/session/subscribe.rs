@@ -5,22 +5,53 @@
 use std::ops;
 
 use crate::{
-    coding::{KeyValuePairs, Location, TrackNamespace},
+    coding::{KeyValuePairs, Location, TrackName, TrackNamespace},
     data,
-    message::{self, FilterType, GroupOrder},
+    message::{self, FilterType, GroupOrder, SubscriptionFilter},
     serve::{self, ServeError, TrackWriter, TrackWriterMode},
 };
 
 use crate::watch::State;
 
+use super::SessionError;
 use super::Subscriber;
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryFilter {
+    pub forward: bool,
+    pub start_location: Option<Location>,
+    pub end_group_id: Option<u64>,
+}
+
+impl DeliveryFilter {
+    pub fn allows(&self, group_id: u64, object_id: u64) -> bool {
+        if !self.forward {
+            return false;
+        }
+
+        let location = Location::new(group_id, object_id);
+        if let Some(start) = self.start_location {
+            if location < start {
+                return false;
+            }
+        }
+
+        if let Some(end_group_id) = self.end_group_id {
+            if group_id > end_group_id {
+                return false;
+            }
+        }
+
+        true
+    }
+}
 
 // TODO rename to SubscriptionInfo when used for Publishes as well?
 #[derive(Debug, Clone)]
 pub struct SubscribeInfo {
     pub id: u64,
     pub track_namespace: TrackNamespace,
-    pub track_name: String,
+    pub track_name: TrackName,
 
     /// Subscriber Priority
     pub subscriber_priority: u8,
@@ -37,6 +68,10 @@ pub struct SubscribeInfo {
     /// End group id, inclusive, for the subscription, if applicable. Only present for "AbsoluteRange" filter type.
     pub end_group_id: Option<u64>,
 
+    /// None means the SUBSCRIPTION_FILTER parameter was omitted and the
+    /// subscription is unfiltered per draft-16 §9.2.2.5.
+    pub filter: Option<SubscriptionFilter>,
+
     /// Optional parameters
     pub params: KeyValuePairs,
 
@@ -45,21 +80,72 @@ pub struct SubscribeInfo {
 }
 
 impl SubscribeInfo {
-    pub fn new_from_subscribe(msg: &message::Subscribe) -> Self {
-        Self {
+    pub fn new_from_subscribe(msg: &message::Subscribe) -> Result<Self, SessionError> {
+        let filter = msg.params.subscription_filter()?;
+        let filter_type = filter
+            .as_ref()
+            .map(|filter| filter.filter_type)
+            .unwrap_or(FilterType::AbsoluteStart);
+        let start_location = filter.as_ref().and_then(|filter| filter.start_location);
+        let end_group_id = filter.as_ref().and_then(|filter| filter.end_group_id);
+
+        Ok(Self {
             id: msg.id,
             track_namespace: msg.track_namespace.clone(),
             track_name: msg.track_name.clone(),
-            subscriber_priority: msg.subscriber_priority,
-            group_order: msg.group_order,
-            forward: msg.forward,
-            filter_type: msg.filter_type,
-            start_location: msg.start_location,
-            end_group_id: msg.end_group_id,
+            subscriber_priority: msg.params.subscriber_priority()?.unwrap_or(128),
+            group_order: msg.params.group_order()?.unwrap_or(GroupOrder::Publisher),
+            forward: msg.params.forward()?.unwrap_or(true),
+            filter_type,
+            start_location,
+            end_group_id,
+            filter,
             params: msg.params.clone(),
             track_status: false,
+        })
+    }
+
+    pub fn delivery_filter(&self, largest_location: Option<Location>) -> DeliveryFilter {
+        let Some(filter) = &self.filter else {
+            return DeliveryFilter {
+                forward: self.forward,
+                start_location: None,
+                end_group_id: None,
+            };
+        };
+
+        let start_location = match filter.filter_type {
+            FilterType::LargestObject => Some(next_object_location(largest_location)),
+            FilterType::NextGroupStart => Some(next_group_location(largest_location)),
+            FilterType::AbsoluteStart | FilterType::AbsoluteRange => filter.start_location,
+        };
+
+        DeliveryFilter {
+            forward: self.forward,
+            start_location,
+            end_group_id: filter.end_group_id,
         }
     }
+}
+
+fn next_object_location(largest_location: Option<Location>) -> Location {
+    let Some(location) = largest_location else {
+        return Location::new(0, 0);
+    };
+
+    if let Some(object_id) = location.object_id.checked_add(1) {
+        Location::new(location.group_id, object_id)
+    } else {
+        next_group_location(Some(location))
+    }
+}
+
+fn next_group_location(largest_location: Option<Location>) -> Location {
+    let Some(location) = largest_location else {
+        return Location::new(0, 0);
+    };
+
+    Location::new(location.group_id.saturating_add(1), 0)
 }
 
 struct SubscribeState {
@@ -97,16 +183,25 @@ impl Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
-            // TODO add prioritization logic on the publisher side
-            subscriber_priority: 127, // default to mid value, see: https://github.com/moq-wg/moq-transport/issues/504
-            group_order: GroupOrder::Publisher, // defer to publisher send order
-            forward: true,            // default to forwarding objects
-            filter_type: FilterType::LargestObject,
-            start_location: None,
-            end_group_id: None,
-            params: Default::default(),
+            params: KeyValuePairs::default(),
         };
-        let info = SubscribeInfo::new_from_subscribe(&subscribe_message);
+        let info = SubscribeInfo::new_from_subscribe(&subscribe_message).unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to decode outbound subscribe parameters");
+            SubscribeInfo {
+                id: request_id,
+                track_namespace: track.namespace.clone(),
+                track_name: track.name.clone(),
+                subscriber_priority: 128,
+                group_order: GroupOrder::Publisher,
+                forward: true,
+                filter_type: FilterType::AbsoluteStart,
+                start_location: None,
+                end_group_id: None,
+                filter: None,
+                params: Default::default(),
+                track_status: false,
+            }
+        });
 
         subscriber.send_message(subscribe_message);
 
@@ -275,5 +370,75 @@ impl SubscribeRecv {
                 Err(ServeError::Mode)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subscribe_info_with(params: KeyValuePairs) -> SubscribeInfo {
+        SubscribeInfo::new_from_subscribe(&message::Subscribe {
+            id: 0,
+            track_namespace: TrackNamespace::from_utf8_path("test"),
+            track_name: "track".into(),
+            params,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn omitted_subscription_filter_is_unfiltered() {
+        let info = subscribe_info_with(KeyValuePairs::default());
+        let filter = info.delivery_filter(Some(Location::new(10, 20)));
+
+        assert!(info.filter.is_none());
+        assert!(filter.allows(0, 0));
+        assert!(filter.allows(10, 20));
+        assert!(filter.allows(100, 0));
+    }
+
+    #[test]
+    fn largest_object_filter_starts_after_largest_object() {
+        let mut params = KeyValuePairs::default();
+        params
+            .set_subscription_filter(&SubscriptionFilter::largest_object())
+            .unwrap();
+        let info = subscribe_info_with(params);
+        let filter = info.delivery_filter(Some(Location::new(2, 3)));
+
+        assert!(!filter.allows(2, 3));
+        assert!(filter.allows(2, 4));
+        assert!(filter.allows(3, 0));
+    }
+
+    #[test]
+    fn absolute_range_filter_limits_start_and_end_group() {
+        let mut params = KeyValuePairs::default();
+        params
+            .set_subscription_filter(&SubscriptionFilter {
+                filter_type: FilterType::AbsoluteRange,
+                start_location: Some(Location::new(2, 3)),
+                end_group_id: Some(4),
+            })
+            .unwrap();
+        let info = subscribe_info_with(params);
+        let filter = info.delivery_filter(None);
+
+        assert!(!filter.allows(2, 2));
+        assert!(filter.allows(2, 3));
+        assert!(filter.allows(4, 10));
+        assert!(!filter.allows(5, 0));
+    }
+
+    #[test]
+    fn forward_false_blocks_delivery() {
+        let mut params = KeyValuePairs::default();
+        params.set_forward(false);
+        let info = subscribe_info_with(params);
+        let filter = info.delivery_filter(None);
+
+        assert!(!filter.allows(0, 0));
+        assert!(!filter.allows(100, 100));
     }
 }

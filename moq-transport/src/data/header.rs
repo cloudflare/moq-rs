@@ -57,6 +57,16 @@ impl StreamHeaderType {
                 | StreamHeaderType::SubgroupIdExtEndOfGroup
         )
     }
+
+    pub fn uses_first_object_id_as_subgroup_id(&self) -> bool {
+        matches!(
+            *self,
+            StreamHeaderType::SubgroupFirstObjectId
+                | StreamHeaderType::SubgroupFirstObjectIdExt
+                | StreamHeaderType::SubgroupFirstObjectIdEndOfGroup
+                | StreamHeaderType::SubgroupFirstObjectIdExtEndOfGroup
+        )
+    }
 }
 
 impl Encode for StreamHeaderType {
@@ -110,7 +120,7 @@ impl Decode for StreamHeaderType {
         };
 
         if let Ok(header_type_inner) = &header_type {
-            tracing::debug!(
+            tracing::trace!(
                 "[DECODE] StreamHeaderType: {}, has_subgroup_id={}, has_extension_headers={}",
                 header_type_inner,
                 header_type_inner.has_subgroup_id(),
@@ -175,7 +185,7 @@ impl Decode for StreamHeader {
             }
         };
 
-        tracing::debug!(
+        tracing::trace!(
             "[DECODE] StreamHeader complete: type={:?}, has_subgroup={}, has_fetch={}, buffer_remaining={} bytes",
             header_type,
             subgroup_header.is_some(),
@@ -225,7 +235,7 @@ impl Encode for StreamHeader {
             return Err(EncodeError::MissingField("FetchHeader".to_string()));
         }
 
-        tracing::debug!("[ENCODE] StreamHeader complete");
+        tracing::trace!("[ENCODE] StreamHeader complete");
 
         Ok(())
     }
@@ -258,6 +268,12 @@ mod tests {
         assert!(ht.is_subgroup());
         assert!(!ht.is_fetch());
         assert!(!ht.has_subgroup_id());
+
+        let ht = StreamHeaderType::SubgroupFirstObjectId;
+        assert!(ht.uses_first_object_id_as_subgroup_id());
+
+        let ht = StreamHeaderType::SubgroupId;
+        assert!(!ht.uses_first_object_id_as_subgroup_id());
     }
 
     #[test]

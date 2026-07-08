@@ -17,7 +17,7 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-web-transport = "0.10"
+web-transport = "0.10.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

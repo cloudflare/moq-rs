@@ -31,7 +31,7 @@ impl Writer {
 
         msg.encode(&mut self.buffer)?;
         let encoded_len = self.buffer.len();
-        tracing::debug!(
+        tracing::trace!(
             "[WRITER] encode: encoded {} ({} bytes), sending to stream",
             std::any::type_name::<T>(),
             encoded_len
@@ -50,7 +50,7 @@ impl Writer {
             );
         }
 
-        tracing::debug!(
+        tracing::trace!(
             "[WRITER] encode: finished sending {} ({} bytes total)",
             std::any::type_name::<T>(),
             total_written
@@ -85,7 +85,7 @@ impl Writer {
             );
         }
 
-        tracing::debug!("[WRITER] write: finished writing {} bytes", total_written);
+        tracing::trace!("[WRITER] write: finished writing {} bytes", total_written);
 
         Ok(())
     }

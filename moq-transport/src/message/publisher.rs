@@ -48,18 +48,19 @@ macro_rules! publisher_msgs {
     }
 }
 
-// Defines messages that a PUBLISHER would send, or that a SUBSCRIBER would handle
+// Defines messages that a PUBLISHER would send, or that a SUBSCRIBER would handle.
+// RequestOk and RequestError are shared responses (draft-16 §9.7 / §9.8).
 publisher_msgs! {
+    // Namespace advertisement and termination.
     PublishNamespace,
     PublishNamespaceDone,
+    // Publisher-initiated subscriptions.
     Publish,
     PublishDone,
+    // Responses to subscriber-initiated requests.
     SubscribeOk,
-    SubscribeError,
-    TrackStatusOk,
-    TrackStatusError,
+    RequestOk,
+    RequestError,
+    // FETCH response; FETCH itself is still unsupported by the session layer.
     FetchOk,
-    FetchError,
-    SubscribeNamespaceOk,
-    SubscribeNamespaceError,
 }
