@@ -262,7 +262,6 @@ impl Relay {
                         let remotes = remote_manager.clone();
                         let forward = forward_producer.clone();
                         let coordinator = coordinator.clone();
-                        let session_config = session_config;
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
