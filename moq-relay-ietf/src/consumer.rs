@@ -6,11 +6,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    serve::Tracks,
+    serve::{ServeError, TrackLease, TrackRequest, Tracks, TrackWriter},
     session::{Announced, SessionError, Subscriber},
 };
 
-use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer};
+use crate::{metrics::GaugeGuard, Coordinator, Locals, Producer, WARM_CACHE_LINGER};
 
 /// Consumer of tracks from a remote Publisher
 #[derive(Clone)]
@@ -158,18 +158,21 @@ impl Consumer {
                 },
 
                 // Wait for the next subscriber and serve the track.
-                Some(track) = request.next() => {
-                    let mut subscriber = self.subscriber.clone();
+                Some(req) = request.next() => {
+                    let subscriber = self.subscriber.clone();
 
                     // Spawn a new task to handle the subscribe
                     tasks.push(async move {
-                        let info = track.clone();
+                        let TrackRequest { writer, lease } = req;
+                        let info = writer.clone();
                         let namespace = info.namespace.to_utf8_path();
                         let track_name = info.name.clone();
                         tracing::info!(namespace = %namespace, track = %track_name, "forwarding subscribe: {:?}", info);
 
-                        // Forward the subscribe request
-                        if let Err(err) = subscriber.subscribe(track).await {
+                        // Forward the subscribe request, dropping the upstream
+                        // subscription (which emits UNSUBSCRIBE) once the last
+                        // downstream subscriber leaves and the linger expires.
+                        if let Err(err) = Self::serve_track_subscribe(subscriber, writer, lease).await {
                             tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed forwarding subscribe: {:?}, error: {}", info, err)
                         }
 
@@ -178,6 +181,55 @@ impl Consumer {
                 },
                 res = tasks.next(), if !tasks.is_empty() => res.unwrap()?,
                 else => return Ok(()),
+            }
+        }
+    }
+
+    /// Forward a single deduplicated subscribe upstream and keep it alive only
+    /// while downstream subscribers are interested.
+    ///
+    /// Sending the SUBSCRIBE and awaiting SUBSCRIBE_OK is done by
+    /// [`Subscriber::subscribe_open`]. We then hold the resulting `Subscribe`
+    /// handle until one of:
+    ///  - the upstream subscription ends on its own (error / PUBLISH_DONE / teardown), or
+    ///  - the last downstream subscriber leaves and stays gone for [`WARM_CACHE_LINGER`].
+    ///
+    /// In the latter case we evict the dedup cache entry and return, dropping the
+    /// `Subscribe` — whose `Drop` emits the upstream UNSUBSCRIBE (the only place
+    /// the transport crate does so). Previously nothing propagated downstream
+    /// interest loss upstream, so the relay kept pulling from the publisher until
+    /// the whole session died.
+    async fn serve_track_subscribe(
+        mut subscriber: Subscriber,
+        writer: TrackWriter,
+        lease: TrackLease,
+    ) -> Result<(), ServeError> {
+        let subscribe = subscriber.subscribe_open(writer).await?;
+
+        loop {
+            // Wait until either the upstream subscription ends, or the last
+            // downstream subscriber goes away (interest drops to zero).
+            tokio::select! {
+                biased;
+                res = subscribe.closed() => return res,
+                _ = lease.interest().idle() => {}
+            }
+
+            // Warm-cache linger: keep the upstream subscription alive briefly so an
+            // instant late-joiner can reattach without a fresh upstream SUBSCRIBE.
+            tokio::select! {
+                biased;
+                res = subscribe.closed() => return res,
+                // A new subscriber arrived during the linger — keep serving.
+                _ = lease.interest().busy() => continue,
+                _ = tokio::time::sleep(WARM_CACHE_LINGER) => {
+                    // Linger elapsed. Evict the dedup entry iff still idle. On
+                    // success, returning drops `subscribe`, sending UNSUBSCRIBE.
+                    if lease.evict_if_idle() {
+                        return Ok(());
+                    }
+                    // Raced with a late joiner right at expiry; re-arm the linger.
+                }
             }
         }
     }

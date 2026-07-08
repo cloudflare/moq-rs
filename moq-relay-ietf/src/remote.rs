@@ -8,12 +8,12 @@ use std::sync::{Arc, Weak};
 
 use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
-use moq_transport::serve::{Track, TrackReader};
+use moq_transport::serve::{Track, TrackInterest, TrackReader};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
+use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError, WARM_CACHE_LINGER};
 
 /// Cache key for upstream relay-to-relay connections.
 ///
@@ -22,7 +22,20 @@ use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
 type RemoteCacheKey = (Url, Option<SocketAddr>);
 type RemoteSlot = Arc<Mutex<Option<Remote>>>;
 type TrackCacheKey = (TrackNamespace, String);
-type TrackSlot = Arc<Mutex<Option<TrackReader>>>;
+type TrackSlot = Arc<Mutex<Option<CachedTrack>>>;
+
+/// A deduplicated cross-relay track subscription.
+///
+/// Mirrors the local dedup cache in `moq-transport`'s `serve::tracks`: many
+/// downstream subscribers share one upstream subscription to a remote relay. The
+/// pinned `reader` clone keeps the track warm; `interest` counts how many
+/// downstream readers are currently live so the subscription task can tear the
+/// upstream subscription down (emitting UNSUBSCRIBE) once the last one leaves.
+#[derive(Clone)]
+struct CachedTrack {
+    reader: TrackReader,
+    interest: TrackInterest,
+}
 
 /// Manages connections to remote relays.
 ///
@@ -234,6 +247,48 @@ async fn remove_empty_track_slot(
     }
 }
 
+/// Log the outcome of a cross-relay track subscription ending.
+fn log_remote_subscription_ended(
+    url: &Url,
+    key: &TrackCacheKey,
+    result: Result<(), moq_transport::serve::ServeError>,
+) {
+    match result {
+        Ok(()) => {
+            tracing::debug!(remote_url = %url, namespace = %key.0, track = %key.1, "remote track subscription ended");
+        }
+        Err(err) => {
+            tracing::warn!(remote_url = %url, namespace = %key.0, track = %key.1, error = %err, "remote track subscription ended with error: {}", err);
+        }
+    }
+}
+
+/// Evict a cross-relay track from its cache slot, but only if the slot still
+/// holds the given reader AND no downstream interest remains.
+///
+/// The interest check runs under the same slot lock that `Remote::subscribe`
+/// holds when handing out readers, so a subscriber that arrives concurrently is
+/// never stranded on a torn-down upstream subscription: it either wins the lock
+/// (interest becomes non-zero and eviction is skipped) or takes the cache-miss
+/// path afterwards and creates a fresh upstream subscription. Returns true if the
+/// entry was evicted.
+async fn evict_remote_track_if_idle(
+    slot: &TrackSlot,
+    reader: &TrackReader,
+    interest: &TrackInterest,
+) -> bool {
+    let mut cached = slot.lock().await;
+    match cached.as_ref() {
+        Some(current)
+            if Arc::ptr_eq(&current.reader.info, &reader.info) && interest.count() == 0 =>
+        {
+            cached.take();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// A connection to a single remote relay with its own QUIC client.
 #[derive(Clone)]
 struct Remote {
@@ -378,9 +433,15 @@ impl Remote {
                 continue;
             }
 
-            if let Some(reader) = cached.as_ref() {
-                if !reader.is_closed() {
-                    return Ok(Some(reader.clone()));
+            if let Some(entry) = cached.as_ref() {
+                if !entry.reader.is_closed() {
+                    // Deduplicate onto the warm upstream subscription. Hand out a
+                    // clone carrying a fresh interest guard (incremented under the
+                    // slot lock, serialized with eviction) so the subscription
+                    // task knows a downstream subscriber is present.
+                    return Ok(Some(
+                        entry.reader.clone().with_interest(entry.interest.guard()),
+                    ));
                 }
 
                 tracing::debug!(remote_url = %self.url, namespace = %key.0, track = %key.1, "removing closed remote track from cache");
@@ -420,32 +481,76 @@ impl Remote {
                 anyhow::bail!("remote connection to {} is closed", self.url);
             }
 
-            *cached = Some(reader.clone());
+            // Per-track interest counter, shared between the pinned cache clone,
+            // the handed-out reader's guard, and the subscription task below.
+            let interest = TrackInterest::new();
+
+            // Attach the first interest guard (count -> 1) BEFORE spawning the
+            // subscription task, so it never observes a spurious idle() at startup.
+            let handed = reader.clone().with_interest(interest.guard());
+
+            *cached = Some(CachedTrack {
+                reader: reader.clone(),
+                interest: interest.clone(),
+            });
             drop(cached);
 
             let cleanup_key = key.clone();
-            let cleanup_reader = reader.clone();
+            let cleanup_reader = reader;
             let cleanup_slot = slot.clone();
+            let cleanup_interest = interest.clone();
             tokio::spawn(async move {
-                tokio::select! {
-                    result = subscribe.closed() => {
-                        match result {
-                            Ok(()) => {
-                                tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription ended");
-                            }
-                            Err(err) => {
-                                tracing::warn!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, error = %err, "remote track subscription ended with error: {}", err);
+                // Hold the upstream subscription until it ends on its own, the
+                // connection is cancelled, or downstream interest stays idle
+                // through the linger window.
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = subscribe.closed() => {
+                            log_remote_subscription_ended(&url, &cleanup_key, result);
+                            break;
+                        }
+                        _ = cancel.cancelled() => {
+                            tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
+                            break;
+                        }
+                        _ = cleanup_interest.idle() => {
+                            // Last downstream subscriber left; linger briefly so an
+                            // instant late-joiner can reattach to the warm upstream
+                            // subscription instead of forcing a fresh SUBSCRIBE.
+                            tokio::select! {
+                                biased;
+                                result = subscribe.closed() => {
+                                    log_remote_subscription_ended(&url, &cleanup_key, result);
+                                    break;
+                                }
+                                _ = cancel.cancelled() => {
+                                    tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
+                                    break;
+                                }
+                                // A new subscriber arrived during the linger; keep serving.
+                                _ = cleanup_interest.busy() => {}
+                                _ = tokio::time::sleep(WARM_CACHE_LINGER) => {
+                                    // Linger elapsed. Evict iff still idle, then tear
+                                    // down (dropping `subscribe` emits UNSUBSCRIBE).
+                                    if evict_remote_track_if_idle(&cleanup_slot, &cleanup_reader, &cleanup_interest).await {
+                                        tracing::info!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track idle; unsubscribing upstream");
+                                        break;
+                                    }
+                                    // Raced with a late joiner right at expiry; re-arm.
+                                }
                             }
                         }
                     }
-                    _ = cancel.cancelled() => {
-                        tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
-                    }
                 }
+
+                // Dropping the upstream subscription emits UNSUBSCRIBE (unless it
+                // already ended). Done explicitly for clarity before slot cleanup.
+                drop(subscribe);
 
                 if let Some(tracks) = tracks.upgrade() {
                     let mut cached = cleanup_slot.lock().await;
-                    if matches!(cached.as_ref(), Some(current) if Arc::ptr_eq(&current.info, &cleanup_reader.info))
+                    if matches!(cached.as_ref(), Some(current) if Arc::ptr_eq(&current.reader.info, &cleanup_reader.info))
                     {
                         cached.take();
                     }
@@ -455,7 +560,7 @@ impl Remote {
                 }
             });
 
-            return Ok(Some(reader));
+            return Ok(Some(handed));
         }
     }
 }

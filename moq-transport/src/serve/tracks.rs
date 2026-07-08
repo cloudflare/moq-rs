@@ -16,9 +16,9 @@
 //! The broadcast is automatically closed with [ServeError::Done] when [Writer] is dropped, or all [Reader]s are dropped.
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
-use super::{ServeError, Track, TrackReader, TrackWriter};
+use super::{ServeError, Track, TrackInterest, TrackReader, TrackWriter};
 use crate::coding::TrackNamespace;
-use crate::watch::{Queue, State};
+use crate::watch::{Queue, State, StateWeak};
 
 /// Full track identifier: namespace + track name
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -51,9 +51,24 @@ impl Tracks {
     }
 }
 
+/// A deduplicated track cache entry.
+struct CachedTrack {
+    /// The pinned reader clone that keeps the track warm for late joiners.
+    ///
+    /// This clone deliberately does NOT carry a [`super::TrackInterestGuard`], so
+    /// it is not counted as downstream interest.
+    reader: TrackReader,
+
+    /// Shared counter of live downstream reader handles for this track.
+    ///
+    /// Incremented for every reader handed to a downstream subscriber (see
+    /// [`TracksReader::subscribe`]) and decremented when that reader is dropped.
+    interest: TrackInterest,
+}
+
 #[derive(Default)]
 pub struct TracksState {
-    tracks: HashMap<FullTrackName, TrackReader>,
+    tracks: HashMap<FullTrackName, CachedTrack>,
 }
 
 /// Publish new tracks for a broadcast by name.
@@ -82,7 +97,13 @@ impl TracksWriter {
             namespace: self.namespace.clone(),
             name: track.to_owned(),
         };
-        self.state.lock_mut()?.tracks.insert(full_name, reader);
+        self.state.lock_mut()?.tracks.insert(
+            full_name,
+            CachedTrack {
+                reader,
+                interest: TrackInterest::new(),
+            },
+        );
 
         Some(writer)
     }
@@ -93,7 +114,11 @@ impl TracksWriter {
             namespace: namespace.clone(),
             name: track_name.to_owned(),
         };
-        self.state.lock_mut()?.tracks.remove(&full_name)
+        self.state
+            .lock_mut()?
+            .tracks
+            .remove(&full_name)
+            .map(|cached| cached.reader)
     }
 }
 
@@ -105,15 +130,81 @@ impl Deref for TracksWriter {
     }
 }
 
+/// A request to create and serve a single track, delivered to the
+/// upstream-subscribe task via [`TracksRequest::next`].
+///
+/// It bundles the [`TrackWriter`] that upstream data is written into with a
+/// [`TrackLease`] the task uses to notice when the last downstream subscriber
+/// has gone away (so it can tear down the upstream subscription and evict the
+/// dedup cache entry).
+pub struct TrackRequest {
+    /// The writer that upstream (relayed) data is fed into.
+    pub writer: TrackWriter,
+
+    /// Downstream-interest lease for this deduplicated track.
+    pub lease: TrackLease,
+}
+
+/// Tracks downstream interest in a deduplicated track, and lets the
+/// upstream-subscribe task evict the shared dedup cache entry once interest is
+/// idle.
+pub struct TrackLease {
+    interest: TrackInterest,
+    state: StateWeak<TracksState>,
+    full_name: FullTrackName,
+}
+
+impl TrackLease {
+    /// The shared downstream-interest counter for this track.
+    ///
+    /// The upstream-subscribe task awaits [`TrackInterest::idle`] /
+    /// [`TrackInterest::busy`] on this to drive the warm-cache linger.
+    pub fn interest(&self) -> &TrackInterest {
+        &self.interest
+    }
+
+    /// Evict this track from the dedup cache, but only if no downstream interest
+    /// remains.
+    ///
+    /// The check and removal happen under the same broadcast lock that
+    /// [`TracksReader::subscribe`] uses to hand out readers, so a subscriber that
+    /// arrives concurrently is never stranded on a torn-down upstream: either it
+    /// wins the lock (interest becomes non-zero and eviction is skipped) or we do
+    /// (the entry is removed and the late subscriber takes the cache-miss path,
+    /// creating a fresh upstream subscription).
+    ///
+    /// Returns true if the entry was evicted (or the broadcast is already gone),
+    /// signalling the caller that it is safe to drop the upstream subscription.
+    pub fn evict_if_idle(&self) -> bool {
+        let state = match self.state.upgrade() {
+            Some(state) => state,
+            // The broadcast is gone; there is nothing left to serve.
+            None => return true,
+        };
+
+        let mut state = match state.lock_mut() {
+            Some(state) => state,
+            None => return true,
+        };
+
+        if self.interest.count() != 0 {
+            return false;
+        }
+
+        state.tracks.remove(&self.full_name);
+        true
+    }
+}
+
 pub struct TracksRequest {
     #[allow(dead_code)] // Avoid dropping the write side
     state: State<TracksState>,
-    incoming: Option<Queue<TrackWriter>>,
+    incoming: Option<Queue<TrackRequest>>,
     pub info: Arc<Tracks>,
 }
 
 impl TracksRequest {
-    fn new(state: State<TracksState>, incoming: Queue<TrackWriter>, info: Arc<Tracks>) -> Self {
+    fn new(state: State<TracksState>, incoming: Queue<TrackRequest>, info: Arc<Tracks>) -> Self {
         Self {
             state,
             incoming: Some(incoming),
@@ -123,7 +214,7 @@ impl TracksRequest {
 
     /// Wait for a request to create a new track.
     /// None is returned if all [TracksReader]s have been dropped.
-    pub async fn next(&mut self) -> Option<TrackWriter> {
+    pub async fn next(&mut self) -> Option<TrackRequest> {
         self.incoming.as_mut()?.pop().await
     }
 }
@@ -148,8 +239,8 @@ impl Drop for TracksRequest {
                 "TracksRequest dropped with pending track requests"
             );
         }
-        for track in pending_tracks {
-            let _ = track.close(ServeError::not_found_ctx(
+        for request in pending_tracks {
+            let _ = request.writer.close(ServeError::not_found_ctx(
                 "tracks request dropped before track handled",
             ));
         }
@@ -162,12 +253,12 @@ impl Drop for TracksRequest {
 #[derive(Clone)]
 pub struct TracksReader {
     state: State<TracksState>,
-    queue: Queue<TrackWriter>,
+    queue: Queue<TrackRequest>,
     pub info: Arc<Tracks>,
 }
 
 impl TracksReader {
-    fn new(state: State<TracksState>, queue: Queue<TrackWriter>, info: Arc<Tracks>) -> Self {
+    fn new(state: State<TracksState>, queue: Queue<TrackRequest>, info: Arc<Tracks>) -> Self {
         Self { state, queue, info }
     }
 
@@ -184,9 +275,11 @@ impl TracksReader {
             name: track_name.to_owned(),
         };
 
-        if let Some(track_reader) = state.tracks.get(&full_name) {
-            if !track_reader.is_closed() {
-                return Some(track_reader.clone());
+        if let Some(cached) = state.tracks.get(&full_name) {
+            if !cached.reader.is_closed() {
+                // NOTE: no interest guard is attached — a track-status probe is
+                // not a real subscription and must not keep the track warm.
+                return Some(cached.reader.clone());
             }
             // Track exists but is closed/stale - don't return it
         }
@@ -201,6 +294,10 @@ impl TracksReader {
         namespace: TrackNamespace,
         track_name: &str,
     ) -> Option<TrackReader> {
+        // A weak handle to the broadcast state, used by the delivered lease to
+        // evict this entry once downstream interest goes idle.
+        let state_weak = self.state.downgrade();
+
         let state = self.state.lock();
         let full_name = FullTrackName {
             namespace: namespace.clone(),
@@ -208,16 +305,19 @@ impl TracksReader {
         };
 
         // Check if we have a cached track that is still alive
-        if let Some(track_reader) = state.tracks.get(&full_name) {
-            if !track_reader.is_closed() {
-                // Track is still active, return the cached reader
+        if let Some(cached) = state.tracks.get(&full_name) {
+            if !cached.reader.is_closed() {
+                // Track is still active, deduplicate onto the warm upstream
+                // subscription. Hand out a clone carrying a fresh interest guard
+                // (incremented under this lock, serialized with eviction) so the
+                // upstream-subscribe task knows a subscriber is present.
                 tracing::debug!(
                     target: "moq_transport::tracks",
                     namespace = %namespace.to_utf8_path(),
                     track = %track_name,
                     "track cache hit (active)"
                 );
-                return Some(track_reader.clone());
+                return Some(cached.reader.clone().with_interest(cached.interest.guard()));
             }
             // Track is closed/stale, fall through to create a new one
             tracing::debug!(
@@ -233,13 +333,29 @@ impl TracksReader {
         // Remove the stale track if it exists (it was closed)
         state.tracks.remove(&full_name);
         // Use the full requested namespace, not self.namespace
-        let track_writer_reader = Track {
+        let (writer, reader) = Track {
             namespace: namespace.clone(),
             name: track_name.to_owned(),
         }
         .produce();
 
-        if self.queue.push(track_writer_reader.0).is_err() {
+        // Per-track interest counter, shared between the pinned cache clone, the
+        // handed-out reader's guard, and the lease delivered to the upstream task.
+        let interest = TrackInterest::new();
+
+        // Attach the first interest guard (count -> 1) BEFORE queueing the request,
+        // so the upstream-subscribe task never observes a spurious idle() before
+        // the caller has started serving. The increment happens under this lock,
+        // serialized with eviction.
+        let handed = reader.clone().with_interest(interest.guard());
+
+        let lease = TrackLease {
+            interest: interest.clone(),
+            state: state_weak,
+            full_name: full_name.clone(),
+        };
+
+        if self.queue.push(TrackRequest { writer, lease }).is_err() {
             tracing::debug!(
                 target: "moq_transport::tracks",
                 namespace = %namespace.to_utf8_path(),
@@ -250,9 +366,14 @@ impl TracksReader {
         }
 
         // We requested the track successfully so we can deduplicate it by full name.
-        state
-            .tracks
-            .insert(full_name, track_writer_reader.1.clone());
+        // The pinned cache clone deliberately carries NO interest guard.
+        state.tracks.insert(
+            full_name,
+            CachedTrack {
+                reader,
+                interest: interest.clone(),
+            },
+        );
 
         tracing::debug!(
             target: "moq_transport::tracks",
@@ -261,7 +382,7 @@ impl TracksReader {
             "track cache miss, requested from upstream"
         );
 
-        Some(track_writer_reader.1)
+        Some(handed)
     }
 }
 
@@ -305,7 +426,8 @@ mod tests {
         let track_writer_1 = request
             .next()
             .await
-            .expect("publisher should receive first track request");
+            .expect("publisher should receive first track request")
+            .writer;
 
         assert_eq!(track_writer_1.name, track_name);
 
@@ -344,7 +466,8 @@ mod tests {
 
         let track_writer_2 = maybe_track_writer_2
             .unwrap()
-            .expect("publisher should receive second track request");
+            .expect("publisher should receive second track request")
+            .writer;
 
         assert_eq!(track_writer_2.name, track_name);
 
@@ -377,8 +500,9 @@ mod tests {
             .subscribe(namespace.clone(), track_name)
             .expect("first subscribe should succeed");
 
-        // Publisher receives request
-        let _track_writer = request
+        // Publisher receives request. Hold the whole request (writer + lease) so
+        // the track stays alive for the dedup check below.
+        let _request = request
             .next()
             .await
             .expect("publisher should receive track request");
@@ -420,7 +544,8 @@ mod tests {
         let track_writer = request
             .next()
             .await
-            .expect("publisher should receive track request");
+            .expect("publisher should receive track request")
+            .writer;
 
         let _subgroups_writer = track_writer
             .subgroups()
@@ -455,7 +580,8 @@ mod tests {
         let track_writer = request
             .next()
             .await
-            .expect("publisher should receive track request");
+            .expect("publisher should receive track request")
+            .writer;
 
         let subgroups_writer = track_writer
             .subgroups()
@@ -477,5 +603,167 @@ mod tests {
         let _second_request = maybe_second_request
             .unwrap()
             .expect("publisher should receive second track request");
+    }
+
+    /// (a) When the last downstream subscriber leaves, the per-track interest
+    /// counter reaches zero, `idle()` fires, and — after the linger — the dedup
+    /// cache entry can be evicted so a future subscriber re-requests upstream.
+    ///
+    /// This is the core of the fix: without interest tracking the pinned cache
+    /// clone kept the track alive forever, so the upstream subscription (and its
+    /// UNSUBSCRIBE) was never released.
+    #[tokio::test]
+    async fn test_interest_idle_allows_eviction_and_resubscribe() {
+        let namespace = TrackNamespace::from_utf8_path("test/namespace");
+        let track_name = "test-track";
+        let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        // A subscriber arrives: cache miss, an upstream request is queued.
+        let track_reader = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("subscribe should succeed");
+
+        let TrackRequest {
+            writer: _upstream_writer,
+            lease,
+        } = request
+            .next()
+            .await
+            .expect("publisher should receive a track request");
+
+        // The pinned cache clone must NOT count as interest — only the one
+        // handed-out reader does.
+        assert_eq!(lease.interest().count(), 1);
+        assert!(
+            !lease.evict_if_idle(),
+            "must not evict while a subscriber is present"
+        );
+
+        // Last subscriber leaves.
+        drop(track_reader);
+
+        // Interest becomes idle (this is what the linger loop awaits before it
+        // drops the upstream Subscribe).
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            lease.interest().idle(),
+        )
+        .await
+        .expect("interest should become idle after the last reader drops");
+        assert_eq!(lease.interest().count(), 0);
+
+        // After the linger, still idle: the entry is evicted (the caller would
+        // then drop its Subscribe, emitting the upstream UNSUBSCRIBE).
+        assert!(lease.evict_if_idle(), "idle track should be evictable");
+
+        // The dedup cache no longer pins the track, so a fresh subscribe takes the
+        // cache-miss path and re-requests from upstream.
+        let _track_reader_2 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("re-subscribe should succeed");
+        let maybe_new =
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.next()).await;
+        assert!(
+            maybe_new.is_ok(),
+            "a new upstream request should be issued after eviction"
+        );
+    }
+
+    /// (b) A late joiner that arrives during the linger window (a cache hit)
+    /// re-arms interest, so the eviction check refuses and the warm upstream
+    /// subscription is kept — no new upstream request is issued.
+    #[tokio::test]
+    async fn test_resubscribe_during_linger_keeps_subscription() {
+        let namespace = TrackNamespace::from_utf8_path("test/namespace");
+        let track_name = "test-track";
+        let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        let track_reader_1 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("subscribe should succeed");
+        let TrackRequest {
+            writer: _upstream_writer,
+            lease,
+        } = request
+            .next()
+            .await
+            .expect("publisher should receive a track request");
+
+        // Subscriber leaves -> interest idle -> linger begins.
+        drop(track_reader_1);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            lease.interest().idle(),
+        )
+        .await
+        .expect("interest should become idle");
+        assert_eq!(lease.interest().count(), 0);
+
+        // A late joiner arrives DURING the linger: cache hit, interest re-armed.
+        let _track_reader_2 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("re-subscribe should succeed");
+        assert_eq!(lease.interest().count(), 1);
+
+        // The linger's eviction check now refuses: the warm subscription is kept.
+        assert!(
+            !lease.evict_if_idle(),
+            "must not evict while a late joiner is present"
+        );
+
+        // No new upstream request was issued (still deduped onto the warm subscription).
+        let maybe_new =
+            tokio::time::timeout(std::time::Duration::from_millis(100), request.next()).await;
+        assert!(
+            maybe_new.is_err(),
+            "no new upstream request should be issued for a cache hit during linger"
+        );
+    }
+
+    /// (c) After the entry is evicted, a brand-new subscriber creates a genuinely
+    /// fresh upstream subscription (new writer + new interest counter).
+    #[tokio::test]
+    async fn test_resubscribe_after_eviction_creates_new_upstream() {
+        let namespace = TrackNamespace::from_utf8_path("test/namespace");
+        let track_name = "test-track";
+        let (_writer, mut request, mut reader) = Tracks::new(namespace.clone()).produce();
+
+        let track_reader = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("subscribe should succeed");
+        let TrackRequest {
+            writer: upstream_writer_1,
+            lease,
+        } = request
+            .next()
+            .await
+            .expect("publisher should receive a track request");
+
+        drop(track_reader);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            lease.interest().idle(),
+        )
+        .await
+        .expect("interest should become idle");
+        assert!(lease.evict_if_idle(), "idle track should be evictable");
+        // Simulate the upstream-subscribe task tearing down after eviction.
+        drop(upstream_writer_1);
+        drop(lease);
+
+        // A brand-new subscriber triggers a fresh upstream subscription.
+        let track_reader_2 = reader
+            .subscribe(namespace.clone(), track_name)
+            .expect("re-subscribe should succeed");
+        let request_2 = tokio::time::timeout(std::time::Duration::from_millis(100), request.next())
+            .await
+            .expect("publisher should receive a request")
+            .expect("a new upstream request should be issued after eviction");
+
+        assert_eq!(request_2.writer.name, track_name);
+        // The new request carries its own, independent interest counter, already
+        // reflecting the single live downstream reader.
+        assert_eq!(request_2.lease.interest().count(), 1);
+        drop(track_reader_2);
     }
 }
