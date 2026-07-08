@@ -232,7 +232,11 @@ impl Subscribe {
         loop {
             {
                 let state = self.state.lock();
-                state.closed.clone()?;
+                match state.closed.clone() {
+                    Ok(()) => {}
+                    Err(ServeError::Done) => return Ok(()),
+                    Err(err) => return Err(err),
+                }
 
                 match state.modified() {
                     Some(notify) => notify,
@@ -442,5 +446,45 @@ mod tests {
 
         assert!(!filter.allows(0, 0));
         assert!(!filter.allows(100, 100));
+    }
+
+    #[tokio::test]
+    async fn closed_returns_ok_for_track_ended() {
+        let rid = crate::session::RequestId::new(0, 100, 100, 0);
+        let subscriber = crate::session::Subscriber::new(
+            crate::session::Queue::default(),
+            None,
+            rid,
+            crate::session::PendingRequests::default(),
+        );
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let (subscribe, recv) = Subscribe::new(subscriber, 1, writer);
+
+        recv.error(ServeError::Done).unwrap();
+
+        assert_eq!(subscribe.closed().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn closed_returns_error_for_non_track_ended() {
+        let rid = crate::session::RequestId::new(0, 100, 100, 0);
+        let subscriber = crate::session::Subscriber::new(
+            crate::session::Queue::default(),
+            None,
+            rid,
+            crate::session::PendingRequests::default(),
+        );
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let (subscribe, recv) = Subscribe::new(subscriber, 1, writer);
+
+        recv.error(ServeError::Closed(message::PublishDoneCode::Expired as u64))
+            .unwrap();
+
+        assert!(matches!(
+            subscribe.closed().await,
+            Err(ServeError::Closed(code)) if code == message::PublishDoneCode::Expired as u64
+        ));
     }
 }

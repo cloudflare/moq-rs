@@ -708,7 +708,12 @@ impl Subscriber {
     fn recv_publish_done(&mut self, msg: &message::PublishDone) -> Result<(), SessionError> {
         // Check SUBSCRIBE-initiated subscriptions first.
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
-            subscribe.error(ServeError::Closed(msg.status_code))?;
+            let err = if msg.status_code == message::PublishDoneCode::TrackEnded as u64 {
+                ServeError::Done
+            } else {
+                ServeError::Closed(msg.status_code)
+            };
+            subscribe.error(err)?;
             return Ok(());
         }
 

@@ -166,7 +166,11 @@ impl PublishReceived {
         loop {
             {
                 let state = self.state.lock();
-                state.closed.clone()?;
+                match state.closed.clone() {
+                    Ok(()) => {}
+                    Err(ServeError::Done) => return Ok(()),
+                    Err(err) => return Err(err),
+                }
                 match state.modified() {
                     Some(notify) => notify,
                     None => return Ok(()),
@@ -440,9 +444,30 @@ mod tests {
         assert!(recv.writer.is_none());
     }
 
+    #[tokio::test]
+    async fn closed_returns_ok_for_track_ended() {
+        let (pr, mut recv, _sub) = make_pair(3);
+
+        recv.recv_done(message::PublishDoneCode::TrackEnded as u64);
+
+        assert_eq!(pr.closed().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn closed_returns_error_for_non_track_ended() {
+        let (pr, mut recv, _sub) = make_pair(4);
+
+        recv.recv_done(message::PublishDoneCode::Expired as u64);
+
+        assert!(matches!(
+            pr.closed().await,
+            Err(ServeError::Closed(code)) if code == message::PublishDoneCode::Expired as u64
+        ));
+    }
+
     #[test]
     fn publish_received_drop_without_ok_does_not_panic() {
-        let (pr, _recv, _sub) = make_pair(3);
+        let (pr, _recv, _sub) = make_pair(5);
         // Drop without calling ok() — should send REQUEST_ERROR, not panic.
         drop(pr);
     }
