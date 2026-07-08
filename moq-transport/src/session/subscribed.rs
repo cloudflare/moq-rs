@@ -276,9 +276,10 @@ impl Subscribed {
         }
 
         let mut object_count = 0;
+        let mut current_object_id: u64 = 0;
         while let Some(mut subgroup_object_reader) = subgroup_reader.next().await? {
             let subgroup_object = data::SubgroupObjectExt {
-                object_id_delta: 0, // before delta logic, used to be subgroup_object_reader.object_id,
+                object_id_delta: subgroup_object_reader.object_id - current_object_id,
                 extension_headers: subgroup_object_reader.extension_headers.clone(), // Pass through extension headers
                 payload_length: subgroup_object_reader.size,
                 status: if subgroup_object_reader.size == 0 {
@@ -346,6 +347,7 @@ impl Subscribed {
                 chunks_sent,
                 bytes_sent
             );
+            current_object_id = subgroup_object_reader.object_id;
             object_count += 1;
         }
 
