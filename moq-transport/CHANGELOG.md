@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.15.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.14.2...moq-transport-v0.15.0) - 2026-07-08
 
+### Added
+
+- add draft-16 PUBLISH, PUBLISH_OK, and PUBLISH_DONE support for publisher-initiated track delivery
+
 ### Fixed
 
 - ignore stale unsubscribe ids

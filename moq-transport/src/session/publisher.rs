@@ -36,6 +36,16 @@ impl NameRegistry {
         self.by_name.contains_key(name)
     }
 
+    fn reserve(&mut self, name: FullTrackName, id: u64) -> bool {
+        if self.by_name.contains_key(&name) || self.by_id.contains_key(&id) {
+            return false;
+        }
+
+        self.by_id.insert(id, name.clone());
+        self.by_name.insert(name, id);
+        true
+    }
+
     fn insert(&mut self, name: FullTrackName, id: u64) {
         if let Some(old_name) = self.by_id.insert(id, name.clone()) {
             self.by_name.remove(&old_name);
@@ -277,37 +287,6 @@ impl Publisher {
             name: track.name.clone(),
         };
 
-        // §5.1: this endpoint can have at most one publisher-role subscription
-        // for a track.  Inbound SUBSCRIBE and outbound PUBLISH are both
-        // publisher-role subscriptions from this endpoint's perspective.
-        {
-            let subscribed_names = self
-                .subscribed_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            let published_names = self
-                .published_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            if subscribed_names.contains_name(&full_name)
-                || published_names.contains_name(&full_name)
-            {
-                return Err(SessionError::Serve(ServeError::Duplicate));
-            }
-        }
-
-        let request_id = match self.request_id.allocate()? {
-            RequestIdAllocation::Allocated(id) => id,
-            blocked @ RequestIdAllocation::Blocked { .. } => {
-                if let Some(msg) = blocked.requests_blocked() {
-                    let _ = self.outgoing.push(msg.into());
-                }
-                return Err(SessionError::TooManyRequests);
-            }
-        };
-
-        let track_alias = request_id;
-
         if let Some(largest) = track.largest_location() {
             params
                 .set_largest_object(largest)
@@ -320,6 +299,43 @@ impl Publisher {
             .unwrap_or(true);
         let largest_location = params.largest_object().map_err(SessionError::Decode)?;
 
+        // §5.1: this endpoint can have at most one publisher-role subscription
+        // for a track. Inbound SUBSCRIBE and outbound PUBLISH are both
+        // publisher-role subscriptions from this endpoint's perspective. Keep
+        // the duplicate check and published-name reservation atomic.
+        let request_id = {
+            let subscribed_names = self
+                .subscribed_names
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            let mut published_names = self
+                .published_names
+                .lock()
+                .map_err(|_| SessionError::Internal)?;
+            if subscribed_names.contains_name(&full_name)
+                || published_names.contains_name(&full_name)
+            {
+                return Err(SessionError::Serve(ServeError::Duplicate));
+            }
+
+            let request_id = match self.request_id.allocate()? {
+                RequestIdAllocation::Allocated(id) => id,
+                blocked @ RequestIdAllocation::Blocked { .. } => {
+                    if let Some(msg) = blocked.requests_blocked() {
+                        let _ = self.outgoing.push(msg.into());
+                    }
+                    return Err(SessionError::TooManyRequests);
+                }
+            };
+
+            if !published_names.reserve(full_name.clone(), request_id) {
+                return Err(SessionError::Duplicate);
+            }
+            request_id
+        };
+
+        let track_alias = request_id;
+
         let info = PublishedInfo {
             id: request_id,
             track_namespace: track.namespace.clone(),
@@ -330,21 +346,22 @@ impl Publisher {
         };
 
         let (published_state, recv_state) = split_published_state(forward);
-        let published = Published::new(self.clone(), info, published_state, track);
 
         // Register state before queuing PUBLISH so fast PUBLISH_OK / REQUEST_ERROR
         // can be routed.
-        {
-            let mut published_names = self
-                .published_names
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            let mut publisheds = self.publisheds.lock().map_err(|_| SessionError::Internal)?;
-            published_names.insert(full_name, request_id);
-            publisheds.insert(
-                request_id,
-                PublishedEntry::new(PublishedRecv::new(recv_state)),
-            );
+        match self.publisheds.lock() {
+            Ok(mut publisheds) => {
+                publisheds.insert(
+                    request_id,
+                    PublishedEntry::new(PublishedRecv::new(recv_state)),
+                );
+            }
+            Err(_) => {
+                if let Ok(mut published_names) = self.published_names.lock() {
+                    published_names.remove_id(request_id);
+                }
+                return Err(SessionError::Internal);
+            }
         }
         if let Err(err) = self
             .pending_requests
@@ -354,14 +371,16 @@ impl Publisher {
             return Err(err);
         }
 
-        self.send_message(message::Publish {
+        let msg = message::Publish {
             id: request_id,
-            track_namespace: published.info.track_namespace.clone(),
-            track_name: published.info.track_name.clone(),
+            track_namespace: info.track_namespace.clone(),
+            track_name: info.track_name.clone(),
             track_alias,
             params,
             track_extensions: Default::default(),
-        });
+        };
+        let published = Published::new(self.clone(), info, published_state, track);
+        self.send_message(msg);
 
         Ok(published)
     }
@@ -925,5 +944,18 @@ mod tests {
         let names = subscribed_names.lock().unwrap();
         assert!(!names.contains_name(&unsubscribed_track));
         assert_eq!(names.by_name.get(&active_track), Some(&8));
+    }
+
+    #[test]
+    fn name_registry_reserve_rejects_duplicate_without_overwrite() {
+        let mut names = NameRegistry::default();
+        let track = full_track_name("bb1", "video.m4s");
+
+        assert!(names.reserve(track.clone(), 6));
+        assert!(!names.reserve(track.clone(), 8));
+
+        assert_eq!(names.by_name.get(&track), Some(&6));
+        assert_eq!(names.by_id.get(&6), Some(&track));
+        assert!(!names.by_id.contains_key(&8));
     }
 }

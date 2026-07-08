@@ -218,7 +218,7 @@ impl Consumer {
             Err(_) => {
                 metrics::counter!("moq_relay_publish_errors_total", "phase" => "session_limit")
                     .increment(1);
-                publish.close(ServeError::Closed(RequestErrorCode::Uninterested as u64));
+                publish.close(ServeError::Closed(RequestErrorCode::InternalError as u64));
                 return Err(ServeError::Cancel.into());
             }
         };

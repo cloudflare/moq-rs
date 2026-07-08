@@ -32,7 +32,7 @@ struct CoordinatorData {
     #[serde(default)]
     namespaces: HashMap<String, HashMap<String, String>>,
     /// Maps connection scope to exact full-track map.
-    /// Key format: `<namespace utf8 path>--<track utf8/lossy>`.
+    /// Key format: `<namespace utf8 byte len>:<namespace utf8 path><track utf8/lossy>`.
     #[serde(default)]
     tracks: HashMap<String, HashMap<String, String>>,
 }
@@ -47,7 +47,8 @@ impl CoordinatorData {
     }
 
     fn track_key(namespace: &TrackNamespace, track: &str) -> String {
-        format!("{}--{}", namespace.to_utf8_path(), track)
+        let namespace = namespace.to_utf8_path();
+        format!("{}:{}{}", namespace.len(), namespace, track)
     }
 }
 
@@ -512,6 +513,40 @@ mod tests {
         assert_eq!(origin.namespace(), &namespace);
         assert_eq!(origin.url(), relay_url);
         assert!(client.is_none());
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn lookup_track_distinguishes_separator_text_in_namespace_and_track() {
+        let file = temp_file_path("track-key-collision");
+        let relay_a = Url::parse("https://relay-a.example.com").unwrap();
+        let relay_b = Url::parse("https://relay-b.example.com").unwrap();
+        let coordinator_a = FileCoordinator::new(&file, relay_a.clone());
+        let coordinator_b = FileCoordinator::new(&file, relay_b.clone());
+        let namespace_a = TrackNamespace::from_utf8_path("room--audio");
+        let namespace_b = TrackNamespace::from_utf8_path("room");
+
+        let _track_a = coordinator_a
+            .register_track(Some("scope-a"), &namespace_a, "main")
+            .await
+            .expect("first track should register");
+        let _track_b = coordinator_b
+            .register_track(Some("scope-a"), &namespace_b, "audio--main")
+            .await
+            .expect("second track should register");
+
+        let (origin_a, _) = coordinator_a
+            .lookup_track(Some("scope-a"), &namespace_a, "main")
+            .await
+            .expect("first track lookup should find original relay");
+        let (origin_b, _) = coordinator_a
+            .lookup_track(Some("scope-a"), &namespace_b, "audio--main")
+            .await
+            .expect("second track lookup should find original relay");
+
+        assert_eq!(origin_a.url(), relay_a);
+        assert_eq!(origin_b.url(), relay_b);
 
         let _ = std::fs::remove_file(file);
     }

@@ -258,22 +258,18 @@ impl Subscriber {
     }
 
     fn remove_publish_received_state(&self, request_id: u64) -> Result<(), SessionError> {
-        let mut publishes_received = self
-            .publishes_received
+        self.publishes_received
             .lock()
-            .map_err(|_| SessionError::Internal)?;
-        let mut aliases = self
-            .track_alias_map
+            .map_err(|_| SessionError::Internal)?
+            .remove(&request_id);
+        self.track_alias_map
             .lock()
-            .map_err(|_| SessionError::Internal)?;
-        let mut names = self
-            .subscriber_names
+            .map_err(|_| SessionError::Internal)?
+            .remove_by_request_id(request_id);
+        self.subscriber_names
             .lock()
-            .map_err(|_| SessionError::Internal)?;
-
-        publishes_received.remove(&request_id);
-        aliases.remove_by_request_id(request_id);
-        names.remove_by_request_id(request_id);
+            .map_err(|_| SessionError::Internal)?
+            .remove_by_request_id(request_id);
         Ok(())
     }
 
@@ -595,8 +591,8 @@ impl Subscriber {
             .unwrap_or(true);
         let largest_location = msg.params.largest_object().map_err(SessionError::Decode)?;
 
-        // Reserve the alias and track name before queueing the PublishReceived.
-        // The duplicate-subscription check intentionally runs before the alias
+        // Reserve the track name before queueing the PublishReceived. The
+        // duplicate-subscription check intentionally runs before the alias
         // check so a duplicate PUBLISH for the same track is rejected as a
         // request error instead of a duplicate-alias session close.
         {
@@ -618,19 +614,29 @@ impl Subscriber {
                 return Ok(());
             }
 
-            let mut aliases = self
-                .track_alias_map
-                .lock()
-                .map_err(|_| SessionError::Internal)?;
-            if aliases.contains_alias(msg.track_alias) {
-                // §9.13: duplicate Track Alias for a different track closes the session.
-                return Err(SessionError::Duplicate);
-            }
-
             names.insert(full_name.clone(), msg.id);
-            aliases
-                .insert(msg.track_alias, TrackOrigin::Publish(msg.id))
-                .map_err(|_| SessionError::Duplicate)?;
+        }
+
+        // Then reserve the alias without holding subscriber_names, avoiding a
+        // lock-order dependency between cleanup and inbound PUBLISH handling.
+        let alias_result = match self.track_alias_map.lock() {
+            Ok(mut aliases) => {
+                if aliases.contains_alias(msg.track_alias) {
+                    // §9.13: duplicate Track Alias for a different track closes the session.
+                    Err(SessionError::Duplicate)
+                } else {
+                    aliases
+                        .insert(msg.track_alias, TrackOrigin::Publish(msg.id))
+                        .map_err(|_| SessionError::Duplicate)
+                }
+            }
+            Err(_) => Err(SessionError::Internal),
+        };
+        if let Err(err) = alias_result {
+            if let Ok(mut names) = self.subscriber_names.lock() {
+                names.remove_by_request_id(msg.id);
+            }
+            return Err(err);
         }
 
         // Allocate the track.  The transport owns the writer; the application
@@ -1390,6 +1396,16 @@ mod tests {
         let err = subscriber.recv_publish(&publish_msg(3, 10, "1.mp4"));
 
         assert!(matches!(err, Err(SessionError::Duplicate)));
+
+        let failed_name = FullTrackName {
+            namespace: TrackNamespace::from_utf8_path("test"),
+            name: TrackName::from("1.mp4"),
+        };
+        assert!(!subscriber
+            .subscriber_names
+            .lock()
+            .unwrap()
+            .contains_name(&failed_name));
     }
 
     #[test]

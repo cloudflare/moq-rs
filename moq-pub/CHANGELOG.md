@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.8.16](https://github.com/cloudflare/moq-rs/compare/moq-pub-v0.8.15...moq-pub-v0.8.16) - 2026-07-08
 
+### Added
+
+- add `--publish` mode to push newly created tracks with PUBLISH after announcing the namespace
+
 ### Other
 
 - Merge pull request #170 from itzmanish/draft-16-rewrite

@@ -1007,10 +1007,14 @@ impl Session {
                 "SUBSCRIBE_OK completed unexpected {:?} request {}",
                 request, msg.id
             ))),
-            None => subscriber
-                .as_mut()
-                .ok_or(SessionError::RoleViolation)?
-                .recv_subscribe_ok(&msg),
+            None => {
+                tracing::debug!(
+                    target: "moq_transport::control",
+                    request_id = msg.id,
+                    "received SUBSCRIBE_OK for unknown outbound request — ignoring"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -1165,5 +1169,23 @@ mod tests {
         // Exactly at the limit (1024 total including leading slash)
         let path = format!("/{}", "a".repeat(Session::MAX_CONNECTION_PATH_LEN - 1));
         assert!(Session::normalize_connection_path(&path).is_ok());
+    }
+
+    #[test]
+    fn subscribe_ok_for_unknown_request_id_is_ignored() {
+        let pending_requests = PendingRequests::default();
+        let mut subscriber = None;
+
+        Session::recv_subscribe_ok(
+            &pending_requests,
+            &mut subscriber,
+            message::SubscribeOk {
+                id: 42,
+                track_alias: 7,
+                params: Default::default(),
+                track_extensions: Default::default(),
+            },
+        )
+        .unwrap();
     }
 }

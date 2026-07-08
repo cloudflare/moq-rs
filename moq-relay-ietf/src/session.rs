@@ -59,9 +59,10 @@ impl Session {
     /// Dropping a `PublishedNamespace` without calling `ok()` triggers its
     /// `Drop` impl, which sends REQUEST_ERROR back to the peer.
     async fn drain_and_reject_publishes(subscriber: Subscriber) -> Result<(), SessionError> {
+        let mut namespace_subscriber = subscriber.clone();
+        let mut publish_subscriber = subscriber;
+
         loop {
-            let mut namespace_subscriber = subscriber.clone();
-            let mut publish_subscriber = subscriber.clone();
             tokio::select! {
                 Some(published_ns) = namespace_subscriber.published_namespace() => {
                     tracing::debug!(

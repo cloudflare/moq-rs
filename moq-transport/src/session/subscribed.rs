@@ -146,7 +146,9 @@ impl ObjectForwarder {
         delivery_filter: DeliveryFilter,
     ) -> Result<(), SessionError> {
         match track.mode().await? {
-            TrackReaderMode::Stream(_stream) => panic!("deprecated"),
+            TrackReaderMode::Stream(_stream) => Err(SessionError::Serve(
+                ServeError::not_implemented_ctx("stream track reader mode"),
+            )),
             TrackReaderMode::Subgroups(subgroups) => {
                 self.serve_subgroups(subgroups, delivery_filter).await
             }

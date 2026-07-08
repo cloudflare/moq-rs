@@ -22,6 +22,7 @@ This repository provides:
 **Supported:**
 - CLIENT_SETUP / SERVER_SETUP
 - PUBLISH_NAMESPACE
+- PUBLISH / PUBLISH_OK / PUBLISH_DONE
 - SUBSCRIBE
 - WebTransport and raw QUIC transport layers
 - Both stream ("subgroup") and datagram delivery modes
