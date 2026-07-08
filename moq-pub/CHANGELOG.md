@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - Merge pull request #170 from itzmanish/draft-16-rewrite
+- Update publisher CLI dependencies for the draft-16 transport/native stack.
 
 ## [0.8.15](https://github.com/cloudflare/moq-rs/compare/moq-pub-v0.8.14...moq-pub-v0.8.15) - 2026-06-10
 

@@ -32,6 +32,7 @@ pub struct PublishedInfo {
 pub(crate) struct PublishedState {
     ok: bool,
     forward: bool,
+    unsubscribed: bool,
     closed: Result<(), ServeError>,
 }
 
@@ -40,6 +41,7 @@ impl PublishedState {
         Self {
             ok: false,
             forward,
+            unsubscribed: false,
             closed: Ok(()),
         }
     }
@@ -55,7 +57,6 @@ pub struct Published {
     publisher: Publisher,
     state: State<PublishedState>,
     track: Option<TrackReader>,
-    served: bool,
 
     pub info: PublishedInfo,
 }
@@ -71,7 +72,6 @@ impl Published {
             publisher,
             state,
             track: Some(track),
-            served: false,
             info,
         }
     }
@@ -115,14 +115,26 @@ impl Published {
     /// This waits for PUBLISH_OK before serving. draft-16 allows serving before
     /// PUBLISH_OK, but does not require it; waiting keeps the first cut simple.
     pub async fn serve(mut self) -> Result<(), SessionError> {
+        let res = self.serve_inner().await;
+        if let Err(err) = &res {
+            self.close_state(err.clone().into())?;
+        }
+
+        res
+    }
+
+    async fn serve_inner(&mut self) -> Result<(), SessionError> {
         self.ok().await?;
 
         let forward = self.state.lock().forward;
         if !forward {
-            let res = self.closed().await;
-            self.served = true;
+            let track = self.track.take().ok_or(SessionError::Internal)?;
+            let res = tokio::select! {
+                res = track.closed() => res,
+                res = self.closed() => res,
+            };
             return match res {
-                Ok(()) | Err(ServeError::Cancel) => Ok(()),
+                Ok(()) | Err(ServeError::Done | ServeError::Cancel) => Ok(()),
                 Err(err) => Err(err.into()),
             };
         }
@@ -141,7 +153,6 @@ impl Published {
             end_group_id: None,
         };
 
-        self.served = true;
         match forwarder.serve(track, delivery_filter).await {
             Err(SessionError::Serve(ServeError::Cancel)) => Ok(()),
             res => res,
@@ -149,6 +160,10 @@ impl Published {
     }
 
     pub fn close(self, err: ServeError) -> Result<(), ServeError> {
+        self.close_state(err)
+    }
+
+    fn close_state(&self, err: ServeError) -> Result<(), ServeError> {
         let state = self
             .state
             .try_lock()
@@ -172,10 +187,6 @@ impl ops::Deref for Published {
 
 impl Drop for Published {
     fn drop(&mut self) {
-        if self.served {
-            return;
-        }
-
         let state = match self.state.try_lock() {
             Ok(state) => state,
             Err(_) => {
@@ -186,19 +197,9 @@ impl Drop for Published {
                 return;
             }
         };
-        // If the subscriber rejected the PUBLISH with REQUEST_ERROR before it
-        // became established, the request is already terminal (§5.1). Do not
-        // send a second terminal message.
-        if !state.ok && state.closed.is_err() {
+        let Some(err) = publish_done_error_on_drop(&state) else {
             return;
-        }
-
-        let err = state
-            .closed
-            .as_ref()
-            .err()
-            .cloned()
-            .unwrap_or(ServeError::Done);
+        };
         drop(state);
 
         if self
@@ -252,7 +253,15 @@ impl PublishedRecv {
     }
 
     pub fn recv_unsubscribe(&mut self) -> Result<(), ServeError> {
-        self.recv_error(ServeError::Cancel)
+        let state = self.state.lock();
+        state.closed.clone()?;
+
+        if let Some(mut state) = state.into_mut() {
+            state.unsubscribed = true;
+            state.closed = Err(ServeError::Cancel);
+        }
+
+        Ok(())
     }
 }
 
@@ -268,6 +277,24 @@ fn publish_done_code(err: &ServeError) -> u64 {
         ServeError::Closed(code) => *code,
         _ => message::PublishDoneCode::InternalError as u64,
     }
+}
+
+fn publish_done_error_on_drop(state: &PublishedState) -> Option<ServeError> {
+    // If the subscriber rejected the PUBLISH with REQUEST_ERROR before it
+    // became established, the request is already terminal (§5.1). If the
+    // subscriber sent UNSUBSCRIBE, it already terminated its side.
+    if state.unsubscribed || (!state.ok && state.closed.is_err()) {
+        return None;
+    }
+
+    Some(
+        state
+            .closed
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or(ServeError::Done),
+    )
 }
 
 #[cfg(test)]
@@ -294,5 +321,34 @@ mod tests {
             publish_done_code(&ServeError::Done),
             message::PublishDoneCode::TrackEnded as u64
         );
+    }
+
+    #[test]
+    fn drop_terminal_error_sends_done_after_accepted_normal_completion() {
+        let mut state = PublishedState::new(true);
+        state.ok = true;
+
+        assert_eq!(publish_done_error_on_drop(&state), Some(ServeError::Done));
+    }
+
+    #[test]
+    fn drop_terminal_error_skips_pre_accept_rejection() {
+        let mut state = PublishedState::new(true);
+        state.closed = Err(ServeError::Closed(123));
+
+        assert_eq!(publish_done_error_on_drop(&state), None);
+    }
+
+    #[test]
+    fn recv_unsubscribe_marks_unsubscribed_and_closes() {
+        let (_send, recv_state) = split_published_state(true);
+        let mut recv = PublishedRecv::new(recv_state);
+
+        recv.recv_unsubscribe().unwrap();
+
+        let state = recv.state.lock();
+        assert!(state.unsubscribed);
+        assert!(matches!(state.closed, Err(ServeError::Cancel)));
+        assert_eq!(publish_done_error_on_drop(&state), None);
     }
 }

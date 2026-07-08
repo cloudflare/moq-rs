@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - Merge pull request #170 from itzmanish/draft-16-rewrite
+- Update the clock example to run on the draft-16 transport/native stack.
 
 ## [0.6.15](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.14...moq-clock-ietf-v0.6.15) - 2026-06-10
 

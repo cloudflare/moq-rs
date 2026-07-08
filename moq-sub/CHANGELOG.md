@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - update Cargo.lock dependencies
+- Update subscriber CLI dependencies for the draft-16 transport/native stack.
 
 ## [0.4.9](https://github.com/cloudflare/moq-rs/compare/moq-sub-v0.4.8...moq-sub-v0.4.9) - 2026-06-10
 

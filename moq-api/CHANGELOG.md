@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - update Cargo.lock dependencies
+- Refresh locked dependencies for the draft-16 release train; no moq-api behavior changes.
 
 ## [0.2.10](https://github.com/cloudflare/moq-rs/compare/moq-api-v0.2.9...moq-api-v0.2.10) - 2026-03-31
 

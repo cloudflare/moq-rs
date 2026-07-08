@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - Merge pull request #170 from itzmanish/draft-16-rewrite
+- Update native QUIC/WebTransport helpers to use the moq-transport 0.15 draft-16 session stack.
 
 ## [0.9.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.8.0...moq-native-ietf-v0.9.0) - 2026-06-10
 
