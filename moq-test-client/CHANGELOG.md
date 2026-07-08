@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add direct PUBLISH interop scenarios for publisher-only completion and exact-track subscriber routing.
+
 ## [0.1.8](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.7...moq-test-client-v0.1.8) - 2026-07-08
 
 ### Other

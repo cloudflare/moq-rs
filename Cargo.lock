@@ -1378,6 +1378,7 @@ name = "moq-test-client"
 version = "0.1.8"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "moq-native-ietf",
  "moq-transport",

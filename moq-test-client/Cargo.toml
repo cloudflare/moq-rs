@@ -23,6 +23,7 @@ moq-transport = { path = "../moq-transport", version = "0.15" }
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.9" }
 web-transport = { workspace = true }
 
+bytes = "1"
 url = "2"
 
 # Async stuff

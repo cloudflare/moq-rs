@@ -50,6 +50,8 @@ moq-test-client --relay https://localhost:4443 --tls-disable-verify
 | `publish-namespace-subscribe` | Publisher sends PUBLISH_NAMESPACE, subscriber subscribes, verify handshake |
 | `subscribe-before-publish-namespace` | Subscriber subscribes before publisher sends PUBLISH_NAMESPACE |
 | `publish-namespace-done` | Send PUBLISH_NAMESPACE, then send PUBLISH_NAMESPACE_DONE |
+| `publish-track-only` | Publisher sends direct PUBLISH, receives PUBLISH_OK, then sends PUBLISH_DONE |
+| `publish-track-subscribe` | Publisher sends direct PUBLISH, subscriber subscribes to the exact track |
 
 ## Running with moq-relay
 
@@ -83,8 +85,10 @@ Relay: https://localhost:4443
 ✓ publish-namespace-subscribe (127 ms)
 ✓ subscribe-before-publish-namespace (89 ms)
 ✓ publish-namespace-done (45 ms)
+✓ publish-track-only (42 ms)
+✓ publish-track-subscribe (76 ms)
 
-Results: 6 passed, 0 failed
+Results: 8 passed, 0 failed
 
 MOQT_TEST_RESULT: SUCCESS
 ```
@@ -114,6 +118,8 @@ The test cases implemented here correspond to the specifications in [moq-interop
 | `setup-only` | MoQT §3.3, §9.3 |
 | `publish-namespace-only` | MoQT §6.2, §9.23-9.24 |
 | `publish-namespace-done` | MoQT §6.2, §9.26 |
+| `publish-track-only` | MoQT §9.13-9.15 |
+| `publish-track-subscribe` | MoQT §5.1, §9.9-9.15 |
 | `subscribe-error` | MoQT §5.1, §9.7, §9.9 |
 | `publish-namespace-subscribe` | MoQT §5.1, §6.2, §9.7-9.8, §9.23-9.24 |
 | `subscribe-before-publish-namespace` | MoQT §5.1, §6.2 |
