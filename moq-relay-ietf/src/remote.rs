@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use moq_native_ietf::quic;
-use moq_transport::coding::{TrackName, TrackNamespace};
-use moq_transport::serve::{Track, TrackReader};
-use moq_transport::session::SessionConfig;
+use moq_transport::coding::{KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix};
+use moq_transport::message::SubscribeOptions;
+use moq_transport::serve::{Track, TrackReader, TracksReader};
+use moq_transport::session::{Publisher, SessionConfig, SubscribeNamespace};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -101,6 +102,50 @@ mod tests {
         assert_eq!(peer.url, url);
         assert_eq!(peer.addr, Some(addr));
     }
+
+    #[tokio::test]
+    async fn subscribe_namespace_to_without_clients_errors() {
+        // No QUIC clients configured, so get_or_connect() fails before any
+        // network activity. This exercises the new forwarding entry point's
+        // connect + error plumbing without needing a live peer.
+        let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![]);
+        let relay = RelayInfo::new(Url::parse("https://relay.example.com/live").unwrap());
+
+        let result = manager
+            .subscribe_namespace_to(
+                &relay,
+                TrackNamespacePrefix::from_utf8_path("example.com"),
+                SubscribeOptions::Namespace,
+            )
+            .await;
+
+        // `SubscribeNamespace` is not `Debug`, so match rather than expect_err.
+        let err = match result {
+            Ok(_) => panic!("expected connect failure with no clients"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("no QUIC clients configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_namespace_to_without_clients_errors() {
+        let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![]);
+        let relay = RelayInfo::new(Url::parse("https://relay.example.com/live").unwrap());
+        let (_writer, _request, reader) =
+            moq_transport::serve::Tracks::new(TrackNamespace::from_utf8_path("example.com"))
+                .produce();
+
+        let result = manager.publish_namespace_to(&relay, reader).await;
+
+        let err = result.expect_err("expected connect failure with no clients");
+        assert!(
+            err.to_string().contains("no QUIC clients configured"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 impl RemoteManager {
@@ -170,6 +215,71 @@ impl RemoteManager {
                 tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
                 self.remove_if_same_remote(&cache_key, &remote).await;
 
+                Err(err)
+            }
+        }
+    }
+
+    /// Forward a `SUBSCRIBE_NAMESPACE` to a specific relay peer.
+    ///
+    /// Connects to (or reuses a connection to) `relay` and opens a namespace
+    /// subscription for `prefix`, returning the [`SubscribeNamespace`] handle.
+    /// The target relay is explicit (supplied by the caller from coordinator
+    /// routing hops) rather than discovered via a coordinator lookup — that is
+    /// how this differs from [`Self::subscribe`].
+    pub async fn subscribe_namespace_to(
+        &self,
+        relay: &RelayInfo,
+        prefix: TrackNamespacePrefix,
+        options: SubscribeOptions,
+    ) -> anyhow::Result<SubscribeNamespace> {
+        let cache_key = (relay.url.clone(), relay.addr);
+
+        let remote = match self.get_or_connect(cache_key.clone(), None).await {
+            Ok(remote) => remote,
+            Err(err) => {
+                tracing::error!(remote_url = %relay.url, error = %err, "failed to connect to remote relay: {}", err);
+                return Err(err);
+            }
+        };
+
+        match remote.subscribe_namespace(prefix, options).await {
+            Ok(handle) => Ok(handle),
+            Err(err) => {
+                tracing::warn!(remote_url = %relay.url, error = %err, "remote subscribe_namespace failed, removing from cache");
+                self.remove_if_same_remote(&cache_key, &remote).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Forward a `PUBLISH_NAMESPACE` to a specific relay peer.
+    ///
+    /// Connects to (or reuses a connection to) `relay` and advertises
+    /// `tracks.namespace`, serving its tracks from `tracks`. Blocks until the
+    /// namespace is unannounced or the session errors (see
+    /// [`Remote::publish_namespace`]), so callers typically drive it from a
+    /// dedicated task.
+    pub async fn publish_namespace_to(
+        &self,
+        relay: &RelayInfo,
+        tracks: TracksReader,
+    ) -> anyhow::Result<()> {
+        let cache_key = (relay.url.clone(), relay.addr);
+
+        let remote = match self.get_or_connect(cache_key.clone(), None).await {
+            Ok(remote) => remote,
+            Err(err) => {
+                tracing::error!(remote_url = %relay.url, error = %err, "failed to connect to remote relay: {}", err);
+                return Err(err);
+            }
+        };
+
+        match remote.publish_namespace(tracks).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                tracing::warn!(remote_url = %relay.url, error = %err, "remote publish_namespace failed, removing from cache");
+                self.remove_if_same_remote(&cache_key, &remote).await;
                 Err(err)
             }
         }
@@ -323,7 +433,11 @@ async fn remove_empty_track_slot(
 struct Remote {
     url: Url,
     context: SessionContext,
+    /// Subscriber role: exact-track `SUBSCRIBE` and `SUBSCRIBE_NAMESPACE`.
     subscriber: moq_transport::session::Subscriber,
+    /// Publisher role: outbound `PUBLISH_NAMESPACE` to advertise namespaces
+    /// to this peer.
+    publisher: Publisher,
     /// Track subscriptions keyed by full track name.
     tracks: Arc<Mutex<HashMap<TrackCacheKey, TrackSlot>>>,
     /// Flag indicating if the connection is still alive.
@@ -353,20 +467,27 @@ impl Remote {
             }
         };
 
-        let (session, subscriber) = match moq_transport::session::Subscriber::connect_with_config(
-            session,
-            transport,
-            session_config,
-        )
-        .await
-        {
-            Ok(session) => session,
-            Err(err) => {
-                metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
-                    .increment(1);
-                return Err(err.into());
-            }
-        };
+        // Establish a full relay-to-relay MoQT session so this connection can
+        // act in both roles: Subscriber (exact-track SUBSCRIBE and
+        // SUBSCRIBE_NAMESPACE discovery) and Publisher (outbound
+        // PUBLISH_NAMESPACE). This mirrors the `--announce` forward path in
+        // relay.rs rather than the subscriber-only upstream pull it replaces.
+        let (session, publisher, subscriber) =
+            match moq_transport::session::Session::connect_with_config(
+                session,
+                None,
+                transport,
+                session_config,
+            )
+            .await
+            {
+                Ok(parts) => parts,
+                Err(err) => {
+                    metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
+                        .increment(1);
+                    return Err(err.into());
+                }
+            };
 
         let connected = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
@@ -417,6 +538,7 @@ impl Remote {
             url,
             context,
             subscriber,
+            publisher,
             tracks: Arc::new(Mutex::new(HashMap::new())),
             connected,
             cancel,
@@ -574,6 +696,64 @@ impl Remote {
 
             return Ok(Some(reader));
         }
+    }
+
+    /// Forward a `SUBSCRIBE_NAMESPACE` to this peer (Subscriber role).
+    ///
+    /// Opens a namespace subscription for `prefix` and returns the
+    /// [`SubscribeNamespace`] handle; the caller drives it via
+    /// [`SubscribeNamespace::next`] / [`SubscribeNamespace::closed`], the same
+    /// way [`Self::subscribe`] returns a [`TrackReader`] for the caller to read.
+    ///
+    /// Unlike [`Self::subscribe`], namespace subscriptions are not cached or
+    /// deduplicated here: per-session prefix aggregation (to avoid draft-16
+    /// `PREFIX_OVERLAP` on reused sessions) is deferred to the multi-relay
+    /// routing work.
+    async fn subscribe_namespace(
+        &self,
+        prefix: TrackNamespacePrefix,
+        options: SubscribeOptions,
+    ) -> anyhow::Result<SubscribeNamespace> {
+        if !self.is_connected() {
+            anyhow::bail!("remote connection to {} is closed", self.url);
+        }
+
+        tracing::info!(remote_url = %self.url, prefix = %prefix.to_utf8_path(), "forwarding SUBSCRIBE_NAMESPACE to remote relay");
+
+        let mut subscriber = self.subscriber.clone();
+        let subscribe_namespace = tokio::select! {
+            result = subscriber.subscribe_namespace(prefix, options, KeyValuePairs::default()) => result?,
+            _ = self.cancel.cancelled() => {
+                anyhow::bail!("subscribe_namespace cancelled, remote connection to {} is closed", self.url);
+            }
+        };
+
+        Ok(subscribe_namespace)
+    }
+
+    /// Forward a `PUBLISH_NAMESPACE` to this peer (Publisher role).
+    ///
+    /// Advertises `tracks.namespace` to the peer and serves its tracks from the
+    /// provided [`TracksReader`]. Like [`moq_transport::session::Publisher::publish_namespace`]
+    /// this blocks until the namespace is unannounced or the session errors, so
+    /// callers typically drive it from a dedicated task (mirroring the
+    /// `--announce` forward path in `consumer.rs`).
+    async fn publish_namespace(&self, tracks: TracksReader) -> anyhow::Result<()> {
+        if !self.is_connected() {
+            anyhow::bail!("remote connection to {} is closed", self.url);
+        }
+
+        tracing::info!(remote_url = %self.url, namespace = %tracks.namespace.to_utf8_path(), "forwarding PUBLISH_NAMESPACE to remote relay");
+
+        let mut publisher = self.publisher.clone();
+        tokio::select! {
+            result = publisher.publish_namespace(tracks) => result?,
+            _ = self.cancel.cancelled() => {
+                anyhow::bail!("publish_namespace cancelled, remote connection to {} is closed", self.url);
+            }
+        }
+
+        Ok(())
     }
 }
 
