@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.22](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.21...moq-relay-ietf-v0.7.22) - 2026-07-09
+
+### Fixed
+
+- *(moq-transport)* send publish done after serve completion
+
+### Other
+
+- address PUBLISH review feedback
+- track pending request responses
+- route PUBLISH tracks by full track name
+
 ## [0.7.21](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.20...moq-relay-ietf-v0.7.21) - 2026-07-08
 
 ### Added

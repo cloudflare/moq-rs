@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.17](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.16...moq-clock-ietf-v0.6.17) - 2026-07-09
+
+### Fixed
+
+- *(moq-transport)* send publish done after serve completion
+
 ## [0.6.16](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.15...moq-clock-ietf-v0.6.16) - 2026-07-08
 
 ### Other
