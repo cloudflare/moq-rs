@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fs2::FileExt;
 use moq_native_ietf::quic::Client;
-use moq_transport::coding::TrackNamespace;
+use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix, TupleField};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -47,7 +47,11 @@ impl CoordinatorData {
     }
 
     fn namespace_key(namespace: &TrackNamespace) -> String {
-        namespace.to_utf8_path()
+        tuple_key(&namespace.fields)
+    }
+
+    fn prefix_key(prefix: &TrackNamespacePrefix) -> String {
+        tuple_key(&prefix.fields)
     }
 
     fn track_key(namespace: &TrackNamespace, track: &str) -> String {
@@ -233,10 +237,46 @@ fn write_data(file: &File, data: &CoordinatorData) -> Result<()> {
 }
 
 fn namespace_key_has_prefix(namespace_key: &str, prefix_key: &str) -> bool {
-    let mut namespace_parts = namespace_key.split('/');
-    prefix_key
-        .split('/')
-        .all(|prefix_part| namespace_parts.next() == Some(prefix_part))
+    let namespace_fields = key_fields(namespace_key);
+    let prefix_fields = key_fields(prefix_key);
+    prefix_fields.len() <= namespace_fields.len()
+        && prefix_fields
+            .iter()
+            .zip(namespace_fields.iter())
+            .all(|(prefix, namespace)| prefix == namespace)
+}
+
+fn tuple_key(fields: &[TupleField]) -> String {
+    fields
+        .iter()
+        .map(|field| hex::encode(&field.value))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn key_fields(key: &str) -> Vec<&str> {
+    if key.is_empty() {
+        Vec::new()
+    } else {
+        key.split('.').collect()
+    }
+}
+
+fn key_field_count(key: &str) -> usize {
+    key_fields(key).len()
+}
+
+fn decode_namespace_key(key: &str) -> Result<TrackNamespace> {
+    let fields = key_fields(key)
+        .into_iter()
+        .map(|field| {
+            hex::decode(field)
+                .map(|value| TupleField { value })
+                .context("failed to decode namespace key field")
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    TrackNamespace::try_from(fields).context("failed to decode namespace key")
 }
 
 /// A coordinator that uses a shared file for state storage.
@@ -371,14 +411,11 @@ impl Coordinator for FileCoordinator {
                 // Try prefix matching (find longest matching prefix)
                 let mut best_match: Option<(String, String)> = None;
                 for (registered_key, url) in bucket {
-                    // FIXME(itzmanish): it would be much better to compare on TupleField
-                    // instead of working on strings
-                    let is_prefix = registered_key
-                        .split('/')
-                        .zip(namespace_key.split('/'))
-                        .all(|(a, b)| a == b);
+                    let is_prefix = namespace_key_has_prefix(&namespace_key, registered_key);
                     match best_match {
-                        Some((ns, _)) if is_prefix && ns.len() < registered_key.len() => {
+                        Some((ns, _))
+                            if is_prefix && key_field_count(&ns) < key_field_count(registered_key) =>
+                        {
                             best_match = Some((registered_key.clone(), url.clone()));
                         }
                         None if is_prefix => {
@@ -391,7 +428,7 @@ impl Coordinator for FileCoordinator {
                 file.unlock()?;
 
                 if let Some((matched_key, relay_url)) = best_match {
-                    let matched_ns = TrackNamespace::from_utf8_path(&matched_key);
+                    let matched_ns = decode_namespace_key(&matched_key)?;
                     let url = Url::parse(&relay_url)?;
                     return Ok(Some((NamespaceOrigin::new(matched_ns, url, None), None)));
                 }
@@ -407,10 +444,10 @@ impl Coordinator for FileCoordinator {
     async fn subscribe_namespace(
         &self,
         scope: Option<&str>,
-        prefix: &TrackNamespace,
+        prefix: &TrackNamespacePrefix,
     ) -> CoordinatorResult<NamespaceSubscription> {
         let scope_key = CoordinatorData::scope_key(scope);
-        let prefix_key = CoordinatorData::namespace_key(prefix);
+        let prefix_key = CoordinatorData::prefix_key(prefix);
         let relay_url = self.relay_url.to_string();
         let file_path = self.file_path.clone();
 
@@ -436,9 +473,9 @@ impl Coordinator for FileCoordinator {
                     .flat_map(|bucket| bucket.keys())
                     .filter(|namespace_key| namespace_key_has_prefix(namespace_key, &prefix_key))
                     .map(|namespace_key| {
-                        TrackNamespace::try_from(namespace_key.as_str()).map(NamespaceInfo::new)
+                        decode_namespace_key(namespace_key).map(NamespaceInfo::new)
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>>>()?;
 
                 let count = data
                     .namespace_subscribers
@@ -628,12 +665,11 @@ impl Coordinator for FileCoordinator {
 
                 let mut best_match: Option<(String, String)> = None;
                 for (registered_key, url) in bucket {
-                    let is_prefix = registered_key
-                        .split('/')
-                        .zip(namespace_key.split('/'))
-                        .all(|(a, b)| a == b);
+                    let is_prefix = namespace_key_has_prefix(&namespace_key, registered_key);
                     match best_match {
-                        Some((ns, _)) if is_prefix && ns.len() < registered_key.len() => {
+                        Some((ns, _))
+                            if is_prefix && key_field_count(&ns) < key_field_count(registered_key) =>
+                        {
                             best_match = Some((registered_key.clone(), url.clone()));
                         }
                         None if is_prefix => {
@@ -646,7 +682,7 @@ impl Coordinator for FileCoordinator {
                 file.unlock()?;
 
                 if let Some((matched_key, relay_url)) = best_match {
-                    let matched_ns = TrackNamespace::from_utf8_path(&matched_key);
+                    let matched_ns = decode_namespace_key(&matched_key)?;
                     let url = Url::parse(&relay_url)?;
                     return Ok(Some((NamespaceOrigin::new(matched_ns, url, None), None)));
                 }
@@ -676,6 +712,20 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("moq-file-coordinator-{name}-{nanos}.json"))
+    }
+
+    fn prefix(path: &str) -> TrackNamespacePrefix {
+        TrackNamespacePrefix::from_utf8_path(path)
+    }
+
+    fn namespace_from_fields(fields: &[&str]) -> TrackNamespace {
+        TrackNamespace::try_from(
+            fields
+                .iter()
+                .map(|field| TupleField::from_utf8(field))
+                .collect::<Vec<_>>(),
+        )
+        .expect("test namespace should be valid")
     }
 
     #[tokio::test]
@@ -786,7 +836,7 @@ mod tests {
             .expect("other should register");
 
         let subscription = coordinator
-            .subscribe_namespace(Some("scope-a"), &TrackNamespace::from_utf8_path("room/123"))
+            .subscribe_namespace(Some("scope-a"), &prefix("room/123"))
             .await
             .expect("namespace subscription should succeed");
         let mut matches: Vec<_> = subscription
@@ -820,7 +870,7 @@ mod tests {
             .expect("scoped should register");
 
         let global = coordinator
-            .subscribe_namespace(None, &TrackNamespace::from_utf8_path("room"))
+            .subscribe_namespace(None, &prefix("room"))
             .await
             .expect("global namespace subscription should succeed");
         assert_eq!(global.existing_namespaces.len(), 1);
@@ -830,7 +880,7 @@ mod tests {
         );
 
         let scoped = coordinator
-            .subscribe_namespace(Some("scope-a"), &TrackNamespace::from_utf8_path("room"))
+            .subscribe_namespace(Some("scope-a"), &prefix("room"))
             .await
             .expect("scoped namespace subscription should succeed");
         assert_eq!(scoped.existing_namespaces.len(), 1);
@@ -849,7 +899,7 @@ mod tests {
         let coordinator = FileCoordinator::new(&file, relay_url.clone());
 
         let _subscription = coordinator
-            .subscribe_namespace(Some("scope-a"), &TrackNamespace::from_utf8_path("room/123"))
+            .subscribe_namespace(Some("scope-a"), &prefix("room/123"))
             .await
             .expect("namespace subscription should register");
 
@@ -881,15 +931,15 @@ mod tests {
         let file = temp_file_path("namespace-subscriber-refcount");
         let relay_url = Url::parse("https://relay.example.com").unwrap();
         let coordinator = FileCoordinator::new(&file, relay_url.clone());
-        let prefix = TrackNamespace::from_utf8_path("room/123");
+        let namespace_prefix = prefix("room/123");
         let namespace = TrackNamespace::from_utf8_path("room/123/camera");
 
         let first = coordinator
-            .subscribe_namespace(Some("scope-a"), &prefix)
+            .subscribe_namespace(Some("scope-a"), &namespace_prefix)
             .await
             .expect("first subscription should register");
         let second = coordinator
-            .subscribe_namespace(Some("scope-a"), &prefix)
+            .subscribe_namespace(Some("scope-a"), &namespace_prefix)
             .await
             .expect("second subscription should register");
 
@@ -914,20 +964,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_namespace_accepts_empty_prefix() {
+        let file = temp_file_path("subscribe-namespace-empty-prefix");
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(&file, relay_url.clone());
+
+        let _room = coordinator
+            .register_namespace(Some("scope-a"), &TrackNamespace::from_utf8_path("room/123"))
+            .await
+            .expect("room should register");
+        let _other = coordinator
+            .register_namespace(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("other/123"),
+            )
+            .await
+            .expect("other should register");
+
+        let subscription = coordinator
+            .subscribe_namespace(Some("scope-a"), &TrackNamespacePrefix::new())
+            .await
+            .expect("empty prefix namespace subscription should succeed");
+        let mut matches: Vec<_> = subscription
+            .existing_namespaces
+            .into_iter()
+            .map(|info| info.namespace.to_utf8_path())
+            .collect();
+        matches.sort();
+
+        assert_eq!(matches, vec!["/other/123", "/room/123"]);
+
+        let subscribers = coordinator
+            .lookup_namespace_subscribers(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/123/camera"),
+            )
+            .await
+            .expect("subscriber lookup should succeed");
+
+        assert_eq!(subscribers.len(), 1);
+        assert_eq!(subscribers[0].url, relay_url);
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn subscribe_namespace_matches_tuple_fields_not_slash_strings() {
+        let file = temp_file_path("subscribe-namespace-tuple-prefix");
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(&file, relay_url);
+
+        let single_field_namespace = namespace_from_fields(&["room/123"]);
+        let two_field_namespace = namespace_from_fields(&["room", "123"]);
+
+        let _single = coordinator
+            .register_namespace(Some("scope-a"), &single_field_namespace)
+            .await
+            .expect("single-field namespace should register");
+        let _two = coordinator
+            .register_namespace(Some("scope-a"), &two_field_namespace)
+            .await
+            .expect("two-field namespace should register");
+
+        let subscription = coordinator
+            .subscribe_namespace(Some("scope-a"), &prefix("room"))
+            .await
+            .expect("namespace subscription should succeed");
+
+        let matches: Vec<_> = subscription
+            .existing_namespaces
+            .into_iter()
+            .map(|info| info.namespace)
+            .collect();
+
+        assert_eq!(matches, vec![two_field_namespace]);
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
     async fn lookup_namespace_subscribers_keeps_scopes_isolated() {
         let file = temp_file_path("namespace-subscriber-scopes");
         let relay_url = Url::parse("https://relay.example.com").unwrap();
         let coordinator = FileCoordinator::new(&file, relay_url);
 
         let _global = coordinator
-            .subscribe_namespace(None, &TrackNamespace::from_utf8_path("room/global"))
+            .subscribe_namespace(None, &prefix("room/global"))
             .await
             .expect("global subscription should register");
         let _scoped = coordinator
-            .subscribe_namespace(
-                Some("scope-a"),
-                &TrackNamespace::from_utf8_path("room/scoped"),
-            )
+            .subscribe_namespace(Some("scope-a"), &prefix("room/scoped"))
             .await
             .expect("scoped subscription should register");
 

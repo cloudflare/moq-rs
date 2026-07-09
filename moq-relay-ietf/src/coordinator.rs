@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 use async_trait::async_trait;
 use moq_native_ietf::quic;
-use moq_transport::coding::TrackNamespace;
+use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix};
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
@@ -587,7 +587,7 @@ pub trait Coordinator: Send + Sync {
     async fn subscribe_namespace(
         &self,
         _scope: Option<&str>,
-        _prefix: &TrackNamespace,
+        _prefix: &TrackNamespacePrefix,
     ) -> CoordinatorResult<NamespaceSubscription> {
         Ok(NamespaceSubscription::default())
     }
@@ -609,7 +609,7 @@ pub trait Coordinator: Send + Sync {
     async fn unsubscribe_namespace(
         &self,
         _scope: Option<&str>,
-        _prefix: &TrackNamespace,
+        _prefix: &TrackNamespacePrefix,
     ) -> CoordinatorResult<()> {
         Ok(())
     }
@@ -833,8 +833,16 @@ mod tests {
         TrackNamespace::from_utf8_path(path)
     }
 
+    fn prefix(path: &str) -> TrackNamespacePrefix {
+        TrackNamespacePrefix::from_utf8_path(path)
+    }
+
     /// Returns true if `namespace` starts with all the fields in `prefix`.
-    fn ns_has_prefix(namespace: &TrackNamespace, prefix: &TrackNamespace) -> bool {
+    fn ns_has_prefix(namespace: &TrackNamespace, prefix: &TrackNamespacePrefix) -> bool {
+        prefix.is_prefix_of(namespace)
+    }
+
+    fn ns_has_namespace_prefix(namespace: &TrackNamespace, prefix: &TrackNamespace) -> bool {
         namespace.fields.len() >= prefix.fields.len()
             && prefix
                 .fields
@@ -881,7 +889,7 @@ mod tests {
         tracks: HashMap<String, HashMap<(TrackNamespace, String), String>>,
 
         /// Maps scope → SUBSCRIBE_NAMESPACE prefixes → list of relay URLs
-        namespace_subscribers: HashMap<String, HashMap<TrackNamespace, Vec<String>>>,
+        namespace_subscribers: HashMap<String, HashMap<TrackNamespacePrefix, Vec<String>>>,
 
         /// Maps scope → subscribed tracks → list of relay URLs
         /// Key: (namespace, track_name)
@@ -940,7 +948,7 @@ mod tests {
     struct MockNamespaceSubHandle {
         state: std::sync::Arc<Mutex<MockState>>,
         scope_key: String,
-        prefix: TrackNamespace,
+        prefix: TrackNamespacePrefix,
         relay_url: String,
     }
 
@@ -1102,7 +1110,7 @@ mod tests {
             // Prefix match (longest wins)
             let mut best: Option<(&TrackNamespace, &String)> = None;
             for (registered, url) in bucket {
-                if ns_has_prefix(namespace, registered) {
+                if ns_has_namespace_prefix(namespace, registered) {
                     match &best {
                         Some((prev, _)) if registered.fields.len() > prev.fields.len() => {
                             best = Some((registered, url));
@@ -1161,7 +1169,7 @@ mod tests {
         async fn subscribe_namespace(
             &self,
             scope: Option<&str>,
-            prefix: &TrackNamespace,
+            prefix: &TrackNamespacePrefix,
         ) -> CoordinatorResult<NamespaceSubscription> {
             let scope_key = MockState::scope_key(scope);
             let relay_url = self.relay_url.to_string();
@@ -1203,7 +1211,7 @@ mod tests {
         async fn unsubscribe_namespace(
             &self,
             scope: Option<&str>,
-            prefix: &TrackNamespace,
+            prefix: &TrackNamespacePrefix,
         ) -> CoordinatorResult<()> {
             let scope_key = MockState::scope_key(scope);
             let relay_url = self.relay_url.to_string();
@@ -1693,7 +1701,7 @@ mod tests {
 
         // Subscribe to the football prefix
         let sub = coord
-            .subscribe_namespace(scope, &ns("sports/football"))
+            .subscribe_namespace(scope, &prefix("sports/football"))
             .await
             .unwrap();
 
@@ -1708,6 +1716,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_namespace_empty_prefix_matches_all_namespaces() {
+        let coord = MockCoordinator::new("https://edge-us-west.example.com");
+        let scope = Some("content-provider-123");
+
+        let _football = coord
+            .register_namespace(scope, &ns("sports/football/match-42"))
+            .await
+            .unwrap();
+        let _tennis = coord
+            .register_namespace(scope, &ns("sports/tennis/open-7"))
+            .await
+            .unwrap();
+
+        let sub = coord
+            .subscribe_namespace(scope, &TrackNamespacePrefix::new())
+            .await
+            .unwrap();
+
+        let mut paths: Vec<String> = sub
+            .existing_namespaces
+            .iter()
+            .map(|n| n.namespace.to_utf8_path())
+            .collect();
+        paths.sort();
+
+        assert_eq!(
+            paths,
+            vec![
+                "/sports/football/match-42".to_string(),
+                "/sports/tennis/open-7".to_string()
+            ]
+        );
+
+        let interested = coord
+            .lookup_namespace_subscribers(scope, &ns("sports/football/match-44"))
+            .await
+            .unwrap();
+
+        assert_eq!(interested.len(), 1);
+        assert_eq!(
+            interested[0].url.as_str(),
+            "https://edge-us-west.example.com/"
+        );
+    }
+
+    #[tokio::test]
     async fn lookup_namespace_subscribers_finds_interested_relays() {
         // An edge relay has subscribers interested in football broadcasts.
         // When a new match starts (namespace registered), the origin relay
@@ -1718,7 +1772,7 @@ mod tests {
 
         // Edge relay subscribes to the football prefix
         let _sub = coord
-            .subscribe_namespace(scope, &ns("sports/football"))
+            .subscribe_namespace(scope, &prefix("sports/football"))
             .await
             .unwrap();
 
@@ -1742,7 +1796,7 @@ mod tests {
 
         {
             let _sub = coord
-                .subscribe_namespace(scope, &ns("sports/football"))
+                .subscribe_namespace(scope, &prefix("sports/football"))
                 .await
                 .unwrap();
 
@@ -1964,7 +2018,7 @@ mod tests {
 
         // Edge subscribes to all football events (SUBSCRIBE_NAMESPACE)
         let _football_sub = edge
-            .subscribe_namespace(scope, &ns("sports/football"))
+            .subscribe_namespace(scope, &prefix("sports/football"))
             .await
             .unwrap();
 
@@ -2075,7 +2129,7 @@ mod tests {
     async fn default_subscribe_namespace_returns_empty() {
         let coord = MinimalCoordinator;
         let sub = coord
-            .subscribe_namespace(Some("scope"), &ns("sports/football"))
+            .subscribe_namespace(Some("scope"), &prefix("sports/football"))
             .await
             .unwrap();
         assert!(sub.existing_namespaces.is_empty());

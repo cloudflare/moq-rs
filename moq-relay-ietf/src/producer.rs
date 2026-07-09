@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
+    coding::{KeyValuePairs, TrackNamespace},
     message::SubscribeOptions,
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{Publisher, SessionError, Subscribed, SubscribedNamespace, TrackStatusRequested},
@@ -217,22 +217,21 @@ impl Producer {
 
         let mut known_namespaces = HashSet::new();
         let coordinator_subscription = if wants_namespace {
-            if let Some(prefix) = prefix_as_namespace(&subscribed_namespace.namespace_prefix) {
-                let subscription = self
-                    .coordinator
-                    .subscribe_namespace(self.scope.as_deref(), &prefix)
-                    .await?;
+            let subscription = self
+                .coordinator
+                .subscribe_namespace(
+                    self.scope.as_deref(),
+                    &subscribed_namespace.namespace_prefix,
+                )
+                .await?;
 
-                for info in &subscription.existing_namespaces {
-                    if known_namespaces.insert(info.namespace.clone()) {
-                        subscribed_namespace.namespace(&info.namespace)?;
-                    }
+            for info in &subscription.existing_namespaces {
+                if known_namespaces.insert(info.namespace.clone()) {
+                    subscribed_namespace.namespace(&info.namespace)?;
                 }
-
-                Some(subscription)
-            } else {
-                None
             }
+
+            Some(subscription)
         } else {
             None
         };
@@ -577,10 +576,6 @@ fn full_name_for_track(track: &TrackReader) -> FullTrackName {
         namespace: track.namespace.clone(),
         name: track.name.clone(),
     }
-}
-
-fn prefix_as_namespace(prefix: &TrackNamespacePrefix) -> Option<TrackNamespace> {
-    TrackNamespace::try_from(prefix.fields.clone()).ok()
 }
 
 #[cfg(test)]
