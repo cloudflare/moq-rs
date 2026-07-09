@@ -8,6 +8,8 @@ use moq_native_ietf::quic;
 use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix};
 use url::Url;
 
+use crate::session::SessionInterface;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
     #[error("namespace not found")]
@@ -284,6 +286,68 @@ impl RelayInfo {
             addr: Some(addr),
         }
     }
+
+    /// Create a `RelayInfo` identity from an inbound peer's socket address.
+    ///
+    /// Used when a relay accepts an internal connection and only knows the
+    /// peer by its transport-level source address — it trusts the incoming
+    /// socket address rather than asking the coordinator to resolve the
+    /// peer's canonical URL. The [`url`](Self::url) is a synthetic
+    /// `https://{addr}` identity; callers should treat [`addr`](Self::addr)
+    /// as the authoritative field and must not assume the URL is dialable.
+    pub fn from_socket_addr(addr: SocketAddr) -> Self {
+        // A `SocketAddr` always renders as a valid `host:port` authority
+        // (IPv6 is bracketed by its `Display`), so this parse is infallible.
+        let url = Url::parse(&format!("https://{addr}"))
+            .expect("socket address forms a valid https authority");
+        Self {
+            url,
+            addr: Some(addr),
+        }
+    }
+}
+
+/// Per-call context describing how a coordinator operation reached this relay.
+///
+/// Passed alongside `scope` to routing/registration methods so a coordinator
+/// can distinguish public client traffic from internal relay-to-relay traffic
+/// and, for the latter, know which peer relay it came from.
+///
+/// The relay's own URL (the "caller") is intentionally **not** part of this
+/// context: each coordinator instance is constructed knowing its own relay
+/// URL, so it does not need to be told on every call.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct CoordinatorContext {
+    /// Whether the originating session is public client-facing or internal
+    /// relay-to-relay. Defaults to [`SessionInterface::Public`].
+    pub interface: SessionInterface,
+
+    /// The peer relay this operation was received from, for internal
+    /// sessions. `None` for public client sessions.
+    ///
+    /// Derived by the relay from the inbound socket address (see
+    /// [`RelayInfo::from_socket_addr`]); the coordinator is not asked to
+    /// resolve peer identity.
+    pub source: Option<RelayInfo>,
+}
+
+impl CoordinatorContext {
+    /// A public, client-facing context with no peer relay.
+    pub fn public() -> Self {
+        Self {
+            interface: SessionInterface::Public,
+            source: None,
+        }
+    }
+
+    /// An internal, relay-to-relay context originating from `source`.
+    pub fn internal(source: Option<RelayInfo>) -> Self {
+        Self {
+            interface: SessionInterface::Internal,
+            source,
+        }
+    }
 }
 
 /// Handle returned when a track is registered with the coordinator.
@@ -448,6 +512,10 @@ pub trait Coordinator: Send + Sync {
     ///   registrations — the same namespace in different scopes may
     ///   route independently.
     /// * `namespace` - The namespace being registered
+    /// * `context` - Whether the registering session is a public client or an
+    ///   internal relay peer (and which peer). Coordinators may use this to
+    ///   avoid, for example, re-advertising registrations that arrived from
+    ///   another relay.
     ///
     /// # Returns
     ///
@@ -459,6 +527,7 @@ pub trait Coordinator: Send + Sync {
         &self,
         scope: Option<&str>,
         namespace: &TrackNamespace,
+        context: &CoordinatorContext,
     ) -> CoordinatorResult<NamespaceRegistration>;
 
     /// Unregister a namespace.
@@ -578,6 +647,8 @@ pub trait Coordinator: Send + Sync {
     ///
     /// * `scope` - The resolved scope identity, or `None` for unscoped sessions.
     /// * `prefix` - The namespace prefix to subscribe to.
+    /// * `context` - Whether the subscribing session is a public client or an
+    ///   internal relay peer (and which peer).
     ///
     /// # Default Implementation
     ///
@@ -588,6 +659,7 @@ pub trait Coordinator: Send + Sync {
         &self,
         _scope: Option<&str>,
         _prefix: &TrackNamespacePrefix,
+        _context: &CoordinatorContext,
     ) -> CoordinatorResult<NamespaceSubscription> {
         Ok(NamespaceSubscription::default())
     }
@@ -1054,6 +1126,7 @@ mod tests {
             &self,
             scope: Option<&str>,
             namespace: &TrackNamespace,
+            _context: &CoordinatorContext,
         ) -> CoordinatorResult<NamespaceRegistration> {
             let scope_key = MockState::scope_key(scope);
             let relay_url = self.relay_url.to_string();
@@ -1170,6 +1243,7 @@ mod tests {
             &self,
             scope: Option<&str>,
             prefix: &TrackNamespacePrefix,
+            _context: &CoordinatorContext,
         ) -> CoordinatorResult<NamespaceSubscription> {
             let scope_key = MockState::scope_key(scope);
             let relay_url = self.relay_url.to_string();
@@ -1555,6 +1629,41 @@ mod tests {
     }
 
     // ========================================================================
+    // RelayInfo / CoordinatorContext
+    // ========================================================================
+
+    #[test]
+    fn relay_info_from_socket_addr_synthesizes_https_identity() {
+        let v4: SocketAddr = "203.0.113.7:4443".parse().unwrap();
+        let info = RelayInfo::from_socket_addr(v4);
+        assert_eq!(info.addr, Some(v4));
+        assert_eq!(info.url.as_str(), "https://203.0.113.7:4443/");
+
+        // IPv6 authorities are bracketed by SocketAddr's Display.
+        let v6: SocketAddr = "[2001:db8::1]:4443".parse().unwrap();
+        let info6 = RelayInfo::from_socket_addr(v6);
+        assert_eq!(info6.addr, Some(v6));
+        assert_eq!(info6.url.as_str(), "https://[2001:db8::1]:4443/");
+    }
+
+    #[test]
+    fn coordinator_context_constructors() {
+        let public = CoordinatorContext::public();
+        assert_eq!(public.interface, SessionInterface::Public);
+        assert!(public.source.is_none());
+
+        let addr: SocketAddr = "10.0.0.7:4443".parse().unwrap();
+        let internal = CoordinatorContext::internal(Some(RelayInfo::from_socket_addr(addr)));
+        assert_eq!(internal.interface, SessionInterface::Internal);
+        assert_eq!(internal.source.unwrap().addr, Some(addr));
+
+        // Default is public with no source.
+        let default = CoordinatorContext::default();
+        assert_eq!(default.interface, SessionInterface::Public);
+        assert!(default.source.is_none());
+    }
+
+    // ========================================================================
     // Namespace registration and lookup
     // ========================================================================
 
@@ -1565,7 +1674,11 @@ mod tests {
         let scope = Some("content-provider-123");
 
         let _reg = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1585,7 +1698,11 @@ mod tests {
         let scope = Some("content-provider-123");
 
         let _reg = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1613,7 +1730,11 @@ mod tests {
         let coord = MockCoordinator::new("https://relay-1.example.com");
 
         let _reg = coord
-            .register_namespace(Some("provider-abc"), &ns("live/main"))
+            .register_namespace(
+                Some("provider-abc"),
+                &ns("live/main"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1635,12 +1756,20 @@ mod tests {
         let scope = Some("content-provider-123");
 
         let _reg = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
         let result = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await;
         assert!(matches!(
             result,
@@ -1655,7 +1784,11 @@ mod tests {
 
         {
             let _reg = coord
-                .register_namespace(scope, &ns("sports/football/match-42"))
+                .register_namespace(
+                    scope,
+                    &ns("sports/football/match-42"),
+                    &CoordinatorContext::public(),
+                )
                 .await
                 .unwrap();
 
@@ -1685,23 +1818,39 @@ mod tests {
 
         // Two football matches already live
         let _reg_match42 = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
         let _reg_match43 = coord
-            .register_namespace(scope, &ns("sports/football/match-43"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-43"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
         // A tennis match (should NOT match the football prefix)
         let _reg_tennis = coord
-            .register_namespace(scope, &ns("sports/tennis/open-7"))
+            .register_namespace(
+                scope,
+                &ns("sports/tennis/open-7"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
         // Subscribe to the football prefix
         let sub = coord
-            .subscribe_namespace(scope, &prefix("sports/football"))
+            .subscribe_namespace(
+                scope,
+                &prefix("sports/football"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1721,16 +1870,28 @@ mod tests {
         let scope = Some("content-provider-123");
 
         let _football = coord
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
         let _tennis = coord
-            .register_namespace(scope, &ns("sports/tennis/open-7"))
+            .register_namespace(
+                scope,
+                &ns("sports/tennis/open-7"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
         let sub = coord
-            .subscribe_namespace(scope, &TrackNamespacePrefix::new())
+            .subscribe_namespace(
+                scope,
+                &TrackNamespacePrefix::new(),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1772,7 +1933,11 @@ mod tests {
 
         // Edge relay subscribes to the football prefix
         let _sub = coord
-            .subscribe_namespace(scope, &prefix("sports/football"))
+            .subscribe_namespace(
+                scope,
+                &prefix("sports/football"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -1796,7 +1961,11 @@ mod tests {
 
         {
             let _sub = coord
-                .subscribe_namespace(scope, &prefix("sports/football"))
+                .subscribe_namespace(
+                    scope,
+                    &prefix("sports/football"),
+                    &CoordinatorContext::public(),
+                )
                 .await
                 .unwrap();
 
@@ -1876,7 +2045,10 @@ mod tests {
         let scope = Some("content-provider-123");
         let match_ns = ns("sports/football/match-42");
 
-        let _namespace = coord.register_namespace(scope, &match_ns).await.unwrap();
+        let _namespace = coord
+            .register_namespace(scope, &match_ns, &CoordinatorContext::public())
+            .await
+            .unwrap();
 
         let (origin, client) = coord
             .lookup_track(scope, &match_ns, "video-1080p")
@@ -1996,7 +2168,11 @@ mod tests {
 
         // Register the match namespace
         let _match_reg = origin
-            .register_namespace(scope, &ns("sports/football/match-42"))
+            .register_namespace(
+                scope,
+                &ns("sports/football/match-42"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -2018,7 +2194,11 @@ mod tests {
 
         // Edge subscribes to all football events (SUBSCRIBE_NAMESPACE)
         let _football_sub = edge
-            .subscribe_namespace(scope, &prefix("sports/football"))
+            .subscribe_namespace(
+                scope,
+                &prefix("sports/football"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
 
@@ -2076,6 +2256,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
+            _context: &CoordinatorContext,
         ) -> CoordinatorResult<NamespaceRegistration> {
             Ok(NamespaceRegistration::new(()))
         }
@@ -2129,7 +2310,11 @@ mod tests {
     async fn default_subscribe_namespace_returns_empty() {
         let coord = MinimalCoordinator;
         let sub = coord
-            .subscribe_namespace(Some("scope"), &prefix("sports/football"))
+            .subscribe_namespace(
+                Some("scope"),
+                &prefix("sports/football"),
+                &CoordinatorContext::public(),
+            )
             .await
             .unwrap();
         assert!(sub.existing_namespaces.is_empty());

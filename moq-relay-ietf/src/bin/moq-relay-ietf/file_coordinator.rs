@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use moq_relay_ietf::{
-    Coordinator, CoordinatorError, CoordinatorResult, NamespaceInfo, NamespaceOrigin,
-    NamespaceRegistration, NamespaceSubscription, RelayInfo, TrackRegistration,
+    Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceInfo,
+    NamespaceOrigin, NamespaceRegistration, NamespaceSubscription, RelayInfo, TrackRegistration,
 };
 
 /// Data stored in the shared file
@@ -310,6 +310,7 @@ impl Coordinator for FileCoordinator {
         &self,
         scope: Option<&str>,
         namespace: &TrackNamespace,
+        _context: &CoordinatorContext,
     ) -> CoordinatorResult<NamespaceRegistration> {
         let scope_key = CoordinatorData::scope_key(scope);
         let namespace_key = CoordinatorData::namespace_key(namespace);
@@ -445,6 +446,7 @@ impl Coordinator for FileCoordinator {
         &self,
         scope: Option<&str>,
         prefix: &TrackNamespacePrefix,
+        _context: &CoordinatorContext,
     ) -> CoordinatorResult<NamespaceSubscription> {
         let scope_key = CoordinatorData::scope_key(scope);
         let prefix_key = CoordinatorData::prefix_key(prefix);
@@ -794,7 +796,7 @@ mod tests {
         let namespace = TrackNamespace::from_utf8_path("room/123");
 
         let _namespace = coordinator
-            .register_namespace(Some("scope-a"), &namespace)
+            .register_namespace(Some("scope-a"), &namespace, &CoordinatorContext::public())
             .await
             .expect("namespace should register");
 
@@ -817,13 +819,18 @@ mod tests {
         let coordinator = FileCoordinator::new(&file, relay_url);
 
         let _room = coordinator
-            .register_namespace(Some("scope-a"), &TrackNamespace::from_utf8_path("room/123"))
+            .register_namespace(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/123"),
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("room should register");
         let _camera = coordinator
             .register_namespace(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/123/camera"),
+                &CoordinatorContext::public(),
             )
             .await
             .expect("camera should register");
@@ -831,12 +838,17 @@ mod tests {
             .register_namespace(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("other/123"),
+                &CoordinatorContext::public(),
             )
             .await
             .expect("other should register");
 
         let subscription = coordinator
-            .subscribe_namespace(Some("scope-a"), &prefix("room/123"))
+            .subscribe_namespace(
+                Some("scope-a"),
+                &prefix("room/123"),
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("namespace subscription should succeed");
         let mut matches: Vec<_> = subscription
@@ -858,19 +870,24 @@ mod tests {
         let coordinator = FileCoordinator::new(&file, relay_url);
 
         let _global = coordinator
-            .register_namespace(None, &TrackNamespace::from_utf8_path("room/global"))
+            .register_namespace(
+                None,
+                &TrackNamespace::from_utf8_path("room/global"),
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("global should register");
         let _scoped = coordinator
             .register_namespace(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/scoped"),
+                &CoordinatorContext::public(),
             )
             .await
             .expect("scoped should register");
 
         let global = coordinator
-            .subscribe_namespace(None, &prefix("room"))
+            .subscribe_namespace(None, &prefix("room"), &CoordinatorContext::public())
             .await
             .expect("global namespace subscription should succeed");
         assert_eq!(global.existing_namespaces.len(), 1);
@@ -880,7 +897,11 @@ mod tests {
         );
 
         let scoped = coordinator
-            .subscribe_namespace(Some("scope-a"), &prefix("room"))
+            .subscribe_namespace(
+                Some("scope-a"),
+                &prefix("room"),
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("scoped namespace subscription should succeed");
         assert_eq!(scoped.existing_namespaces.len(), 1);
@@ -899,7 +920,11 @@ mod tests {
         let coordinator = FileCoordinator::new(&file, relay_url.clone());
 
         let _subscription = coordinator
-            .subscribe_namespace(Some("scope-a"), &prefix("room/123"))
+            .subscribe_namespace(
+                Some("scope-a"),
+                &prefix("room/123"),
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("namespace subscription should register");
 
@@ -935,11 +960,19 @@ mod tests {
         let namespace = TrackNamespace::from_utf8_path("room/123/camera");
 
         let first = coordinator
-            .subscribe_namespace(Some("scope-a"), &namespace_prefix)
+            .subscribe_namespace(
+                Some("scope-a"),
+                &namespace_prefix,
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("first subscription should register");
         let second = coordinator
-            .subscribe_namespace(Some("scope-a"), &namespace_prefix)
+            .subscribe_namespace(
+                Some("scope-a"),
+                &namespace_prefix,
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("second subscription should register");
 
@@ -970,19 +1003,28 @@ mod tests {
         let coordinator = FileCoordinator::new(&file, relay_url.clone());
 
         let _room = coordinator
-            .register_namespace(Some("scope-a"), &TrackNamespace::from_utf8_path("room/123"))
+            .register_namespace(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/123"),
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("room should register");
         let _other = coordinator
             .register_namespace(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("other/123"),
+                &CoordinatorContext::public(),
             )
             .await
             .expect("other should register");
 
         let subscription = coordinator
-            .subscribe_namespace(Some("scope-a"), &TrackNamespacePrefix::new())
+            .subscribe_namespace(
+                Some("scope-a"),
+                &TrackNamespacePrefix::new(),
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("empty prefix namespace subscription should succeed");
         let mut matches: Vec<_> = subscription
@@ -1018,16 +1060,28 @@ mod tests {
         let two_field_namespace = namespace_from_fields(&["room", "123"]);
 
         let _single = coordinator
-            .register_namespace(Some("scope-a"), &single_field_namespace)
+            .register_namespace(
+                Some("scope-a"),
+                &single_field_namespace,
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("single-field namespace should register");
         let _two = coordinator
-            .register_namespace(Some("scope-a"), &two_field_namespace)
+            .register_namespace(
+                Some("scope-a"),
+                &two_field_namespace,
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("two-field namespace should register");
 
         let subscription = coordinator
-            .subscribe_namespace(Some("scope-a"), &prefix("room"))
+            .subscribe_namespace(
+                Some("scope-a"),
+                &prefix("room"),
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("namespace subscription should succeed");
 
@@ -1049,11 +1103,15 @@ mod tests {
         let coordinator = FileCoordinator::new(&file, relay_url);
 
         let _global = coordinator
-            .subscribe_namespace(None, &prefix("room/global"))
+            .subscribe_namespace(None, &prefix("room/global"), &CoordinatorContext::public())
             .await
             .expect("global subscription should register");
         let _scoped = coordinator
-            .subscribe_namespace(Some("scope-a"), &prefix("room/scoped"))
+            .subscribe_namespace(
+                Some("scope-a"),
+                &prefix("room/scoped"),
+                &CoordinatorContext::public(),
+            )
             .await
             .expect("scoped subscription should register");
 

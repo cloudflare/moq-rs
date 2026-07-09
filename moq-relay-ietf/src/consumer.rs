@@ -125,9 +125,14 @@ impl Consumer {
 
         // Register namespace with the coordinator so other relay nodes can route to us.
         tracing::debug!(namespace = %ns, "registering namespace with coordinator");
+        let coordinator_context = self.context.coordinator_context();
         let _namespace_registration = match self
             .coordinator
-            .register_namespace(self.context.scope(), &published_ns.namespace)
+            .register_namespace(
+                self.context.scope(),
+                &published_ns.namespace,
+                &coordinator_context,
+            )
             .await
         {
             Ok(reg) => reg,

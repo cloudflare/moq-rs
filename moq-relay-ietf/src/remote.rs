@@ -50,6 +50,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
+            _context: &crate::CoordinatorContext,
         ) -> crate::CoordinatorResult<crate::NamespaceRegistration> {
             Ok(crate::NamespaceRegistration::new(()))
         }

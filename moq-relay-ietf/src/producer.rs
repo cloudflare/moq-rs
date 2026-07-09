@@ -215,9 +215,14 @@ impl Producer {
 
         let mut known_namespaces = HashSet::new();
         let coordinator_subscription = if wants_namespace {
+            let coordinator_context = self.context.coordinator_context();
             let subscription = self
                 .coordinator
-                .subscribe_namespace(self.context.scope(), &subscribed_namespace.namespace_prefix)
+                .subscribe_namespace(
+                    self.context.scope(),
+                    &subscribed_namespace.namespace_prefix,
+                    &coordinator_context,
+                )
                 .await?;
 
             for info in &subscription.existing_namespaces {

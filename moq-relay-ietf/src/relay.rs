@@ -343,7 +343,9 @@ impl Relay {
                             // permissions, while the embedder-supplied tagger decides the
                             // transport interface from the peer socket address, TLS SNI, and
                             // connection path. With no tagger configured every inbound
-                            // connection is treated as a public client.
+                            // connection is treated as a public client. For connections
+                            // classified internal, the peer relay identity is derived from
+                            // the inbound socket address (see RelayInfo::from_socket_addr).
                             let scope = scope_info.as_ref().map(|info| info.scope_id.clone());
                             let context = match connection_tagger.as_ref() {
                                 Some(tagger) => {
@@ -352,7 +354,8 @@ impl Relay {
                                         server_name,
                                         moq_session.connection_path().map(str::to_string),
                                     );
-                                    SessionContext::from_tags(scope, &tagger.tag(&meta))
+                                    let tags = tagger.tag(&meta);
+                                    SessionContext::from_tags(scope, &tags, Some(remote_addr))
                                 }
                                 None => SessionContext::public(scope),
                             };

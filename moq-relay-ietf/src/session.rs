@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::session::{Publisher, SessionError, Subscriber};
 
-use crate::{Consumer, Producer, RelayInfo};
+use crate::{Consumer, CoordinatorContext, Producer, RelayInfo};
 
 /// Well-known connection tag key identifying the session interface.
 pub const TAG_INTERFACE: &str = "interface";
@@ -19,9 +19,13 @@ pub const INTERFACE_PUBLIC: &str = "public";
 pub const INTERFACE_INTERNAL: &str = "internal";
 
 /// Identifies whether a relay session came from a public client or another relay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionInterface {
     /// A public, client-facing connection.
+    ///
+    /// This is the default: an unclassified connection is treated as a public
+    /// client (see [`ConnectionTags::interface`]).
+    #[default]
     Public,
     /// An internal, relay-to-relay connection.
     Internal,
@@ -257,21 +261,49 @@ impl SessionContext {
         }
     }
 
-    /// Build a context from a resolved scope and connection tags.
+    /// Build an inbound context from a resolved scope, connection tags, and
+    /// the peer's socket address.
     ///
     /// The interface is taken from the tags (see [`ConnectionTags::interface`]).
-    /// Inbound connections have no known relay endpoint, so `peer` is `None`.
-    pub fn from_tags(scope: Option<String>, tags: &ConnectionTags) -> Self {
+    /// For connections classified [`SessionInterface::Internal`], the peer
+    /// identity is derived from `remote_addr` (the relay trusts the inbound
+    /// socket address rather than asking the coordinator to resolve it; see
+    /// [`RelayInfo::from_socket_addr`]). Public connections — and internal
+    /// connections with no known address — leave `peer` as `None`.
+    pub fn from_tags(
+        scope: Option<String>,
+        tags: &ConnectionTags,
+        remote_addr: Option<SocketAddr>,
+    ) -> Self {
+        let interface = tags.interface();
+        let peer = match interface {
+            SessionInterface::Internal => remote_addr.map(RelayInfo::from_socket_addr),
+            SessionInterface::Public => None,
+        };
         Self {
             scope,
-            interface: tags.interface(),
-            peer: None,
+            interface,
+            peer,
         }
     }
 
     /// The resolved scope identity, if any.
     pub fn scope(&self) -> Option<&str> {
         self.scope.as_deref()
+    }
+
+    /// Build the [`CoordinatorContext`] for coordinator calls made on behalf
+    /// of this session.
+    ///
+    /// Maps the session interface through unchanged and forwards [`peer`] as
+    /// the operation's `source`.
+    ///
+    /// [`peer`]: Self::peer
+    pub fn coordinator_context(&self) -> CoordinatorContext {
+        CoordinatorContext {
+            interface: self.interface,
+            source: self.peer.clone(),
+        }
     }
 }
 
@@ -452,20 +484,53 @@ mod tests {
     }
 
     #[test]
-    fn session_context_from_tags_reads_interface_and_leaves_peer_unset() {
+    fn session_context_from_tags_populates_peer_for_internal() {
+        let addr: SocketAddr = "10.0.0.7:4443".parse().unwrap();
+
+        // Internal + known address → peer derived from the socket address.
         let internal = SessionContext::from_tags(
             Some("scope-c".to_string()),
             &ConnectionTags::new().with_interface(SessionInterface::Internal),
+            Some(addr),
         );
         assert_eq!(internal.interface, SessionInterface::Internal);
         assert_eq!(internal.scope(), Some("scope-c"));
-        // Inbound connections have no known relay endpoint.
-        assert!(internal.peer.is_none());
+        let peer = internal.peer.expect("internal context should carry a peer");
+        assert_eq!(peer.addr, Some(addr));
+        assert_eq!(peer.url.as_str(), "https://10.0.0.7:4443/");
 
-        let public = SessionContext::from_tags(None, &ConnectionTags::new());
+        // Internal but no known address → no peer.
+        let internal_no_addr = SessionContext::from_tags(
+            None,
+            &ConnectionTags::new().with_interface(SessionInterface::Internal),
+            None,
+        );
+        assert_eq!(internal_no_addr.interface, SessionInterface::Internal);
+        assert!(internal_no_addr.peer.is_none());
+
+        // Public → never carries a peer, even with a known address.
+        let public = SessionContext::from_tags(None, &ConnectionTags::new(), Some(addr));
         assert_eq!(public.interface, SessionInterface::Public);
         assert!(public.scope().is_none());
         assert!(public.peer.is_none());
+    }
+
+    #[test]
+    fn coordinator_context_forwards_interface_and_peer() {
+        let addr: SocketAddr = "10.0.0.7:4443".parse().unwrap();
+        let internal = SessionContext::from_tags(
+            None,
+            &ConnectionTags::new().with_interface(SessionInterface::Internal),
+            Some(addr),
+        );
+        let ctx = internal.coordinator_context();
+        assert_eq!(ctx.interface, SessionInterface::Internal);
+        assert_eq!(ctx.source.expect("source should be set").addr, Some(addr));
+
+        let public = SessionContext::public(None);
+        let ctx = public.coordinator_context();
+        assert_eq!(ctx.interface, SessionInterface::Public);
+        assert!(ctx.source.is_none());
     }
 
     #[test]
