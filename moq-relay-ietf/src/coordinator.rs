@@ -2122,6 +2122,110 @@ mod tests {
     }
 
     // ========================================================================
+    // Cross-relay SUBSCRIBE_NAMESPACE choreography (two relays, one oracle)
+    //
+    // These integration-style tests play out the full two-relay handshake the
+    // relay performs across a shared coordinator oracle, in both orderings.
+    // Each step is annotated with the production call site that drives it, so
+    // the tests pin the oracle contract that `Consumer::serve` (consumer.rs)
+    // and `Producer::serve_subscribe_namespace` (producer.rs) rely on to decide
+    // whether a PUBLISH_NAMESPACE is routed between relays.
+    //
+    // A live two-relay MoQT session is intentionally out of scope: there is no
+    // in-memory session harness, so `Consumer`/`Producer` cannot be built
+    // without standing up real QUIC endpoints. We validate the coordination
+    // decisions here; the transport plumbing is covered elsewhere.
+    // ========================================================================
+
+    #[tokio::test]
+    async fn two_relay_subscribe_before_publish_routes_publish_namespace() {
+        // Ordering: edge subscribes first, publisher arrives at the origin
+        // later. The origin's reverse lookup must discover the waiting edge so
+        // it pushes PUBLISH_NAMESPACE to it (the publish-after-subscribe path).
+        let origin = MockCoordinator::new("https://origin.example.com");
+        let edge = origin.peer("https://edge.example.com");
+        let scope = Some("content-provider-123");
+
+        // Edge relay: a client sent SUBSCRIBE_NAMESPACE, so the edge records its
+        // interest with the oracle. Maps to Producer::serve_subscribe_namespace
+        // -> coordinator.subscribe_namespace. Nothing is published yet, so the
+        // initial snapshot is empty.
+        let sub = edge
+            .subscribe_namespace(scope, &prefix("room"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+        assert!(
+            sub.existing_namespaces.is_empty(),
+            "no namespaces exist yet, so the initial snapshot must be empty"
+        );
+
+        // Origin relay: a publisher sent PUBLISH_NAMESPACE, registering the
+        // namespace. Maps to Consumer::serve -> coordinator.register_namespace.
+        let _registration = origin
+            .register_namespace(scope, &ns("room/alice"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+
+        // Origin relay: still inside Consumer::serve, it asks the oracle who is
+        // interested (coordinator.lookup_namespace_subscribers). The waiting edge
+        // must be returned and the origin (the caller) excluded, so the origin
+        // pushes exactly one PUBLISH_NAMESPACE — to the edge.
+        let interested = origin
+            .lookup_namespace_subscribers(scope, &ns("room/alice"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+        assert_eq!(interested.len(), 1);
+        assert_eq!(interested[0].url.as_str(), "https://edge.example.com/");
+    }
+
+    #[tokio::test]
+    async fn two_relay_publish_before_subscribe_returns_existing_namespaces() {
+        // Ordering: the publisher is already live at the origin before any
+        // subscriber. A new edge subscriber must learn the existing namespace
+        // from its initial snapshot, and its interest must persist so that
+        // later namespaces still route to it.
+        let origin = MockCoordinator::new("https://origin.example.com");
+        let edge = origin.peer("https://edge.example.com");
+        let scope = Some("content-provider-123");
+
+        // Origin relay: publisher registers the namespace first. Maps to
+        // Consumer::serve -> coordinator.register_namespace.
+        let _registration = origin
+            .register_namespace(scope, &ns("room/alice"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+
+        // Edge relay: a client subscribes to the prefix afterwards. Maps to
+        // Producer::serve_subscribe_namespace -> coordinator.subscribe_namespace.
+        // The snapshot must include the already-published namespace so the edge
+        // can announce it to its client immediately.
+        let sub = edge
+            .subscribe_namespace(scope, &prefix("room"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+        let paths: Vec<String> = sub
+            .existing_namespaces
+            .iter()
+            .map(|n| n.namespace.to_utf8_path())
+            .collect();
+        assert_eq!(paths, vec!["/room/alice".to_string()]);
+
+        // The edge's interest persists past the initial snapshot: a *different*
+        // namespace published later under the same prefix must still discover
+        // the edge. Maps to Consumer::serve -> coordinator.lookup_namespace_subscribers.
+        let interested = origin
+            .lookup_namespace_subscribers(
+                scope,
+                &ns("room/beatrice"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(interested.len(), 1);
+        assert_eq!(interested[0].url.as_str(), "https://edge.example.com/");
+    }
+
+    // ========================================================================
     // Track-level PUBLISH registration
     // ========================================================================
 
