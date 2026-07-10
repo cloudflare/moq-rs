@@ -2181,9 +2181,10 @@ mod tests {
     #[tokio::test]
     async fn two_relay_publish_before_subscribe_returns_existing_namespaces() {
         // Ordering: the publisher is already live at the origin before any
-        // subscriber. A new edge subscriber must learn the existing namespace
-        // from its initial snapshot, and its interest must persist so that
-        // later namespaces still route to it.
+        // subscriber. This pins two independent oracle guarantees: the
+        // coordinator reports the already-registered namespace in the new
+        // subscriber's initial snapshot, and the subscriber's interest persists
+        // so later namespaces still route to it.
         let origin = MockCoordinator::new("https://origin.example.com");
         let edge = origin.peer("https://edge.example.com");
         let scope = Some("content-provider-123");
@@ -2197,8 +2198,10 @@ mod tests {
 
         // Edge relay: a client subscribes to the prefix afterwards. Maps to
         // Producer::serve_subscribe_namespace -> coordinator.subscribe_namespace.
-        // The snapshot must include the already-published namespace so the edge
-        // can announce it to its client immediately.
+        // The oracle's snapshot reports the already-published namespace. NOTE:
+        // the relay does not forward this snapshot to its client today (it
+        // serves matching namespaces from relay-local state); this assertion
+        // pins the coordinator contract, not current relay behavior.
         let sub = edge
             .subscribe_namespace(scope, &prefix("room"), &CoordinatorContext::public())
             .await

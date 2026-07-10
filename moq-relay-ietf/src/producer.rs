@@ -215,6 +215,17 @@ impl Producer {
 
         let mut known_namespaces = HashSet::new();
         let coordinator_subscription = if wants_namespace {
+            // Register this SUBSCRIBE_NAMESPACE with the coordinator so that
+            // remote relays can discover us and fan out matching
+            // PUBLISH_NAMESPACE notifications to this relay (see Consumer::serve).
+            //
+            // We intentionally do NOT announce the coordinator's
+            // `existing_namespaces` snapshot here. Matching namespaces are served
+            // entirely from relay-local state below (send_namespace_snapshot plus
+            // the namespace_changes loop), keeping the subscriber-facing behavior
+            // identical to a single-relay subscribe. The returned handle is
+            // retained only for its RAII registration lifetime and dropped when
+            // this request ends.
             let coordinator_context = self.context.coordinator_context();
             let subscription = self
                 .coordinator
@@ -224,12 +235,6 @@ impl Producer {
                     &coordinator_context,
                 )
                 .await?;
-
-            for info in &subscription.existing_namespaces {
-                if known_namespaces.insert(info.namespace.clone()) {
-                    subscribed_namespace.namespace(&info.namespace)?;
-                }
-            }
 
             Some(subscription)
         } else {
