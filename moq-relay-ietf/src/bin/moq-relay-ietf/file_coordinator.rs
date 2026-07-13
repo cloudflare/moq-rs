@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use moq_relay_ietf::{
-    Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceInfo,
-    NamespaceOrigin, NamespaceRegistration, NamespaceSubscription, RelayInfo, TrackRegistration,
+    Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceOrigin,
+    NamespaceRegistration, NamespaceSubscription, RelayInfo, TrackRegistration,
 };
 
 /// Data stored in the shared file
@@ -446,18 +446,25 @@ impl Coordinator for FileCoordinator {
         &self,
         scope: Option<&str>,
         prefix: &TrackNamespacePrefix,
-        _context: &CoordinatorContext,
+        context: &CoordinatorContext,
     ) -> CoordinatorResult<NamespaceSubscription> {
         let scope_key = CoordinatorData::scope_key(scope);
         let prefix_key = CoordinatorData::prefix_key(prefix);
         let relay_url = self.relay_url.to_string();
         let file_path = self.file_path.clone();
 
-        let existing = tokio::task::spawn_blocking({
+        // Exclude the caller (this relay) and the inbound source peer so we
+        // never return ourselves or the relay the SUBSCRIBE_NAMESPACE arrived
+        // from as an upstream pull target. The caller string matches the value
+        // format written by register_namespace (self.relay_url.to_string()).
+        let caller = relay_url.clone();
+        let source = context.source.as_ref().map(|relay| relay.url.to_string());
+
+        let upstream_relays = tokio::task::spawn_blocking({
             let scope_key = scope_key.clone();
             let prefix_key = prefix_key.clone();
             let relay_url = relay_url.clone();
-            move || -> Result<Vec<NamespaceInfo>> {
+            move || -> Result<Vec<RelayInfo>> {
                 let file = OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -468,16 +475,26 @@ impl Coordinator for FileCoordinator {
                 file.lock_exclusive()?;
 
                 let mut data = read_data(&file)?;
-                let existing = data
-                    .namespaces
-                    .get(&scope_key)
-                    .into_iter()
-                    .flat_map(|bucket| bucket.keys())
-                    .filter(|namespace_key| namespace_key_has_prefix(namespace_key, &prefix_key))
-                    .map(|namespace_key| {
-                        decode_namespace_key(namespace_key).map(NamespaceInfo::new)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+
+                // The distinct relays hosting a currently-matching namespace are
+                // the upstream pull targets. Exclude ourselves and the inbound
+                // source peer so we never pull from the caller or the relay the
+                // SUBSCRIBE_NAMESPACE arrived from.
+                let mut seen_relays = HashSet::new();
+                let mut upstream_relays = Vec::new();
+                if let Some(bucket) = data.namespaces.get(&scope_key) {
+                    for (namespace_key, hosting_relay) in bucket {
+                        if !namespace_key_has_prefix(namespace_key, &prefix_key) {
+                            continue;
+                        }
+                        if hosting_relay == &caller || Some(hosting_relay) == source.as_ref() {
+                            continue;
+                        }
+                        if seen_relays.insert(hosting_relay.clone()) {
+                            upstream_relays.push(RelayInfo::new(Url::parse(hosting_relay)?));
+                        }
+                    }
+                }
 
                 let count = data
                     .namespace_subscribers
@@ -493,13 +510,13 @@ impl Coordinator for FileCoordinator {
 
                 file.unlock()?;
 
-                Ok(existing)
+                Ok(upstream_relays)
             }
         })
         .await??;
 
         Ok(NamespaceSubscription::new(
-            existing,
+            upstream_relays,
             NamespaceSubscriptionHandle {
                 scope_key,
                 prefix_key,
@@ -824,12 +841,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_namespace_returns_existing_matches() {
+    async fn subscribe_namespace_returns_hosting_relays_for_matching_prefix() {
         let file = temp_file_path("subscribe-namespace-existing");
-        let relay_url = Url::parse("https://relay.example.com").unwrap();
-        let coordinator = FileCoordinator::new(&file, relay_url);
+        let edge = FileCoordinator::new(&file, Url::parse("https://edge.example.com").unwrap());
 
-        let _room = coordinator
+        // The origin hosts two namespaces under the prefix; a third relay hosts
+        // a non-matching namespace that must be filtered out.
+        let origin = FileCoordinator::new(&file, Url::parse("https://origin.example.com").unwrap());
+        let other_origin = FileCoordinator::new(
+            &file,
+            Url::parse("https://other-origin.example.com").unwrap(),
+        );
+
+        let _room = origin
             .register_namespace(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/123"),
@@ -837,7 +861,7 @@ mod tests {
             )
             .await
             .expect("room should register");
-        let _camera = coordinator
+        let _camera = origin
             .register_namespace(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/123/camera"),
@@ -845,7 +869,7 @@ mod tests {
             )
             .await
             .expect("camera should register");
-        let _other = coordinator
+        let _other = other_origin
             .register_namespace(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("other/123"),
@@ -854,7 +878,11 @@ mod tests {
             .await
             .expect("other should register");
 
-        let subscription = coordinator
+        // Subscribing to the prefix returns the distinct relays hosting a
+        // matching namespace. The origin hosts two matches but is deduplicated
+        // to a single entry; other-origin hosts only a non-matching namespace
+        // and is excluded.
+        let subscription = edge
             .subscribe_namespace(
                 Some("scope-a"),
                 &prefix("room/123"),
@@ -862,14 +890,13 @@ mod tests {
             )
             .await
             .expect("namespace subscription should succeed");
-        let mut matches: Vec<_> = subscription
-            .existing_namespaces
-            .into_iter()
-            .map(|info| info.namespace.to_utf8_path())
+        let upstream: Vec<String> = subscription
+            .upstream_relays
+            .iter()
+            .map(|relay| relay.url.to_string())
             .collect();
-        matches.sort();
 
-        assert_eq!(matches, vec!["/room/123", "/room/123/camera"]);
+        assert_eq!(upstream, vec!["https://origin.example.com/".to_string()]);
 
         let _ = std::fs::remove_file(file);
     }
@@ -877,10 +904,21 @@ mod tests {
     #[tokio::test]
     async fn subscribe_namespace_keeps_scopes_isolated() {
         let file = temp_file_path("subscribe-namespace-scopes");
-        let relay_url = Url::parse("https://relay.example.com").unwrap();
-        let coordinator = FileCoordinator::new(&file, relay_url);
+        let edge = FileCoordinator::new(&file, Url::parse("https://edge.example.com").unwrap());
 
-        let _global = coordinator
+        // Each scope's namespace is hosted by a different origin relay, so scope
+        // isolation is observable through which relay is returned as an upstream
+        // pull target.
+        let origin_global = FileCoordinator::new(
+            &file,
+            Url::parse("https://origin-global.example.com").unwrap(),
+        );
+        let origin_scoped = FileCoordinator::new(
+            &file,
+            Url::parse("https://origin-scoped.example.com").unwrap(),
+        );
+
+        let _global = origin_global
             .register_namespace(
                 None,
                 &TrackNamespace::from_utf8_path("room/global"),
@@ -888,7 +926,7 @@ mod tests {
             )
             .await
             .expect("global should register");
-        let _scoped = coordinator
+        let _scoped = origin_scoped
             .register_namespace(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/scoped"),
@@ -897,17 +935,23 @@ mod tests {
             .await
             .expect("scoped should register");
 
-        let global = coordinator
+        // The global (unscoped) subscription only sees the global origin.
+        let global = edge
             .subscribe_namespace(None, &prefix("room"), &CoordinatorContext::public())
             .await
             .expect("global namespace subscription should succeed");
-        assert_eq!(global.existing_namespaces.len(), 1);
+        let global_upstream: Vec<String> = global
+            .upstream_relays
+            .iter()
+            .map(|relay| relay.url.to_string())
+            .collect();
         assert_eq!(
-            global.existing_namespaces[0].namespace,
-            TrackNamespace::from_utf8_path("room/global")
+            global_upstream,
+            vec!["https://origin-global.example.com/".to_string()]
         );
 
-        let scoped = coordinator
+        // The scope-a subscription only sees the scoped origin.
+        let scoped = edge
             .subscribe_namespace(
                 Some("scope-a"),
                 &prefix("room"),
@@ -915,10 +959,14 @@ mod tests {
             )
             .await
             .expect("scoped namespace subscription should succeed");
-        assert_eq!(scoped.existing_namespaces.len(), 1);
+        let scoped_upstream: Vec<String> = scoped
+            .upstream_relays
+            .iter()
+            .map(|relay| relay.url.to_string())
+            .collect();
         assert_eq!(
-            scoped.existing_namespaces[0].namespace,
-            TrackNamespace::from_utf8_path("room/scoped")
+            scoped_upstream,
+            vec!["https://origin-scoped.example.com/".to_string()]
         );
 
         let _ = std::fs::remove_file(file);
@@ -1028,12 +1076,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_namespace_accepts_empty_prefix() {
+    async fn subscribe_namespace_empty_prefix_matches_all_namespaces() {
         let file = temp_file_path("subscribe-namespace-empty-prefix");
-        let relay_url = Url::parse("https://relay.example.com").unwrap();
-        let coordinator = FileCoordinator::new(&file, relay_url.clone());
+        let edge_url = Url::parse("https://edge.example.com").unwrap();
+        let edge = FileCoordinator::new(&file, edge_url.clone());
 
-        let _room = coordinator
+        // Two different origin relays each host a namespace under the scope.
+        let origin_a =
+            FileCoordinator::new(&file, Url::parse("https://origin-a.example.com").unwrap());
+        let origin_b =
+            FileCoordinator::new(&file, Url::parse("https://origin-b.example.com").unwrap());
+
+        let _room = origin_a
             .register_namespace(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/123"),
@@ -1041,7 +1095,7 @@ mod tests {
             )
             .await
             .expect("room should register");
-        let _other = coordinator
+        let _other = origin_b
             .register_namespace(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("other/123"),
@@ -1050,7 +1104,9 @@ mod tests {
             .await
             .expect("other should register");
 
-        let subscription = coordinator
+        // An empty prefix matches every namespace in the scope, so both hosting
+        // relays are returned as upstream pull targets.
+        let subscription = edge
             .subscribe_namespace(
                 Some("scope-a"),
                 &TrackNamespacePrefix::new(),
@@ -1058,21 +1114,24 @@ mod tests {
             )
             .await
             .expect("empty prefix namespace subscription should succeed");
-        let mut matches: Vec<_> = subscription
-            .existing_namespaces
-            .into_iter()
-            .map(|info| info.namespace.to_utf8_path())
+        let mut upstream: Vec<String> = subscription
+            .upstream_relays
+            .iter()
+            .map(|relay| relay.url.to_string())
             .collect();
-        matches.sort();
+        upstream.sort();
 
-        assert_eq!(matches, vec!["/other/123", "/room/123"]);
+        assert_eq!(
+            upstream,
+            vec![
+                "https://origin-a.example.com/".to_string(),
+                "https://origin-b.example.com/".to_string(),
+            ]
+        );
 
-        // A second relay (the origin) shares the coordinator file and performs
-        // the lookup, so the subscribing relay is returned rather than filtered
-        // out as the caller.
-        let looker = FileCoordinator::new(&file, Url::parse("https://origin.example.com").unwrap());
-
-        let subscribers = looker
+        // An origin performing the reverse lookup discovers the subscribing
+        // edge; the origin (caller) is excluded, leaving the edge.
+        let subscribers = origin_a
             .lookup_namespace_subscribers(
                 Some("scope-a"),
                 &TrackNamespace::from_utf8_path("room/123/camera"),
@@ -1082,7 +1141,7 @@ mod tests {
             .expect("subscriber lookup should succeed");
 
         assert_eq!(subscribers.len(), 1);
-        assert_eq!(subscribers[0].url, relay_url);
+        assert_eq!(subscribers[0].url, edge_url);
 
         let _ = std::fs::remove_file(file);
     }
@@ -1090,13 +1149,21 @@ mod tests {
     #[tokio::test]
     async fn subscribe_namespace_matches_tuple_fields_not_slash_strings() {
         let file = temp_file_path("subscribe-namespace-tuple-prefix");
-        let relay_url = Url::parse("https://relay.example.com").unwrap();
-        let coordinator = FileCoordinator::new(&file, relay_url);
+        let edge = FileCoordinator::new(&file, Url::parse("https://edge.example.com").unwrap());
 
         let single_field_namespace = namespace_from_fields(&["room/123"]);
         let two_field_namespace = namespace_from_fields(&["room", "123"]);
 
-        let _single = coordinator
+        // Host each namespace on a distinct origin so the matched namespace is
+        // identifiable by which relay is returned as an upstream pull target.
+        let origin_single = FileCoordinator::new(
+            &file,
+            Url::parse("https://origin-single.example.com").unwrap(),
+        );
+        let origin_two =
+            FileCoordinator::new(&file, Url::parse("https://origin-two.example.com").unwrap());
+
+        let _single = origin_single
             .register_namespace(
                 Some("scope-a"),
                 &single_field_namespace,
@@ -1104,7 +1171,7 @@ mod tests {
             )
             .await
             .expect("single-field namespace should register");
-        let _two = coordinator
+        let _two = origin_two
             .register_namespace(
                 Some("scope-a"),
                 &two_field_namespace,
@@ -1113,7 +1180,11 @@ mod tests {
             .await
             .expect("two-field namespace should register");
 
-        let subscription = coordinator
+        // The prefix has a single field "room". It matches the two-field
+        // namespace ["room", "123"] but NOT the single-field namespace
+        // ["room/123"], so only the two-field namespace's origin is returned
+        // (tuple-aware matching, not slash-string matching).
+        let subscription = edge
             .subscribe_namespace(
                 Some("scope-a"),
                 &prefix("room"),
@@ -1122,13 +1193,16 @@ mod tests {
             .await
             .expect("namespace subscription should succeed");
 
-        let matches: Vec<_> = subscription
-            .existing_namespaces
-            .into_iter()
-            .map(|info| info.namespace)
+        let upstream: Vec<String> = subscription
+            .upstream_relays
+            .iter()
+            .map(|relay| relay.url.to_string())
             .collect();
 
-        assert_eq!(matches, vec![two_field_namespace]);
+        assert_eq!(
+            upstream,
+            vec!["https://origin-two.example.com/".to_string()]
+        );
 
         let _ = std::fs::remove_file(file);
     }

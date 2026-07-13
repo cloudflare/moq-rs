@@ -217,13 +217,16 @@ impl Producer {
         let coordinator_subscription = if wants_namespace {
             // Register this SUBSCRIBE_NAMESPACE with the coordinator so that
             // remote relays can discover us and fan out matching
-            // PUBLISH_NAMESPACE notifications to this relay (see Consumer::serve).
+            // PUBLISH_NAMESPACE notifications to this relay (the push path; see
+            // Consumer::serve).
             //
-            // We intentionally do NOT announce the coordinator's
-            // `existing_namespaces` snapshot here. Matching namespaces are served
-            // entirely from relay-local state below (send_namespace_snapshot plus
-            // the namespace_changes loop), keeping the subscriber-facing behavior
-            // identical to a single-relay subscribe. The returned handle is
+            // The returned handle also reports `upstream_relays` -- the peer
+            // relays already hosting a matching namespace -- but we do not act
+            // on them yet: matching namespaces are still served entirely from
+            // relay-local state below (send_namespace_snapshot plus the
+            // namespace_changes loop), keeping the subscriber-facing behavior
+            // identical to a single-relay subscribe. Opening upstream pull
+            // sessions to those peers is a follow-up. The handle is otherwise
             // retained only for its RAII registration lifetime and dropped when
             // this request ends.
             let coordinator_context = self.context.coordinator_context();
