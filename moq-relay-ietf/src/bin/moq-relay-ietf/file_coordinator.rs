@@ -22,7 +22,7 @@ use url::Url;
 
 use moq_relay_ietf::{
     Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceOrigin,
-    NamespaceRegistration, NamespaceSubscription, RelayInfo, TrackRegistration,
+    NamespaceRegistration, NamespaceSubscription, RelayInfo, SessionInterface, TrackRegistration,
 };
 
 /// Data stored in the shared file
@@ -459,6 +459,7 @@ impl Coordinator for FileCoordinator {
         // format written by register_namespace (self.relay_url.to_string()).
         let caller = relay_url.clone();
         let source = context.source.as_ref().map(|relay| relay.url.to_string());
+        let is_public = context.interface == SessionInterface::Public;
 
         let upstream_relays = tokio::task::spawn_blocking({
             let scope_key = scope_key.clone();
@@ -477,21 +478,27 @@ impl Coordinator for FileCoordinator {
                 let mut data = read_data(&file)?;
 
                 // The distinct relays hosting a currently-matching namespace are
-                // the upstream pull targets. Exclude ourselves and the inbound
-                // source peer so we never pull from the caller or the relay the
-                // SUBSCRIBE_NAMESPACE arrived from.
-                let mut seen_relays = HashSet::new();
+                // the upstream pull targets. Only public sessions fan out: an
+                // internal (relay-to-relay) pull must not recurse, so it is
+                // served from local state alone (empty upstream_relays breaks the
+                // loop). Exclude ourselves and the inbound source peer so we
+                // never pull from the caller or the relay the SUBSCRIBE_NAMESPACE
+                // arrived from. Interest is still recorded below for the push
+                // path regardless of interface.
                 let mut upstream_relays = Vec::new();
-                if let Some(bucket) = data.namespaces.get(&scope_key) {
-                    for (namespace_key, hosting_relay) in bucket {
-                        if !namespace_key_has_prefix(namespace_key, &prefix_key) {
-                            continue;
-                        }
-                        if hosting_relay == &caller || Some(hosting_relay) == source.as_ref() {
-                            continue;
-                        }
-                        if seen_relays.insert(hosting_relay.clone()) {
-                            upstream_relays.push(RelayInfo::new(Url::parse(hosting_relay)?));
+                if is_public {
+                    let mut seen_relays = HashSet::new();
+                    if let Some(bucket) = data.namespaces.get(&scope_key) {
+                        for (namespace_key, hosting_relay) in bucket {
+                            if !namespace_key_has_prefix(namespace_key, &prefix_key) {
+                                continue;
+                            }
+                            if hosting_relay == &caller || Some(hosting_relay) == source.as_ref() {
+                                continue;
+                            }
+                            if seen_relays.insert(hosting_relay.clone()) {
+                                upstream_relays.push(RelayInfo::new(Url::parse(hosting_relay)?));
+                            }
                         }
                     }
                 }
@@ -1202,6 +1209,61 @@ mod tests {
         assert_eq!(
             upstream,
             vec!["https://origin-two.example.com/".to_string()]
+        );
+
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn internal_subscribe_namespace_returns_no_upstream_relays() {
+        // A pull opened on another relay's behalf arrives as an internal
+        // session, so the coordinator returns no upstream relays even though a
+        // peer hosts a matching namespace: the pull is served from local state
+        // and does not recurse (the loop-breaker). The source is a *third* relay
+        // that does not host the namespace, so only the interface -- not
+        // caller/source exclusion -- can explain the empty result.
+        let file = temp_file_path("subscribe-namespace-internal");
+        let edge = FileCoordinator::new(&file, Url::parse("https://edge.example.com").unwrap());
+        let origin = FileCoordinator::new(&file, Url::parse("https://origin.example.com").unwrap());
+
+        let _registration = origin
+            .register_namespace(
+                Some("scope-a"),
+                &TrackNamespace::from_utf8_path("room/123"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .expect("origin should register");
+
+        // A public subscribe is told to pull from the origin...
+        let public_sub = edge
+            .subscribe_namespace(
+                Some("scope-a"),
+                &prefix("room"),
+                &CoordinatorContext::public(),
+            )
+            .await
+            .expect("public subscription should succeed");
+        assert_eq!(
+            public_sub.upstream_relays.len(),
+            1,
+            "public sessions fan out to hosting relays"
+        );
+
+        // ...but an internal subscribe is given nothing to pull.
+        let internal_sub = edge
+            .subscribe_namespace(
+                Some("scope-a"),
+                &prefix("room"),
+                &CoordinatorContext::internal(Some(RelayInfo::new(
+                    Url::parse("https://other.example.com").unwrap(),
+                ))),
+            )
+            .await
+            .expect("internal subscription should succeed");
+        assert!(
+            internal_sub.upstream_relays.is_empty(),
+            "internal sessions are served from local state, breaking the pull loop"
         );
 
         let _ = std::fs::remove_file(file);

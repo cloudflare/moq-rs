@@ -626,8 +626,8 @@ pub trait Coordinator: Send + Sync {
     /// Called when a subscriber sends SUBSCRIBE_NAMESPACE. The coordinator
     /// should:
     /// 1. Record that this relay is interested in the prefix
-    /// 2. Return currently-matching namespaces (advisory) and the peer relays
-    ///    that host them (the upstream pull targets)
+    /// 2. Return the peer relays that host currently-matching namespaces (the
+    ///    upstream pull targets)
     /// 3. Return an RAII handle for cleanup on disconnect
     ///
     /// The subscribing relay opens upstream SUBSCRIBE_NAMESPACE sessions to the
@@ -638,10 +638,25 @@ pub trait Coordinator: Send + Sync {
     /// [`lookup_namespace_subscribers()`] to find interested relays and push
     /// PUBLISH_NAMESPACE to them (the subscribe-before-publish case).
     ///
-    /// Implementations MUST exclude, from `upstream_relays`, both the **caller**
-    /// (this relay's own endpoint) and the **source**
-    /// ([`CoordinatorContext::source`]), so a relay never pulls from itself or
-    /// from the peer the SUBSCRIBE_NAMESPACE just arrived from.
+    /// The subscribing relay applies **no** routing or topology policy of its
+    /// own and does not interpret the session interface: it simply opens an
+    /// upstream pull to each relay in `upstream_relays`, and an empty list means
+    /// "serve from local state only, do not connect upstream". All routing
+    /// policy therefore lives in the coordinator.
+    ///
+    /// To decide what to return, the coordinator MAY use the informational
+    /// [`CoordinatorContext`] — in particular the session
+    /// [`interface`][CoordinatorContext::interface] (public client vs. internal
+    /// relay peer) and the [`source`][CoordinatorContext::source] peer. For
+    /// example, the built-in implementations exclude both the caller (this
+    /// relay's own endpoint) and the source peer, so a relay is never told to
+    /// pull from itself or from the peer the SUBSCRIBE_NAMESPACE just arrived
+    /// from; and they return an empty list for internal sessions, so a pull
+    /// opened on another relay's behalf does not itself fan out upstream (which
+    /// would otherwise make relays recurse — and, in a mesh, cycle). Those are
+    /// policy choices of the built-in implementations, not requirements of this
+    /// trait. Interest is still recorded for the push path regardless of
+    /// interface.
     ///
     /// # Arguments
     ///
@@ -652,8 +667,7 @@ pub trait Coordinator: Send + Sync {
     ///
     /// # Default Implementation
     ///
-    /// Returns an empty subscription (no existing namespaces, no upstream
-    /// relays, no-op cleanup).
+    /// Returns an empty subscription (no upstream relays, no-op cleanup).
     ///
     /// [`lookup_namespace_subscribers()`]: Coordinator::lookup_namespace_subscribers
     async fn subscribe_namespace(
@@ -1280,19 +1294,26 @@ mod tests {
             let mut state = self.state.lock().unwrap();
 
             // Find the distinct relays hosting namespaces that match the prefix
-            // (the upstream pull targets), excluding the caller and source.
-            let mut seen_relays = std::collections::HashSet::new();
+            // (the upstream pull targets), excluding the caller and source. Only
+            // public sessions fan out: an internal (relay-to-relay) pull must
+            // not recurse, so it is served from local state alone (empty
+            // upstream_relays breaks the loop). Interest is still recorded below
+            // for the push path regardless of interface.
             let mut upstream_relays = Vec::new();
-            if let Some(bucket) = state.namespaces.get(&scope_key) {
-                for (ns, hosting_relay) in bucket {
-                    if !ns_has_prefix(ns, prefix) {
-                        continue;
-                    }
-                    if hosting_relay == &caller || Some(hosting_relay) == source.as_ref() {
-                        continue;
-                    }
-                    if seen_relays.insert(hosting_relay.clone()) {
-                        upstream_relays.push(RelayInfo::new(Url::parse(hosting_relay).unwrap()));
+            if context.interface == SessionInterface::Public {
+                let mut seen_relays = std::collections::HashSet::new();
+                if let Some(bucket) = state.namespaces.get(&scope_key) {
+                    for (ns, hosting_relay) in bucket {
+                        if !ns_has_prefix(ns, prefix) {
+                            continue;
+                        }
+                        if hosting_relay == &caller || Some(hosting_relay) == source.as_ref() {
+                            continue;
+                        }
+                        if seen_relays.insert(hosting_relay.clone()) {
+                            upstream_relays
+                                .push(RelayInfo::new(Url::parse(hosting_relay).unwrap()));
+                        }
                     }
                 }
             }
@@ -1974,6 +1995,53 @@ mod tests {
         assert_eq!(
             interested[0].url.as_str(),
             "https://edge-us-west.example.com/"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_subscribe_namespace_returns_no_upstream_relays() {
+        // A pull opened on another relay's behalf arrives as an internal
+        // session. Even though a peer hosts a matching namespace, the
+        // coordinator returns no upstream relays, so the pull is served from
+        // local state and does not recurse -- this is the loop-breaker. The
+        // source peer is deliberately a *third* relay that does not host the
+        // namespace, so only the interface (not caller/source exclusion) can
+        // explain the empty result.
+        let origin = MockCoordinator::new("https://origin.example.com");
+        let edge = origin.peer("https://edge.example.com");
+        let scope = Some("content-provider-123");
+
+        let _registration = origin
+            .register_namespace(scope, &ns("room/alice"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+
+        // A public subscribe from the edge is told to pull from the origin...
+        let public_sub = edge
+            .subscribe_namespace(scope, &prefix("room"), &CoordinatorContext::public())
+            .await
+            .unwrap();
+        assert_eq!(
+            public_sub.upstream_relays.len(),
+            1,
+            "public sessions fan out to hosting relays"
+        );
+
+        // ...but an internal subscribe (a relay pulling on another's behalf) is
+        // given nothing to pull, so it serves from local state only.
+        let internal_sub = edge
+            .subscribe_namespace(
+                scope,
+                &prefix("room"),
+                &CoordinatorContext::internal(Some(RelayInfo::new(
+                    Url::parse("https://other.example.com").unwrap(),
+                ))),
+            )
+            .await
+            .unwrap();
+        assert!(
+            internal_sub.upstream_relays.is_empty(),
+            "internal sessions are served from local state, breaking the pull loop"
         );
     }
 
