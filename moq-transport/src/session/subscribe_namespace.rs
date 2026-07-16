@@ -59,10 +59,11 @@ impl Default for SubscribeNamespaceState {
 /// [`Subscriber::publish_received`].
 #[must_use = "cancels SUBSCRIBE_NAMESPACE on drop"]
 pub struct SubscribeNamespace {
-    subscriber: Subscriber,
     state: State<SubscribeNamespaceState>,
-    // Keep the request half alive. Dropping it sends FIN, cancelling the request (§6.1).
-    _writer: Writer,
+    // Keep the request half after FIN so a cancellation timeout can still reset it (§6.1).
+    writer: Option<Writer>,
+    request_finished: bool,
+    force_reset: Option<oneshot::Sender<u32>>,
 
     pub info: SubscribeNamespaceInfo,
 }
@@ -74,18 +75,21 @@ impl SubscribeNamespace {
         writer: Writer,
     ) -> (Self, SubscribeNamespaceRecv) {
         let (send_state, recv_state) = State::default().split();
+        let (force_reset, recv_force_reset) = oneshot::channel();
         let recv = SubscribeNamespaceRecv {
             state: recv_state,
             request_id: info.request_id,
             namespace_prefix: info.namespace_prefix.clone(),
             responded: false,
             known_suffixes: HashSet::default(),
-            subscriber: subscriber.clone(),
+            subscriber,
+            force_reset: Some(recv_force_reset),
         };
         let send = Self {
-            subscriber,
             state: send_state,
-            _writer: writer,
+            writer: Some(writer),
+            request_finished: false,
+            force_reset: Some(force_reset),
             info,
         };
 
@@ -110,14 +114,37 @@ impl SubscribeNamespace {
         }
     }
 
+    /// Cancel the request gracefully with FIN while continuing to receive its response.
+    pub fn finish_request(&mut self) -> Result<(), SessionError> {
+        if self.request_finished {
+            return Ok(());
+        }
+
+        self.request_finished = true;
+        match self.writer.as_mut() {
+            Some(writer) => writer.finish(),
+            None => Ok(()),
+        }
+    }
+
+    /// Force both halves of this request stream closed without closing the session.
+    pub fn reset_request(&mut self, code: u32) {
+        let Some(force_reset) = self.force_reset.take() else {
+            return;
+        };
+
+        let _ = force_reset.send(code);
+        if let Some(mut writer) = self.writer.take() {
+            writer.reset(code);
+        }
+    }
+
     pub async fn next(&self) -> Result<Option<NamespaceEvent>, ServeError> {
         loop {
             {
                 let state = self.state.lock();
                 if !state.events.is_empty() {
-                    return Ok(state
-                        .into_mut()
-                        .and_then(|mut state| state.events.pop_front()));
+                    return Ok(state.into_mut_closed().events.pop_front());
                 }
 
                 state.closed.clone()?;
@@ -146,13 +173,6 @@ impl SubscribeNamespace {
     }
 }
 
-impl Drop for SubscribeNamespace {
-    fn drop(&mut self) {
-        self.subscriber
-            .remove_subscribe_namespace(self.info.request_id);
-    }
-}
-
 impl ops::Deref for SubscribeNamespace {
     type Target = SubscribeNamespaceInfo;
 
@@ -168,6 +188,7 @@ pub(super) struct SubscribeNamespaceRecv {
     responded: bool,
     known_suffixes: HashSet<TrackNamespacePrefix>,
     subscriber: Subscriber,
+    force_reset: Option<oneshot::Receiver<u32>>,
 }
 
 impl SubscribeNamespaceRecv {
@@ -176,13 +197,37 @@ impl SubscribeNamespaceRecv {
         mut reader: Reader,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
     ) -> Result<(), SessionError> {
+        let mut force_reset = self.force_reset.take().ok_or(SessionError::Internal)?;
+
+        tokio::select! {
+            biased;
+            reset = &mut force_reset => {
+                if let Ok(code) = reset {
+                    reader.stop(code);
+                }
+                Ok(())
+            }
+            result = self.run_response(&mut reader, &mlog) => {
+                match result {
+                    Err(err) if err.is_stream_error() => Ok(()),
+                    result => result,
+                }
+            }
+        }
+    }
+
+    async fn run_response(
+        &mut self,
+        reader: &mut Reader,
+        mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(), SessionError> {
         loop {
             if self.responded && reader.done().await? {
                 return Ok(());
             }
 
             let msg = reader.decode::<Message>().await?;
-            self.emit_mlog(&mlog, &msg);
+            self.emit_mlog(mlog, &msg);
             if !self.recv_message(msg)? {
                 return Ok(());
             }
@@ -268,7 +313,6 @@ impl SubscribeNamespaceRecv {
         if let Some(mut state) = self.state.lock_mut() {
             state.closed = Err(err);
         }
-        self.subscriber.remove_subscribe_namespace(self.request_id);
     }
 
     fn recv_namespace(&mut self, msg: message::Namespace) -> Result<bool, SessionError> {
@@ -388,7 +432,83 @@ mod tests {
             responded: false,
             known_suffixes: HashSet::default(),
             subscriber: subscriber(),
+            force_reset: None,
         }
+    }
+
+    fn pair(prefix: &str) -> (SubscribeNamespace, SubscribeNamespaceRecv) {
+        let info = SubscribeNamespaceInfo {
+            request_id: 0,
+            namespace_prefix: TrackNamespacePrefix::from_utf8_path(prefix),
+            subscribe_options: SubscribeOptions::Namespace,
+        };
+        let subscriber = subscriber();
+        let (send_state, recv_state) = State::default().split();
+        let (force_reset, recv_force_reset) = oneshot::channel();
+
+        (
+            SubscribeNamespace {
+                state: send_state,
+                writer: None,
+                request_finished: false,
+                force_reset: Some(force_reset),
+                info: info.clone(),
+            },
+            SubscribeNamespaceRecv {
+                state: recv_state,
+                request_id: info.request_id,
+                namespace_prefix: info.namespace_prefix,
+                responded: false,
+                known_suffixes: HashSet::default(),
+                subscriber,
+                force_reset: Some(recv_force_reset),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn queued_event_is_drained_after_response_fin() {
+        let (subscribe, mut recv) = pair("example.com");
+        recv.recv_message(Message::RequestOk(RequestOk {
+            id: 0,
+            params: Default::default(),
+        }))
+        .unwrap();
+        recv.recv_message(Message::Namespace(message::Namespace {
+            track_namespace_suffix: TrackNamespacePrefix::from_utf8_path("meeting=123"),
+        }))
+        .unwrap();
+
+        drop(recv);
+
+        assert_eq!(
+            subscribe.next().await.unwrap(),
+            Some(NamespaceEvent::Added(TrackNamespace::from_utf8_path(
+                "example.com/meeting=123"
+            )))
+        );
+        assert_eq!(subscribe.next().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn graceful_finish_keeps_response_half_open() {
+        let (mut subscribe, mut recv) = pair("example.com");
+
+        subscribe.finish_request().unwrap();
+        subscribe.finish_request().unwrap();
+
+        assert!(subscribe.request_finished);
+        assert_eq!(recv.force_reset.as_mut().unwrap().try_recv().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn forced_reset_signals_response_half() {
+        let (mut subscribe, mut recv) = pair("example.com");
+        let force_reset = recv.force_reset.take().unwrap();
+
+        subscribe.reset_request(42);
+
+        assert_eq!(force_reset.await.unwrap(), 42);
     }
 
     #[test]

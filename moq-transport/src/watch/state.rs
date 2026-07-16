@@ -179,6 +179,14 @@ impl<'a, T> StateRef<'a, T> {
             _drop: self.drop,
         })
     }
+
+    /// Mutate locally buffered state after the other half has closed.
+    pub(crate) fn into_mut_closed(self) -> StateMut<'a, T> {
+        StateMut {
+            lock: self.lock,
+            _drop: self.drop,
+        }
+    }
 }
 
 impl<T> Deref for StateRef<'_, T> {

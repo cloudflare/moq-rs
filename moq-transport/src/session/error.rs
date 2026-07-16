@@ -136,6 +136,30 @@ impl SessionError {
             _ => false,
         }
     }
+
+    /// Returns true when only one WebTransport stream was closed or reset.
+    pub(crate) fn is_stream_error(&self) -> bool {
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        {
+            matches!(
+                self,
+                Self::WebTransport(
+                    web_transport::Error::Write(
+                        web_transport::quinn::WriteError::Stopped(_)
+                            | web_transport::quinn::WriteError::ClosedStream
+                    ) | web_transport::Error::Read(
+                        web_transport::quinn::ReadError::Reset(_)
+                            | web_transport::quinn::ReadError::ClosedStream
+                    )
+                )
+            )
+        }
+
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        {
+            matches!(self, Self::WebTransport(web_transport::Error::Stream(_)))
+        }
+    }
 }
 
 impl From<SessionError> for serve::ServeError {
@@ -201,5 +225,24 @@ fn is_connection_error_graceful(err: &web_transport::quinn::quinn::ConnectionErr
         ConnectionError::LocallyClosed => true,
         // Other errors are not graceful closes
         _ => false,
+    }
+}
+
+#[cfg(all(test, any(not(target_arch = "wasm32"), target_os = "wasi")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_errors_are_not_session_errors() {
+        let reset = SessionError::WebTransport(web_transport::Error::Read(
+            web_transport::quinn::ReadError::Reset(42),
+        ));
+        let stopped = SessionError::WebTransport(web_transport::Error::Write(
+            web_transport::quinn::WriteError::Stopped(42),
+        ));
+
+        assert!(reset.is_stream_error());
+        assert!(stopped.is_stream_error());
+        assert!(!SessionError::Internal.is_stream_error());
     }
 }

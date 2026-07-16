@@ -47,7 +47,6 @@ impl Default for SubscribedNamespaceState {
 pub struct SubscribedNamespace {
     state: State<SubscribedNamespaceState>,
     outgoing: tokio::sync::mpsc::UnboundedSender<Message>,
-    active_prefixes: Arc<Mutex<HashMap<u64, TrackNamespacePrefix>>>,
 
     pub info: SubscribedNamespaceInfo,
 }
@@ -62,13 +61,12 @@ impl SubscribedNamespace {
         let send = Self {
             state: send_state,
             outgoing: send_queue,
-            active_prefixes,
             info,
         };
         let recv = SubscribedNamespaceRecv {
             state: recv_state,
             outgoing: recv_queue,
-            active_prefixes: send.active_prefixes.clone(),
+            active_prefixes,
             request_id: send.info.request_id,
         };
 
@@ -104,6 +102,7 @@ impl SubscribedNamespace {
 
         {
             let mut state = self.state.lock().into_mut().ok_or(ServeError::Cancel)?;
+            state.closed.clone()?;
             if !state.responded {
                 return Err(ServeError::internal_ctx(
                     "NAMESPACE before SUBSCRIBE_NAMESPACE accepted",
@@ -131,6 +130,7 @@ impl SubscribedNamespace {
 
         {
             let mut state = self.state.lock().into_mut().ok_or(ServeError::Cancel)?;
+            state.closed.clone()?;
             if !state.responded {
                 return Err(ServeError::internal_ctx(
                     "NAMESPACE_DONE before SUBSCRIBE_NAMESPACE accepted",
@@ -195,10 +195,6 @@ impl Drop for SubscribedNamespace {
                 "not handled",
             ));
         }
-
-        if let Ok(mut prefixes) = self.active_prefixes.lock() {
-            prefixes.remove(&self.info.request_id);
-        }
     }
 }
 
@@ -239,16 +235,23 @@ impl SubscribedNamespaceRecv {
             tokio::select! {
                 msg = self.outgoing.recv() => {
                     let Some(msg) = msg else {
-                        return Ok(());
+                        return self.finish_response(&mut writer);
                     };
-                    self.emit_mlog(&mlog, &msg);
-                    writer.encode(&msg).await?;
+                    if !self.send_message(&mut writer, &mlog, msg).await? {
+                        self.recv_cancel();
+                        return Ok(());
+                    }
                 }
                 done = reader.done() => {
                     match done {
                         Ok(true) => {
                             self.recv_cancel();
-                            return Ok(());
+                            while let Some(msg) = self.outgoing.recv().await {
+                                if !self.send_message(&mut writer, &mlog, msg).await? {
+                                    return Ok(());
+                                }
+                            }
+                            return self.finish_response(&mut writer);
                         }
                         Ok(false) => {
                             return Err(SessionError::ProtocolViolation(
@@ -262,11 +265,36 @@ impl SubscribedNamespaceRecv {
                                 "SUBSCRIBE_NAMESPACE request stream closed with error"
                             );
                             self.recv_cancel();
-                            return Ok(());
+                            if err.is_stream_error() {
+                                return Ok(());
+                            }
+                            return Err(err);
                         }
                     }
                 }
             }
+        }
+    }
+
+    async fn send_message(
+        &self,
+        writer: &mut Writer,
+        mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>,
+        msg: Message,
+    ) -> Result<bool, SessionError> {
+        self.emit_mlog(mlog, &msg);
+        match writer.encode(&msg).await {
+            Ok(()) => Ok(true),
+            Err(err) if err.is_stream_error() => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn finish_response(&self, writer: &mut Writer) -> Result<(), SessionError> {
+        match writer.finish() {
+            Ok(()) => Ok(()),
+            Err(err) if err.is_stream_error() => Ok(()),
+            Err(err) => Err(err),
         }
     }
 
@@ -304,7 +332,7 @@ impl SubscribedNamespaceRecv {
         if let Some(mut state) = self.state.lock_mut() {
             state.closed = Err(ServeError::Cancel);
         }
-        self.remove_active_prefix();
+        self.outgoing.close();
     }
 
     fn remove_active_prefix(&self) {
@@ -413,15 +441,46 @@ mod tests {
             recv.outgoing.recv().await,
             Some(Message::RequestError(_))
         ));
+        assert!(active.lock().unwrap().contains_key(&0));
+
+        drop(recv);
         assert!(!active.lock().unwrap().contains_key(&0));
     }
 
-    #[test]
-    fn cancel_removes_active_prefix() {
-        let (_send, mut recv, active) = make();
+    #[tokio::test]
+    async fn cancel_keeps_active_prefix_until_receiver_drops() {
+        let (send, mut recv, active) = make();
 
         recv.recv_cancel();
 
+        assert!(matches!(send.closed().await, Err(ServeError::Cancel)));
+        assert!(active.lock().unwrap().contains_key(&0));
+
+        drop(recv);
         assert!(!active.lock().unwrap().contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn graceful_cancel_preserves_queued_responses() {
+        let (mut send, mut recv, _active) = make();
+        let namespace = TrackNamespace::from_utf8_path("example.com/meeting=123/participant=100");
+        send.ok().unwrap();
+        send.namespace(&namespace).unwrap();
+
+        recv.recv_cancel();
+
+        assert!(matches!(
+            recv.outgoing.recv().await,
+            Some(Message::RequestOk(_))
+        ));
+        assert!(matches!(
+            recv.outgoing.recv().await,
+            Some(Message::Namespace(_))
+        ));
+        assert!(recv.outgoing.recv().await.is_none());
+        assert!(matches!(
+            send.namespace(&namespace),
+            Err(ServeError::Cancel)
+        ));
     }
 }

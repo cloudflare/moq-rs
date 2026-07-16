@@ -133,4 +133,8 @@ impl Reader {
 
         Ok(self.stream.read_buf(&mut self.buffer).await?.is_none())
     }
+
+    pub(super) fn stop(&mut self, code: u32) {
+        self.stream.stop(code);
+    }
 }
