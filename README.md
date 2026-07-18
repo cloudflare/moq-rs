@@ -24,11 +24,11 @@ This repository provides:
 - PUBLISH_NAMESPACE
 - PUBLISH / PUBLISH_OK / PUBLISH_DONE
 - SUBSCRIBE
+- SUBSCRIBE_NAMESPACE
 - WebTransport and raw QUIC transport layers
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
-- SUBSCRIBE_NAMESPACE (Soon)
 - FETCH (Not Soon)
 
 ## Interoperability
