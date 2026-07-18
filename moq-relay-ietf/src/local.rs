@@ -319,30 +319,6 @@ impl Locals {
         })
     }
 
-    async fn insert_track(
-        &mut self,
-        scope: Option<&str>,
-        full_name: FullTrackName,
-        track: TrackReader,
-    ) -> anyhow::Result<()> {
-        let scope_key = scope.unwrap_or(UNSCOPED).to_string();
-        let mut tracks = self
-            .tracks
-            .lock()
-            .map_err(|_| ServeError::internal_ctx("locals track registry lock poisoned"))?;
-        let bucket = tracks.entry(scope_key).or_default();
-        match bucket.entry(full_name) {
-            hash_map::Entry::Vacant(entry) => {
-                entry.insert(TrackEntry {
-                    reader: track,
-                    source: TrackSource::Cache,
-                });
-                Ok(())
-            }
-            hash_map::Entry::Occupied(_) => Err(ServeError::Duplicate.into()),
-        }
-    }
-
     /// Retrieve one actual media track by exact Full Track Name.
     pub fn retrieve_track(
         &self,
@@ -418,10 +394,34 @@ impl Locals {
 
         let source = self.route_namespace(scope, &namespace)?;
 
-        let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
-        self.insert_track(scope, full_name.clone(), reader.clone())
-            .await
-            .ok()?;
+        // Reserve the pull-through cache slot under a single lock so concurrent
+        // misses for the same track collapse onto one produced reader. The caller
+        // that finds no live entry claims the slot with a freshly produced track and
+        // owns requesting it from the source; concurrent callers share the reserved
+        // reader instead of racing to insert and failing with a spurious `None`.
+        let (writer, reader) = {
+            let mut tracks = self.tracks.lock().ok()?;
+            let bucket = tracks
+                .entry(scope.unwrap_or(UNSCOPED).to_string())
+                .or_default();
+
+            if let Some(entry) = bucket.get(&full_name) {
+                if !entry.reader.is_closed() {
+                    return Some(entry.reader.clone());
+                }
+            }
+
+            // Vacant slot (or a stale, closed reader): claim it with a fresh track.
+            let (writer, reader) = Track::new(namespace, track_name).produce();
+            bucket.insert(
+                full_name.clone(),
+                TrackEntry {
+                    reader: reader.clone(),
+                    source: TrackSource::Cache,
+                },
+            );
+            (writer, reader)
+        };
 
         if source.requests.send(writer).await.is_err() {
             if let Ok(mut tracks) = self.tracks.lock() {
@@ -833,6 +833,50 @@ mod tests {
             no_second_request.is_err(),
             "concurrent misses should be deduplicated"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_get_or_request_track_multi_thread_never_returns_spurious_none() {
+        // Exercise the cache-slot race across real threads: many callers miss the
+        // cache for the same track at once. Every caller must receive a reader (the
+        // winner's reserved reader), and the source must see exactly one request.
+        for _ in 0..64 {
+            let mut locals = Locals::new();
+            let namespace = ns("room/123");
+            let (_registration, mut requests) = locals
+                .register_namespace(None, namespace.clone())
+                .await
+                .expect("namespace source should register");
+
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let mut clone = locals.clone();
+                let namespace = namespace.clone();
+                handles.push(tokio::spawn(async move {
+                    clone.get_or_request_track(None, namespace, "video").await
+                }));
+            }
+
+            for handle in handles {
+                let reader = handle.await.expect("task should not panic");
+                assert!(
+                    reader.is_some(),
+                    "every concurrent caller should receive a reader"
+                );
+            }
+
+            let first = requests
+                .recv()
+                .await
+                .expect("source should receive exactly one TrackWriter");
+            assert_eq!(first.namespace, namespace);
+            let extra =
+                tokio::time::timeout(std::time::Duration::from_millis(50), requests.recv()).await;
+            assert!(
+                extra.is_err(),
+                "concurrent misses across threads must be deduplicated"
+            );
+        }
     }
 
     #[tokio::test]
