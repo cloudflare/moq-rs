@@ -26,6 +26,14 @@ const UNSCOPED: &str = "";
 
 const NAMESPACE_REQUEST_CHANNEL_CAPACITY: usize = 1024;
 
+/// Capacity of the namespace add/remove notification broadcast channel used by
+/// SUBSCRIBE_NAMESPACE handlers.
+const NAMESPACE_CHANGE_CHANNEL_CAPACITY: usize = 1024;
+
+/// Capacity of the PUBLISH track add/remove notification broadcast channel used
+/// by Publish/Both fan-out.
+const TRACK_CHANGE_CHANNEL_CAPACITY: usize = 1024;
+
 #[derive(Clone)]
 struct NamespaceSource {
     requests: mpsc::Sender<TrackWriter>,
@@ -102,8 +110,8 @@ impl Default for Locals {
 
 impl Locals {
     pub fn new() -> Self {
-        let (namespace_changes, _) = broadcast::channel(1024);
-        let (track_changes, _) = broadcast::channel(1024);
+        let (namespace_changes, _) = broadcast::channel(NAMESPACE_CHANGE_CHANNEL_CAPACITY);
+        let (track_changes, _) = broadcast::channel(TRACK_CHANGE_CHANNEL_CAPACITY);
         Self {
             tracks: Default::default(),
             namespaces: Default::default(),
