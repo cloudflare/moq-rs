@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.9...moq-test-client-v0.1.10) - 2026-07-19
+
+### Other
+
+- updated the following local packages: moq-transport
+
 ## [0.1.9](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.8...moq-test-client-v0.1.9) - 2026-07-09
 
 ### Fixed

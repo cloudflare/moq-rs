@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.15.1...moq-transport-v0.16.0) - 2026-07-19
+
+### Added
+
+- *(moq-transport)* add namespace request stream cancellation
+
+### Fixed
+
+- *(moq-transport)* bound SubscribedNamespace outgoing queue
+- *(moq-transport)* bound inbound subscribe-namespace stream resources
+- *(moq-transport)* reconcile subscribe namespace cherry-pick
+
+### Other
+
+- *(moq-transport)* document received_above_low_water window bound
+- *(moq-transport)* explain subscribe-namespace cleanup guard
+- add subscribe namespace mlog events
+- allow reordered incoming request ids
+- cover subscribe namespace overlap
+- handle inbound subscribe namespace
+- add outbound subscribe namespace
+- add namespace prefix helpers
+
 ## [0.15.1](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.15.0...moq-transport-v0.15.1) - 2026-07-09
 
 ### Fixed
