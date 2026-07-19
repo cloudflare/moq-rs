@@ -299,8 +299,8 @@ impl Relay {
                         let locals = locals.clone();
                         let remotes = remote_manager.clone();
                         let forward = forward_producer.clone();
-                            let coordinator = coordinator.clone();
-                            let upstream_namespaces = upstream_namespaces.clone();
+                        let coordinator = coordinator.clone();
+                        let upstream_namespaces = upstream_namespaces.clone();
                         let connection_tagger = connection_tagger.clone();
 
                         // Spawn a new task to handle the connection
