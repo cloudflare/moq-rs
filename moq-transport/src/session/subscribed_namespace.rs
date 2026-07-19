@@ -19,6 +19,12 @@ use crate::{
 
 use super::{Reader, SessionError, Writer};
 
+/// Capacity of the per-subscription outbound message queue. Bounds memory when a
+/// downstream reader is slow: rather than buffering namespace updates without
+/// limit under sustained churn, a full queue tears the subscription down (the peer
+/// can re-subscribe and receive a fresh snapshot).
+const OUTGOING_QUEUE_CAPACITY: usize = 8192;
+
 #[derive(Debug, Clone)]
 pub struct SubscribedNamespaceInfo {
     pub request_id: u64,
@@ -46,7 +52,7 @@ impl Default for SubscribedNamespaceState {
 #[must_use = "rejects SUBSCRIBE_NAMESPACE on drop if not accepted"]
 pub struct SubscribedNamespace {
     state: State<SubscribedNamespaceState>,
-    outgoing: tokio::sync::mpsc::UnboundedSender<Message>,
+    outgoing: tokio::sync::mpsc::Sender<Message>,
 
     pub info: SubscribedNamespaceInfo,
 }
@@ -57,7 +63,7 @@ impl SubscribedNamespace {
         active_prefixes: Arc<Mutex<HashMap<u64, TrackNamespacePrefix>>>,
     ) -> (Self, SubscribedNamespaceRecv) {
         let (send_state, recv_state) = State::default().split();
-        let (send_queue, recv_queue) = tokio::sync::mpsc::unbounded_channel();
+        let (send_queue, recv_queue) = tokio::sync::mpsc::channel(OUTGOING_QUEUE_CAPACITY);
         let send = Self {
             state: send_state,
             outgoing: send_queue,
@@ -76,7 +82,7 @@ impl SubscribedNamespace {
     pub fn ok(&mut self) -> Result<(), ServeError> {
         self.responded()?;
         self.outgoing
-            .send(
+            .try_send(
                 message::RequestOk {
                     id: self.info.request_id,
                     params: Default::default(),
@@ -89,7 +95,7 @@ impl SubscribedNamespace {
     pub fn reject(mut self, error_code: u64, reason: &str) -> Result<(), ServeError> {
         self.responded()?;
         self.outgoing
-            .send(request_error(self.info.request_id, error_code, reason))
+            .try_send(request_error(self.info.request_id, error_code, reason))
             .map_err(|_| ServeError::Cancel)
     }
 
@@ -112,7 +118,7 @@ impl SubscribedNamespace {
         }
 
         self.outgoing
-            .send(
+            .try_send(
                 message::Namespace {
                     track_namespace_suffix: suffix,
                 }
@@ -144,7 +150,7 @@ impl SubscribedNamespace {
         }
 
         self.outgoing
-            .send(
+            .try_send(
                 message::NamespaceDone {
                     track_namespace_suffix: suffix,
                 }
@@ -189,7 +195,7 @@ impl Drop for SubscribedNamespace {
         };
 
         if should_reject {
-            let _ = self.outgoing.send(request_error(
+            let _ = self.outgoing.try_send(request_error(
                 self.info.request_id,
                 RequestErrorCode::DoesNotExist as u64,
                 "not handled",
@@ -208,15 +214,15 @@ impl ops::Deref for SubscribedNamespace {
 
 pub(super) struct SubscribedNamespaceRecv {
     state: State<SubscribedNamespaceState>,
-    outgoing: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    outgoing: tokio::sync::mpsc::Receiver<Message>,
     active_prefixes: Arc<Mutex<HashMap<u64, TrackNamespacePrefix>>>,
     request_id: u64,
 }
 
 impl SubscribedNamespaceRecv {
     pub(super) fn rejected(request_id: u64, error_code: u64, reason: &str) -> Self {
-        let (send_queue, recv_queue) = tokio::sync::mpsc::unbounded_channel();
-        let _ = send_queue.send(request_error(request_id, error_code, reason));
+        let (send_queue, recv_queue) = tokio::sync::mpsc::channel(OUTGOING_QUEUE_CAPACITY);
+        let _ = send_queue.try_send(request_error(request_id, error_code, reason));
         Self {
             state: State::default(),
             outgoing: recv_queue,
