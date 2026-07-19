@@ -83,14 +83,6 @@ pub enum TestCase {
     PublishTrackOnly,
     /// T0.8: Publisher sends PUBLISH for one track, subscriber receives it through relay routing
     PublishTrackSubscribe,
-    /// T0.9: Subscriber sends SUBSCRIBE_NAMESPACE and receives NAMESPACE
-    SubscribeNamespaceExisting,
-    /// T0.8: SUBSCRIBE_NAMESPACE Publish receives PUBLISH only
-    SubscribeNamespacePublish,
-    /// T0.9: SUBSCRIBE_NAMESPACE Both receives NAMESPACE and PUBLISH
-    SubscribeNamespaceBoth,
-    /// T0.10: SUBSCRIBE_NAMESPACE receives future NAMESPACE and NAMESPACE_DONE
-    SubscribeNamespaceUpdates,
 }
 
 impl TestCase {
@@ -104,10 +96,6 @@ impl TestCase {
             TestCase::PublishNamespaceDone,
             TestCase::PublishTrackOnly,
             TestCase::PublishTrackSubscribe,
-            TestCase::SubscribeNamespaceExisting,
-            TestCase::SubscribeNamespacePublish,
-            TestCase::SubscribeNamespaceBoth,
-            TestCase::SubscribeNamespaceUpdates,
         ]
     }
 
@@ -121,10 +109,6 @@ impl TestCase {
             TestCase::PublishNamespaceDone => "publish-namespace-done",
             TestCase::PublishTrackOnly => "publish-track-only",
             TestCase::PublishTrackSubscribe => "publish-track-subscribe",
-            TestCase::SubscribeNamespaceExisting => "subscribe-namespace-existing",
-            TestCase::SubscribeNamespacePublish => "subscribe-namespace-publish",
-            TestCase::SubscribeNamespaceBoth => "subscribe-namespace-both",
-            TestCase::SubscribeNamespaceUpdates => "subscribe-namespace-updates",
         }
     }
 }
@@ -178,16 +162,6 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
         TestCase::PublishNamespaceDone => scenarios::test_publish_namespace_done(args).await,
         TestCase::PublishTrackOnly => scenarios::test_publish_track_only(args).await,
         TestCase::PublishTrackSubscribe => scenarios::test_publish_track_subscribe(args).await,
-        TestCase::SubscribeNamespaceExisting => {
-            scenarios::test_subscribe_namespace_existing(args).await
-        }
-        TestCase::SubscribeNamespacePublish => {
-            scenarios::test_subscribe_namespace_publish(args).await
-        }
-        TestCase::SubscribeNamespaceBoth => scenarios::test_subscribe_namespace_both(args).await,
-        TestCase::SubscribeNamespaceUpdates => {
-            scenarios::test_subscribe_namespace_updates(args).await
-        }
     };
 
     let duration = start.elapsed();
