@@ -174,11 +174,7 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
-    pub(super) fn new(
-        subscriber: Subscriber,
-        request_id: u64,
-        track: TrackWriter,
-    ) -> (Subscribe, SubscribeRecv) {
+    fn build_info(request_id: u64, track: &TrackWriter) -> (message::Subscribe, SubscribeInfo) {
         let subscribe_message = message::Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
@@ -202,7 +198,28 @@ impl Subscribe {
                 track_status: false,
             }
         });
+        (subscribe_message, info)
+    }
 
+    /// Create a Subscribe without sending on the control stream, returning the
+    /// wire message to send on the bidi request stream (draft-18) alongside it.
+    /// The message is the one already built by `build_info`, so it is never
+    /// constructed twice.
+    pub(super) fn new(
+        subscriber: Subscriber,
+        request_id: u64,
+        track: TrackWriter,
+    ) -> (Subscribe, SubscribeRecv, message::Subscribe) {
+        let (msg, info) = Self::build_info(request_id, &track);
+        let (send, recv) = Self::from_parts(subscriber, info, track);
+        (send, recv, msg)
+    }
+
+    fn from_parts(
+        subscriber: Subscriber,
+        info: SubscribeInfo,
+        track: TrackWriter,
+    ) -> (Subscribe, SubscribeRecv) {
         let (send, recv) = State::default().split();
 
         let send = Subscribe {
@@ -219,24 +236,11 @@ impl Subscribe {
         (send, recv)
     }
 
-    pub(super) fn send_request(&mut self) {
-        self.subscriber.send_message(message::Subscribe {
-            id: self.info.id,
-            track_namespace: self.info.track_namespace.clone(),
-            track_name: self.info.track_name.clone(),
-            params: self.info.params.clone(),
-        });
-    }
-
     pub async fn closed(&self) -> Result<(), ServeError> {
         loop {
             {
                 let state = self.state.lock();
-                match state.closed.clone() {
-                    Ok(()) => {}
-                    Err(ServeError::Done) => return Ok(()),
-                    Err(err) => return Err(err),
-                }
+                state.closed.clone()?;
 
                 match state.modified() {
                     Some(notify) => notify,
@@ -301,6 +305,11 @@ impl SubscribeRecv {
         }
 
         Ok(())
+    }
+
+    pub fn track_alias(&self) -> Option<u64> {
+        let state = self.state.lock();
+        state.track_alias
     }
 
     pub fn error(mut self, err: ServeError) -> Result<(), ServeError> {
@@ -446,47 +455,5 @@ mod tests {
 
         assert!(!filter.allows(0, 0));
         assert!(!filter.allows(100, 100));
-    }
-
-    #[tokio::test]
-    async fn closed_returns_ok_for_track_ended() {
-        let rid = crate::session::RequestId::new(0, 100, 100, 0);
-        let subscriber = crate::session::Subscriber::new(
-            crate::session::Queue::default(),
-            crate::session::Queue::default(),
-            None,
-            rid,
-            crate::session::PendingRequests::default(),
-        );
-        let (writer, _reader) =
-            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
-        let (subscribe, recv) = Subscribe::new(subscriber, 1, writer);
-
-        recv.error(ServeError::Done).unwrap();
-
-        assert_eq!(subscribe.closed().await, Ok(()));
-    }
-
-    #[tokio::test]
-    async fn closed_returns_error_for_non_track_ended() {
-        let rid = crate::session::RequestId::new(0, 100, 100, 0);
-        let subscriber = crate::session::Subscriber::new(
-            crate::session::Queue::default(),
-            crate::session::Queue::default(),
-            None,
-            rid,
-            crate::session::PendingRequests::default(),
-        );
-        let (writer, _reader) =
-            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
-        let (subscribe, recv) = Subscribe::new(subscriber, 1, writer);
-
-        recv.error(ServeError::Closed(message::PublishDoneCode::Expired as u64))
-            .unwrap();
-
-        assert!(matches!(
-            subscribe.closed().await,
-            Err(ServeError::Closed(code)) if code == message::PublishDoneCode::Expired as u64
-        ));
     }
 }

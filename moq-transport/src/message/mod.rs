@@ -25,7 +25,7 @@ mod fetch_type;
 mod filter_type;
 mod go_away;
 mod group_order;
-mod max_request_id;
+
 mod namespace;
 mod params;
 mod pubilsh_namespace_done;
@@ -38,7 +38,7 @@ mod publisher;
 mod request_error;
 mod request_ok;
 mod request_update;
-mod requests_blocked;
+
 mod subscribe;
 mod subscribe_namespace;
 mod subscribe_ok;
@@ -53,7 +53,7 @@ pub use fetch_type::*;
 pub use filter_type::*;
 pub use go_away::*;
 pub use group_order::*;
-pub use max_request_id::*;
+
 pub use namespace::*;
 pub use params::*;
 pub use pubilsh_namespace_done::*;
@@ -66,7 +66,7 @@ pub use publisher::*;
 pub use request_error::*;
 pub use request_ok::*;
 pub use request_update::*;
-pub use requests_blocked::*;
+
 pub use subscribe::*;
 pub use subscribe_namespace::*;
 pub use subscribe_ok::*;
@@ -81,6 +81,16 @@ use std::fmt;
 // Use a macro to generate the Message enum and its encode/decode impls.
 macro_rules! message_types {
     {$($name:ident = $val:expr,)*} => {
+        /// Wire type IDs for control messages (draft-18 Table 5).
+        ///
+        /// These are the `u64` values used in the `Message Type` field on
+        /// the wire. Use these constants instead of hardcoded hex literals
+        /// when matching or constructing message frames.
+        #[allow(non_upper_case_globals)]
+        pub mod wire_id {
+            $(pub const $name: u64 = $val;)*
+        }
+
         /// All supported control message types.
         #[derive(Clone)]
         pub enum Message {
@@ -167,6 +177,23 @@ macro_rules! message_types {
                     _ => None,
                 }
             }
+
+            /// Return the target request ID for response/follow-up messages sent
+            /// back on a bidi stream (draft-18). Returns `None` for request-initiating
+            /// messages and session-level messages.
+            pub fn response_target_id(&self) -> Option<u64> {
+                match self {
+                    Self::RequestOk(m) => Some(m.id),
+                    Self::RequestError(m) => Some(m.id),
+                    Self::SubscribeOk(m) => Some(m.id),
+                    Self::PublishDone(m) => Some(m.id),
+                    Self::PublishNamespaceDone(m) => Some(m.id),
+                    Self::Unsubscribe(m) => Some(m.id),
+                    Self::PublishOk(m) => Some(m.id),
+                    Self::FetchOk(m) => Some(m.id),
+                    _ => None,
+                }
+            }
         }
 
         $(impl From<$name> for Message {
@@ -224,8 +251,6 @@ message_types! {
 
     // ── Session management ────────────────────────────────────────────────────
     GoAway          = 0x10,
-    MaxRequestId    = 0x15,
-    RequestsBlocked = 0x1a,
 }
 
 #[cfg(test)]

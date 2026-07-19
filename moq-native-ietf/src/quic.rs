@@ -308,10 +308,11 @@ impl Endpoint {
         let mut server_config = None;
 
         if let Some(mut config) = config.tls.server {
-            config.alpn_protocols = vec![
-                web_transport_quinn::ALPN.as_bytes().to_vec(),
-                moq_transport::setup::ALPN.to_vec(),
-            ];
+            // Offer WebTransport ALPN plus all supported MoQT versions for raw QUIC.
+            config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+            for alpn in moq_transport::setup::SUPPORTED_ALPNS {
+                config.alpn_protocols.push(alpn.as_bytes().to_vec());
+            }
             config.key_log = Arc::new(rustls::KeyLogFile::new());
 
             let config: quinn::crypto::rustls::QuicServerConfig = config.try_into()?;
@@ -505,14 +506,12 @@ impl Server {
                 .await
                 .context("failed to receive WebTransport request")?;
 
-            let moqt_protocol = std::str::from_utf8(moq_transport::setup::ALPN)
-                .context("invalid MoQT ALPN")?
-                .to_string();
-            let response = if request.protocols.contains(&moqt_protocol) {
-                web_transport_quinn::proto::ConnectResponse::OK.with_protocol(moqt_protocol)
-            } else {
-                web_transport_quinn::proto::ConnectResponse::OK
-            };
+            // Negotiate the MoQT version from the clients offered protocols.
+            // Reject if no mutually-supported version exists.
+            let selected = moq_transport::setup::negotiate_version(&request.protocols)
+                .context("no mutually supported MoQT version in WT-Available-Protocols")?;
+            let response =
+                web_transport_quinn::proto::ConnectResponse::OK.with_protocol(selected.to_string());
 
             // Accept the CONNECT request.
             let session = request
@@ -520,7 +519,10 @@ impl Server {
                 .await
                 .context("failed to respond to WebTransport request")?;
             (session, Transport::WebTransport)
-        } else if alpn_bytes == moq_transport::setup::ALPN {
+        } else if moq_transport::setup::SUPPORTED_ALPNS
+            .iter()
+            .any(|v| v.as_bytes() == alpn_bytes)
+        {
             // Raw QUIC mode — create a "fake" WebTransport session with no H3 framing.
             let request = url::Url::parse("moqt://localhost").unwrap();
             let session = web_transport_quinn::Session::raw(
@@ -649,11 +651,11 @@ impl Client {
 
         let (session, transport) = match url.scheme() {
             "https" => {
-                let moqt_protocol = std::str::from_utf8(moq_transport::setup::ALPN)
-                    .context("invalid MoQT ALPN")?
-                    .to_string();
-                let request = web_transport_quinn::proto::ConnectRequest::new(url.clone())
-                    .with_protocol(moqt_protocol);
+                // Offer all supported MoQT versions via WT-Available-Protocols.
+                let mut request = web_transport_quinn::proto::ConnectRequest::new(url.clone());
+                for alpn in moq_transport::setup::SUPPORTED_ALPNS {
+                    request = request.with_protocol(alpn.to_string());
+                }
                 (
                     web_transport_quinn::Session::connect(connection, request).await?,
                     Transport::WebTransport,

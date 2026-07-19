@@ -8,8 +8,7 @@
 // - RequestUpdate (parsed/created)
 // - Fetch, FetchOk, FetchCancel (parsed/created)
 // - Publish, PublishOk, PublishDone (parsed/created)
-// - MaxRequestId (parsed/created)
-// - RequestsBlocked (parsed/created)
+// Note: MaxRequestId/RequestsBlocked removed in draft-18 (#1471)
 // - Namespace and NamespaceDone are implemented for SUBSCRIBE_NAMESPACE response streams.
 //
 // TODO: Unimplemented data plane events (from draft-pardue-moq-qlog-moq-events):
@@ -210,7 +209,7 @@ fn create_control_message_event(
 
 /// Create a control_message_parsed event for CLIENT_SETUP.
 /// From draft-16 the setup payload carries only parameters; version is agreed via ALPN.
-pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Event {
+pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Setup) -> Event {
     create_control_message_event(
         time,
         stream_id,
@@ -224,7 +223,7 @@ pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Ev
 
 /// Create a control_message_created event for SERVER_SETUP.
 /// From draft-16 the setup payload carries only parameters; version is agreed via ALPN.
-pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Server) -> Event {
+pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Setup) -> Event {
     create_control_message_event(
         time,
         stream_id,
