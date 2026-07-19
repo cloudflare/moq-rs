@@ -3,36 +3,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod error;
-mod pending_requests;
 mod publish_namespace;
-mod publish_received;
-mod published;
 mod published_namespace;
 mod publisher;
 mod reader;
 mod request_id;
 mod subscribe;
-mod subscribe_namespace;
 mod subscribed;
-mod subscribed_namespace;
 mod subscriber;
 mod track_status_requested;
 mod writer;
 
 pub use error::*;
-pub(crate) use pending_requests::{PendingRequest, PendingRequests, PendingResponse};
 pub use publish_namespace::*;
-pub use publish_received::PublishReceived;
-pub(crate) use publish_received::PublishReceivedRecv;
-pub(crate) use published::{split_published_state, PublishedRecv};
-pub use published::{Published, PublishedInfo};
 pub use published_namespace::*;
 pub use publisher::*;
-pub use request_id::{RequestId, RequestIdAllocation};
+pub use request_id::RequestId;
 pub use subscribe::*;
-pub use subscribe_namespace::*;
 pub use subscribed::*;
-pub use subscribed_namespace::*;
 pub use subscriber::*;
 pub use track_status_requested::*;
 
@@ -40,33 +28,39 @@ use reader::*;
 use writer::*;
 
 use futures::{stream::FuturesUnordered, StreamExt};
-use request_id::max_request_id_from_params;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use crate::coding::{KeyValuePairs, Value};
+use crate::coding::{Encode, KeyValuePairs, Value};
 use crate::message::Message;
 use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
 
-fn add_mlog_event<F>(mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>, make_event: F)
-where
-    F: FnOnce(f64) -> mlog::Event,
-{
-    if let Some(mlog) = mlog {
-        if let Ok(mut mlog) = mlog.lock() {
-            let event = make_event(mlog.elapsed_ms());
-            let _ = mlog.add_event(event);
-        }
-    }
-}
+/// Registry mapping bidi-request IDs to a channel for forwarding responses.
+/// When `run_send` pops a response message from the outgoing queue, it checks
+/// this map: if the response's target request ID has a registered sender, the
+/// response is forwarded to the bidi handler task that owns the Writer.
+type BidiResponseMap = Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Message>>>>;
+
+/// A bidi response reader future handed from Publisher/Subscriber to
+/// `Session::run`. Boxed so the publisher and subscriber reader loops can
+/// share one channel and one `FuturesUnordered` type.
+type BidiReaderFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Channel for bidi response reader futures. Publisher/Subscriber send boxed
+/// futures here; `Session::run` polls them cooperatively under structured
+/// concurrency — no task is spawned, so a reader cannot outlive the session.
+type BidiTaskSender = tokio::sync::mpsc::UnboundedSender<BidiReaderFuture>;
 
 /// The transport protocol negotiated for this MoQT connection.
 ///
 /// MoQT can run over either WebTransport (HTTP/3 + QUIC) or raw QUIC.
 /// The transport type affects protocol behavior — for example, the PATH
-/// parameter is only sent in CLIENT_SETUP for raw QUIC connections,
+/// parameter is only sent in SETUP for raw QUIC connections,
 /// since WebTransport carries the path in the HTTP/3 CONNECT URL.
 ///
 /// This enum is intentionally extensible for future transport options
@@ -77,35 +71,8 @@ pub enum Transport {
     /// ALPN: "h3". Path carried in HTTP/3 CONNECT :path pseudo-header.
     WebTransport,
     /// Raw QUIC with MoQT framing directly on QUIC streams.
-    /// ALPN: "moqt-16". Path carried in CLIENT_SETUP PATH parameter.
+    /// ALPN: "moqt-16". Path carried in SETUP PATH parameter.
     RawQuic,
-}
-
-const DEFAULT_MAX_REQUEST_ID: u64 = 100;
-
-/// Maximum number of concurrently accepted inbound SUBSCRIBE_NAMESPACE request
-/// streams. Backpressures `accept_bi()` so a peer cannot exhaust memory by opening
-/// unbounded bidirectional streams (draft-16 §3.3/§9.25).
-const MAX_CONCURRENT_SUBSCRIBE_NAMESPACE_STREAMS: usize = 256;
-
-/// Maximum time to wait for the SUBSCRIBE_NAMESPACE header on a freshly accepted
-/// bidirectional stream before treating the peer as misbehaving. Prevents idle or
-/// malicious streams from occupying an accept slot indefinitely.
-const SUBSCRIBE_NAMESPACE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Session-level protocol limits advertised during setup.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct SessionConfig {
-    /// Maximum request ID plus one that we advertise to the peer.
-    pub max_request_id: u64,
-}
-
-impl Default for SessionConfig {
-    fn default() -> Self {
-        Self {
-            max_request_id: DEFAULT_MAX_REQUEST_ID,
-        }
-    }
 }
 
 /// Session object for managing all communications in a single QUIC connection.
@@ -123,15 +90,9 @@ pub struct Session {
     /// Queue used by Publisher and Subscriber for sending Control Messages
     outgoing: Queue<Message>,
 
-    /// Queue used by Subscriber to request opening SUBSCRIBE_NAMESPACE bidi streams.
-    subscribe_namespace_open: Queue<OpenSubscribeNamespace>,
-
     /// Session-level request ID manager.
     /// Publisher and Subscriber share one outbound request ID sequence.
     request_id: RequestId,
-
-    /// Outbound requests that are waiting for a terminal response.
-    pending_requests: PendingRequests,
 
     /// Optional mlog writer for MoQ Transport events
     /// Wrapped in Arc<Mutex<>> to share across send/recv tasks when enabled
@@ -140,24 +101,22 @@ pub struct Session {
     /// The transport protocol negotiated for this connection.
     transport: Transport,
 
-    /// The connection path, derived from the WebTransport URL path or CLIENT_SETUP PATH parameter.
+    /// The connection path, derived from the WebTransport URL path or SETUP PATH parameter.
     /// For incoming connections: extracted during accept() from the WebTransport CONNECT URL
-    /// (takes precedence) or the CLIENT_SETUP PATH parameter (key 0x1).
+    /// (takes precedence) or the SETUP PATH parameter (key 0x1).
     /// For outgoing connections: auto-extracted from the session URL in connect().
     connection_path: Option<String>,
+
+    /// Receiver for bidi reader futures.
+    /// Polled by Session::run; dropping FuturesUnordered cancels all in-flight futures.
+    bidi_task_rx: tokio::sync::mpsc::UnboundedReceiver<BidiReaderFuture>,
+
+    /// Maps bidi-request IDs to their response stream writers (draft-18).
+    bidi_response_map: BidiResponseMap,
 }
 
 impl Session {
     const MAX_CONNECTION_PATH_LEN: usize = 1024;
-
-    fn log_peer_max_request_id(peer_max: u64) {
-        if peer_max == 0 {
-            tracing::warn!(
-                target: "moq_transport::control",
-                "peer MAX_REQUEST_ID is 0; outbound requests are disabled until MAX_REQUEST_ID increases"
-            );
-        }
-    }
 
     /// Normalize and validate a connection path.
     ///
@@ -249,7 +208,7 @@ impl Session {
     ///
     /// For server-side sessions (created via `accept()`), this is derived from:
     /// 1. The WebTransport CONNECT URL path (takes precedence), or
-    /// 2. The CLIENT_SETUP PATH parameter (key 0x1), used for raw QUIC connections.
+    /// 2. The SETUP PATH parameter (key 0x1), used for raw QUIC connections.
     ///
     /// Returns `None` if no path was present or if the path was just "/".
     pub fn connection_path(&self) -> Option<&str> {
@@ -429,24 +388,6 @@ impl Session {
                     "MoQT control message"
                 );
             }
-            Message::MaxRequestId(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "MAX_REQUEST_ID",
-                    request_id = m.request_id,
-                    "MoQT control message"
-                );
-            }
-            Message::RequestsBlocked(m) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    direction,
-                    msg_type = "REQUESTS_BLOCKED",
-                    max_request_id = m.max_request_id,
-                    "MoQT control message"
-                );
-            }
             Message::RequestOk(m) => {
                 tracing::debug!(
                     target: "moq_transport::control",
@@ -490,25 +431,26 @@ impl Session {
         request_id: RequestId,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let outgoing = Queue::default().split();
-        let pending_requests = PendingRequests::default();
-        let subscribe_namespace_open = Queue::default().split();
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
+
+        let (bidi_task_tx, bidi_task_rx) =
+            tokio::sync::mpsc::unbounded_channel::<BidiReaderFuture>();
 
         let publisher = Some(Publisher::new(
             outgoing.0.clone(),
             webtransport.clone(),
             mlog_shared.clone(),
             request_id.clone(),
-            pending_requests.clone(),
+            bidi_task_tx.clone(),
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
-            subscribe_namespace_open.0,
+            webtransport.clone(),
             mlog_shared.clone(),
             request_id.clone(),
-            pending_requests.clone(),
+            bidi_task_tx,
         ));
 
         let session = Self {
@@ -518,12 +460,12 @@ impl Session {
             publisher: publisher.clone(),
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
-            subscribe_namespace_open: subscribe_namespace_open.1,
             request_id,
-            pending_requests,
             mlog: mlog_shared,
             transport,
             connection_path,
+            bidi_task_rx,
+            bidi_response_map: Arc::new(Mutex::new(HashMap::new())),
         };
 
         (session, publisher, subscriber)
@@ -531,8 +473,8 @@ impl Session {
 
     /// Create an outbound/client QUIC connection.
     ///
-    /// Opens the bidirectional control stream, sends CLIENT_SETUP with
-    /// parameters only (version is agreed via ALPN), and waits for SERVER_SETUP.
+    /// Opens a unidirectional control stream, sends SETUP with
+    /// parameters only (version is agreed via ALPN), and waits for SETUP.
     ///
     /// For native `moqt://` connections the PATH and AUTHORITY parameters are
     /// sent automatically.  For WebTransport the path is carried in the HTTP/3
@@ -541,16 +483,6 @@ impl Session {
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
-    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
-        Self::connect_with_config(session, mlog_path, transport, SessionConfig::default()).await
-    }
-
-    /// Create an outbound/client QUIC connection with explicit session configuration.
-    pub async fn connect_with_config(
-        session: web_transport::Session,
-        mlog_path: Option<PathBuf>,
-        transport: Transport,
-        config: SessionConfig,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let url = session.url().clone();
         let url_path = url.path();
@@ -562,9 +494,9 @@ impl Session {
                 .ok()
         });
 
-        let control = session.open_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
+        // Open our unidirectional control send stream.
+        let send_stream = session.open_uni().await?;
+        let mut sender = Writer::new(send_stream);
 
         let mut params = KeyValuePairs::default();
 
@@ -595,62 +527,44 @@ impl Session {
             }
         }
 
-        // The MAX_REQUEST_ID we advertise to the server.
-        let our_max_request_id = config.max_request_id;
-        params.set_intvalue(
-            setup::ParameterType::MaxRequestId.into(),
-            our_max_request_id,
-        );
-
-        let client = setup::Client { params };
+        let client = setup::Setup { params };
 
         tracing::debug!(
             target: "moq_transport::control",
             direction = "sent",
-            msg_type = "CLIENT_SETUP",
+            msg_type = "SETUP",
             ?transport,
             path = path.as_deref(),
             "MoQT control message"
         );
         sender.encode(&client).await?;
 
-        let server: setup::Server = recver.decode().await?;
+        // Accept the peer's unidirectional control stream.
+        let recv_stream = session.accept_uni().await?;
+        let mut recver = Reader::new(recv_stream);
+        let _server: setup::Setup = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
-            msg_type = "SERVER_SETUP",
+            msg_type = "SETUP (recv)",
             "MoQT control message"
         );
 
-        let peer_max = max_request_id_from_params(&server.params);
-        Self::log_peer_max_request_id(peer_max);
         // Client sends even IDs (0); peer server sends odd IDs (1).
-        let request_id = RequestId::new(0, peer_max, our_max_request_id, 1);
+        let request_id = RequestId::new(0, 1);
         let session = Session::new(session, sender, recver, mlog, transport, path, request_id);
-        let publisher = session.1.ok_or(SessionError::Internal)?;
-        let subscriber = session.2.ok_or(SessionError::Internal)?;
-        Ok((session.0, publisher, subscriber))
+        Ok((session.0, session.1.unwrap(), session.2.unwrap()))
     }
 
     /// Accept an inbound server connection.
     ///
-    /// Waits for the bidirectional control stream, decodes CLIENT_SETUP,
-    /// sends SERVER_SETUP with parameters only.  Version is already agreed
+    /// Opens a unidirectional control stream and accepts the peer.s, decodes SETUP,
+    /// sends SETUP with parameters only.  Version is already agreed
     /// via ALPN before this is called.
     pub async fn accept(
         session: web_transport::Session,
         mlog_path: Option<PathBuf>,
         transport: Transport,
-    ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
-        Self::accept_with_config(session, mlog_path, transport, SessionConfig::default()).await
-    }
-
-    /// Accept an inbound server connection with explicit session configuration.
-    pub async fn accept_with_config(
-        session: web_transport::Session,
-        mlog_path: Option<PathBuf>,
-        transport: Transport,
-        config: SessionConfig,
     ) -> Result<(Session, Option<Publisher>, Option<Subscriber>), SessionError> {
         let mut mlog = mlog_path.and_then(|p| {
             mlog::MlogWriter::new(p)
@@ -658,15 +572,19 @@ impl Session {
                 .ok()
         });
 
-        let control = session.accept_bi().await?;
-        let mut sender = Writer::new(control.0);
-        let mut recver = Reader::new(control.1);
+        // Open our unidirectional control send stream.
+        let send_stream = session.open_uni().await?;
+        let mut sender = Writer::new(send_stream);
 
-        let client: setup::Client = recver.decode().await?;
+        // Accept the peer's unidirectional control stream.
+        let recv_stream = session.accept_uni().await?;
+        let mut recver = Reader::new(recv_stream);
+
+        let client: setup::Setup = recver.decode().await?;
         tracing::debug!(
             target: "moq_transport::control",
             direction = "recv",
-            msg_type = "CLIENT_SETUP",
+            msg_type = "SETUP",
             "MoQT control message"
         );
 
@@ -695,23 +613,14 @@ impl Session {
             let _ = mlog.add_event(event);
         }
 
-        let peer_max = max_request_id_from_params(&client.params);
-        Self::log_peer_max_request_id(peer_max);
+        let params = KeyValuePairs::default();
 
-        // The MAX_REQUEST_ID we advertise to the client.
-        let our_max_request_id = config.max_request_id;
-        let mut params = KeyValuePairs::default();
-        params.set_intvalue(
-            setup::ParameterType::MaxRequestId.into(),
-            our_max_request_id,
-        );
-
-        let server = setup::Server { params };
+        let server = setup::Setup { params };
 
         tracing::debug!(
             target: "moq_transport::control",
             direction = "sent",
-            msg_type = "SERVER_SETUP",
+            msg_type = "SETUP (recv)",
             "MoQT control message"
         );
 
@@ -723,7 +632,7 @@ impl Session {
         sender.encode(&server).await?;
 
         // Server sends odd IDs (1); peer client sends even IDs (0).
-        let request_id = RequestId::new(1, peer_max, our_max_request_id, 0);
+        let request_id = RequestId::new(1, 0);
         Ok(Session::new(
             session,
             sender,
@@ -739,193 +648,487 @@ impl Session {
     /// inbound control messages, receiving and processing new inbound uni-directional QUIC streams,
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
-        tokio::select! {
-            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
-            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_open(self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_accept(self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
+        let mut bidi_task_rx = self.bidi_task_rx;
+        let mut reader_tasks: FuturesUnordered<BidiReaderFuture> = FuturesUnordered::new();
+
+        let result = tokio::select! {
+            res = Self::run_recv(self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.outgoing.clone()) => res,
+            res = Self::run_send(self.sender, self.outgoing, self.mlog.clone(), self.bidi_response_map.clone()) => res,
+            res = Self::run_bidi_requests(self.webtransport.clone(), self.publisher.clone(), self.subscriber.clone(), self.request_id.clone(), self.bidi_response_map.clone()) => res,
             res = Self::run_streams(self.webtransport.clone(), self.subscriber.clone()) => res,
-            res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
-            res = Self::run_pending_timeouts(self.publisher, self.subscriber, self.pending_requests) => res,
-        }
+            res = Self::run_datagrams(self.webtransport, self.subscriber) => res,
+            // Collect bidi reader futures and poll them cooperatively as part of
+            // this select. They progress only while run() is polled, so they
+            // cannot outlive the session (true structured concurrency).
+            () = async {
+                loop {
+                    tokio::select! {
+                        fut = bidi_task_rx.recv() => {
+                            match fut {
+                                Some(f) => reader_tasks.push(f),
+                                None => break, // all senders dropped
+                            }
+                        }
+                        Some(_) = reader_tasks.next() => {}
+                    }
+                }
+            } => Ok(()),
+        };
+
+        // Dropping reader_tasks (FuturesUnordered<BidiReaderFuture>) drops every
+        // in-flight reader future, cancelling them — no task abort needed since
+        // nothing was ever spawned onto the runtime.
+        drop(reader_tasks);
+
+        result
     }
 
-    /// Processes the outgoing control message queue, and sends queued messages on the control stream sender/writer.
+    /// Processes the outgoing control message queue. Response messages targeting
+    /// a bidi request stream are redirected there (draft-18); everything else
+    /// goes to the control stream.
     async fn run_send(
         mut sender: Writer,
         mut outgoing: Queue<message::Message>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        bidi_response_map: BidiResponseMap,
     ) -> Result<(), SessionError> {
         while let Some(msg) = outgoing.pop().await {
-            // Emit structured tracing log for sent control messages
             Self::log_control_message(&msg, "sent");
 
-            // Emit mlog event for sent control messages
             if let Some(ref mlog) = mlog {
                 if let Ok(mut mlog_guard) = mlog.lock() {
                     let time = mlog_guard.elapsed_ms();
-                    let stream_id = 0; // Control stream is always stream 0
-
-                    // Emit events based on message type
+                    // Draft-18: Subscribe and PublishNamespace travel on bidi
+                    // request streams, not the control stream. Use the request
+                    // ID as the stream identifier for mlog; only GoAway still
+                    // uses stream 0 (control).
                     let event = match &msg {
                         Message::Subscribe(m) => {
-                            Some(mlog::events::subscribe_created(time, stream_id, m))
+                            Some(mlog::events::subscribe_created(time, m.id, m))
                         }
                         Message::SubscribeOk(m) => {
-                            Some(mlog::events::subscribe_ok_created(time, stream_id, m))
+                            Some(mlog::events::subscribe_ok_created(time, m.id, m))
                         }
                         Message::Unsubscribe(m) => {
-                            Some(mlog::events::unsubscribe_created(time, stream_id, m))
+                            Some(mlog::events::unsubscribe_created(time, m.id, m))
                         }
                         Message::PublishNamespace(m) => {
-                            Some(mlog::events::publish_namespace_created(time, stream_id, m))
+                            Some(mlog::events::publish_namespace_created(time, m.id, m))
                         }
-                        Message::GoAway(m) => {
-                            Some(mlog::events::go_away_created(time, stream_id, m))
-                        }
-                        _ => None, // TODO: Add other message types
+                        Message::GoAway(m) => Some(mlog::events::go_away_created(time, 0, m)),
+                        _ => None,
                     };
-
                     if let Some(event) = event {
                         let _ = mlog_guard.add_event(event);
                     }
                 }
             }
 
+            // Draft-18: response messages with a target request ID belong on
+            // the bidi stream, never the control stream.
+            if let Some(target_id) = msg.response_target_id() {
+                let tx_opt = bidi_response_map
+                    .lock()
+                    .map_err(|_| SessionError::Internal)?
+                    .get(&target_id)
+                    .cloned();
+                if let Some(tx) = tx_opt {
+                    if tx.send(msg).is_err() {
+                        tracing::warn!(target_id, "bidi response channel closed, dropping message");
+                    }
+                } else {
+                    tracing::warn!(
+                        target_id,
+                        "bidi response map entry gone, dropping late response"
+                    );
+                }
+                continue; // never fall through to control stream for bidi-only messages
+            }
+
+            // Only control-stream messages (no response_target_id) reach here.
             sender.encode(&msg).await?;
         }
 
         Ok(())
     }
 
-    async fn run_subscribe_namespace_open(
-        webtransport: web_transport::Session,
-        mut requests: Queue<OpenSubscribeNamespace>,
-        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
-    ) -> Result<(), SessionError> {
-        let mut tasks = FuturesUnordered::new();
-        let mut requests_done = false;
+    /// Accept incoming bidirectional request streams (draft-18 §10).
+    /// Each peer-initiated bidi stream carries one request message followed
+    /// by responses/follow-ups on the same stream.
+    /// Maximum number of bidi request handler tasks running concurrently.
+    /// Provides back-pressure when a peer opens many streams at once.
+    const MAX_CONCURRENT_BIDI_STREAMS: usize = 128;
 
-        loop {
-            tokio::select! {
-                request = requests.pop(), if !requests_done => {
-                    match request {
-                        Some(request) => {
-                            let webtransport = webtransport.clone();
-                            tasks.push(Self::open_subscribe_namespace(webtransport, request, mlog.clone()));
-                        }
-                        None => requests_done = true,
-                    }
-                }
-                Some(res) = tasks.next(), if !tasks.is_empty() => res?,
-                else => return Ok(()),
-            }
-        }
-    }
+    /// Upper bound on how long a bidi request handler waits, applied to two
+    /// phases only: (a) the initial request read, and (b) the response phase of
+    /// one-shot request types (TRACK_STATUS, REQUEST_UPDATE).
+    ///
+    /// Long-lived request types (SUBSCRIBE, PUBLISH_NAMESPACE, PUBLISH,
+    /// SUBSCRIBE_NAMESPACE, FETCH) intentionally keep their bidi stream open
+    /// until an explicit terminal message, so they are deliberately NOT bounded
+    /// here — bounding them would break the protocol. For those, the QUIC
+    /// connection idle timeout (configured by the transport layer; e.g.
+    /// moq-native-ietf sets 10s) reclaims a slot held by a dead peer.
+    ///
+    /// This timeout closes the remaining gap: an *alive but misbehaving* peer
+    /// that keeps the connection alive (so the QUIC idle timeout never fires)
+    /// could otherwise pin a `MAX_CONCURRENT_BIDI_STREAMS` slot forever by
+    /// opening a stream and never sending a complete request, or by stalling a
+    /// one-shot request after it is accepted. Both are bounded below.
+    const BIDI_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    async fn open_subscribe_namespace(
-        webtransport: web_transport::Session,
-        request: OpenSubscribeNamespace,
-        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
-    ) -> Result<(), SessionError> {
-        let (send, recv) = webtransport.open_bi().await?;
-        let mut writer = Writer::new(send);
-        let reader = Reader::new(recv);
-
-        let msg = Message::SubscribeNamespace(request.message.clone());
-        Self::log_control_message(&msg, "sent");
-        add_mlog_event(&mlog, |time| {
-            mlog::events::subscribe_namespace_created(time, 0, &request.message)
-        });
-        writer.encode(&msg).await?;
-
-        let (send, recv) = SubscribeNamespace::new(request.subscriber, request.info, writer);
-        if request.reply.send(Ok(send)).is_err() {
-            return Ok(());
-        }
-
-        recv.run(reader, mlog).await
-    }
-
-    async fn run_subscribe_namespace_accept(
+    async fn run_bidi_requests(
         webtransport: web_transport::Session,
         publisher: Option<Publisher>,
+        subscriber: Option<Subscriber>,
         request_id: RequestId,
-        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        bidi_response_map: BidiResponseMap,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
 
         loop {
             tokio::select! {
-                // Only accept a new stream while below the concurrency cap; otherwise
-                // apply backpressure until an in-flight stream completes (#1).
-                stream = webtransport.accept_bi(), if tasks.len() < MAX_CONCURRENT_SUBSCRIBE_NAMESPACE_STREAMS => {
-                    let (send, recv) = stream?;
-                    let publisher = publisher.clone().ok_or(SessionError::RoleViolation)?;
-                    let request_id = request_id.clone();
-                    tasks.push(Self::accept_subscribe_namespace_stream(publisher, request_id, send, recv, mlog.clone()));
+                res = webtransport.accept_bi(), if tasks.len() < Self::MAX_CONCURRENT_BIDI_STREAMS => {
+                    let (send_stream, recv_stream) = res?;
+                    let mut pub_clone = publisher.clone();
+                    let mut sub_clone = subscriber.clone();
+                    let rid = request_id.clone();
+                    let map = bidi_response_map.clone();
+
+                    tasks.push(async move {
+                        if let Err(e) = Self::handle_bidi_request(
+                            send_stream, recv_stream,
+                            &mut pub_clone, &mut sub_clone, &rid, &map,
+                        ).await {
+                            tracing::debug!(error = %e, "bidi request stream ended");
+                        }
+                    });
                 }
-                Some(res) = tasks.next(), if !tasks.is_empty() => res?,
+                Some(()) = tasks.next() => {}
             }
         }
     }
 
-    async fn accept_subscribe_namespace_stream(
-        mut publisher: Publisher,
-        request_id: RequestId,
-        send: web_transport::SendStream,
-        recv: web_transport::RecvStream,
-        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    /// Handle a single bidi request stream: decode the request, dispatch
+    /// to handlers, then wait for responses and write them back on the
+    /// same stream (without Request ID, per draft-18).
+    async fn handle_bidi_request(
+        send_stream: web_transport::SendStream,
+        recv_stream: web_transport::RecvStream,
+        publisher: &mut Option<Publisher>,
+        subscriber: &mut Option<Subscriber>,
+        request_id: &RequestId,
+        bidi_response_map: &BidiResponseMap,
     ) -> Result<(), SessionError> {
-        let writer = Writer::new(send);
-        let mut reader = Reader::new(recv);
-        // Bound the wait for the stream's opening SUBSCRIBE_NAMESPACE header so an
-        // idle or malicious peer cannot hold an accept slot open forever (#2).
-        let msg = tokio::time::timeout(
-            SUBSCRIBE_NAMESPACE_HEADER_TIMEOUT,
-            reader.decode::<Message>(),
-        )
-        .await
-        .map_err(|_| {
-            SessionError::ProtocolViolation(
-                "timed out waiting for SUBSCRIBE_NAMESPACE header on bidirectional stream"
-                    .to_string(),
-            )
-        })??;
+        let mut reader = Reader::new(recv_stream);
+        let mut writer = Writer::new(send_stream);
 
-        let subscribe_namespace = match msg {
-            Message::SubscribeNamespace(msg) => msg,
-            other => {
-                return Err(SessionError::ProtocolViolation(format!(
-                    "bidirectional stream began with {} instead of SUBSCRIBE_NAMESPACE",
-                    other.name()
-                )))
-            }
+        // Read the first (request) message from the bidi stream. Bound this so a
+        // peer that opens a bidi stream but never sends a complete request
+        // cannot pin a concurrency slot indefinitely.
+        let msg: Message =
+            match tokio::time::timeout(Self::BIDI_REQUEST_TIMEOUT, reader.decode()).await {
+                Ok(decoded) => decoded?,
+                Err(_) => {
+                    tracing::debug!("bidi request read timed out; reclaiming slot");
+                    return Ok(());
+                }
+            };
+
+        // Classify the request. One-shot request/response flows are bounded in
+        // the response phase below; long-lived flows (SUBSCRIBE, PUBLISH,
+        // PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE, FETCH) may legitimately stay
+        // open until an explicit terminal message and are therefore not bounded.
+        let bounded_response = matches!(&msg, Message::TrackStatus(_) | Message::RequestUpdate(_));
+
+        let req_id = msg.sequenced_request_id();
+
+        // Validate request ID sequencing and register a response channel.
+        let mut rx = if let Some(id) = req_id {
+            request_id.validate_incoming(id)?;
+
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+            bidi_response_map
+                .lock()
+                .map_err(|_| SessionError::Internal)?
+                .insert(id, tx);
+            Some(rx)
+        } else {
+            None
         };
-        let log_msg = Message::SubscribeNamespace(subscribe_namespace.clone());
-        Self::log_control_message(&log_msg, "recv");
-        add_mlog_event(&mlog, |time| {
-            mlog::events::subscribe_namespace_parsed(time, 0, &subscribe_namespace)
-        });
 
-        request_id.validate_incoming(subscribe_namespace.id)?;
-        let recv = publisher.recv_subscribe_namespace(subscribe_namespace)?;
-        recv.run(writer, reader, mlog).await
+        // Dispatch to the appropriate role handler (same as run_recv).
+        // Capture the result so cleanup runs unconditionally on error.
+        let dispatch_result = (|| -> Result<(), SessionError> {
+            let msg = match TryInto::<message::Publisher>::try_into(msg) {
+                Ok(msg) => {
+                    subscriber
+                        .as_mut()
+                        .ok_or(SessionError::RoleViolation)?
+                        .recv_message(msg)?;
+                    return Ok(());
+                }
+                Err(msg) => msg,
+            };
+            match TryInto::<message::Subscriber>::try_into(msg) {
+                Ok(msg) => {
+                    publisher
+                        .as_mut()
+                        .ok_or(SessionError::RoleViolation)?
+                        .recv_message(msg)?;
+                }
+                Err(msg) => {
+                    tracing::warn!(
+                        msg_type = msg.name(),
+                        "unexpected message on bidi request stream"
+                    );
+                }
+            }
+            Ok(())
+        })();
+
+        // Wait for responses only if dispatch succeeded; otherwise the
+        // handlers didn't register anything to respond to.
+        if dispatch_result.is_ok() {
+            if let Some(ref mut rx) = rx {
+                let pump = async {
+                    while let Some(response) = rx.recv().await {
+                        let is_terminal = matches!(
+                            response,
+                            Message::RequestError(_)
+                                | Message::PublishDone(_)
+                                | Message::PublishNamespaceDone(_)
+                                | Message::Unsubscribe(_)
+                        );
+                        if let Err(e) = Self::encode_bidi_response(&mut writer, &response).await {
+                            tracing::warn!(error = %e, "failed to write bidi response");
+                            break;
+                        }
+                        if is_terminal {
+                            // Give Quinn's connection driver a scheduling
+                            // opportunity to transmit the STREAM data before
+                            // the Writer is dropped (which sends FIN).
+                            tokio::time::sleep(std::time::Duration::ZERO).await;
+                            break;
+                        }
+                    }
+                };
+
+                // One-shot requests are bounded so a stalled peer cannot pin a
+                // slot after the request is accepted. Long-lived requests wait
+                // as long as needed; the QUIC idle timeout backstops a dead peer.
+                if bounded_response {
+                    if tokio::time::timeout(Self::BIDI_REQUEST_TIMEOUT, pump)
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!(
+                            ?req_id,
+                            "one-shot bidi request timed out awaiting response; reclaiming slot"
+                        );
+                    }
+                } else {
+                    pump.await;
+                }
+            }
+        }
+
+        // Always clean up — runs on both success and error paths.
+        if let Some(id) = req_id {
+            if let Ok(mut map) = bidi_response_map.lock() {
+                map.remove(&id);
+            }
+        }
+
+        // Explicitly finish the stream and yield for Quinn to flush.
+        writer.finish();
+        tokio::task::yield_now().await;
+
+        dispatch_result
     }
 
-    /// Receives inbound messages from the control stream reader/receiver.  Analyzes if the message
-    /// is to be handled by Subscriber or Publisher logic and calls recv_message on either the
-    /// Publisher or Subscriber.
-    /// Receives and dispatches control messages.
-    /// Handles session-level messages (GOAWAY, MAX_REQUEST_ID, REQUESTS_BLOCKED)
-    /// directly and routes role-specific messages to Publisher or Subscriber.
+    /// Encode a response message to a bidi stream, omitting the Request ID
+    /// field per draft-18 (the stream identity provides the association).
+    /// Build the wire frame for a bidi response message (type + length +
+    /// payload with Request ID omitted). Separated from the async writer
+    /// so tests can verify the encoding without a QUIC stream.
+    fn encode_bidi_response_frame(msg: &Message) -> Result<bytes::BytesMut, SessionError> {
+        use bytes::BufMut;
+
+        // Encode the payload (all fields EXCEPT Request ID, which is
+        // implicit from the bidi stream identity in draft-18).
+        let mut payload = bytes::BytesMut::new();
+        match msg {
+            Message::RequestOk(m) => {
+                m.params.encode(&mut payload)?;
+            }
+            Message::RequestError(m) => {
+                m.error_code.encode(&mut payload)?;
+                m.retry_interval.encode(&mut payload)?;
+                m.reason.encode(&mut payload)?;
+            }
+            Message::SubscribeOk(m) => {
+                m.track_alias.encode(&mut payload)?;
+                m.params.encode(&mut payload)?;
+                m.track_extensions.encode(&mut payload)?;
+            }
+            Message::PublishDone(m) => {
+                m.status_code.encode(&mut payload)?;
+                m.stream_count.encode(&mut payload)?;
+                m.reason.encode(&mut payload)?;
+            }
+            // id-only messages: payload is empty (id omitted on bidi).
+            Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {}
+            Message::PublishOk(m) => {
+                m.params.encode(&mut payload)?;
+            }
+            Message::FetchOk(m) => {
+                m.end_of_track.encode(&mut payload)?;
+                m.end_location.encode(&mut payload)?;
+                m.params.encode(&mut payload)?;
+                m.track_extensions.encode(&mut payload)?;
+            }
+            other => {
+                tracing::warn!(
+                    msg_type = other.name(),
+                    "unexpected message type in encode_bidi_response — not a bidi response message"
+                );
+                return Err(SessionError::Internal);
+            }
+        };
+
+        let msg_type = msg.id();
+
+        if payload.len() > u16::MAX as usize {
+            return Err(crate::coding::EncodeError::MsgBoundsExceeded.into());
+        }
+        let mut frame = bytes::BytesMut::new();
+        msg_type.encode(&mut frame)?;
+        (payload.len() as u16).encode(&mut frame)?;
+        frame.put(payload);
+        Ok(frame)
+    }
+
+    async fn encode_bidi_response(writer: &mut Writer, msg: &Message) -> Result<(), SessionError> {
+        let frame = Self::encode_bidi_response_frame(msg)?;
+        writer.write(&frame).await?;
+        Ok(())
+    }
+
+    /// Decode a response message from a bidi request stream (draft-18).
+    ///
+    /// Response messages omit the Request ID field — the stream identity
+    /// provides the association. The caller supplies the known `request_id`
+    /// which is injected into the decoded `Message`.
+    pub(super) async fn decode_bidi_response(
+        reader: &mut Reader,
+        request_id: u64,
+    ) -> Result<Message, SessionError> {
+        use crate::coding::{Decode, DecodeError, ReasonPhrase};
+
+        let msg_type: u64 = reader.decode().await?;
+        let msg_len: u16 = reader.decode().await?;
+        let len = msg_len as usize;
+
+        let mut payload = bytes::BytesMut::new();
+        while payload.len() < len {
+            let remaining = len - payload.len();
+            match reader.read_chunk(remaining).await? {
+                Some(chunk) => payload.extend_from_slice(&chunk),
+                None => return Err(DecodeError::More(remaining).into()),
+            }
+        }
+        let mut buf = &payload[..];
+
+        use message::wire_id;
+
+        match msg_type {
+            wire_id::RequestError => {
+                let error_code = u64::decode(&mut buf)?;
+                let retry_interval = u64::decode(&mut buf)?;
+                let reason = ReasonPhrase::decode(&mut buf)?;
+                Ok(Message::RequestError(message::RequestError {
+                    id: request_id,
+                    error_code,
+                    retry_interval,
+                    reason,
+                }))
+            }
+            wire_id::RequestOk => {
+                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                Ok(Message::RequestOk(message::RequestOk {
+                    id: request_id,
+                    params,
+                }))
+            }
+            wire_id::SubscribeOk => {
+                let track_alias = u64::decode(&mut buf)?;
+                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                let track_extensions = message::TrackExtensions::decode(&mut buf)?;
+                Ok(Message::SubscribeOk(message::SubscribeOk {
+                    id: request_id,
+                    track_alias,
+                    params,
+                    track_extensions,
+                }))
+            }
+            wire_id::PublishNamespaceDone => Ok(Message::PublishNamespaceDone(
+                message::PublishNamespaceDone { id: request_id },
+            )),
+            wire_id::PublishDone => {
+                let status_code = u64::decode(&mut buf)?;
+                let stream_count = u64::decode(&mut buf)?;
+                let reason = ReasonPhrase::decode(&mut buf)?;
+                Ok(Message::PublishDone(message::PublishDone {
+                    id: request_id,
+                    status_code,
+                    stream_count,
+                    reason,
+                }))
+            }
+            wire_id::Unsubscribe => Ok(Message::Unsubscribe(message::Unsubscribe {
+                id: request_id,
+            })),
+            wire_id::PublishOk => {
+                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                Ok(Message::PublishOk(message::PublishOk {
+                    id: request_id,
+                    params,
+                }))
+            }
+            wire_id::FetchOk => {
+                let end_of_track = bool::decode(&mut buf)?;
+                let end_location = crate::coding::Location::decode(&mut buf)?;
+                let params = crate::coding::KeyValuePairs::decode(&mut buf)?;
+                let track_extensions = message::TrackExtensions::decode(&mut buf)?;
+                Ok(Message::FetchOk(message::FetchOk {
+                    id: request_id,
+                    end_of_track,
+                    end_location,
+                    params,
+                    track_extensions,
+                }))
+            }
+            other => {
+                tracing::warn!(msg_type = other, "unexpected bidi response message type");
+                Err(SessionError::unimplemented(&format!(
+                    "bidi response type 0x{:x}",
+                    other
+                )))
+            }
+        }
+    }
+
+    /// Receives inbound messages from the control stream reader/receiver.
+    /// Handles session-level messages (GOAWAY) directly and routes
+    /// role-specific messages to Publisher or Subscriber.
     async fn run_recv(
         mut recver: Reader,
         mut publisher: Option<Publisher>,
         mut subscriber: Option<Subscriber>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         request_id: RequestId,
-        pending_requests: PendingRequests,
+        _outgoing: Queue<Message>,
     ) -> Result<(), SessionError> {
         let mut goaway_received = false;
 
@@ -971,31 +1174,6 @@ impl Session {
                 request_id.validate_incoming(id)?;
             }
 
-            let msg = match msg {
-                Message::RequestOk(msg) => {
-                    Self::recv_request_ok(&pending_requests, &mut publisher, msg)?;
-                    continue;
-                }
-                Message::RequestError(msg) => {
-                    Self::recv_request_error(
-                        &pending_requests,
-                        &mut publisher,
-                        &mut subscriber,
-                        msg,
-                    )?;
-                    continue;
-                }
-                Message::PublishOk(msg) => {
-                    Self::recv_publish_ok(&pending_requests, &mut publisher, msg)?;
-                    continue;
-                }
-                Message::SubscribeOk(msg) => {
-                    Self::recv_subscribe_ok(&pending_requests, &mut subscriber, msg)?;
-                    continue;
-                }
-                msg => msg,
-            };
-
             let msg = match TryInto::<message::Publisher>::try_into(msg) {
                 Ok(msg) => {
                     subscriber
@@ -1035,170 +1213,12 @@ impl Session {
                     );
                     // TODO(itzmanish): trigger session migration.
                 }
-                Message::MaxRequestId(ref m) => {
-                    request_id.apply_max_request_id(m)?;
-                    tracing::debug!(
-                        target: "moq_transport::control",
-                        max_request_id = m.request_id,
-                        "received MAX_REQUEST_ID"
-                    );
-                }
-                Message::RequestsBlocked(ref m) => {
-                    tracing::debug!(
-                        target: "moq_transport::control",
-                        max_request_id = m.max_request_id,
-                        "received REQUESTS_BLOCKED"
-                    );
-                    // REQUESTS_BLOCKED tells us the peer's send budget is exhausted.
-                    request_id.handle_requests_blocked(m)?;
-                }
                 other => {
                     tracing::warn!(msg_type = other.name(), "received unhandled message type");
                     return Err(SessionError::unimplemented(&format!(
                         "message type {}",
                         other.name()
                     )));
-                }
-            }
-        }
-    }
-
-    fn recv_request_ok(
-        pending_requests: &PendingRequests,
-        publisher: &mut Option<Publisher>,
-        msg: message::RequestOk,
-    ) -> Result<(), SessionError> {
-        match pending_requests.complete(msg.id, PendingResponse::RequestOk)? {
-            Some(PendingRequest::PublishNamespace) => publisher
-                .as_mut()
-                .ok_or(SessionError::RoleViolation)?
-                .recv_request_ok(msg),
-            Some(request) => Err(SessionError::ProtocolViolation(format!(
-                "REQUEST_OK completed unexpected {:?} request {}",
-                request, msg.id
-            ))),
-            None => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received REQUEST_OK for unknown outbound request — ignoring"
-                );
-                Ok(())
-            }
-        }
-    }
-
-    fn recv_request_error(
-        pending_requests: &PendingRequests,
-        publisher: &mut Option<Publisher>,
-        subscriber: &mut Option<Subscriber>,
-        msg: message::RequestError,
-    ) -> Result<(), SessionError> {
-        match pending_requests.complete(msg.id, PendingResponse::RequestError)? {
-            Some(PendingRequest::PublishNamespace | PendingRequest::Publish) => publisher
-                .as_mut()
-                .ok_or(SessionError::RoleViolation)?
-                .recv_request_error(msg),
-            Some(PendingRequest::Subscribe) => subscriber
-                .as_mut()
-                .ok_or(SessionError::RoleViolation)?
-                .recv_request_error(&msg),
-            None => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    error_code = msg.error_code,
-                    retry_interval = msg.retry_interval,
-                    reason = %msg.reason.0,
-                    "received REQUEST_ERROR for unknown outbound request — ignoring"
-                );
-                Ok(())
-            }
-        }
-    }
-
-    fn recv_publish_ok(
-        pending_requests: &PendingRequests,
-        publisher: &mut Option<Publisher>,
-        msg: message::PublishOk,
-    ) -> Result<(), SessionError> {
-        match pending_requests.complete(msg.id, PendingResponse::PublishOk)? {
-            Some(PendingRequest::Publish) => publisher
-                .as_mut()
-                .ok_or(SessionError::RoleViolation)?
-                .recv_publish_ok(msg),
-            Some(request) => Err(SessionError::ProtocolViolation(format!(
-                "PUBLISH_OK completed unexpected {:?} request {}",
-                request, msg.id
-            ))),
-            None => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received PUBLISH_OK for unknown outbound request — ignoring"
-                );
-                Ok(())
-            }
-        }
-    }
-
-    fn recv_subscribe_ok(
-        pending_requests: &PendingRequests,
-        subscriber: &mut Option<Subscriber>,
-        msg: message::SubscribeOk,
-    ) -> Result<(), SessionError> {
-        match pending_requests.complete(msg.id, PendingResponse::SubscribeOk)? {
-            Some(PendingRequest::Subscribe) => subscriber
-                .as_mut()
-                .ok_or(SessionError::RoleViolation)?
-                .recv_subscribe_ok(&msg),
-            Some(request) => Err(SessionError::ProtocolViolation(format!(
-                "SUBSCRIBE_OK completed unexpected {:?} request {}",
-                request, msg.id
-            ))),
-            None => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received SUBSCRIBE_OK for unknown outbound request — ignoring"
-                );
-                Ok(())
-            }
-        }
-    }
-
-    async fn run_pending_timeouts(
-        mut publisher: Option<Publisher>,
-        mut subscriber: Option<Subscriber>,
-        pending_requests: PendingRequests,
-    ) -> Result<(), SessionError> {
-        loop {
-            let Some(deadline) = pending_requests.next_deadline()? else {
-                pending_requests.changed().await;
-                continue;
-            };
-
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => {},
-                _ = pending_requests.changed() => continue,
-            }
-
-            for (id, request) in pending_requests.expire()? {
-                tracing::warn!(
-                    target: "moq_transport::control",
-                    request_id = id,
-                    request = ?request,
-                    "outbound request timed out waiting for response"
-                );
-                match request {
-                    PendingRequest::PublishNamespace | PendingRequest::Publish => publisher
-                        .as_mut()
-                        .ok_or(SessionError::RoleViolation)?
-                        .recv_request_timeout(id, request)?,
-                    PendingRequest::Subscribe => subscriber
-                        .as_mut()
-                        .ok_or(SessionError::RoleViolation)?
-                        .recv_request_timeout(id, request)?,
                 }
             }
         }
@@ -1320,21 +1340,128 @@ mod tests {
         assert!(Session::normalize_connection_path(&path).is_ok());
     }
 
-    #[test]
-    fn subscribe_ok_for_unknown_request_id_is_ignored() {
-        let pending_requests = PendingRequests::default();
-        let mut subscriber = None;
+    // ========================================================================
+    // encode_bidi_response — verify wire format (no Request ID)
+    // ========================================================================
 
-        Session::recv_subscribe_ok(
-            &pending_requests,
-            &mut subscriber,
-            message::SubscribeOk {
-                id: 42,
-                track_alias: 7,
-                params: Default::default(),
-                track_extensions: Default::default(),
-            },
-        )
-        .unwrap();
+    /// Helper: calls the production `encode_bidi_response_frame` and
+    /// returns the raw bytes. No duplicate encoding logic.
+    fn encode_bidi_response_bytes(msg: &Message) -> Vec<u8> {
+        Session::encode_bidi_response_frame(msg).unwrap().to_vec()
+    }
+
+    #[test]
+    fn encode_bidi_request_ok_omits_request_id() {
+        use message::wire_id;
+        let msg = Message::RequestOk(message::RequestOk {
+            id: 42, // should NOT appear on the wire
+            params: crate::coding::KeyValuePairs::default(),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        // type (1 byte) + length 0x0001 (2 bytes) + params_count=0 (1 byte) = 4 bytes
+        assert_eq!(bytes[0], wire_id::RequestOk as u8);
+        assert_eq!(bytes.len(), 4);
+    }
+
+    #[test]
+    fn encode_bidi_request_error_omits_request_id() {
+        use message::wire_id;
+        let msg = Message::RequestError(message::RequestError {
+            id: 99, // should NOT appear on the wire
+            error_code: 0x10,
+            retry_interval: 0,
+            reason: crate::coding::ReasonPhrase("nf".to_string()),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        assert_eq!(bytes[0], wire_id::RequestError as u8);
+        // No 99 (0x63) anywhere in the output
+        assert!(
+            !bytes.contains(&99),
+            "Request ID must not appear in bidi encoding"
+        );
+    }
+
+    #[test]
+    fn response_target_id_covers_responses_only() {
+        // Response messages should return Some(id)
+        assert!(Message::RequestOk(message::RequestOk {
+            id: 1,
+            params: Default::default(),
+        })
+        .response_target_id()
+        .is_some());
+        assert!(Message::RequestError(message::RequestError {
+            id: 1,
+            error_code: 0,
+            retry_interval: 0,
+            reason: Default::default(),
+        })
+        .response_target_id()
+        .is_some());
+
+        // Request messages should return None
+        assert!(Message::Subscribe(message::Subscribe {
+            id: 1,
+            track_namespace: crate::coding::TrackNamespace::from_utf8_path("t"),
+            track_name: "n".into(),
+            params: Default::default(),
+        })
+        .response_target_id()
+        .is_none());
+        assert!(Message::GoAway(message::GoAway {
+            uri: crate::coding::SessionUri(String::new()),
+        })
+        .response_target_id()
+        .is_none());
+    }
+
+    #[test]
+    fn encode_bidi_publish_done_omits_request_id() {
+        use message::wire_id;
+        let msg = Message::PublishDone(message::PublishDone {
+            id: 77,
+            status_code: 0,
+            stream_count: 3,
+            reason: crate::coding::ReasonPhrase("done".to_string()),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        assert_eq!(bytes[0], wire_id::PublishDone as u8);
+        assert!(
+            !bytes.contains(&77),
+            "Request ID must not appear in bidi encoding"
+        );
+    }
+
+    #[test]
+    fn encode_bidi_publish_ok_omits_request_id() {
+        use message::wire_id;
+        let msg = Message::PublishOk(message::PublishOk {
+            id: 55,
+            params: crate::coding::KeyValuePairs::default(),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        assert_eq!(bytes[0], wire_id::PublishOk as u8);
+        assert!(
+            !bytes.contains(&55),
+            "Request ID must not appear in bidi encoding"
+        );
+    }
+
+    #[test]
+    fn encode_bidi_fetch_ok_omits_request_id() {
+        use message::wire_id;
+        let msg = Message::FetchOk(message::FetchOk {
+            id: 88,
+            end_of_track: true,
+            end_location: crate::coding::Location::new(5, 10),
+            params: crate::coding::KeyValuePairs::default(),
+            track_extensions: Default::default(),
+        });
+        let bytes = encode_bidi_response_bytes(&msg);
+        assert_eq!(bytes[0], wire_id::FetchOk as u8);
+        assert!(
+            !bytes.contains(&88),
+            "Request ID must not appear in bidi encoding"
+        );
     }
 }

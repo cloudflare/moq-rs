@@ -90,12 +90,8 @@ impl Writer {
         Ok(())
     }
 
-    pub(super) fn finish(&mut self) -> Result<(), SessionError> {
-        self.stream.finish()?;
-        Ok(())
-    }
-
-    pub(super) fn reset(&mut self, code: u32) {
-        self.stream.reset(code);
+    /// Signal that no more data will be written (sends QUIC FIN).
+    pub fn finish(&mut self) {
+        let _ = self.stream.finish();
     }
 }

@@ -20,6 +20,7 @@
 //! A sequence of KVPs is prefixed by a varint count of the number of pairs.
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
+use bytes::Buf as _;
 use std::fmt;
 
 /// Maximum byte-value length for a bytes-typed KVP (2^16 − 1).
@@ -536,5 +537,46 @@ mod tests {
             decoded.get(1).unwrap().value,
             Value::BytesValue(vec![0x01, 0x02, 0x03, 0x04, 0x05])
         );
+    }
+}
+
+impl KeyValuePairs {
+    /// Decode KVPs from a length-bounded byte slice (draft-18+).
+    ///
+    /// Unlike the count-prefixed [`Decode`] impl, this reads KVPs until
+    /// exactly `byte_len` bytes have been consumed. No leading count varint.
+    pub fn decode_bounded(r: &mut impl bytes::Buf, byte_len: usize) -> Result<Self, DecodeError> {
+        if byte_len == 0 {
+            return Ok(Self::default());
+        }
+
+        <u64 as Decode>::decode_remaining(r, byte_len)?;
+        let mut payload = r.copy_to_bytes(byte_len);
+
+        let mut kvps = Vec::new();
+        let mut prev = 0u64;
+
+        while payload.has_remaining() {
+            let (pair, new_prev) = KeyValuePair::decode_with_prev(&mut payload, prev)?;
+            prev = new_prev;
+            kvps.push(pair);
+        }
+
+        Ok(KeyValuePairs(kvps))
+    }
+
+    /// Encode KVPs without a leading count prefix (draft-18+ length-bounded).
+    ///
+    /// Returns the encoded bytes. The caller writes the length separately.
+    pub fn encode_bounded(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut buf = Vec::new();
+        let mut sorted = self.0.clone();
+        sorted.sort_by_key(|k| k.key);
+
+        let mut prev = 0u64;
+        for kvp in &sorted {
+            prev = kvp.encode_with_prev(&mut buf, prev)?;
+        }
+        Ok(buf)
     }
 }

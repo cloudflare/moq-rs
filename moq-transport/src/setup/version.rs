@@ -30,6 +30,7 @@ impl Version {
 
     /// https://www.ietf.org/archive/id/draft-ietf-moq-transport-16.html
     pub const DRAFT_16: Version = Version(0xff000010);
+    pub const DRAFT_18: Version = Version(0xff000012);
 }
 
 impl From<u32> for Version {
@@ -147,9 +148,9 @@ mod tests {
                 // Version 1
                 0x01,
                 // Version DRAFT_12 (0xff00000c)
-                0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0C,
+                0xF0, 0xFF, 0x00, 0x00, 0x0C,
                 // Version DRAFT_13 (0xff00000d)
-                0xC0, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0D,
+                0xF0, 0xFF, 0x00, 0x00, 0x0D,
             ]
         );
 

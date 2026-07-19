@@ -7,15 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use moq_native_ietf::quic;
-use moq_transport::coding::{KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix};
-use moq_transport::message::SubscribeOptions;
-use moq_transport::serve::{Track, TrackReader, TracksReader};
-use moq_transport::session::{Publisher, SessionConfig, SubscribeNamespace};
+use moq_transport::coding::{TrackName, TrackNamespace};
+use moq_transport::serve::{Track, TrackReader};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError, RelayInfo, SessionContext};
+use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError};
 
 /// Cache key for upstream relay-to-relay connections.
 ///
@@ -35,135 +33,15 @@ type TrackSlot = Arc<Mutex<Option<TrackReader>>>;
 pub struct RemoteManager {
     coordinator: Arc<dyn Coordinator>,
     clients: Vec<quic::Client>,
-    session_config: SessionConfig,
     remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct NoopCoordinator;
-
-    #[async_trait::async_trait]
-    impl Coordinator for NoopCoordinator {
-        async fn register_namespace(
-            &self,
-            _scope: Option<&str>,
-            _namespace: &TrackNamespace,
-            _context: &crate::CoordinatorContext,
-        ) -> crate::CoordinatorResult<crate::NamespaceRegistration> {
-            Ok(crate::NamespaceRegistration::new(()))
-        }
-
-        async fn unregister_namespace(
-            &self,
-            _scope: Option<&str>,
-            _namespace: &TrackNamespace,
-        ) -> crate::CoordinatorResult<()> {
-            Ok(())
-        }
-
-        async fn lookup(
-            &self,
-            _scope: Option<&str>,
-            _namespace: &TrackNamespace,
-        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
-            Err(crate::CoordinatorError::NamespaceNotFound)
-        }
-    }
-
-    #[test]
-    fn new_uses_default_session_config() {
-        let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![]);
-
-        assert_eq!(manager.session_config, SessionConfig::default());
-    }
-
-    #[test]
-    fn new_with_session_config_stores_custom_config() {
-        let config = SessionConfig { max_request_id: 7 };
-        let manager =
-            RemoteManager::new_with_session_config(Arc::new(NoopCoordinator), vec![], config);
-
-        assert_eq!(manager.session_config, config);
-    }
-
-    #[test]
-    fn remote_endpoint_context_is_internal() {
-        let url = Url::parse("https://relay.example.com/live").unwrap();
-        let addr = "127.0.0.1:4433".parse().unwrap();
-
-        let context = Remote::context_for_endpoint(url.clone(), Some(addr));
-
-        assert_eq!(context.interface, crate::SessionInterface::Internal);
-        assert!(context.scope().is_none());
-        let peer = context.peer.unwrap();
-        assert_eq!(peer.url, url);
-        assert_eq!(peer.addr, Some(addr));
-    }
-
-    #[tokio::test]
-    async fn subscribe_namespace_without_clients_errors() {
-        // No QUIC clients configured, so get_or_connect() fails before any
-        // network activity. This exercises the new forwarding entry point's
-        // connect + error plumbing without needing a live peer.
-        let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![]);
-        let relay = RelayInfo::new(Url::parse("https://relay.example.com/live").unwrap());
-
-        let result = manager
-            .subscribe_namespace(
-                &relay,
-                TrackNamespacePrefix::from_utf8_path("example.com"),
-                SubscribeOptions::Namespace,
-            )
-            .await;
-
-        // `SubscribeNamespace` is not `Debug`, so match rather than expect_err.
-        let err = match result {
-            Ok(_) => panic!("expected connect failure with no clients"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("no QUIC clients configured"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn publish_namespace_without_clients_errors() {
-        let manager = RemoteManager::new(Arc::new(NoopCoordinator), vec![]);
-        let relay = RelayInfo::new(Url::parse("https://relay.example.com/live").unwrap());
-        let (_writer, _request, reader) =
-            moq_transport::serve::Tracks::new(TrackNamespace::from_utf8_path("example.com"))
-                .produce();
-
-        let result = manager.publish_namespace(&relay, reader).await;
-
-        let err = result.expect_err("expected connect failure with no clients");
-        assert!(
-            err.to_string().contains("no QUIC clients configured"),
-            "unexpected error: {err}"
-        );
-    }
 }
 
 impl RemoteManager {
     /// Create a new RemoteManager.
     pub fn new(coordinator: Arc<dyn Coordinator>, clients: Vec<quic::Client>) -> Self {
-        Self::new_with_session_config(coordinator, clients, SessionConfig::default())
-    }
-
-    /// Create a new RemoteManager with explicit MoQT session configuration.
-    pub fn new_with_session_config(
-        coordinator: Arc<dyn Coordinator>,
-        clients: Vec<quic::Client>,
-        session_config: SessionConfig,
-    ) -> Self {
         Self {
             coordinator,
             clients,
-            session_config,
             remotes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -181,15 +59,7 @@ impl RemoteManager {
         track_name: impl Into<TrackName>,
     ) -> anyhow::Result<Option<TrackReader>> {
         let track_name = track_name.into();
-
-        // Coordinator::lookup_track is the ergonomic routing entry point: it
-        // tries exact PUBLISH track registrations first, then falls back to
-        // PUBLISH_NAMESPACE namespace routing.
-        let (origin, client) = match self
-            .coordinator
-            .lookup_track(scope, namespace, &track_name.to_string())
-            .await
-        {
+        let (origin, client) = match self.coordinator.lookup(scope, namespace).await {
             Ok(result) => result,
             Err(CoordinatorError::NamespaceNotFound) => return Ok(None),
             Err(err) => return Err(err.into()),
@@ -215,70 +85,6 @@ impl RemoteManager {
                 tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
                 self.remove_if_same_remote(&cache_key, &remote).await;
 
-                Err(err)
-            }
-        }
-    }
-
-    /// Forward a `SUBSCRIBE_NAMESPACE` to a specific relay peer.
-    ///
-    /// Connects to (or reuses a connection to) `relay` and opens a namespace
-    /// subscription for `prefix`, returning the [`SubscribeNamespace`] handle.
-    ///
-    /// The target `relay` is supplied explicitly by the caller (from a
-    /// coordinator lookup result). This is the namespace-level counterpart of
-    /// [`Self::subscribe`], which instead resolves a single origin internally
-    /// via [`Coordinator::lookup_track`].
-    pub async fn subscribe_namespace(
-        &self,
-        relay: &RelayInfo,
-        prefix: TrackNamespacePrefix,
-        options: SubscribeOptions,
-    ) -> anyhow::Result<SubscribeNamespace> {
-        let cache_key = (relay.url.clone(), relay.addr);
-
-        let remote = match self.get_or_connect(cache_key.clone(), None).await {
-            Ok(remote) => remote,
-            Err(err) => {
-                tracing::error!(remote_url = %relay.url, error = %err, "failed to connect to remote relay: {}", err);
-                return Err(err);
-            }
-        };
-
-        // A namespace request owns a dedicated bidirectional stream. Its
-        // rejection or reset must not evict the pooled session, which may still
-        // carry exact-track subscriptions and other non-overlapping requests.
-        remote.subscribe_namespace(prefix, options).await
-    }
-
-    /// Forward a `PUBLISH_NAMESPACE` to a specific relay peer.
-    ///
-    /// Connects to (or reuses a connection to) `relay` and advertises
-    /// `tracks.namespace`, serving its tracks from `tracks`. The target `relay`
-    /// is supplied explicitly by the caller (from a coordinator lookup result).
-    /// Blocks until the namespace is unannounced or the session errors (see
-    /// [`Remote::publish_namespace`]), so callers typically drive it from a
-    /// dedicated task.
-    pub async fn publish_namespace(
-        &self,
-        relay: &RelayInfo,
-        tracks: TracksReader,
-    ) -> anyhow::Result<()> {
-        let cache_key = (relay.url.clone(), relay.addr);
-
-        let remote = match self.get_or_connect(cache_key.clone(), None).await {
-            Ok(remote) => remote,
-            Err(err) => {
-                tracing::error!(remote_url = %relay.url, error = %err, "failed to connect to remote relay: {}", err);
-                return Err(err);
-            }
-        };
-
-        match remote.publish_namespace(tracks).await {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                tracing::warn!(remote_url = %relay.url, error = %err, "remote publish_namespace failed, removing from cache");
-                self.remove_if_same_remote(&cache_key, &remote).await;
                 Err(err)
             }
         }
@@ -336,7 +142,6 @@ impl RemoteManager {
                 cache_key.0.clone(),
                 cache_key.1,
                 client,
-                self.session_config,
                 Arc::downgrade(&self.remotes),
                 cache_key.clone(),
                 Arc::downgrade(&slot),
@@ -431,12 +236,7 @@ async fn remove_empty_track_slot(
 #[derive(Clone)]
 struct Remote {
     url: Url,
-    context: SessionContext,
-    /// Subscriber role: exact-track `SUBSCRIBE` and `SUBSCRIBE_NAMESPACE`.
     subscriber: moq_transport::session::Subscriber,
-    /// Publisher role: outbound `PUBLISH_NAMESPACE` to advertise namespaces
-    /// to this peer.
-    publisher: Publisher,
     /// Track subscriptions keyed by full track name.
     tracks: Arc<Mutex<HashMap<TrackCacheKey, TrackSlot>>>,
     /// Flag indicating if the connection is still alive.
@@ -451,7 +251,6 @@ impl Remote {
         url: Url,
         addr: Option<SocketAddr>,
         client: &quic::Client,
-        session_config: SessionConfig,
         remotes: Weak<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
         cache_key: RemoteCacheKey,
         cache_slot: Weak<Mutex<Option<Remote>>>,
@@ -466,21 +265,9 @@ impl Remote {
             }
         };
 
-        // Establish a full relay-to-relay MoQT session so this connection can
-        // act in both roles: Subscriber (exact-track SUBSCRIBE and
-        // SUBSCRIBE_NAMESPACE discovery) and Publisher (outbound
-        // PUBLISH_NAMESPACE). This mirrors the `--announce` forward path in
-        // relay.rs rather than the subscriber-only upstream pull it replaces.
-        let (session, publisher, subscriber) =
-            match moq_transport::session::Session::connect_with_config(
-                session,
-                None,
-                transport,
-                session_config,
-            )
-            .await
-            {
-                Ok(parts) => parts,
+        let (session, subscriber) =
+            match moq_transport::session::Subscriber::connect(session, transport).await {
+                Ok(session) => session,
                 Err(err) => {
                     metrics::counter!("moq_relay_upstream_errors_total", "stage" => "session")
                         .increment(1);
@@ -491,7 +278,6 @@ impl Remote {
         let connected = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
         let upstream_guard = GaugeGuard::new("moq_relay_upstream_connections");
-        let context = Self::context_for_endpoint(url.clone(), addr);
 
         let session_url = url.clone();
         let session_connected = connected.clone();
@@ -535,9 +321,7 @@ impl Remote {
 
         Ok(Self {
             url,
-            context,
             subscriber,
-            publisher,
             tracks: Arc::new(Mutex::new(HashMap::new())),
             connected,
             cancel,
@@ -551,30 +335,6 @@ impl Remote {
 
     fn is_same_connection(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.connected, &other.connected)
-    }
-
-    /// Build the [`SessionContext`] for an outbound connection dialed by the
-    /// [`RemoteManager`].
-    ///
-    /// Every connection originated here targets a relay-mesh peer resolved via
-    /// the coordinator for relay-to-relay routing, so it is always tagged
-    /// [`SessionContext::internal`]. Inbound classification (public vs internal)
-    /// is handled separately in `relay.rs` via the connection tagger.
-    ///
-    /// This label is local to this relay and is **not** sent over the wire: the
-    /// relay on the accepting end sees only the raw connection and classifies it
-    /// independently with its own [`ConnectionTagger`]. To have the peer treat
-    /// this link as internal, dial it on an address/SNI/path its tagger
-    /// recognizes.
-    ///
-    /// [`ConnectionTagger`]: crate::ConnectionTagger
-    fn context_for_endpoint(url: Url, addr: Option<SocketAddr>) -> SessionContext {
-        let endpoint = match addr {
-            Some(addr) => RelayInfo::with_addr(url, addr),
-            None => RelayInfo::new(url),
-        };
-
-        SessionContext::internal(None, Some(endpoint))
     }
 
     /// Shutdown the remote connection.
@@ -696,71 +456,12 @@ impl Remote {
             return Ok(Some(reader));
         }
     }
-
-    /// Forward a `SUBSCRIBE_NAMESPACE` to this peer (Subscriber role).
-    ///
-    /// Opens a namespace subscription for `prefix` and returns the
-    /// [`SubscribeNamespace`] handle; the caller drives it via
-    /// [`SubscribeNamespace::next`] / [`SubscribeNamespace::closed`], the same
-    /// way [`Self::subscribe`] returns a [`TrackReader`] for the caller to read.
-    ///
-    /// Unlike [`Self::subscribe`], namespace subscriptions are not cached or
-    /// deduplicated here: per-session prefix aggregation (to avoid draft-16
-    /// `PREFIX_OVERLAP` on reused sessions) is deferred to the multi-relay
-    /// routing work.
-    async fn subscribe_namespace(
-        &self,
-        prefix: TrackNamespacePrefix,
-        options: SubscribeOptions,
-    ) -> anyhow::Result<SubscribeNamespace> {
-        if !self.is_connected() {
-            anyhow::bail!("remote connection to {} is closed", self.url);
-        }
-
-        tracing::info!(remote_url = %self.url, prefix = %prefix.to_utf8_path(), "forwarding SUBSCRIBE_NAMESPACE to remote relay");
-
-        let mut subscriber = self.subscriber.clone();
-        let subscribe_namespace = tokio::select! {
-            result = subscriber.subscribe_namespace(prefix, options, KeyValuePairs::default()) => result?,
-            _ = self.cancel.cancelled() => {
-                anyhow::bail!("subscribe_namespace cancelled, remote connection to {} is closed", self.url);
-            }
-        };
-
-        Ok(subscribe_namespace)
-    }
-
-    /// Forward a `PUBLISH_NAMESPACE` to this peer (Publisher role).
-    ///
-    /// Advertises `tracks.namespace` to the peer and serves its tracks from the
-    /// provided [`TracksReader`]. Like [`moq_transport::session::Publisher::publish_namespace`]
-    /// this blocks until the namespace is unannounced or the session errors, so
-    /// callers typically drive it from a dedicated task (mirroring the
-    /// `--announce` forward path in `consumer.rs`).
-    async fn publish_namespace(&self, tracks: TracksReader) -> anyhow::Result<()> {
-        if !self.is_connected() {
-            anyhow::bail!("remote connection to {} is closed", self.url);
-        }
-
-        tracing::info!(remote_url = %self.url, namespace = %tracks.namespace.to_utf8_path(), "forwarding PUBLISH_NAMESPACE to remote relay");
-
-        let mut publisher = self.publisher.clone();
-        tokio::select! {
-            result = publisher.publish_namespace(tracks) => result?,
-            _ = self.cancel.cancelled() => {
-                anyhow::bail!("publish_namespace cancelled, remote connection to {} is closed", self.url);
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl std::fmt::Debug for Remote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Remote")
             .field("url", &self.url.to_string())
-            .field("interface", &self.context.interface)
             .field("connected", &self.is_connected())
             .finish()
     }

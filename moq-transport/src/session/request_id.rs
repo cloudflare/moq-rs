@@ -1,27 +1,23 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Request ID flow control per draft-ietf-moq-transport-16 §9.1.
+//! Request ID allocation per draft-ietf-moq-transport-18 §10.1.
 //!
-//! This module intentionally exposes one cloneable session-level handle,
-//! [`RequestId`]. Internally it owns two independent states under one shared
-//! allocation:
+//! Draft-18 removed MAX_REQUEST_ID and REQUESTS_BLOCKED. Request IDs are
+//! simple incrementing counters: clients use even IDs starting at 0,
+//! servers use odd IDs starting at 1, each incremented by 2.
 //!
-//! - `send`: outbound request ID allocation and peer-advertised max.
-//! - `recv`: inbound request ID validation and our advertised max.
-//!
-//! The two states use separate mutexes. That keeps outbound allocation from
-//! blocking inbound validation while still keeping all request-ID state tied to
-//! one session handle.
+//! This module validates inbound request IDs (correct parity and no
+//! duplicates — out-of-order arrival is permitted because bidi streams
+//! may arrive in any order) and allocates outbound IDs.
 
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
-use crate::coding::KeyValuePairs;
-use crate::message::{MaxRequestId, RequestsBlocked};
 use crate::session::SessionError;
+
+/// Maximum number of distinct request IDs tracked per session (~512 KB).
+const MAX_REQUEST_IDS_PER_SESSION: usize = 65536;
 
 #[derive(Clone, Debug)]
 pub struct RequestId {
@@ -37,295 +33,110 @@ struct RequestIdInner {
 #[derive(Debug)]
 struct SendState {
     next: u64,
-    peer_max: u64,
-    blocked_sent_for: Option<u64>,
 }
 
 #[derive(Debug)]
 struct RecvState {
-    first: u64,
-    low_water: u64,
-    /// Out-of-order request IDs received at or above `low_water` but not yet
-    /// contiguous with it. This is a sliding reassembly window, not an unbounded
-    /// set: `validate_incoming` rejects any `id >= our_max`, so every stored ID
-    /// lies in `[low_water, our_max)` and the set size is bounded by that window
-    /// (`our_max - low_water`, i.e. the peer's outstanding request lookahead).
-    received_above_low_water: HashSet<u64>,
-    our_max: u64,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum RequestIdAllocation {
-    Allocated(u64),
-    Blocked {
-        max_request_id: u64,
-        should_send_requests_blocked: bool,
-    },
-}
-
-impl RequestIdAllocation {
-    /// Return a REQUESTS_BLOCKED message if this allocation should emit one.
-    pub fn requests_blocked(&self) -> Option<RequestsBlocked> {
-        match self {
-            Self::Blocked {
-                max_request_id,
-                should_send_requests_blocked: true,
-            } => Some(RequestsBlocked {
-                max_request_id: *max_request_id,
-            }),
-            _ => None,
-        }
-    }
+    /// Expected parity bit (0 for client-originated, 1 for server-originated).
+    expected_parity: u64,
+    /// Request IDs already received, for duplicate detection per §10.1.
+    /// Bounded to MAX_REQUEST_IDS_PER_SESSION entries (~512 KB). Never
+    /// remove entries: doing so would allow request ID reuse, which
+    /// draft-18 §10.1 forbids.
+    seen: HashSet<u64>,
 }
 
 impl RequestId {
     /// Create a request-ID manager for one endpoint in a session.
     ///
     /// `local_first_id` is 0 for clients and 1 for servers.
-    /// `peer_max` is the peer-advertised MAX_REQUEST_ID from setup.
-    /// `our_max` is the MAX_REQUEST_ID we advertised in setup.
     /// `peer_first_id` is 0 if the peer is client, 1 if the peer is server.
-    pub fn new(local_first_id: u64, peer_max: u64, our_max: u64, peer_first_id: u64) -> Self {
+    pub fn new(local_first_id: u64, peer_first_id: u64) -> Self {
         Self {
             inner: Arc::new(RequestIdInner {
                 send: Mutex::new(SendState {
                     next: local_first_id,
-                    peer_max,
-                    blocked_sent_for: None,
                 }),
                 recv: Mutex::new(RecvState {
-                    first: peer_first_id,
-                    low_water: peer_first_id,
-                    received_above_low_water: HashSet::new(),
-                    our_max,
+                    expected_parity: peer_first_id & 1,
+                    seen: HashSet::new(),
                 }),
             }),
         }
     }
 
     /// Allocate the next outbound request ID.
-    ///
-    /// If the peer-advertised budget is exhausted, returns `Blocked` with
-    /// `should_send_requests_blocked=true` once per max value.
-    pub fn allocate(&self) -> Result<RequestIdAllocation, SessionError> {
+    pub fn allocate(&self) -> Result<u64, SessionError> {
         let mut send = self.inner.send.lock().map_err(|_| SessionError::Internal)?;
-
-        if send.next >= send.peer_max {
-            let should_send_requests_blocked = if send.blocked_sent_for == Some(send.peer_max) {
-                false
-            } else {
-                send.blocked_sent_for = Some(send.peer_max);
-                true
-            };
-
-            return Ok(RequestIdAllocation::Blocked {
-                max_request_id: send.peer_max,
-                should_send_requests_blocked,
-            });
-        }
 
         let id = send.next;
         send.next = send
             .next
             .checked_add(2)
             .ok_or(SessionError::TooManyRequests)?;
-        send.blocked_sent_for = None;
-        Ok(RequestIdAllocation::Allocated(id))
+        Ok(id)
     }
 
-    /// Apply a peer MAX_REQUEST_ID update to the outbound allocator.
-    pub fn apply_max_request_id(&self, msg: &MaxRequestId) -> Result<(), SessionError> {
-        let mut send = self.inner.send.lock().map_err(|_| SessionError::Internal)?;
-
-        if msg.request_id <= send.peer_max {
-            return Err(SessionError::ProtocolViolation(
-                "MAX_REQUEST_ID must be strictly increasing".to_string(),
-            ));
-        }
-
-        send.peer_max = msg.request_id;
-        send.blocked_sent_for = None;
-        Ok(())
-    }
-
-    /// Validate an incoming new request ID from the peer.
+    /// Validate an incoming request ID from the peer.
+    ///
+    /// Draft-18 §10.1: checks correct parity and rejects duplicates.
+    /// Does NOT enforce strict sequential order because bidi request
+    /// streams can arrive concurrently in any order.
     pub fn validate_incoming(&self, id: u64) -> Result<(), SessionError> {
         let mut recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
 
-        if id >= recv.our_max {
+        // Wrong parity (e.g. server sent an even ID).
+        if (id & 1) != recv.expected_parity {
+            return Err(SessionError::InvalidRequestId);
+        }
+
+        // Cap to prevent unbounded memory growth.
+        if recv.seen.len() >= MAX_REQUEST_IDS_PER_SESSION {
             return Err(SessionError::TooManyRequests);
         }
 
-        if id < recv.first || id % 2 != recv.first % 2 || id < recv.low_water {
+        // Duplicate request ID.
+        if !recv.seen.insert(id) {
             return Err(SessionError::InvalidRequestId);
-        }
-
-        if !recv.received_above_low_water.insert(id) {
-            return Err(SessionError::InvalidRequestId);
-        }
-
-        while {
-            let low_water = recv.low_water;
-            recv.received_above_low_water.remove(&low_water)
-        } {
-            recv.low_water = recv
-                .low_water
-                .checked_add(2)
-                .ok_or(SessionError::InvalidRequestId)?;
         }
 
         Ok(())
     }
-
-    /// Handle REQUESTS_BLOCKED from the peer.
-    ///
-    /// If the peer has consumed our current advertised maximum and reports that
-    /// same maximum as blocked, we currently ignore this. In the future, we may
-    /// advertise new incremented MAX_REQUEST_ID.
-    pub fn handle_requests_blocked(&self, msg: &RequestsBlocked) -> Result<(), SessionError> {
-        let recv = self.inner.recv.lock().map_err(|_| SessionError::Internal)?;
-        tracing::warn!(
-            "got requests blocked, peer max: {}, configured limit: {}, limit hit: {}, ignoring it",
-            msg.max_request_id,
-            recv.our_max,
-            msg.max_request_id == recv.our_max
-        );
-
-        Ok(())
-    }
-}
-
-/// Extract the MAX_REQUEST_ID value from setup parameters (0 if absent).
-pub fn max_request_id_from_params(params: &KeyValuePairs) -> u64 {
-    use crate::coding::Value;
-    use crate::setup::ParameterType;
-
-    params
-        .get(ParameterType::MaxRequestId.into())
-        .and_then(|kvp| match &kvp.value {
-            Value::IntValue(v) => Some(*v),
-            _ => None,
-        })
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::setup::ParameterType;
 
-    fn client_ids(peer_max: u64, our_max: u64) -> RequestId {
-        // local client sends even, peer server sends odd
-        RequestId::new(0, peer_max, our_max, 1)
+    fn client_ids() -> RequestId {
+        // local client sends even (0), peer server sends odd (1)
+        RequestId::new(0, 1)
     }
 
-    fn server_ids(peer_max: u64, our_max: u64) -> RequestId {
-        // local server sends odd, peer client sends even
-        RequestId::new(1, peer_max, our_max, 0)
-    }
-
-    #[test]
-    fn max_request_id_from_params_uses_draft_default_zero() {
-        let params = KeyValuePairs::default();
-
-        assert_eq!(max_request_id_from_params(&params), 0);
-    }
-
-    #[test]
-    fn max_request_id_from_params_reads_setup_value() {
-        let mut params = KeyValuePairs::default();
-        params.set_intvalue(ParameterType::MaxRequestId.into(), 42);
-
-        assert_eq!(max_request_id_from_params(&params), 42);
+    fn server_ids() -> RequestId {
+        // local server sends odd (1), peer client sends even (0)
+        RequestId::new(1, 0)
     }
 
     #[test]
     fn client_allocates_even_ids() {
-        let ids = client_ids(10, 10);
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(0));
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(2));
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(4));
+        let ids = client_ids();
+        assert_eq!(ids.allocate().unwrap(), 0);
+        assert_eq!(ids.allocate().unwrap(), 2);
+        assert_eq!(ids.allocate().unwrap(), 4);
     }
 
     #[test]
     fn server_allocates_odd_ids() {
-        let ids = server_ids(10, 10);
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(1));
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(3));
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(5));
-    }
-
-    #[test]
-    fn allocation_blocks_at_peer_max() {
-        let ids = client_ids(4, 10);
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(0));
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(2));
-        assert_eq!(
-            ids.allocate().unwrap(),
-            RequestIdAllocation::Blocked {
-                max_request_id: 4,
-                should_send_requests_blocked: true,
-            }
-        );
-    }
-
-    #[test]
-    fn requests_blocked_is_stable_for_same_limit() {
-        let ids = client_ids(2, 10);
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(0));
-        let first_block = ids.allocate().unwrap();
-        assert_eq!(
-            first_block,
-            RequestIdAllocation::Blocked {
-                max_request_id: 2,
-                should_send_requests_blocked: true,
-            }
-        );
-        assert_eq!(first_block.requests_blocked().unwrap().max_request_id, 2);
-
-        let second_block = ids.allocate().unwrap();
-        assert_eq!(
-            second_block,
-            RequestIdAllocation::Blocked {
-                max_request_id: 2,
-                should_send_requests_blocked: false,
-            }
-        );
-        assert!(second_block.requests_blocked().is_none());
-    }
-
-    #[test]
-    fn max_request_id_must_increase() {
-        let ids = client_ids(10, 10);
-        assert!(matches!(
-            ids.apply_max_request_id(&MaxRequestId { request_id: 10 })
-                .unwrap_err(),
-            SessionError::ProtocolViolation(_)
-        ));
-        assert!(matches!(
-            ids.apply_max_request_id(&MaxRequestId { request_id: 9 })
-                .unwrap_err(),
-            SessionError::ProtocolViolation(_)
-        ));
-    }
-
-    #[test]
-    fn max_request_id_increases_allocation_budget() {
-        let ids = client_ids(2, 10);
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(0));
-        assert!(matches!(
-            ids.allocate().unwrap(),
-            RequestIdAllocation::Blocked { .. }
-        ));
-        ids.apply_max_request_id(&MaxRequestId { request_id: 10 })
-            .unwrap();
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(2));
-        assert_eq!(ids.allocate().unwrap(), RequestIdAllocation::Allocated(4));
+        let ids = server_ids();
+        assert_eq!(ids.allocate().unwrap(), 1);
+        assert_eq!(ids.allocate().unwrap(), 3);
+        assert_eq!(ids.allocate().unwrap(), 5);
     }
 
     #[test]
     fn validates_client_peer_sequence() {
-        let ids = server_ids(10, 10);
+        let ids = server_ids();
         ids.validate_incoming(0).unwrap();
         ids.validate_incoming(2).unwrap();
         ids.validate_incoming(4).unwrap();
@@ -333,15 +144,16 @@ mod tests {
 
     #[test]
     fn validates_server_peer_sequence() {
-        let ids = client_ids(10, 10);
+        let ids = client_ids();
         ids.validate_incoming(1).unwrap();
         ids.validate_incoming(3).unwrap();
         ids.validate_incoming(5).unwrap();
     }
 
     #[test]
-    fn rejects_wrong_first_id() {
-        let ids = server_ids(10, 10);
+    fn rejects_wrong_parity() {
+        let ids = server_ids();
+        // Server expects even IDs from client peer; odd ID is rejected.
         assert!(matches!(
             ids.validate_incoming(1).unwrap_err(),
             SessionError::InvalidRequestId
@@ -349,52 +161,48 @@ mod tests {
     }
 
     #[test]
-    fn accepts_cross_stream_out_of_order_ids() {
-        let ids = server_ids(10, 10);
+    fn accepts_out_of_order_ids() {
+        // Draft-18: bidi streams can arrive in any order.
+        let ids = server_ids();
         ids.validate_incoming(4).unwrap();
         ids.validate_incoming(0).unwrap();
         ids.validate_incoming(2).unwrap();
-        ids.validate_incoming(6).unwrap();
     }
 
     #[test]
     fn rejects_repeated_id() {
-        let ids = server_ids(10, 10);
-        ids.validate_incoming(4).unwrap();
+        let ids = server_ids();
         ids.validate_incoming(0).unwrap();
-        ids.validate_incoming(2).unwrap();
         assert!(matches!(
-            ids.validate_incoming(4).unwrap_err(),
+            ids.validate_incoming(0).unwrap_err(),
             SessionError::InvalidRequestId
         ));
     }
 
     #[test]
-    fn rejects_id_at_our_max() {
-        let ids = server_ids(10, 4);
-        ids.validate_incoming(0).unwrap();
-        ids.validate_incoming(2).unwrap();
-        assert!(matches!(
-            ids.validate_incoming(4).unwrap_err(),
-            SessionError::TooManyRequests
-        ));
-    }
-
-    #[test]
     fn send_and_receive_state_do_not_block_each_other() {
-        let ids = client_ids(10, 10);
+        let ids = client_ids();
         let send_ids = ids.clone();
         let recv_ids = ids.clone();
 
-        assert_eq!(
-            send_ids.allocate().unwrap(),
-            RequestIdAllocation::Allocated(0)
-        );
+        assert_eq!(send_ids.allocate().unwrap(), 0);
         recv_ids.validate_incoming(1).unwrap();
-        assert_eq!(
-            send_ids.allocate().unwrap(),
-            RequestIdAllocation::Allocated(2)
-        );
+        assert_eq!(send_ids.allocate().unwrap(), 2);
         recv_ids.validate_incoming(3).unwrap();
+    }
+
+    #[test]
+    fn rejects_at_seen_cap() {
+        let ids = server_ids();
+        // Fill to the cap with even IDs (peer is client).
+        for i in 0..MAX_REQUEST_IDS_PER_SESSION {
+            ids.validate_incoming((i as u64) * 2).unwrap();
+        }
+        // Next ID exceeds the cap.
+        assert!(matches!(
+            ids.validate_incoming((MAX_REQUEST_IDS_PER_SESSION as u64) * 2)
+                .unwrap_err(),
+            SessionError::TooManyRequests
+        ));
     }
 }

@@ -30,7 +30,6 @@
 //! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
 //! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
 //! | `moq_relay_upstream_errors_total` | `stage` | Upstream connection failures (stage: connect, session) |
-//! | `moq_relay_namespace_transition_timeouts_total` | - | Namespace pull streams reset after graceful transition timeout |
 //!
 //! ## Gauges
 //!
@@ -78,14 +77,6 @@ pub fn describe_metrics() {
         "Total publishers (PUBLISH_NAMESPACE requests) received"
     );
     describe_counter!(
-        "moq_relay_published_tracks_total",
-        "Total publisher-initiated PUBLISH track requests received"
-    );
-    describe_counter!(
-        "moq_relay_publish_errors_total",
-        "Publisher-initiated PUBLISH failures by phase (take_reader, local_register, coordinator_register, send_ok)"
-    );
-    describe_counter!(
         "moq_relay_announce_ok_total",
         "Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE"
     );
@@ -109,10 +100,6 @@ pub fn describe_metrics() {
         "moq_relay_upstream_errors_total",
         "Upstream connection failures by stage (connect, session)"
     );
-    describe_counter!(
-        "moq_relay_namespace_transition_timeouts_total",
-        "Namespace pull streams reset after graceful transition timeout"
-    );
 
     // Gauges
     describe_gauge!(
@@ -130,10 +117,6 @@ pub fn describe_metrics() {
     describe_gauge!(
         "moq_relay_active_tracks",
         "Current number of tracks being served"
-    );
-    describe_gauge!(
-        "moq_relay_active_published_tracks",
-        "Current number of exact tracks registered from PUBLISH"
     );
     describe_gauge!(
         "moq_relay_announced_namespaces",

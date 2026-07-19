@@ -349,8 +349,8 @@ mod tests {
             payload: Some(Bytes::from("payload")),
         };
         msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(2),ExtensionValueLen(1),ExtensionValue(4) = 13 + 8 = 21
-        assert_eq!(21, buf.len());
+        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 13 + 7 = 20
+        assert_eq!(20, buf.len());
         let decoded = Datagram::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
 
@@ -383,8 +383,8 @@ mod tests {
             payload: Some(Bytes::from("payload")),
         };
         msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(2),ExtensionValueLen(1),ExtensionValue(4) = 13 + 8 = 21
-        assert_eq!(21, buf.len());
+        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 13 + 7 = 20
+        assert_eq!(20, buf.len());
         let decoded = Datagram::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
 
@@ -417,8 +417,8 @@ mod tests {
             payload: None,
         };
         msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(2),ExtensionValueLen(1),ExtensionValue(4) = 7 + 8 = 15
-        assert_eq!(15, buf.len());
+        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 7 + 7 = 14
+        assert_eq!(14, buf.len());
         let decoded = Datagram::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
 
@@ -451,8 +451,8 @@ mod tests {
             payload: Some(Bytes::from("payload")),
         };
         msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(2),ExtensionValueLen(1),ExtensionValue(4) = 11 + 8 = 19
-        assert_eq!(19, buf.len());
+        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 11 + 7 = 18
+        assert_eq!(18, buf.len());
         let decoded = Datagram::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
 
@@ -485,8 +485,8 @@ mod tests {
             payload: Some(Bytes::from("payload")),
         };
         msg.encode(&mut buf).unwrap();
-        // Length should be: Same as above plus NumExt(1),ExtensionKey(2),ExtensionValueLen(1),ExtensionValue(4) = 11 + 8 = 19
-        assert_eq!(19, buf.len());
+        // Length should be: Same as above plus NumExt(1),ExtensionKey(1),ExtensionValueLen(1),ExtensionValue(4) = 11 + 7 = 18
+        assert_eq!(18, buf.len());
         let decoded = Datagram::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
     }
