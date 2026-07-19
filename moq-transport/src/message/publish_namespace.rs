@@ -20,7 +20,7 @@ impl Decode for PublishNamespace {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
         let track_namespace = TrackNamespace::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode_message_params(r)?;
 
         Ok(Self {
             id,
@@ -34,7 +34,7 @@ impl Encode for PublishNamespace {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.id.encode(w)?;
         self.track_namespace.encode(w)?;
-        self.params.encode(w)?;
+        self.params.encode_message_params(w)?;
 
         Ok(())
     }

@@ -31,7 +31,7 @@ impl Decode for Subscribe {
         let track_name = TrackName::decode(r)?;
         validate_full_track_name(&track_namespace, track_name.as_bytes())?;
 
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode_message_params(r)?;
 
         Ok(Self {
             id,
@@ -49,7 +49,7 @@ impl Encode for Subscribe {
         self.track_namespace.encode(w)?;
         self.track_name.encode(w)?;
 
-        self.params.encode(w)?;
+        self.params.encode_message_params(w)?;
 
         Ok(())
     }
@@ -58,6 +58,7 @@ impl Encode for Subscribe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{GroupOrder, U8_VALUE_PARAMETER_TYPES};
     use bytes::BytesMut;
 
     #[test]
@@ -124,5 +125,82 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = Subscribe::decode(&mut buf).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    // ── draft-18 typed-parameter wire format ──────────────────────────────────
+    // Draft-17 §10.2 changed SUBSCRIBER_PRIORITY (0x20), GROUP_ORDER (0x22) and
+    // FORWARD (0x10) from a varint value to a single raw uint8. The default
+    // SUBSCRIBER_PRIORITY of 128 is the value that breaks the older varint form:
+    // as a draft-17 leading-1-bits varint it is two bytes (0x80 0x80),
+    // desynchronising the whole parameter block for imquic / moq-go peers that
+    // read exactly one byte. These vectors pin the byte layout against those
+    // reference implementations.
+
+    #[test]
+    fn subscribe_params_encode_typed_values_as_single_bytes() {
+        let mut params = KeyValuePairs::new();
+        params.set_forward(true); // 0x10 → 0x01
+        params.set_subscriber_priority(128); // 0x20 → 0x80 (single byte)
+        params.set_group_order(GroupOrder::Descending); // 0x22 → 0x02
+
+        let mut buf = BytesMut::new();
+        params
+            .encode_with_u8_types(&mut buf, U8_VALUE_PARAMETER_TYPES)
+            .unwrap();
+
+        // count=3; then delta-encoded (delta, value) pairs sorted by type:
+        //   FORWARD             delta 0x10, value 0x01
+        //   SUBSCRIBER_PRIORITY delta 0x10, value 0x80  ← single byte, not 0x80 0x80
+        //   GROUP_ORDER         delta 0x02, value 0x02
+        assert_eq!(buf.to_vec(), vec![0x03, 0x10, 0x01, 0x10, 0x80, 0x02, 0x02]);
+
+        let decoded =
+            KeyValuePairs::decode_with_u8_types(&mut buf, U8_VALUE_PARAMETER_TYPES).unwrap();
+        assert_eq!(decoded.forward().unwrap(), Some(true));
+        assert_eq!(decoded.subscriber_priority().unwrap(), Some(128));
+        assert_eq!(decoded.group_order().unwrap(), Some(GroupOrder::Descending));
+    }
+
+    #[test]
+    fn typed_encoding_avoids_two_byte_varint_priority() {
+        // Guard the fix boundary: the *generic* KVP encoding (even=varint) emits
+        // the desyncing two-byte 0x80 0x80 for priority 128, whereas the u8-typed
+        // encoding used by SUBSCRIBE must emit a single 0x80.
+        let mut params = KeyValuePairs::new();
+        params.set_subscriber_priority(128); // 0x20 = 128
+
+        let mut generic = BytesMut::new();
+        params.encode(&mut generic).unwrap();
+        assert_eq!(generic.to_vec(), vec![0x01, 0x20, 0x80, 0x80]);
+
+        let mut typed = BytesMut::new();
+        params
+            .encode_with_u8_types(&mut typed, U8_VALUE_PARAMETER_TYPES)
+            .unwrap();
+        assert_eq!(typed.to_vec(), vec![0x01, 0x20, 0x80]);
+    }
+
+    #[test]
+    fn subscribe_round_trips_default_priority_128() {
+        // Insert in ascending key order (FORWARD 0x10, SUBSCRIBER_PRIORITY 0x20,
+        // GROUP_ORDER 0x22) so this Vec matches the sorted order that decode
+        // reconstructs — KeyValuePairs equality is order-sensitive.
+        let mut params = KeyValuePairs::new();
+        params.set_forward(true);
+        params.set_subscriber_priority(128);
+        params.set_group_order(GroupOrder::Ascending);
+
+        let msg = Subscribe {
+            id: 7,
+            track_namespace: TrackNamespace::from_utf8_path("ns/v"),
+            track_name: "track".into(),
+            params,
+        };
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Subscribe::decode(&mut buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(decoded.params.subscriber_priority().unwrap(), Some(128));
     }
 }

@@ -55,7 +55,7 @@ impl Decode for SubscribeNamespace {
         let id = u64::decode(r)?;
         let track_namespace_prefix = TrackNamespacePrefix::decode(r)?;
         let subscribe_options = SubscribeOptions::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode_message_params(r)?;
 
         Ok(Self {
             id,
@@ -71,7 +71,7 @@ impl Encode for SubscribeNamespace {
         self.id.encode(w)?;
         self.track_namespace_prefix.encode(w)?;
         self.subscribe_options.encode(w)?;
-        self.params.encode(w)?;
+        self.params.encode_message_params(w)?;
 
         Ok(())
     }
