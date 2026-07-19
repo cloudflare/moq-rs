@@ -441,22 +441,19 @@ impl Producer {
         known: &mut HashSet<FullTrackName>,
         publish_tasks: &mut FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
     ) -> Result<(), anyhow::Error> {
-        let tracks: Vec<_> = self
+        // Single pass: build only the `current` set while publishing new tracks,
+        // instead of materializing an intermediate Vec of (name, reader) pairs.
+        let mut current = HashSet::new();
+        for track in self
             .locals
             .list_tracks_matching(self.context.scope(), &subscribed_namespace.namespace_prefix)
-            .into_iter()
-            .map(|track| (full_name_for_track(&track), track))
-            .collect();
-        let current: HashSet<_> = tracks
-            .iter()
-            .map(|(full_name, _)| full_name.clone())
-            .collect();
-
-        for (full_name, track) in tracks {
+        {
+            let full_name = full_name_for_track(&track);
             if !known.contains(&full_name) {
                 self.publish_track_for_namespace(subscribed_namespace, known, publish_tasks, track)
                     .await?;
             }
+            current.insert(full_name);
         }
 
         known.retain(|full_name| current.contains(full_name));
