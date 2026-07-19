@@ -107,7 +107,9 @@ impl Consumer {
         // Track active publishers - decrements when this function returns.
         let _publisher_guard = GaugeGuard::new("moq_relay_active_publishers");
 
-        let mut tasks = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<
+            futures::future::BoxFuture<'static, Result<(), anyhow::Error>>,
+        > = FuturesUnordered::new();
         let ns = published_ns.namespace.to_utf8_path();
 
         // Register namespace routing metadata locally. This does not register
@@ -171,10 +173,18 @@ impl Consumer {
                         namespace = %namespace,
                         "forwarding PUBLISH_NAMESPACE: {:?}", forward_reader.info
                     );
-                    forward
+                    // Best-effort upstream propagation: a forwarding failure must not
+                    // tear down the local PUBLISH_NAMESPACE registration for other peers.
+                    if let Err(err) = forward
                         .publish_namespace(forward_reader)
                         .await
                         .context("failed forwarding PUBLISH_NAMESPACE")
+                    {
+                        metrics::counter!("moq_relay_announce_errors_total", "phase" => "forward")
+                            .increment(1);
+                        tracing::warn!(namespace = %namespace, error = %err, "failed forwarding PUBLISH_NAMESPACE upstream");
+                    }
+                    Ok(())
                 }
                 .boxed(),
             );
@@ -216,12 +226,21 @@ impl Consumer {
                         remote = %relay.url,
                         "forwarding PUBLISH_NAMESPACE to peer relay"
                     );
-                    remotes
+                    // Best-effort fan-out: one downstream relay failing must not tear
+                    // down the PUBLISH_NAMESPACE registration for the publisher or the
+                    // other peer relays.
+                    if let Err(err) = remotes
                         .publish_namespace(&relay, reader)
                         .await
                         .with_context(|| {
                             format!("failed forwarding PUBLISH_NAMESPACE to {}", relay.url)
                         })
+                    {
+                        metrics::counter!("moq_relay_announce_errors_total", "phase" => "peer_fanout")
+                            .increment(1);
+                        tracing::warn!(namespace = %namespace, remote = %relay.url, error = %err, "failed forwarding PUBLISH_NAMESPACE to peer relay");
+                    }
+                    Ok(())
                 }
                 .boxed(),
             );
