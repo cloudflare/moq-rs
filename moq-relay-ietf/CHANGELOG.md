@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.24](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.23...moq-relay-ietf-v0.7.24) - 2026-07-20
+
+### Added
+
+- forward local accept IP to the connection tagger
+
 ## [0.7.23](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.22...moq-relay-ietf-v0.7.23) - 2026-07-19
 
 ### Added
