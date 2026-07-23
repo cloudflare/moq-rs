@@ -828,7 +828,17 @@ impl Session {
         // cannot pin a concurrency slot indefinitely.
         let msg: Message =
             match tokio::time::timeout(Self::BIDI_REQUEST_TIMEOUT, reader.decode()).await {
-                Ok(decoded) => decoded?,
+                Ok(Ok(msg)) => msg,
+                Ok(Err(e)) => {
+                    // A conformant peer always sends a decodable request as the
+                    // first message on a bidi stream. A decode failure here means
+                    // a malformed or wire-incompatible request (e.g. a parameter
+                    // value-encoding mismatch) that would otherwise be dropped
+                    // invisibly at debug level — surface it at warn so this class
+                    // of interop break is observable in production.
+                    tracing::warn!(error = %e, "failed to decode inbound request; dropping stream");
+                    return Err(e);
+                }
                 Err(_) => {
                     tracing::debug!("bidi request read timed out; reclaiming slot");
                     return Ok(());

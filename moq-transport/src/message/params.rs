@@ -21,6 +21,23 @@ pub mod parameter_type {
     pub const NEW_GROUP_REQUEST: u64 = 0x32;
 }
 
+/// Message-parameter type IDs whose value is a single raw `uint8` byte rather
+/// than a varint (draft-18 §10.2).
+///
+/// Draft-17 replaced the generic even=varint / odd=length-prefixed KVP rule for
+/// message parameters with per-parameter value kinds. These three are the
+/// byte-valued parameters carried by SUBSCRIBE / FETCH. Notably
+/// SUBSCRIBER_PRIORITY defaults to 128, which a varint encodes in two bytes —
+/// desynchronising the parameter block for peers (imquic, moq-go) that expect a
+/// single byte. SUBSCRIPTION_FILTER (0x21) stays length-prefixed bytes and the
+/// varint-valued parameters (timeouts, EXPIRES, NEW_GROUP_REQUEST) are
+/// unaffected, so they are intentionally absent here.
+pub const U8_VALUE_PARAMETER_TYPES: &[u64] = &[
+    parameter_type::FORWARD,             // 0x10
+    parameter_type::SUBSCRIBER_PRIORITY, // 0x20
+    parameter_type::GROUP_ORDER,         // 0x22
+];
+
 /// Draft-16 extension-header type IDs.
 pub mod extension_type {
     pub const DELIVERY_TIMEOUT: u64 = 0x02;
@@ -251,6 +268,24 @@ fn get_kvp_u8(pairs: &[KeyValuePair], key: u64) -> Result<Option<u8>, DecodeErro
 }
 
 impl KeyValuePairs {
+    /// Decode a draft-18 §10.2 message-parameter block (SUBSCRIBE, FETCH,
+    /// PUBLISH, PUBLISH_OK, REQUEST_OK, REQUEST_UPDATE, …).
+    ///
+    /// This is the count-prefixed KVP decode with the draft-17 byte-valued
+    /// parameter kinds applied uniformly (see [`U8_VALUE_PARAMETER_TYPES`]).
+    /// Every message carrying §10.2 parameters MUST use this rather than the
+    /// generic [`KeyValuePairs::decode`], otherwise a peer's single-byte
+    /// SUBSCRIBER_PRIORITY (default 128) desynchronises the whole block.
+    pub fn decode_message_params<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+        Self::decode_with_u8_types(r, U8_VALUE_PARAMETER_TYPES)
+    }
+
+    /// Encode a draft-18 §10.2 message-parameter block. Counterpart to
+    /// [`decode_message_params`](KeyValuePairs::decode_message_params).
+    pub fn encode_message_params<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        self.encode_with_u8_types(w, U8_VALUE_PARAMETER_TYPES)
+    }
+
     fn int_parameter(&self, key: u64) -> Result<Option<u64>, DecodeError> {
         get_kvp_int(&self.0, key)
     }

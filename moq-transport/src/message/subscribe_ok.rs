@@ -25,7 +25,7 @@ impl Decode for SubscribeOk {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
         let track_alias = u64::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode_message_params(r)?;
         let track_extensions = TrackExtensions::decode(r)?;
 
         Ok(Self {
@@ -41,7 +41,7 @@ impl Encode for SubscribeOk {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.id.encode(w)?;
         self.track_alias.encode(w)?;
-        self.params.encode(w)?;
+        self.params.encode_message_params(w)?;
         self.track_extensions.encode(w)?;
 
         Ok(())
