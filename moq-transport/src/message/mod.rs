@@ -246,8 +246,8 @@ message_types! {
     FetchCancel     = 0x17,
     FetchOk         = 0x18,
 
-    // ── SUBSCRIBE_NAMESPACE (bidi stream; §9.25) ──────────────────────────────
-    SubscribeNamespace = 0x11,
+    // ── SUBSCRIBE_NAMESPACE (bidi stream; §10.18) ────────────────────────────
+    SubscribeNamespace = 0x50,
 
     // ── Session management ────────────────────────────────────────────────────
     GoAway          = 0x10,
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn draft16_wire_layouts_for_changed_control_messages() {
+    fn draft18_wire_layouts_for_control_messages() {
         fn encoded(msg: Message) -> Vec<u8> {
             let mut buf = bytes::BytesMut::new();
             msg.encode(&mut buf).unwrap();
@@ -505,7 +505,7 @@ mod tests {
                 subscribe_options: SubscribeOptions::Both,
                 params: KeyValuePairs::default(),
             })),
-            vec![0x11, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00]
+            vec![0x50, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00]
         );
     }
 }
