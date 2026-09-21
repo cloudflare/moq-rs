@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cat_token::{
-    decode_token, CatError, CatToken, CatTokenValidator, Es256Algorithm, MoqtAction, MoqtValidator,
+    CatError, CatToken, CatTokenValidator, Decoder, Es256Algorithm, MoqtAction, MoqtValidator,
 };
 use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix};
 
@@ -105,7 +105,7 @@ pub struct CatAuthHook {
 /// One configured verification key.
 ///
 /// The token's own `alg` header is checked against the key by
-/// `decode_token` before any signature work, so the key's algorithm does
+/// `Decoder::decode` before any signature work, so the key's algorithm does
 /// not need to be tracked separately while ES256 is the only variant.
 struct CatKey {
     kid: Option<String>,
@@ -174,13 +174,21 @@ impl CatAuthHook {
         let clock_skew =
             duration_to_seconds(config.effective_clock_skew()).min(MAX_CLOCK_SKEW_SECS);
 
-        let mut token_validator = CatTokenValidator::new()
+        // cat-token 0.3 requires the allowed issuer set to be established
+        // at construction time. An empty configured issuer list is an
+        // explicit "no issuer pinning" — surface that as
+        // `dangerously_any_issuer` so the choice is auditable at every
+        // call site, rather than an implicit consequence of an empty
+        // `Vec`.
+        let mut token_validator = if config.issuers.is_empty() {
+            CatTokenValidator::dangerously_any_issuer()
+        } else {
+            CatTokenValidator::for_expected_issuers(config.issuers.iter().cloned())
+        };
+        token_validator = token_validator
             .with_clock_skew_tolerance(clock_skew)
             .map_err(|err| AuthError::Configuration(err.to_string()))?
-            .allow_unencrypted_privacy_claims();
-        if !config.issuers.is_empty() {
-            token_validator = token_validator.with_expected_issuers(config.issuers.clone());
-        }
+            .dangerously_allow_unencrypted_privacy_claims();
         if !config.audiences.is_empty() {
             token_validator = token_validator.with_expected_audiences(config.audiences.clone());
         }
@@ -189,7 +197,7 @@ impl CatAuthHook {
         // it MUST reject all tokens with a 'moqt-reval' claim." This relay does
         // not revalidate mid-session, so saying so makes `validate_moqt_claims`
         // reject such tokens instead of silently ignoring the requirement.
-        let moqt_validator = MoqtValidator::new().without_revalidation_support();
+        let moqt_validator = MoqtValidator::new().disable_revalidation_support();
 
         tracing::info!(
             scope = scope.unwrap_or(UNSCOPED),
@@ -233,7 +241,7 @@ impl CatAuthHook {
         // worth trying. It is only a hint; see `header_kid`.
         let kid = header_kid(token.expose_value());
 
-        // Try each key in turn. `decode_token` compares the header's
+        // Try each key in turn. `Decoder::decode` compares the header's
         // `alg` before verifying, so a key of the wrong algorithm costs no
         // signature operation.
         let mut best_error: Option<CatError> = None;
@@ -249,7 +257,7 @@ impl CatAuthHook {
             }
             *budget -= 1;
 
-            match decode_token(token.expose_value(), &key.verifier) {
+            match Decoder::with_algorithm(&key.verifier).decode(token.expose_value()) {
                 Ok(token) => {
                     decoded = Some(token);
                     break;
@@ -656,7 +664,7 @@ fn prefix_tuple(prefix: &TrackNamespacePrefix) -> Vec<Vec<u8>> {
 /// [`AuthPublicKey::kid`] is operator-facing text. Such a token simply has no
 /// identifier this relay can match, which is not grounds for rejection.
 ///
-/// Degrading is also cheap: `decode_token` reads `alg` from the same header
+/// Degrading is also cheap: `Decoder::decode` reads `alg` from the same header
 /// and fails before performing any signature operation, so a garbage header
 /// costs a few CBOR parses rather than a set of ECDSA verifications.
 ///
@@ -904,12 +912,9 @@ mod tests {
     use super::*;
 
     use bytes::Bytes;
-    // `CryptographicAlgorithm` brings `sign` and `algorithm_id` into scope for
-    // the hand-rolled token minting below.
-    use cat_token::{
-        create_signing_input, encode_token, CatTokenBuilder, CryptographicAlgorithm, Cwt,
-        MoqtScopeBuilder,
-    };
+    // Sign hand-minted tokens with the library's own COSE Sig_structure builder.
+    use cat_token::crypto::create_signing_input;
+    use cat_token::{encode_token, CryptographicAlgorithm, Cwt, MoqtScopeBuilder, ALG_ES256};
     use moq_transport::coding::TrackName;
     use p256::pkcs8::EncodePublicKey;
 
@@ -978,8 +983,7 @@ mod tests {
         let payload_cbor = cwt.encode_payload().expect("payload cbor");
 
         let signing_input =
-            create_signing_input(&header_cbor, &payload_cbor, signer.algorithm_id())
-                .expect("signing input");
+            create_signing_input(&header_cbor, &payload_cbor, ALG_ES256).expect("signing input");
         let signature = signer.sign(&signing_input).expect("sign");
 
         let cose = ciborium::Value::Tag(
@@ -1039,15 +1043,13 @@ mod tests {
             .action(MoqtAction::ClientSetup)
             .build();
 
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(expires_in)
-            .moqt_scope(scope)
-            .moqt_scope(setup_scope)
-            .build()
-            .expect("build token");
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(expires_in)
+            .with_moqt_scope(scope)
+            .with_moqt_scope(setup_scope);
 
         let encoded = match kid {
             Some(kid) => encode_with_kid(&token, signer, kid),
@@ -1074,25 +1076,23 @@ mod tests {
 
     /// A valid, minimally-scoped token: publisher under `sports`, plus setup.
     fn base_token() -> CatToken {
-        CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(3600)
-            .moqt_scope(
+        CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .publisher()
                     .namespace_prefix(b"sports")
                     .track_prefix(b"")
                     .build(),
             )
-            .moqt_scope(
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .action(MoqtAction::ClientSetup)
                     .build(),
             )
-            .build()
-            .expect("build token")
     }
 
     /// Encode [`base_token`] with one extra claim spliced into the payload.
@@ -1134,8 +1134,7 @@ mod tests {
         ciborium::ser::into_writer(&header, &mut header_cbor).expect("header cbor");
 
         let signing_input =
-            create_signing_input(&header_cbor, &payload_cbor, signer.algorithm_id())
-                .expect("signing input");
+            create_signing_input(&header_cbor, &payload_cbor, ALG_ES256).expect("signing input");
         let signature = signer.sign(&signing_input).expect("sign");
 
         let cose = ciborium::Value::Tag(
@@ -1156,12 +1155,12 @@ mod tests {
     /// publisher shape, and the one the library's own `roles::publisher`
     /// helper produces.
     fn track_scoped_token(signer: &Es256Algorithm, track_prefix: &[u8]) -> Bytes {
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(3600)
-            .moqt_scope(
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .publisher()
                     .subscriber()
@@ -1169,13 +1168,11 @@ mod tests {
                     .track_prefix(track_prefix)
                     .build(),
             )
-            .moqt_scope(
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .action(MoqtAction::ClientSetup)
                     .build(),
-            )
-            .build()
-            .expect("build token");
+            );
 
         Bytes::from(encode_token(&token, signer).expect("encode"))
     }
@@ -1365,14 +1362,12 @@ mod tests {
             .namespace_prefix(b"sports")
             .track_prefix(b"")
             .build();
-        let token = CatTokenBuilder::new()
-            .issuer("some-other-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(3600)
-            .moqt_scope(scope)
-            .build()
-            .expect("build token");
+        let token = CatToken::new()
+            .with_issuer("some-other-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(scope);
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
 
         let decision = hook
@@ -1395,14 +1390,12 @@ mod tests {
             .namespace_prefix(b"sports")
             .track_prefix(b"")
             .build();
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("some-other-relay")
-            .subject("test-subject")
-            .expires_in(3600)
-            .moqt_scope(scope)
-            .build()
-            .expect("build token");
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("some-other-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(scope);
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
 
         let decision = hook
@@ -1426,14 +1419,12 @@ mod tests {
             .namespace_prefix(b"sports")
             .track_prefix(b"")
             .build();
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(3600)
-            .moqt_scope(scope)
-            .build()
-            .expect("build token");
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(scope);
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
 
         let decision = hook
@@ -1453,13 +1444,11 @@ mod tests {
 
         // "The default for all actions is 'Blocked'": a token carrying no
         // `moqt` claim authorizes nothing.
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(3600)
-            .build()
-            .expect("build token");
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600);
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
 
         let decision = hook
@@ -1487,16 +1476,14 @@ mod tests {
         let setup = MoqtScopeBuilder::new()
             .action(MoqtAction::ClientSetup)
             .build();
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(3600)
-            .moqt_scope(scope)
-            .moqt_scope(setup)
-            .moqt_reval(30.0)
-            .build()
-            .expect("build token");
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(scope)
+            .with_moqt_scope(setup)
+            .with_moqt_reval(30.0);
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
 
         let decision = hook
@@ -1732,25 +1719,23 @@ mod tests {
         let key = generate_key();
         let hook = hook(vec![AuthPublicKey::es256(key.pem.clone())]);
 
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(3600)
-            .moqt_scope(
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .publisher()
                     .namespace_prefix(b"sports")
                     .track_prefix(b"")
                     .build(),
             )
-            .moqt_scope(
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .action(MoqtAction::ClientSetup)
                     .build(),
-            )
-            .build()
-            .expect("build token");
+            );
 
         // A binary thumbprint, an integer label, and an outright absent header
         // map: each is unusable as a hint, none is grounds for denial.
@@ -1977,13 +1962,13 @@ mod tests {
         let key = generate_key();
         let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
 
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(3600)
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
             // One scope, granting setup and publish, narrowed by track prefix.
-            .moqt_scope(
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .action(MoqtAction::ClientSetup)
                     .action(MoqtAction::PublishNamespace)
@@ -1991,9 +1976,7 @@ mod tests {
                     .namespace_prefix(b"sports")
                     .track_prefix(b"live/")
                     .build(),
-            )
-            .build()
-            .expect("build token");
+            );
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
 
         assert!(hook
@@ -2011,19 +1994,19 @@ mod tests {
         let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
 
         let base = || {
-            CatTokenBuilder::new()
-                .issuer("test-issuer")
-                .single_audience("test-relay")
-                .subject("test-subject")
-                .expires_in(3600)
-                .moqt_scope(
+            CatToken::new()
+                .with_issuer("test-issuer")
+                .with_single_audience("test-relay")
+                .with_subject("test-subject")
+                .with_expires_in(3600)
+                .with_moqt_scope(
                     MoqtScopeBuilder::new()
                         .publisher()
                         .namespace_prefix(b"sports")
                         .track_prefix(b"")
                         .build(),
                 )
-                .moqt_scope(
+                .with_moqt_scope(
                     MoqtScopeBuilder::new()
                         .action(MoqtAction::ClientSetup)
                         .build(),
@@ -2034,10 +2017,8 @@ mod tests {
         // relay never evaluates, so both must deny.
         for token in [
             base()
-                .replay_protection(cat_token::ReplayProtection::Prohibited)
-                .build()
-                .expect("build token"),
-            base().geohash("9q8yy").build().expect("build token"),
+                .with_replay_protection(cat_token::ReplayProtection::Prohibited),
+            base().with_geohash("9q8yy"),
         ] {
             let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
             let decision = hook
@@ -2053,7 +2034,7 @@ mod tests {
 
         // The same token without those claims is fine, so the refusal is
         // attributable to the claim and not to the fixture.
-        let token = base().build().expect("build token");
+        let token = base();
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
         assert!(hook
             .on_setup(&session(), &[auth_token(encoded)])
@@ -2076,20 +2057,18 @@ mod tests {
         let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
 
         // Discovery of the prefix only: no Subscribe action at all.
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(3600)
-            .moqt_scope(
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .action(MoqtAction::ClientSetup)
                     .action(MoqtAction::SubscribeNamespace)
                     .namespace_prefix(b"sports")
                     .build(),
-            )
-            .build()
-            .expect("build token");
+            );
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
         let principal = principal_for(&hook, encoded).await;
 
@@ -2380,25 +2359,23 @@ mod tests {
             i64::MIN / 2,
             now_unix() - 10 * MAX_TOKEN_LIFETIME_SECS,
         ] {
-            let mut token = CatTokenBuilder::new()
-                .issuer("test-issuer")
-                .single_audience("test-relay")
-                .subject("test-subject")
-                .expires_in(3600)
-                .moqt_scope(
+            let mut token = CatToken::new()
+                .with_issuer("test-issuer")
+                .with_single_audience("test-relay")
+                .with_subject("test-subject")
+                .with_expires_in(3600)
+                .with_moqt_scope(
                     MoqtScopeBuilder::new()
                         .publisher()
                         .namespace_prefix(b"sports")
                         .track_prefix(b"")
                         .build(),
                 )
-                .moqt_scope(
+                .with_moqt_scope(
                     MoqtScopeBuilder::new()
                         .action(MoqtAction::ClientSetup)
                         .build(),
-                )
-                .build()
-                .expect("build token");
+                );
             token.core.nbf = Some(nbf);
 
             let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
@@ -2606,21 +2583,19 @@ mod tests {
         let key = generate_key();
         let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
 
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .expires_in(3600)
-            .moqt_scope(
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .subscriber()
                     .action(MoqtAction::ClientSetup)
                     .namespace_exact(b"sports")
                     .namespace_nil()
                     .build(),
-            )
-            .build()
-            .expect("build token");
+            );
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
         let principal = principal_for(&hook, encoded).await;
 
@@ -2728,24 +2703,22 @@ mod tests {
         let key = generate_key();
         let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
 
-        let token = CatTokenBuilder::new()
-            .issuer("test-issuer")
-            .single_audience("test-relay")
-            .subject("test-subject")
-            .moqt_scope(
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .publisher()
                     .namespace_prefix(b"sports")
                     .track_prefix(b"")
                     .build(),
             )
-            .moqt_scope(
+            .with_moqt_scope(
                 MoqtScopeBuilder::new()
                     .action(MoqtAction::ClientSetup)
                     .build(),
-            )
-            .build()
-            .expect("build token");
+            );
         assert!(token.core.exp.is_none(), "fixture must omit exp");
 
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
