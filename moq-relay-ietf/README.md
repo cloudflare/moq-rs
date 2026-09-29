@@ -1,7 +1,8 @@
 # moq-relay
 
 A server that connects publishing clients to subscribing clients.
-All subscriptions are deduplicated and cached, so that a single publisher can serve many subscribers.
+SUBSCRIBE requests are deduplicated and cached, so that a single publisher can serve many subscribers.
+Standalone FETCH requests always create a fresh upstream request and are never cached or deduplicated.
 
 ## Usage
 

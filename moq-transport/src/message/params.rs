@@ -21,6 +21,27 @@ pub mod parameter_type {
     pub const NEW_GROUP_REQUEST: u64 = 0x32;
 }
 
+pub(crate) fn validate_message_parameter_types(params: &KeyValuePairs) -> Result<(), DecodeError> {
+    if params.0.iter().all(|param| {
+        matches!(
+            param.key,
+            parameter_type::DELIVERY_TIMEOUT
+                | parameter_type::AUTHORIZATION_TOKEN
+                | parameter_type::EXPIRES
+                | parameter_type::LARGEST_OBJECT
+                | parameter_type::FORWARD
+                | parameter_type::SUBSCRIBER_PRIORITY
+                | parameter_type::SUBSCRIPTION_FILTER
+                | parameter_type::GROUP_ORDER
+                | parameter_type::NEW_GROUP_REQUEST
+        )
+    }) {
+        Ok(())
+    } else {
+        Err(DecodeError::InvalidParameter)
+    }
+}
+
 /// Draft-16 extension-header type IDs.
 pub mod extension_type {
     pub const DELIVERY_TIMEOUT: u64 = 0x02;

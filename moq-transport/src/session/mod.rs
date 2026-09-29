@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod error;
+mod fetch;
+mod fetch_requested;
 mod pending_requests;
 mod publish_namespace;
 mod publish_received;
@@ -21,6 +23,10 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
+pub use fetch::Fetch;
+pub(crate) use fetch::FetchRecv;
+pub use fetch_requested::FetchRequested;
+pub(crate) use fetch_requested::FetchRequestedRecv;
 pub(crate) use pending_requests::{PendingRequest, PendingRequests, PendingResponse};
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
@@ -1325,7 +1331,7 @@ impl Session {
                 .as_mut()
                 .ok_or(SessionError::RoleViolation)?
                 .recv_request_error(msg),
-            Some(PendingRequest::Subscribe) => subscriber
+            Some(PendingRequest::Subscribe | PendingRequest::Fetch) => subscriber
                 .as_mut()
                 .ok_or(SessionError::RoleViolation)?
                 .recv_request_error(&msg),
@@ -1428,7 +1434,7 @@ impl Session {
                         .as_mut()
                         .ok_or(SessionError::RoleViolation)?
                         .recv_request_timeout(id, request)?,
-                    PendingRequest::Subscribe => subscriber
+                    PendingRequest::Subscribe | PendingRequest::Fetch => subscriber
                         .as_mut()
                         .ok_or(SessionError::RoleViolation)?
                         .recv_request_timeout(id, request)?,

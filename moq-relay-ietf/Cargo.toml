@@ -76,6 +76,8 @@ metrics-exporter-prometheus = { version = "0.16", optional = true }
 tokio = { version = "1", features = ["full", "test-util"] }
 # Used to assert that session correlation fields actually reach formatted output.
 tracing-subscriber = { workspace = true }
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
 
 [features]
 default = []

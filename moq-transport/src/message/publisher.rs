@@ -61,6 +61,6 @@ publisher_msgs! {
     SubscribeOk,
     RequestOk,
     RequestError,
-    // FETCH response; FETCH itself is still unsupported by the session layer.
+    // FETCH response.
     FetchOk,
 }

@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use moq_transport::session::{Publisher, SessionError, SessionId, Subscriber};
+use moq_transport::{
+    message::RequestErrorCode,
+    session::{Publisher, SessionError, SessionId, Subscriber},
+};
 use tracing::Instrument;
 
 use crate::{Consumer, CoordinatorContext, Producer, RelayInfo};
@@ -499,15 +502,16 @@ impl Session {
         }
     }
 
-    /// Drain incoming SUBSCRIBE and SUBSCRIBE_NAMESPACE requests and reject each one.
+    /// Drain incoming SUBSCRIBE, SUBSCRIBE_NAMESPACE, and FETCH requests.
     ///
     /// The transport `Publisher` queues incoming SUBSCRIBE messages as
     /// `Subscribed` events. Dropping a `Subscribed` without calling `ok()`
-    /// triggers its `Drop` impl, which sends SUBSCRIBE_ERROR back to the
-    /// peer.
+    /// triggers its `Drop` impl, which sends REQUEST_ERROR back to the
+    /// peer. FETCH is rejected explicitly with REQUEST_ERROR.
     async fn drain_and_reject_subscribes(mut publisher: Publisher) -> Result<(), SessionError> {
         loop {
             let mut namespace_publisher = publisher.clone();
+            let mut fetch_publisher = publisher.clone();
             tokio::select! {
                 Some(subscribed) = publisher.subscribed() => {
                     tracing::debug!(
@@ -523,6 +527,12 @@ impl Session {
                         "rejecting SUBSCRIBE_NAMESPACE: subscribe not permitted for this session"
                     );
                     drop(subscribed_namespace);
+                }
+                Some(fetch) = fetch_publisher.fetch_requested() => {
+                    let _ = fetch.reject(
+                        RequestErrorCode::Unauthorized,
+                        "FETCH not permitted for this session",
+                    );
                 }
                 else => return Ok(()),
             }

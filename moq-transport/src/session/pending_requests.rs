@@ -26,6 +26,7 @@ pub(crate) enum PendingRequest {
     PublishNamespace,
     Publish,
     Subscribe,
+    Fetch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +35,7 @@ pub(crate) enum PendingResponse {
     RequestError,
     PublishOk,
     SubscribeOk,
+    FetchOk,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -55,6 +57,9 @@ impl PendingRequest {
             ) | (
                 Self::Subscribe,
                 PendingResponse::SubscribeOk | PendingResponse::RequestError,
+            ) | (
+                Self::Fetch,
+                PendingResponse::FetchOk | PendingResponse::RequestError,
             )
         )
     }

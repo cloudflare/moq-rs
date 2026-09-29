@@ -19,10 +19,11 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, ObjectForwarderRecv, PendingRequest, PendingRequests, PublishNamespace,
-    PublishNamespaceRecv, Published, PublishedInfo, PublishedRecv, RequestId, RequestIdAllocation,
-    Session, SessionConfig, SessionError, SessionId, Subscribed, SubscribedNamespace,
-    SubscribedNamespaceInfo, SubscribedNamespaceRecv, TrackStatusRequested,
+    split_published_state, FetchRequested, FetchRequestedRecv, ObjectForwarderRecv, PendingRequest,
+    PendingRequests, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
+    PublishedRecv, RequestId, RequestIdAllocation, Session, SessionConfig, SessionError, SessionId,
+    Subscribed, SubscribedNamespace, SubscribedNamespaceInfo, SubscribedNamespaceRecv,
+    TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -112,6 +113,12 @@ pub struct Publisher {
     /// TRACK_STATUS requests for namespaces that have no matching PUBLISH_NAMESPACE.
     unknown_track_status_requested: Queue<TrackStatusRequested>,
 
+    /// Standalone FETCH requests waiting for application routing.
+    unknown_fetch_requested: Queue<FetchRequested>,
+
+    /// Active inbound FETCH requests, keyed by request ID.
+    fetches: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
+
     /// Active inbound SUBSCRIBE_NAMESPACE prefixes, keyed by Request ID.
     subscribed_namespace_prefixes: Arc<Mutex<HashMap<u64, TrackNamespacePrefix>>>,
 
@@ -157,6 +164,8 @@ impl Publisher {
             subscribed_names: Default::default(),
             unknown_subscribed: Default::default(),
             unknown_track_status_requested: Default::default(),
+            unknown_fetch_requested: Default::default(),
+            fetches: Default::default(),
             subscribed_namespace_prefixes: Default::default(),
             unknown_subscribed_namespace: Default::default(),
             outgoing,
@@ -547,6 +556,11 @@ impl Publisher {
         self.unknown_track_status_requested.pop().await
     }
 
+    /// Returns the next standalone FETCH waiting for application routing.
+    pub async fn fetch_requested(&mut self) -> Option<FetchRequested> {
+        self.unknown_fetch_requested.pop().await
+    }
+
     pub async fn subscribed_namespace(&mut self) -> Option<SubscribedNamespace> {
         self.unknown_subscribed_namespace.pop().await
     }
@@ -598,19 +612,8 @@ impl Publisher {
             // Draft-16: REQUEST_ERROR rejects PUBLISH_NAMESPACE or PUBLISH.
             message::Subscriber::RequestError(msg) => self.recv_request_error(msg)?,
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg)?,
-            // FETCH not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
-            message::Subscriber::Fetch(msg) => {
-                self.send_not_supported(msg.id, "fetch");
-            }
-            // FETCH_CANCEL references an existing request; log and ignore.
-            message::Subscriber::FetchCancel(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    session_id = %self.session_id,
-                    request_id = msg.id,
-                    "received FETCH_CANCEL for unsupported FETCH — ignoring"
-                );
-            }
+            message::Subscriber::Fetch(msg) => self.recv_fetch(msg)?,
+            message::Subscriber::FetchCancel(msg) => self.recv_fetch_cancel(msg)?,
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg)?,
             // Draft-16 §3.3/§9.25: SUBSCRIBE_NAMESPACE begins a dedicated bidi stream.
             message::Subscriber::SubscribeNamespace(msg) => {
@@ -648,6 +651,66 @@ impl Publisher {
                 reason: crate::coding::ReasonPhrase("not supported".to_string()),
             },
         );
+    }
+
+    fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
+        let id = msg.id;
+        validate_fetch_params(&msg.params)?;
+        if msg.fetch_type != message::FetchType::Standalone {
+            self.send_not_supported(msg.id, "joining fetch");
+            return Ok(());
+        }
+
+        let standalone = msg
+            .standalone_fetch
+            .as_ref()
+            .ok_or(SessionError::Internal)?;
+        if standalone.start_location != standalone.end_location
+            && standalone.start_location
+                > super::fetch_requested::inclusive_end(standalone.end_location)
+        {
+            self.send_request_error(
+                "fetch",
+                message::RequestError::new(
+                    msg.id,
+                    RequestErrorCode::InvalidRange,
+                    0,
+                    "fetch start is after end",
+                ),
+            );
+            return Ok(());
+        }
+
+        let (request, recv) = FetchRequested::new(
+            Some(self.webtransport.clone()),
+            self.session_id.clone(),
+            self.outgoing.clone(),
+            self.fetches.clone(),
+            msg,
+        );
+        self.fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .insert(id, recv);
+        if let Err(request) = self.unknown_fetch_requested.push(request) {
+            request
+                .reject(RequestErrorCode::InternalError, "fetch queue closed")
+                .map_err(SessionError::Serve)?;
+        }
+
+        Ok(())
+    }
+
+    fn recv_fetch_cancel(&mut self, msg: message::FetchCancel) -> Result<(), SessionError> {
+        if let Some(mut recv) = self
+            .fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .remove(&msg.id)
+        {
+            recv.cancel()?;
+        }
+        Ok(())
     }
 
     /// Handle REQUEST_OK from subscriber (draft-16 §9.7).
@@ -725,7 +788,9 @@ impl Publisher {
                     published.recv.recv_error(err)?;
                 }
             }
-            PendingRequest::Subscribe => return Err(SessionError::Internal),
+            PendingRequest::Subscribe | PendingRequest::Fetch => {
+                return Err(SessionError::Internal)
+            }
         }
 
         Ok(())
@@ -1073,6 +1138,13 @@ impl Publisher {
     }
 }
 
+fn validate_fetch_params(params: &KeyValuePairs) -> Result<(), crate::coding::DecodeError> {
+    crate::message::validate_message_parameter_types(params)?;
+    params.subscriber_priority()?;
+    params.group_order()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1083,13 +1155,43 @@ mod tests {
         serve::FullTrackName,
     };
 
-    use super::{NameRegistry, Publisher};
+    use super::{validate_fetch_params, NameRegistry, Publisher};
 
     fn full_track_name(namespace: &str, name: &str) -> FullTrackName {
         FullTrackName {
             namespace: TrackNamespace::from_utf8_path(namespace),
             name: TrackName::from(name),
         }
+    }
+
+    #[test]
+    fn fetch_parameters_reject_invalid_known_values() {
+        let mut priority = crate::coding::KeyValuePairs::default();
+        priority.set_intvalue(crate::message::parameter_type::SUBSCRIBER_PRIORITY, 256);
+        assert!(validate_fetch_params(&priority).is_err());
+
+        let mut order = crate::coding::KeyValuePairs::default();
+        order.set_intvalue(crate::message::parameter_type::GROUP_ORDER, 0);
+        assert!(validate_fetch_params(&order).is_err());
+
+        let mut unknown = crate::coding::KeyValuePairs::default();
+        unknown.set_intvalue(0x40, 1);
+        assert!(validate_fetch_params(&unknown).is_err());
+    }
+
+    #[test]
+    fn fetch_parameters_ignore_known_inapplicable_values() {
+        use crate::message::parameter_type;
+
+        let mut params = crate::coding::KeyValuePairs::default();
+        params.set_intvalue(parameter_type::DELIVERY_TIMEOUT, 1);
+        params.set_intvalue(parameter_type::EXPIRES, 1);
+        params.set_bytesvalue(parameter_type::LARGEST_OBJECT, Vec::new());
+        params.set_intvalue(parameter_type::FORWARD, 2);
+        params.set_bytesvalue(parameter_type::SUBSCRIPTION_FILTER, Vec::new());
+        params.set_intvalue(parameter_type::NEW_GROUP_REQUEST, 1);
+
+        assert!(validate_fetch_params(&params).is_ok());
     }
 
     #[test]

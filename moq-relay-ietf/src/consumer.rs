@@ -192,7 +192,11 @@ impl Consumer {
         tracing::debug!(namespace = %ns, "registering namespace route source in locals");
         let (_register, mut requests) = match self
             .locals
-            .register_namespace(self.context.scope(), published_ns.namespace.clone())
+            .register_namespace_with_fetch(
+                self.context.scope(),
+                published_ns.namespace.clone(),
+                self.subscriber.clone(),
+            )
             .await
         {
             Ok(reg) => reg,
