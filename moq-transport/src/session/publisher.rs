@@ -1093,6 +1093,11 @@ impl Publisher {
         }
     }
 
+    pub(super) fn complete_subscribe(&mut self, id: u64) -> Result<(), SessionError> {
+        let _ = self.remove_subscribe(id)?;
+        Ok(())
+    }
+
     pub(super) fn register_published_subscription(
         &mut self,
         id: u64,

@@ -1504,6 +1504,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn natural_subscribe_completion_retires_joining_association() {
+        let mut peer = manual_peer().await;
+        let mut publisher = peer.server_publisher.clone();
+        let mut fetch_publisher = publisher.clone();
+        let namespace = TrackNamespace::from_utf8_path("test/joining/natural-completion");
+        let (writer, reader) = Track::new(namespace.clone(), "video").produce();
+        let mut datagrams = writer.datagrams().unwrap();
+        datagrams
+            .write(Datagram {
+                group_id: 2,
+                object_id: 3,
+                priority: 1,
+                payload: Vec::from(&b"live"[..]).into(),
+                extension_headers: Default::default(),
+            })
+            .unwrap();
+
+        let scenario = async {
+            write(
+                &mut peer.control_send,
+                &largest_object_subscribe(0, &namespace, "video".into()),
+            )
+            .await;
+            let subscribed = publisher.subscribed().await.unwrap();
+            let serve = subscribed.serve(reader);
+            tokio::pin!(serve);
+            let Message::SubscribeOk(ok) = (tokio::select! {
+                result = &mut serve => panic!("subscription ended before SUBSCRIBE_OK: {result:?}"),
+                message = peer.control_recv.decode::<Message>() => message,
+            }) else {
+                panic!("expected SUBSCRIBE_OK");
+            };
+            assert_eq!(ok.id, 0);
+
+            write(
+                &mut peer.control_send,
+                &joining_fetch_request(
+                    2,
+                    0,
+                    FetchType::RelativeJoining,
+                    0,
+                    KeyValuePairs::default(),
+                ),
+            )
+            .await;
+            let accepted = fetch_publisher.fetch_requested().await.unwrap();
+
+            drop(datagrams);
+            serve.await.unwrap();
+            let Message::PublishDone(done) = peer.control_recv.decode::<Message>().await else {
+                panic!("expected PUBLISH_DONE");
+            };
+            assert_eq!(done.id, 0);
+
+            write(
+                &mut peer.control_send,
+                &joining_fetch_request(
+                    4,
+                    0,
+                    FetchType::RelativeJoining,
+                    0,
+                    KeyValuePairs::default(),
+                ),
+            )
+            .await;
+            let Message::RequestError(error) = peer.control_recv.decode::<Message>().await else {
+                panic!("expected completed association rejection");
+            };
+            assert_eq!(error.id, 4);
+            assert_eq!(
+                error.error_code,
+                RequestErrorCode::InvalidJoiningRequestId as u64
+            );
+
+            assert_eq!(
+                accepted.resolve().await.unwrap(),
+                Some(message::StandaloneFetch {
+                    track_namespace: namespace,
+                    track_name: "video".into(),
+                    start_location: Location::new(2, 0),
+                    end_location: Location::new(2, 4),
+                })
+            );
+            accepted
+                .reject(RequestErrorCode::DoesNotExist, "test complete")
+                .unwrap();
+            let Message::RequestError(error) = peer.control_recv.decode::<Message>().await else {
+                panic!("expected accepted FETCH rejection");
+            };
+            assert_eq!(error.id, 2);
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scenario => {},
+                result = peer.server_session.run() => panic!("server session ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn publish_association_is_joinable_only_after_publish_ok() {
         let mut peer = manual_peer().await;
         let namespace = TrackNamespace::from_utf8_path("test/joining/publish");

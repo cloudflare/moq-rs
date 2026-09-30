@@ -380,6 +380,8 @@ impl Subscribed {
         let res = self.serve_inner(track).await;
         if let Err(err) = &res {
             self.close(err.clone().into())?;
+        } else {
+            self.forwarder.publisher.complete_subscribe(self.info.id)?;
         }
 
         res
