@@ -18,7 +18,10 @@ use crate::{
     watch::{Queue, State},
 };
 
-use super::{Fetch, SessionError, SessionId, Writer};
+use super::{
+    Fetch, JoiningAssociation, JoiningSnapshot, JoiningSnapshotError, SessionError, SessionId,
+    Writer,
+};
 
 const COPY_CHUNK_SIZE: usize = 64 * 1024;
 
@@ -32,7 +35,7 @@ impl Default for FetchRequestedState {
     }
 }
 
-/// An inbound standalone FETCH waiting for application routing.
+/// An inbound FETCH waiting for application routing.
 #[must_use = "proxy, reject, or drop the FETCH request"]
 pub struct FetchRequested {
     webtransport: Option<web_transport::Session>,
@@ -41,6 +44,7 @@ pub struct FetchRequested {
     active: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
     state: State<FetchRequestedState>,
     id: u64,
+    joining: Option<JoiningAssociation>,
     pub request: message::Fetch,
 }
 
@@ -55,6 +59,7 @@ impl FetchRequested {
         outgoing: Queue<Message>,
         active: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
         request: message::Fetch,
+        joining: Option<JoiningAssociation>,
     ) -> (Self, FetchRequestedRecv) {
         let id = request.id;
         let (send, recv) = State::default().split();
@@ -66,6 +71,7 @@ impl FetchRequested {
                 active,
                 state: send,
                 id,
+                joining,
                 request,
             },
             FetchRequestedRecv { state: recv },
@@ -82,6 +88,67 @@ impl FetchRequested {
             match notify {
                 Some(notify) => notify.await,
                 None => return Ok(()),
+            }
+        }
+    }
+
+    /// Resolve this inbound request to the equivalent standalone FETCH range.
+    ///
+    /// Joining requests can wait for their associated SUBSCRIBE to become
+    /// established. `None` means the request was canceled or a request-level
+    /// resolution error was already sent.
+    pub async fn resolve(&self) -> Result<Option<message::StandaloneFetch>, SessionError> {
+        if self.request.fetch_type == message::FetchType::Standalone {
+            return self
+                .request
+                .standalone_fetch
+                .clone()
+                .map(Some)
+                .ok_or(SessionError::Internal);
+        }
+
+        let joining = self.joining.as_ref().ok_or(SessionError::Internal)?;
+        let joining_fields = self
+            .request
+            .joining_fetch
+            .as_ref()
+            .ok_or(SessionError::Internal)?;
+        let snapshot = tokio::select! {
+            biased;
+            _ = self.closed() => return Ok(None),
+            snapshot = joining.snapshot() => snapshot,
+        };
+
+        let snapshot = match snapshot {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                self.send_resolution_error(
+                    RequestErrorCode::InvalidRange,
+                    "joining subscription has no largest object",
+                );
+                return Ok(None);
+            }
+            Err(JoiningSnapshotError::InvalidRequestId) => {
+                self.send_resolution_error(
+                    RequestErrorCode::InvalidJoiningRequestId,
+                    "joining subscription is no longer active",
+                );
+                return Ok(None);
+            }
+        };
+
+        match resolve_joining_range(
+            &snapshot,
+            self.request.fetch_type,
+            joining_fields.joining_start,
+        ) {
+            Ok(standalone) => Ok(Some(standalone)),
+            Err(JoiningRangeError::InvalidRange) => {
+                self.send_resolution_error(
+                    RequestErrorCode::InvalidRange,
+                    "invalid joining FETCH range",
+                );
+                Ok(None)
             }
         }
     }
@@ -210,11 +277,56 @@ impl FetchRequested {
             .push(message::RequestError::new(self.id, code, 0, &reason).into());
     }
 
+    fn send_resolution_error(&self, code: RequestErrorCode, reason: &'static str) {
+        if self.claim_response().is_ok() {
+            self.send_error(code, reason);
+        }
+    }
+
     fn remove_active(&self) {
         if let Ok(mut active) = self.active.lock() {
             active.remove(&self.id);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum JoiningRangeError {
+    InvalidRange,
+}
+
+fn resolve_joining_range(
+    snapshot: &JoiningSnapshot,
+    fetch_type: message::FetchType,
+    joining_start: u64,
+) -> Result<message::StandaloneFetch, JoiningRangeError> {
+    let start_group = match fetch_type {
+        message::FetchType::RelativeJoining => snapshot
+            .largest
+            .group_id
+            .checked_sub(joining_start)
+            .ok_or(JoiningRangeError::InvalidRange)?,
+        message::FetchType::AbsoluteJoining => joining_start,
+        message::FetchType::Standalone => return Err(JoiningRangeError::InvalidRange),
+    };
+    let start_location = Location::new(start_group, 0);
+    if snapshot.largest.group_id > VarInt::MAX.into_inner() || start_location > snapshot.largest {
+        return Err(JoiningRangeError::InvalidRange);
+    }
+
+    let end_object = snapshot
+        .largest
+        .object_id
+        .checked_add(1)
+        .filter(|object_id| *object_id <= VarInt::MAX.into_inner())
+        .ok_or(JoiningRangeError::InvalidRange)?;
+
+    Ok(message::StandaloneFetch {
+        track_namespace: snapshot.track_namespace.clone(),
+        track_name: snapshot.track_name.clone(),
+        start_location,
+        end_location: Location::new(snapshot.largest.group_id, end_object),
+    })
 }
 
 impl Drop for FetchRequested {
@@ -332,8 +444,9 @@ impl FetchReset {
 #[cfg(test)]
 mod tests {
     use crate::{
-        coding::{Location, TrackNamespace},
-        message::{Fetch, FetchType, StandaloneFetch},
+        coding::{Location, TrackName, TrackNamespace, VarInt},
+        message::{Fetch, FetchType, JoiningFetch, StandaloneFetch},
+        session::{JoiningAssociationEntry, JoiningSnapshot},
     };
 
     use super::*;
@@ -351,6 +464,154 @@ mod tests {
             joining_fetch: None,
             params: Default::default(),
         }
+    }
+
+    fn joining_request(id: u64, fetch_type: FetchType, joining_start: u64) -> Fetch {
+        Fetch {
+            id,
+            fetch_type,
+            standalone_fetch: None,
+            joining_fetch: Some(JoiningFetch {
+                joining_request_id: 2,
+                joining_start,
+            }),
+            params: Default::default(),
+        }
+    }
+
+    fn joining_snapshot(group_id: u64, object_id: u64) -> JoiningSnapshot {
+        JoiningSnapshot {
+            track_namespace: TrackNamespace::from_utf8_path("test/exact"),
+            track_name: TrackName::from(vec![0, 0xff]),
+            largest: Location::new(group_id, object_id),
+        }
+    }
+
+    #[test]
+    fn joining_range_uses_exact_identity_and_checked_boundaries() {
+        let snapshot = joining_snapshot(7, 11);
+        assert_eq!(
+            resolve_joining_range(&snapshot, FetchType::RelativeJoining, 3).unwrap(),
+            StandaloneFetch {
+                track_namespace: snapshot.track_namespace.clone(),
+                track_name: snapshot.track_name.clone(),
+                start_location: Location::new(4, 0),
+                end_location: Location::new(7, 12),
+            }
+        );
+        assert_eq!(
+            resolve_joining_range(&snapshot, FetchType::AbsoluteJoining, 7).unwrap(),
+            StandaloneFetch {
+                track_namespace: snapshot.track_namespace.clone(),
+                track_name: snapshot.track_name.clone(),
+                start_location: Location::new(7, 0),
+                end_location: Location::new(7, 12),
+            }
+        );
+    }
+
+    #[test]
+    fn joining_range_rejects_underflow_future_start_and_object_overflow() {
+        assert_eq!(
+            resolve_joining_range(&joining_snapshot(2, 3), FetchType::RelativeJoining, 3,),
+            Err(JoiningRangeError::InvalidRange)
+        );
+        assert_eq!(
+            resolve_joining_range(&joining_snapshot(2, 3), FetchType::AbsoluteJoining, 3,),
+            Err(JoiningRangeError::InvalidRange)
+        );
+        assert_eq!(
+            resolve_joining_range(
+                &joining_snapshot(2, VarInt::MAX.into_inner()),
+                FetchType::RelativeJoining,
+                0,
+            ),
+            Err(JoiningRangeError::InvalidRange)
+        );
+        assert_eq!(
+            resolve_joining_range(
+                &joining_snapshot(VarInt::MAX.into_inner() + 1, 0),
+                FetchType::RelativeJoining,
+                0,
+            ),
+            Err(JoiningRangeError::InvalidRange)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_joining_is_pending_sends_no_response() {
+        let (outgoing, receiver) = Queue::default().split();
+        let keepalive = outgoing.clone();
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        let association = JoiningAssociationEntry::pending_subscriber(
+            TrackNamespace::from_utf8_path("test/exact"),
+            "video".into(),
+            Some(crate::message::FilterType::LargestObject),
+        );
+        let (request, mut recv) = FetchRequested::new(
+            None,
+            SessionId::generate(),
+            outgoing,
+            active.clone(),
+            joining_request(7, FetchType::RelativeJoining, 1),
+            Some(association.association()),
+        );
+        active.lock().unwrap().insert(
+            7,
+            FetchRequestedRecv {
+                state: recv.state.clone(),
+            },
+        );
+
+        let resolved = {
+            let resolve = request.resolve();
+            tokio::pin!(resolve);
+            assert!(futures::poll!(&mut resolve).is_pending());
+            recv.cancel().unwrap();
+            resolve.await.unwrap()
+        };
+
+        assert!(resolved.is_none());
+        drop(request);
+        assert!(active.lock().unwrap().is_empty());
+        assert!(receiver.close().is_empty());
+        drop(keepalive);
+    }
+
+    #[tokio::test]
+    async fn established_joining_without_largest_sends_invalid_range_once() {
+        let (outgoing, mut receiver) = Queue::default().split();
+        let keepalive = outgoing.clone();
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        let association = JoiningAssociationEntry::pending_subscriber(
+            TrackNamespace::from_utf8_path("test/exact"),
+            "video".into(),
+            Some(crate::message::FilterType::LargestObject),
+        );
+        association
+            .association()
+            .establish_subscriber(None)
+            .unwrap();
+        let (request, recv) = FetchRequested::new(
+            None,
+            SessionId::generate(),
+            outgoing,
+            active.clone(),
+            joining_request(13, FetchType::AbsoluteJoining, 0),
+            Some(association.association()),
+        );
+        active.lock().unwrap().insert(13, recv);
+
+        assert!(request.resolve().await.unwrap().is_none());
+        let Message::RequestError(error) = receiver.pop().await.unwrap() else {
+            panic!("expected REQUEST_ERROR");
+        };
+        assert_eq!(error.id, 13);
+        assert_eq!(error.error_code, RequestErrorCode::InvalidRange as u64);
+        drop(request);
+        assert!(receiver.close().is_empty());
+        assert!(active.lock().unwrap().is_empty());
+        drop(keepalive);
     }
 
     struct Handles {
@@ -371,6 +632,7 @@ mod tests {
             outgoing,
             active.clone(),
             request(id),
+            None,
         );
         Handles {
             request,

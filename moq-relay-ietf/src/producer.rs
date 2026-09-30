@@ -172,11 +172,18 @@ impl Producer {
 
     async fn serve_fetch(self, fetch: FetchRequested) -> Result<(), anyhow::Error> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let standalone = fetch
-            .request
-            .standalone_fetch
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("standalone FETCH missing range"))?;
+        let standalone = tokio::select! {
+            biased;
+            _ = fetch.closed() => return Ok(()),
+            _ = tokio::time::sleep_until(deadline) => {
+                fetch.reject(RequestErrorCode::Timeout, "FETCH resolution timed out")?;
+                return Ok(());
+            }
+            result = fetch.resolve() => match result? {
+                Some(standalone) => standalone,
+                None => return Ok(()),
+            },
+        };
         let params = match upstream_fetch_params(&fetch.request.params) {
             Ok(params) => params,
             Err(err) => {
@@ -755,10 +762,13 @@ mod tests {
     use async_trait::async_trait;
     use moq_native_ietf::quic;
     use moq_transport::{
-        coding::{Decode, DecodeError, Encode, KeyValuePairs, Location, TrackNamespace},
+        coding::{Decode, DecodeError, Encode, KeyValuePairs, Location, TrackName, TrackNamespace},
         data::{FetchHeader, StreamHeader, StreamHeaderType},
-        message::{self, parameter_type, FetchType, GroupOrder, Message, RequestErrorCode},
-        serve::ServeError,
+        message::{
+            self, parameter_type, FetchType, FilterType, GroupOrder, JoiningFetch, Message,
+            RequestErrorCode, SubscriptionFilter,
+        },
+        serve::{Datagram, ServeError, Track},
         session::{Session, SessionError},
         setup,
     };
@@ -983,6 +993,48 @@ mod tests {
         .into()
     }
 
+    fn joining_fetch_request(
+        id: u64,
+        joining_request_id: u64,
+        fetch_type: FetchType,
+        joining_start: u64,
+        params: KeyValuePairs,
+    ) -> Message {
+        message::Fetch {
+            id,
+            fetch_type,
+            standalone_fetch: None,
+            joining_fetch: Some(JoiningFetch {
+                joining_request_id,
+                joining_start,
+            }),
+            params,
+        }
+        .into()
+    }
+
+    fn largest_object_subscribe(
+        id: u64,
+        namespace: &TrackNamespace,
+        track_name: TrackName,
+    ) -> Message {
+        let mut params = KeyValuePairs::default();
+        params
+            .set_subscription_filter(&SubscriptionFilter {
+                filter_type: FilterType::LargestObject,
+                start_location: None,
+                end_group_id: None,
+            })
+            .unwrap();
+        message::Subscribe {
+            id,
+            track_namespace: namespace.clone(),
+            track_name,
+            params,
+        }
+        .into()
+    }
+
     fn fetch_group(request: &message::Fetch) -> u64 {
         request
             .standalone_fetch
@@ -1140,6 +1192,676 @@ mod tests {
             recv.decode::<Message>().await,
             Message::RequestOk(message::RequestOk { id: 2, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn local_joining_fetch_resolves_to_fresh_standalone_with_exact_identity() {
+        let mut downstream = manual_peer().await;
+        let mut upstream = manual_peer().await;
+        let coordinator: Arc<dyn Coordinator> = Arc::new(MockCoordinator::without_route());
+        let mut locals = Locals::new();
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let producer = Producer::new(
+            downstream.server_publisher,
+            locals.clone(),
+            remotes,
+            coordinator,
+            SessionContext::public(None),
+        );
+        let namespace = TrackNamespace::from_utf8_path("test/joining/exact");
+        let track_name = TrackName::from(vec![0, 0xff, b'v']);
+        let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
+        let mut datagrams = writer.datagrams().unwrap();
+        datagrams
+            .write(Datagram {
+                group_id: 7,
+                object_id: 11,
+                priority: 9,
+                payload: Vec::from(&b"live"[..]).into(),
+                extension_headers: Default::default(),
+            })
+            .unwrap();
+        let track_registration = locals.register_track(None, reader).await.unwrap();
+        let (namespace_registration, namespace_requests) = locals
+            .register_namespace_with_fetch(
+                None,
+                namespace.clone(),
+                upstream.server_subscriber.clone(),
+            )
+            .await
+            .unwrap();
+
+        let scenario = async {
+            write(
+                &mut downstream.control_send,
+                &largest_object_subscribe(0, &namespace, track_name.clone()),
+            )
+            .await;
+            let Message::SubscribeOk(ok) = downstream.control_recv.decode::<Message>().await else {
+                panic!("expected SUBSCRIBE_OK");
+            };
+            assert_eq!(ok.id, 0);
+            assert_eq!(
+                ok.params.largest_object().unwrap(),
+                Some(Location::new(7, 11))
+            );
+
+            let mut params = KeyValuePairs::default();
+            params.set_group_order(GroupOrder::Descending);
+            write(
+                &mut downstream.control_send,
+                &joining_fetch_request(2, 0, FetchType::RelativeJoining, 3, params),
+            )
+            .await;
+            let Message::Fetch(upstream_fetch) = upstream.control_recv.decode::<Message>().await
+            else {
+                panic!("expected normalized upstream FETCH");
+            };
+            assert_eq!(upstream_fetch.fetch_type, FetchType::Standalone);
+            assert!(upstream_fetch.joining_fetch.is_none());
+            assert_eq!(
+                upstream_fetch.standalone_fetch,
+                Some(message::StandaloneFetch {
+                    track_namespace: namespace.clone(),
+                    track_name: track_name.clone(),
+                    start_location: Location::new(4, 0),
+                    end_location: Location::new(7, 12),
+                })
+            );
+            assert_eq!(
+                upstream_fetch.params.group_order().unwrap(),
+                Some(GroupOrder::Descending)
+            );
+
+            let body = fetch_object(4, 0, b"history");
+            send_fetch_success(
+                &upstream.transport,
+                &mut upstream.control_send,
+                &upstream_fetch,
+                &body,
+                FetchResponseOrder::StreamFirst,
+            )
+            .await;
+            assert_eq!(receive_fetch_stream(&downstream.transport).await, (2, body));
+            receive_fetch_ok(&mut downstream.control_recv, 2).await;
+
+            drop(namespace_requests);
+            drop(namespace_registration);
+            drop(track_registration);
+            drop(datagrams);
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scenario => {},
+                result = producer.run() => panic!("producer ended: {result:?}"),
+                result = downstream.server_session.run() => panic!("downstream session ended: {result:?}"),
+                result = upstream.server_session.run() => panic!("upstream session ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_joining_fetch_creates_no_upstream_request() {
+        let mut downstream = manual_peer().await;
+        let mut upstream = manual_peer().await;
+        let coordinator: Arc<dyn Coordinator> = Arc::new(MockCoordinator::without_route());
+        let mut locals = Locals::new();
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let producer = Producer::new(
+            downstream.server_publisher,
+            locals.clone(),
+            remotes,
+            coordinator,
+            SessionContext::public(None),
+        );
+        let namespace = TrackNamespace::from_utf8_path("test/joining/pending");
+        let (namespace_registration, mut namespace_requests) = locals
+            .register_namespace_with_fetch(
+                None,
+                namespace.clone(),
+                upstream.server_subscriber.clone(),
+            )
+            .await
+            .unwrap();
+
+        let scenario = async {
+            write(
+                &mut downstream.control_send,
+                &largest_object_subscribe(0, &namespace, "video".into()),
+            )
+            .await;
+            write(
+                &mut downstream.control_send,
+                &joining_fetch_request(
+                    2,
+                    0,
+                    FetchType::RelativeJoining,
+                    1,
+                    KeyValuePairs::default(),
+                ),
+            )
+            .await;
+            write(
+                &mut downstream.control_send,
+                &Message::FetchCancel(message::FetchCancel { id: 2 }),
+            )
+            .await;
+
+            let request = namespace_requests.recv().await.unwrap();
+            let mut pending_datagrams = request.writer.datagrams().unwrap();
+            pending_datagrams
+                .write(Datagram {
+                    group_id: 3,
+                    object_id: 1,
+                    priority: 1,
+                    payload: Vec::from(&b"live"[..]).into(),
+                    extension_headers: Default::default(),
+                })
+                .unwrap();
+            request.upstream.established();
+            let Message::SubscribeOk(ok) = downstream.control_recv.decode::<Message>().await else {
+                panic!("expected SUBSCRIBE_OK after pending establishment");
+            };
+            assert_eq!(ok.id, 0);
+
+            write(
+                &mut downstream.control_send,
+                &fetch_request(4, &namespace, 9),
+            )
+            .await;
+
+            let Message::Fetch(upstream_fetch) = upstream.control_recv.decode::<Message>().await
+            else {
+                panic!("expected sentinel standalone FETCH");
+            };
+            assert_eq!(upstream_fetch.fetch_type, FetchType::Standalone);
+            assert_eq!(fetch_group(&upstream_fetch), 9);
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    upstream.control_recv.decode::<Message>()
+                )
+                .await
+                .is_err(),
+                "canceled Joining FETCH opened a delayed upstream request"
+            );
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    downstream.control_recv.decode::<Message>()
+                )
+                .await
+                .is_err(),
+                "canceled Joining FETCH produced an extra response"
+            );
+
+            drop(request.lease);
+            drop(request.upstream);
+            drop(pending_datagrams);
+            drop(namespace_registration);
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scenario => {},
+                result = producer.run() => panic!("producer ended: {result:?}"),
+                result = downstream.server_session.run() => panic!("downstream session ended: {result:?}"),
+                result = upstream.server_session.run() => panic!("upstream session ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn immediate_unsubscribe_before_subscribe_serve_is_benign() {
+        let mut peer = manual_peer().await;
+        let mut publisher = peer.server_publisher.clone();
+        let namespace = TrackNamespace::from_utf8_path("test/joining/unsubscribe-race");
+        let (writer, reader) = Track::new(namespace.clone(), "video").produce();
+        let mut datagrams = writer.datagrams().unwrap();
+        datagrams
+            .write(Datagram {
+                group_id: 2,
+                object_id: 3,
+                priority: 1,
+                payload: Vec::from(&b"live"[..]).into(),
+                extension_headers: Default::default(),
+            })
+            .unwrap();
+
+        let scenario = async {
+            write(
+                &mut peer.control_send,
+                &largest_object_subscribe(0, &namespace, "video".into()),
+            )
+            .await;
+            write(
+                &mut peer.control_send,
+                &Message::Unsubscribe(message::Unsubscribe { id: 0 }),
+            )
+            .await;
+            write(
+                &mut peer.control_send,
+                &joining_fetch_request(
+                    2,
+                    0,
+                    FetchType::RelativeJoining,
+                    0,
+                    KeyValuePairs::default(),
+                ),
+            )
+            .await;
+
+            let Message::RequestError(error) = peer.control_recv.decode::<Message>().await else {
+                panic!("expected removed subscription rejection");
+            };
+            assert_eq!(error.id, 2);
+            assert_eq!(
+                error.error_code,
+                RequestErrorCode::InvalidJoiningRequestId as u64
+            );
+
+            let subscribed = publisher.subscribed().await.unwrap();
+            assert!(matches!(
+                subscribed.serve(reader).await,
+                Err(SessionError::Serve(ServeError::Cancel))
+            ));
+            write(
+                &mut peer.control_send,
+                &joining_fetch_request(
+                    4,
+                    0,
+                    FetchType::RelativeJoining,
+                    0,
+                    KeyValuePairs::default(),
+                ),
+            )
+            .await;
+            let Message::RequestError(error) = peer.control_recv.decode::<Message>().await else {
+                panic!("canceled SUBSCRIBE produced an extra response");
+            };
+            assert_eq!(error.id, 4);
+            assert_eq!(
+                error.error_code,
+                RequestErrorCode::InvalidJoiningRequestId as u64
+            );
+
+            drop(datagrams);
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scenario => {},
+                result = peer.server_session.run() => panic!("server session ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_association_is_joinable_only_after_publish_ok() {
+        let mut peer = manual_peer().await;
+        let namespace = TrackNamespace::from_utf8_path("test/joining/publish");
+        let track_name = TrackName::from(vec![0, 0xfe, b'p']);
+        let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
+        let mut datagrams = writer.datagrams().unwrap();
+        datagrams
+            .write(Datagram {
+                group_id: 5,
+                object_id: 8,
+                priority: 1,
+                payload: Vec::from(&b"live"[..]).into(),
+                extension_headers: Default::default(),
+            })
+            .unwrap();
+        let mut publisher = peer.server_publisher.clone();
+        let published = publisher
+            .publish(reader, KeyValuePairs::default())
+            .await
+            .unwrap();
+        let publish_id = published.info.id;
+        let mut fetch_publisher = publisher.clone();
+
+        let scenario = async {
+            let Message::Publish(publish) = peer.control_recv.decode::<Message>().await else {
+                panic!("expected PUBLISH");
+            };
+            assert_eq!(publish.id, publish_id);
+            assert_eq!(
+                publish.params.largest_object().unwrap(),
+                Some(Location::new(5, 8))
+            );
+
+            for (id, joining_request_id) in [(0, publish_id), (2, publish_id + 100)] {
+                write(
+                    &mut peer.control_send,
+                    &joining_fetch_request(
+                        id,
+                        joining_request_id,
+                        FetchType::RelativeJoining,
+                        1,
+                        KeyValuePairs::default(),
+                    ),
+                )
+                .await;
+                let Message::RequestError(error) = peer.control_recv.decode::<Message>().await
+                else {
+                    panic!("expected INVALID_JOINING_REQUEST_ID");
+                };
+                assert_eq!(error.id, id);
+                assert_eq!(
+                    error.error_code,
+                    RequestErrorCode::InvalidJoiningRequestId as u64
+                );
+            }
+
+            let mut ok_params = KeyValuePairs::default();
+            ok_params
+                .set_subscription_filter(&SubscriptionFilter::largest_object())
+                .unwrap();
+            write(
+                &mut peer.control_send,
+                &Message::PublishOk(message::PublishOk {
+                    id: publish_id,
+                    params: ok_params,
+                }),
+            )
+            .await;
+            write(
+                &mut peer.control_send,
+                &joining_fetch_request(
+                    4,
+                    publish_id,
+                    FetchType::AbsoluteJoining,
+                    3,
+                    KeyValuePairs::default(),
+                ),
+            )
+            .await;
+            let fetch = fetch_publisher.fetch_requested().await.unwrap();
+            assert_eq!(
+                fetch.resolve().await.unwrap(),
+                Some(message::StandaloneFetch {
+                    track_namespace: namespace.clone(),
+                    track_name: track_name.clone(),
+                    start_location: Location::new(3, 0),
+                    end_location: Location::new(5, 9),
+                })
+            );
+            fetch
+                .reject(RequestErrorCode::DoesNotExist, "test complete")
+                .unwrap();
+            let Message::RequestError(error) = peer.control_recv.decode::<Message>().await else {
+                panic!("expected FETCH rejection");
+            };
+            assert_eq!(error.id, 4);
+
+            write(
+                &mut peer.control_send,
+                &Message::Unsubscribe(message::Unsubscribe { id: publish_id }),
+            )
+            .await;
+            write(
+                &mut peer.control_send,
+                &joining_fetch_request(
+                    6,
+                    publish_id,
+                    FetchType::RelativeJoining,
+                    0,
+                    KeyValuePairs::default(),
+                ),
+            )
+            .await;
+            let Message::RequestError(error) = peer.control_recv.decode::<Message>().await else {
+                panic!("expected terminated association rejection");
+            };
+            assert_eq!(error.id, 6);
+            assert_eq!(
+                error.error_code,
+                RequestErrorCode::InvalidJoiningRequestId as u64
+            );
+
+            drop(published);
+            drop(datagrams);
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scenario => {},
+                result = peer.server_session.run() => panic!("server session ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn joining_fetch_with_non_largest_filter_closes_session() {
+        let filters = [
+            None,
+            Some(SubscriptionFilter {
+                filter_type: FilterType::NextGroupStart,
+                start_location: None,
+                end_group_id: None,
+            }),
+            Some(SubscriptionFilter {
+                filter_type: FilterType::AbsoluteStart,
+                start_location: Some(Location::new(0, 0)),
+                end_group_id: None,
+            }),
+            Some(SubscriptionFilter {
+                filter_type: FilterType::AbsoluteRange,
+                start_location: Some(Location::new(0, 0)),
+                end_group_id: Some(1),
+            }),
+        ];
+
+        for filter in filters {
+            let mut peer = manual_peer().await;
+            let namespace = TrackNamespace::from_utf8_path("test/joining/filter");
+            let mut params = KeyValuePairs::default();
+            if let Some(filter) = filter {
+                params.set_subscription_filter(&filter).unwrap();
+            }
+            write(
+                &mut peer.control_send,
+                &Message::Subscribe(message::Subscribe {
+                    id: 0,
+                    track_namespace: namespace,
+                    track_name: "video".into(),
+                    params,
+                }),
+            )
+            .await;
+            write(
+                &mut peer.control_send,
+                &joining_fetch_request(
+                    2,
+                    0,
+                    FetchType::RelativeJoining,
+                    0,
+                    KeyValuePairs::default(),
+                ),
+            )
+            .await;
+
+            let result = tokio::time::timeout(Duration::from_secs(5), peer.server_session.run())
+                .await
+                .unwrap();
+            assert!(matches!(result, Err(SessionError::ProtocolViolation(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn two_relay_joining_fetch_is_normalized_and_cache_free() {
+        let mut downstream = manual_peer().await;
+        let mut publisher = manual_peer().await;
+        let TestEndpoint {
+            client: route_client,
+            server: mut origin_server,
+            url: origin_url,
+            addr: origin_addr,
+        } = test_endpoint();
+        let edge_coordinator: Arc<dyn Coordinator> = Arc::new(MockCoordinator::with_route(
+            origin_url,
+            origin_addr,
+            route_client,
+        ));
+        let origin_coordinator: Arc<dyn Coordinator> = Arc::new(MockCoordinator::without_route());
+        let mut edge_locals = Locals::new();
+        let origin_locals = Locals::new();
+        let edge_remotes = RemoteManager::new(edge_coordinator.clone(), Vec::new());
+        let origin_remotes = RemoteManager::new(origin_coordinator.clone(), Vec::new());
+        let edge = Producer::new(
+            downstream.server_publisher,
+            edge_locals.clone(),
+            edge_remotes,
+            edge_coordinator,
+            SessionContext::public(Some("scope-a".to_string())),
+        );
+        let origin_consumer = Consumer::new(
+            publisher.server_subscriber,
+            origin_locals.clone(),
+            origin_coordinator.clone(),
+            origin_remotes.clone(),
+            None,
+            SessionContext::public(Some("scope-a".to_string())),
+        );
+        let origin_locals_for_connection = origin_locals.clone();
+        let origin_remotes_for_connection = origin_remotes.clone();
+        let origin_coordinator_for_connection = origin_coordinator.clone();
+        let origin_connection = async move {
+            let (transport, info) = origin_server.accept().await.unwrap();
+            let (session, relay_publisher, _) = Session::accept(transport, None, info.transport)
+                .await
+                .unwrap();
+            let origin = Producer::new(
+                relay_publisher.unwrap(),
+                origin_locals_for_connection,
+                origin_remotes_for_connection,
+                origin_coordinator_for_connection,
+                SessionContext::internal(Some("scope-a".to_string()), None),
+            );
+            tokio::select! {
+                result = session.run() => panic!("origin relay session ended: {result:?}"),
+                result = origin.run() => panic!("origin producer ended: {result:?}"),
+            }
+        };
+        let namespace = TrackNamespace::from_utf8_path("test/joining/two-relay");
+        let track_name = TrackName::from(vec![0, 0xfd, b'r']);
+        let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
+        let mut datagrams = writer.datagrams().unwrap();
+        datagrams
+            .write(Datagram {
+                group_id: 12,
+                object_id: 4,
+                priority: 1,
+                payload: Vec::from(&b"edge-live"[..]).into(),
+                extension_headers: Default::default(),
+            })
+            .unwrap();
+        let edge_track_registration = edge_locals
+            .register_track(Some("scope-a"), reader)
+            .await
+            .unwrap();
+
+        let scenario = async {
+            write(
+                &mut publisher.control_send,
+                &Message::PublishNamespace(message::PublishNamespace {
+                    id: 0,
+                    track_namespace: namespace.clone(),
+                    params: KeyValuePairs::default(),
+                }),
+            )
+            .await;
+            assert!(matches!(
+                publisher.control_recv.decode::<Message>().await,
+                Message::RequestOk(message::RequestOk { id: 0, .. })
+            ));
+
+            write(
+                &mut downstream.control_send,
+                &largest_object_subscribe(0, &namespace, track_name.clone()),
+            )
+            .await;
+            let Message::SubscribeOk(ok) = downstream.control_recv.decode::<Message>().await else {
+                panic!("expected SUBSCRIBE_OK");
+            };
+            assert_eq!(
+                ok.params.largest_object().unwrap(),
+                Some(Location::new(12, 4))
+            );
+
+            let mut upstream_ids = HashSet::new();
+            for id in [2, 4] {
+                let start = 10;
+                write(
+                    &mut downstream.control_send,
+                    &joining_fetch_request(
+                        id,
+                        0,
+                        FetchType::AbsoluteJoining,
+                        start,
+                        KeyValuePairs::default(),
+                    ),
+                )
+                .await;
+                let Message::Fetch(origin_fetch) = publisher.control_recv.decode::<Message>().await
+                else {
+                    panic!("expected origin Standalone FETCH");
+                };
+                assert_publisher_fetch(&origin_fetch);
+                assert!(upstream_ids.insert(origin_fetch.id));
+                assert_eq!(origin_fetch.fetch_type, FetchType::Standalone);
+                assert!(origin_fetch.joining_fetch.is_none());
+                assert_eq!(
+                    origin_fetch.standalone_fetch,
+                    Some(message::StandaloneFetch {
+                        track_namespace: namespace.clone(),
+                        track_name: track_name.clone(),
+                        start_location: Location::new(start, 0),
+                        end_location: Location::new(12, 5),
+                    })
+                );
+
+                let body = fetch_object(start, 0, &[id as u8]);
+                send_fetch_success(
+                    &publisher.transport,
+                    &mut publisher.control_send,
+                    &origin_fetch,
+                    &body,
+                    FetchResponseOrder::StreamFirst,
+                )
+                .await;
+                assert_eq!(
+                    receive_fetch_stream(&downstream.transport).await,
+                    (id, body)
+                );
+                receive_fetch_ok(&mut downstream.control_recv, id).await;
+            }
+
+            drop(edge_track_registration);
+            drop(datagrams);
+        };
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::select! {
+                _ = scenario => {},
+                result = edge.run() => panic!("edge producer ended: {result:?}"),
+                result = origin_consumer.run() => panic!("origin consumer ended: {result:?}"),
+                _ = origin_connection => {},
+                result = downstream.server_session.run() => panic!("downstream session ended: {result:?}"),
+                result = publisher.server_session.run() => panic!("publisher session ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

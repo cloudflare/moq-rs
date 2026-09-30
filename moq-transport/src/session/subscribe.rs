@@ -128,6 +128,233 @@ impl SubscribeInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum JoiningEligibility {
+    Pending,
+    Established,
+    InvalidRequestId,
+    WrongFilter,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(super) struct JoiningSnapshot {
+    pub track_namespace: TrackNamespace,
+    pub track_name: TrackName,
+    pub largest: Location,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum JoiningSnapshotError {
+    InvalidRequestId,
+}
+
+#[derive(Debug)]
+enum JoiningPhase {
+    PendingSubscriber {
+        filter: Option<FilterType>,
+    },
+    PendingPublisher {
+        saved_largest: Option<Location>,
+    },
+    Established {
+        filter: Option<FilterType>,
+        saved_largest: Option<Location>,
+    },
+    Terminated {
+        saved_largest: Option<Option<Location>>,
+    },
+}
+
+#[derive(Clone)]
+pub(super) struct JoiningAssociation {
+    track_namespace: TrackNamespace,
+    track_name: TrackName,
+    state: State<JoiningPhase>,
+}
+
+pub(super) struct JoiningAssociationEntry {
+    association: JoiningAssociation,
+    _owner: State<JoiningPhase>,
+}
+
+impl JoiningAssociationEntry {
+    pub fn pending_subscriber(
+        track_namespace: TrackNamespace,
+        track_name: TrackName,
+        filter: Option<FilterType>,
+    ) -> Self {
+        Self::new(
+            track_namespace,
+            track_name,
+            JoiningPhase::PendingSubscriber { filter },
+        )
+    }
+
+    pub fn pending_publisher(
+        track_namespace: TrackNamespace,
+        track_name: TrackName,
+        saved_largest: Option<Location>,
+    ) -> Self {
+        Self::new(
+            track_namespace,
+            track_name,
+            JoiningPhase::PendingPublisher { saved_largest },
+        )
+    }
+
+    fn new(track_namespace: TrackNamespace, track_name: TrackName, phase: JoiningPhase) -> Self {
+        let (state, owner) = State::new(phase).split();
+        Self {
+            association: JoiningAssociation {
+                track_namespace,
+                track_name,
+                state,
+            },
+            _owner: owner,
+        }
+    }
+
+    pub fn association(&self) -> JoiningAssociation {
+        self.association.clone()
+    }
+
+    pub fn establish_publisher(&self, filter: Option<FilterType>) -> Result<(), SessionError> {
+        self.association.establish_publisher(filter)
+    }
+
+    pub fn terminate(&self) -> Result<(), SessionError> {
+        self.association.terminate()
+    }
+
+    #[cfg(test)]
+    pub fn poison_state(&self) {
+        let state = self.association.state.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = state.try_lock_mut().unwrap();
+            panic!("poison joining association state");
+        }));
+    }
+}
+
+impl JoiningAssociation {
+    pub fn establish_subscriber(
+        &self,
+        saved_largest: Option<Location>,
+    ) -> Result<(), SessionError> {
+        let Some(mut state) = self
+            .state
+            .try_lock_mut()
+            .map_err(|_| SessionError::Internal)?
+        else {
+            return Ok(());
+        };
+        let JoiningPhase::PendingSubscriber { filter } = *state else {
+            return Err(SessionError::ProtocolViolation(
+                "subscription is not pending subscriber establishment".to_string(),
+            ));
+        };
+        *state = JoiningPhase::Established {
+            filter,
+            saved_largest,
+        };
+        Ok(())
+    }
+
+    pub fn establish_publisher(&self, filter: Option<FilterType>) -> Result<(), SessionError> {
+        let Some(mut state) = self
+            .state
+            .try_lock_mut()
+            .map_err(|_| SessionError::Internal)?
+        else {
+            return Ok(());
+        };
+        let JoiningPhase::PendingPublisher { saved_largest } = *state else {
+            return Err(SessionError::ProtocolViolation(
+                "subscription is not pending publisher establishment".to_string(),
+            ));
+        };
+        *state = JoiningPhase::Established {
+            filter,
+            saved_largest,
+        };
+        Ok(())
+    }
+
+    pub fn terminate(&self) -> Result<(), SessionError> {
+        let Some(mut state) = self
+            .state
+            .try_lock_mut()
+            .map_err(|_| SessionError::Internal)?
+        else {
+            return Ok(());
+        };
+        let saved_largest = match *state {
+            JoiningPhase::Established { saved_largest, .. } => Some(saved_largest),
+            _ => None,
+        };
+        *state = JoiningPhase::Terminated { saved_largest };
+        Ok(())
+    }
+
+    pub fn eligibility(&self) -> Result<JoiningEligibility, SessionError> {
+        let state = self.state.try_lock().map_err(|_| SessionError::Internal)?;
+        Ok(match &*state {
+            JoiningPhase::PendingSubscriber {
+                filter: Some(FilterType::LargestObject),
+            } => JoiningEligibility::Pending,
+            JoiningPhase::Established {
+                filter: Some(FilterType::LargestObject),
+                ..
+            } => JoiningEligibility::Established,
+            JoiningPhase::PendingSubscriber { .. } | JoiningPhase::Established { .. } => {
+                JoiningEligibility::WrongFilter
+            }
+            JoiningPhase::PendingPublisher { .. } | JoiningPhase::Terminated { .. } => {
+                JoiningEligibility::InvalidRequestId
+            }
+        })
+    }
+
+    pub async fn snapshot(&self) -> Result<Option<JoiningSnapshot>, JoiningSnapshotError> {
+        loop {
+            let notify = {
+                let state = self
+                    .state
+                    .try_lock()
+                    .map_err(|_| JoiningSnapshotError::InvalidRequestId)?;
+                match &*state {
+                    JoiningPhase::PendingSubscriber { .. } => state
+                        .modified()
+                        .ok_or(JoiningSnapshotError::InvalidRequestId)?,
+                    JoiningPhase::Established { saved_largest, .. } => {
+                        return Ok(saved_largest.map(|largest| JoiningSnapshot {
+                            track_namespace: self.track_namespace.clone(),
+                            track_name: self.track_name.clone(),
+                            largest,
+                        }));
+                    }
+                    JoiningPhase::Terminated {
+                        saved_largest: Some(saved_largest),
+                    } => {
+                        return Ok(saved_largest.map(|largest| JoiningSnapshot {
+                            track_namespace: self.track_namespace.clone(),
+                            track_name: self.track_name.clone(),
+                            largest,
+                        }));
+                    }
+                    JoiningPhase::PendingPublisher { .. }
+                    | JoiningPhase::Terminated {
+                        saved_largest: None,
+                    } => {
+                        return Err(JoiningSnapshotError::InvalidRequestId);
+                    }
+                }
+            };
+            notify.await;
+        }
+    }
+}
+
 fn next_object_location(largest_location: Option<Location>) -> Location {
     let Some(location) = largest_location else {
         return Location::new(0, 0);
@@ -382,6 +609,192 @@ impl SubscribeRecv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn full_name() -> (TrackNamespace, TrackName) {
+        (
+            TrackNamespace::from_utf8_path("test/binary"),
+            vec![0, 0xff].into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn joining_association_saves_initial_largest_immutably() {
+        let (namespace, name) = full_name();
+        let entry = JoiningAssociationEntry::pending_subscriber(
+            namespace.clone(),
+            name.clone(),
+            Some(FilterType::LargestObject),
+        );
+        let association = entry.association();
+
+        assert_eq!(
+            association.eligibility().unwrap(),
+            JoiningEligibility::Pending
+        );
+        association
+            .establish_subscriber(Some(Location::new(7, 11)))
+            .unwrap();
+
+        assert_eq!(
+            association.snapshot().await.unwrap(),
+            Some(JoiningSnapshot {
+                track_namespace: namespace,
+                track_name: name,
+                largest: Location::new(7, 11),
+            })
+        );
+        assert!(association
+            .establish_subscriber(Some(Location::new(9, 13)))
+            .is_err());
+        assert_eq!(
+            association.snapshot().await.unwrap().unwrap().largest,
+            Location::new(7, 11)
+        );
+    }
+
+    #[test]
+    fn pending_publisher_is_not_joinable() {
+        let (namespace, name) = full_name();
+        let entry =
+            JoiningAssociationEntry::pending_publisher(namespace, name, Some(Location::new(3, 4)));
+
+        assert_eq!(
+            entry.association().eligibility().unwrap(),
+            JoiningEligibility::InvalidRequestId
+        );
+
+        entry
+            .establish_publisher(Some(FilterType::LargestObject))
+            .unwrap();
+        assert_eq!(
+            entry.association().eligibility().unwrap(),
+            JoiningEligibility::Established
+        );
+    }
+
+    #[test]
+    fn omitted_and_non_largest_filters_are_protocol_violations() {
+        for filter in [
+            None,
+            Some(FilterType::NextGroupStart),
+            Some(FilterType::AbsoluteStart),
+            Some(FilterType::AbsoluteRange),
+        ] {
+            let (namespace, name) = full_name();
+            let entry = JoiningAssociationEntry::pending_subscriber(namespace, name, filter);
+            assert_eq!(
+                entry.association().eligibility().unwrap(),
+                JoiningEligibility::WrongFilter
+            );
+
+            let (namespace, name) = full_name();
+            let published = JoiningAssociationEntry::pending_publisher(
+                namespace,
+                name,
+                Some(Location::new(1, 2)),
+            );
+            published.establish_publisher(filter).unwrap();
+            assert_eq!(
+                published.association().eligibility().unwrap(),
+                JoiningEligibility::WrongFilter
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminating_pending_association_wakes_snapshot_waiter() {
+        let (namespace, name) = full_name();
+        let entry = JoiningAssociationEntry::pending_subscriber(
+            namespace,
+            name,
+            Some(FilterType::LargestObject),
+        );
+        let association = entry.association();
+        let waiter = tokio::spawn(async move { association.snapshot().await });
+
+        entry.terminate().unwrap();
+
+        assert_eq!(
+            waiter.await.unwrap().unwrap_err(),
+            JoiningSnapshotError::InvalidRequestId
+        );
+    }
+
+    #[tokio::test]
+    async fn established_snapshot_survives_subscription_termination() {
+        let (namespace, name) = full_name();
+        let entry = JoiningAssociationEntry::pending_subscriber(
+            namespace.clone(),
+            name.clone(),
+            Some(FilterType::LargestObject),
+        );
+        let association = entry.association();
+        association
+            .establish_subscriber(Some(Location::new(8, 12)))
+            .unwrap();
+        entry.terminate().unwrap();
+
+        assert_eq!(
+            association.snapshot().await.unwrap(),
+            Some(JoiningSnapshot {
+                track_namespace: namespace,
+                track_name: name,
+                largest: Location::new(8, 12),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_waiter_observes_snapshot_when_establishment_immediately_terminates() {
+        let (namespace, name) = full_name();
+        let entry = JoiningAssociationEntry::pending_subscriber(
+            namespace,
+            name,
+            Some(FilterType::LargestObject),
+        );
+        let association = entry.association();
+        let waiter_association = association.clone();
+        let waiter = tokio::spawn(async move { waiter_association.snapshot().await });
+
+        association
+            .establish_subscriber(Some(Location::new(9, 3)))
+            .unwrap();
+        entry.terminate().unwrap();
+
+        assert_eq!(
+            waiter.await.unwrap().unwrap().unwrap().largest,
+            Location::new(9, 3)
+        );
+    }
+
+    #[test]
+    fn subscriber_establishment_is_benign_after_association_owner_drops() {
+        let (namespace, name) = full_name();
+        let entry = JoiningAssociationEntry::pending_subscriber(
+            namespace,
+            name,
+            Some(FilterType::LargestObject),
+        );
+        let association = entry.association();
+        drop(entry);
+
+        assert!(association
+            .establish_subscriber(Some(Location::new(1, 2)))
+            .is_ok());
+    }
+
+    #[test]
+    fn publisher_establishment_is_benign_after_association_owner_drops() {
+        let (namespace, name) = full_name();
+        let entry =
+            JoiningAssociationEntry::pending_publisher(namespace, name, Some(Location::new(1, 2)));
+        let association = entry.association();
+        drop(entry);
+
+        assert!(association
+            .establish_publisher(Some(FilterType::LargestObject))
+            .is_ok());
+    }
 
     fn subscribe_info_with(params: KeyValuePairs) -> SubscribeInfo {
         SubscribeInfo::new_from_subscribe(&message::Subscribe {
