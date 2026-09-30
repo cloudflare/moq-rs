@@ -79,6 +79,15 @@ pub struct SubscribeInfo {
     pub track_status: bool,
 }
 
+/// Start selection for a Joining FETCH associated with this subscription.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoiningStart {
+    /// Start at the beginning of the saved Largest Location's group minus this offset.
+    Relative(u64),
+    /// Start at the beginning of this absolute group.
+    Absolute(u64),
+}
+
 impl SubscribeInfo {
     pub fn new_from_subscribe(msg: &message::Subscribe) -> Result<Self, SessionError> {
         let filter = msg.params.subscription_filter()?;
@@ -378,6 +387,7 @@ fn next_group_location(largest_location: Option<Location>) -> Location {
 struct SubscribeState {
     ok: bool,
     track_alias: Option<u64>,
+    largest_location: Option<Location>,
     closed: Result<(), ServeError>,
 }
 
@@ -386,6 +396,7 @@ impl Default for SubscribeState {
         Self {
             ok: Default::default(),
             track_alias: None,
+            largest_location: None,
             closed: Ok(()),
         }
     }
@@ -401,34 +412,19 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
-    pub(super) fn new(
+    pub(super) fn new_with_params(
         subscriber: Subscriber,
         request_id: u64,
         track: TrackWriter,
-    ) -> (Subscribe, SubscribeRecv) {
+        params: KeyValuePairs,
+    ) -> Result<(Subscribe, SubscribeRecv), SessionError> {
         let subscribe_message = message::Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
             track_name: track.name.clone(),
-            params: KeyValuePairs::default(),
+            params,
         };
-        let info = SubscribeInfo::new_from_subscribe(&subscribe_message).unwrap_or_else(|err| {
-            tracing::warn!(session_id = %subscriber.session_id(), error = %err, "failed to decode outbound subscribe parameters");
-            SubscribeInfo {
-                id: request_id,
-                track_namespace: track.namespace.clone(),
-                track_name: track.name.clone(),
-                subscriber_priority: 128,
-                group_order: GroupOrder::Publisher,
-                forward: true,
-                filter_type: FilterType::AbsoluteStart,
-                start_location: None,
-                end_group_id: None,
-                filter: None,
-                params: Default::default(),
-                track_status: false,
-            }
-        });
+        let info = SubscribeInfo::new_from_subscribe(&subscribe_message)?;
 
         let (send, recv) = State::default().split();
 
@@ -443,7 +439,7 @@ impl Subscribe {
             writer: Some(track.into()),
         };
 
-        (send, recv)
+        Ok((send, recv))
     }
 
     pub(super) fn send_request(&mut self) {
@@ -492,6 +488,45 @@ impl Subscribe {
             .await;
         }
     }
+
+    /// Issue a Relative or Absolute Joining FETCH associated with this
+    /// subscription. The subscription must use the Largest Object filter.
+    pub fn fetch_joining(
+        &self,
+        start: JoiningStart,
+        params: KeyValuePairs,
+    ) -> Result<super::Fetch, ServeError> {
+        self.state.lock().closed.clone()?;
+        if self.info.filter_type != FilterType::LargestObject {
+            return Err(ServeError::Mode);
+        }
+        let mut subscriber = self.subscriber.clone();
+        let largest = self.state.lock().largest_location.ok_or(ServeError::Size)?;
+        let start_location = match start {
+            JoiningStart::Relative(offset) => Location::new(
+                largest
+                    .group_id
+                    .checked_sub(offset)
+                    .ok_or(ServeError::Size)?,
+                0,
+            ),
+            JoiningStart::Absolute(group) => Location::new(group, 0),
+        };
+        if start_location > largest {
+            return Err(ServeError::Size);
+        }
+        let end_object = largest
+            .object_id
+            .checked_add(1)
+            .filter(|object| *object <= crate::coding::VarInt::MAX.into_inner())
+            .ok_or(ServeError::Size)?;
+        subscriber.fetch_joining_id(
+            self.info.id,
+            start,
+            (start_location, Location::new(largest.group_id, end_object)),
+            params,
+        )
+    }
 }
 
 impl Drop for Subscribe {
@@ -516,7 +551,7 @@ pub(super) struct SubscribeRecv {
 }
 
 impl SubscribeRecv {
-    pub fn ok(&mut self, alias: u64) -> Result<(), ServeError> {
+    pub fn ok(&mut self, alias: u64, largest_location: Option<Location>) -> Result<(), ServeError> {
         let state = self.state.lock();
         if state.ok {
             return Err(ServeError::Duplicate);
@@ -525,6 +560,7 @@ impl SubscribeRecv {
         if let Some(mut state) = state.into_mut() {
             state.ok = true;
             state.track_alias = Some(alias);
+            state.largest_location = largest_location;
         }
 
         Ok(())
@@ -874,7 +910,8 @@ mod tests {
         );
         let (writer, _reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
-        let (subscribe, recv) = Subscribe::new(subscriber, 1, writer);
+        let (subscribe, recv) =
+            Subscribe::new_with_params(subscriber, 1, writer, KeyValuePairs::default()).unwrap();
 
         recv.error(ServeError::Done).unwrap();
 
@@ -894,7 +931,8 @@ mod tests {
         );
         let (writer, _reader) =
             serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
-        let (subscribe, recv) = Subscribe::new(subscriber, 1, writer);
+        let (subscribe, recv) =
+            Subscribe::new_with_params(subscriber, 1, writer, KeyValuePairs::default()).unwrap();
 
         recv.error(ServeError::Closed(message::PublishDoneCode::Expired as u64))
             .unwrap();

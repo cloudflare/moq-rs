@@ -5,6 +5,7 @@
 mod error;
 mod fetch;
 mod fetch_requested;
+mod fetch_validation;
 mod pending_requests;
 mod publish_namespace;
 mod publish_received;
@@ -23,10 +24,11 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
-pub use fetch::Fetch;
 pub(crate) use fetch::FetchRecv;
-pub use fetch_requested::FetchRequested;
+pub use fetch::{Fetch, FetchRejection};
 pub(crate) use fetch_requested::FetchRequestedRecv;
+pub use fetch_requested::{FetchOkInfo, FetchRequested, FetchWriter};
+pub(crate) use fetch_validation::FetchValidator;
 pub(crate) use pending_requests::{PendingRequest, PendingRequests, PendingResponse};
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
@@ -54,7 +56,7 @@ use std::sync::{Arc, Mutex};
 use crate::coding::{KeyValuePairs, Location, Value, VarInt};
 use crate::message::Message;
 use crate::mlog;
-use crate::watch::Queue;
+use crate::watch::{Queue, State};
 use crate::{message, setup};
 use std::path::PathBuf;
 
@@ -179,6 +181,12 @@ pub struct Session {
 
     /// Queue used by Subscriber to request opening SUBSCRIBE_NAMESPACE bidi streams.
     subscribe_namespace_open: Queue<OpenSubscribeNamespace>,
+
+    /// Fatal errors discovered by lazily consumed data streams.
+    fatal_errors: Queue<SessionError>,
+
+    /// Dropping this half wakes request handles that outlive Session::run.
+    lifetime: State<()>,
 
     /// Session-level request ID manager.
     /// Publisher and Subscriber share one outbound request ID sequence.
@@ -594,6 +602,8 @@ impl Session {
         let outgoing = Queue::default().split();
         let pending_requests = PendingRequests::default();
         let subscribe_namespace_open = Queue::default().split();
+        let fatal_errors = Queue::default().split();
+        let (session_lifetime, handle_lifetime) = State::<()>::default().split();
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
@@ -605,14 +615,17 @@ impl Session {
             request_id.clone(),
             pending_requests.clone(),
             session_id.clone(),
+            handle_lifetime.clone(),
         ));
-        let subscriber = Some(Subscriber::new(
+        let subscriber = Some(Subscriber::new_with_fatal(
             outgoing.0,
             subscribe_namespace_open.0,
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
             session_id.clone(),
+            fatal_errors.0,
+            handle_lifetime,
         ));
 
         let session = Self {
@@ -623,6 +636,8 @@ impl Session {
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
             subscribe_namespace_open: subscribe_namespace_open.1,
+            fatal_errors: fatal_errors.1,
+            lifetime: session_lifetime,
             request_id,
             pending_requests,
             mlog: mlog_shared,
@@ -966,6 +981,7 @@ impl Session {
     /// inbound control messages, receiving and processing new inbound uni-directional QUIC streams,
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
+        let _lifetime = self.lifetime;
         tokio::select! {
             res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
             res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => res,
@@ -974,6 +990,14 @@ impl Session {
             res = Self::run_streams(self.session_id.clone(), self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => res,
+            res = Self::run_fatal_errors(self.fatal_errors) => res,
+        }
+    }
+
+    async fn run_fatal_errors(mut errors: Queue<SessionError>) -> Result<(), SessionError> {
+        match errors.pop().await {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -1344,6 +1368,11 @@ impl Session {
                 .ok_or(SessionError::RoleViolation)?
                 .recv_request_error(&msg),
             None => {
+                if let Some(subscriber) = subscriber.as_mut() {
+                    if subscriber.recv_late_fetch_error(&msg)? {
+                        return Ok(());
+                    }
+                }
                 tracing::debug!(
                     target: "moq_transport::control",
                     session_id = %session_id,

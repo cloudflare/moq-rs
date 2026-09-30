@@ -1,13 +1,74 @@
 // SPDX-FileCopyrightText: 2026 Cloudflare Inc.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::sync::{Arc, Mutex};
+
 use crate::{
+    coding::{ReasonPhrase, VarInt},
+    data::{FetchRecord, FetchRecordDecoder, FetchRecordObject},
     message::{self, FetchOk},
     serve::ServeError,
     watch::State,
 };
 
-use super::{Reader, Subscriber};
+use super::{FetchValidator, Reader, Subscriber};
+
+/// Exact REQUEST_ERROR metadata for a rejected FETCH.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchRejection {
+    error_code: u64,
+    retry_interval: u64,
+    reason: ReasonPhrase,
+}
+
+impl FetchRejection {
+    /// Construct a FETCH rejection using the exact wire retry interval.
+    pub fn new(
+        code: message::RequestErrorCode,
+        retry_interval: u64,
+        reason: impl Into<String>,
+    ) -> Result<Self, ServeError> {
+        VarInt::try_from(retry_interval).map_err(|_| ServeError::Size)?;
+        let reason = reason.into();
+        if reason.len() > ReasonPhrase::MAX_LEN {
+            return Err(ServeError::Size);
+        }
+        Ok(Self {
+            error_code: code as u64,
+            retry_interval,
+            reason: ReasonPhrase(reason),
+        })
+    }
+
+    pub fn error_code(&self) -> u64 {
+        self.error_code
+    }
+
+    pub fn retry_interval(&self) -> u64 {
+        self.retry_interval
+    }
+
+    pub fn reason(&self) -> &ReasonPhrase {
+        &self.reason
+    }
+
+    pub(crate) fn from_message(error: &message::RequestError) -> Self {
+        Self {
+            error_code: error.error_code,
+            retry_interval: error.retry_interval,
+            reason: error.reason.clone(),
+        }
+    }
+
+    pub(crate) fn into_message(self, id: u64) -> message::RequestError {
+        message::RequestError {
+            id,
+            error_code: self.error_code,
+            retry_interval: self.retry_interval,
+            reason: self.reason,
+        }
+    }
+}
 
 struct FetchState {
     reader: Option<Reader>,
@@ -31,41 +92,66 @@ impl Default for FetchState {
     }
 }
 
-/// An outbound standalone FETCH.
+/// An outbound Standalone or Joining FETCH.
 #[must_use = "dropping a FETCH sends FETCH_CANCEL"]
 pub struct Fetch {
     subscriber: Subscriber,
     state: State<FetchState>,
     reader: Option<Reader>,
+    decoder: FetchRecordDecoder,
+    payload_remaining: u64,
+    body_mode: FetchBodyMode,
+    validator: Arc<Mutex<FetchValidator>>,
+    session_lifetime: State<()>,
     stream_done: bool,
     id: u64,
     pub request: message::Fetch,
 }
 
+#[derive(Default)]
+enum FetchBodyMode {
+    #[default]
+    Undecided,
+    Raw,
+    Records,
+}
+
 pub(crate) struct FetchRecv {
     state: State<FetchState>,
-    pub start: crate::coding::Location,
+    validator: Arc<Mutex<FetchValidator>>,
 }
 
 impl Fetch {
-    pub(super) fn new(subscriber: Subscriber, request: message::Fetch) -> (Self, FetchRecv) {
+    pub(super) fn new(
+        subscriber: Subscriber,
+        request: message::Fetch,
+        range: Option<(crate::coding::Location, crate::coding::Location)>,
+        session_lifetime: State<()>,
+    ) -> (Self, FetchRecv) {
         let id = request.id;
-        let start = request
-            .standalone_fetch
-            .as_ref()
-            .map(|fetch| fetch.start_location)
-            .unwrap_or_default();
         let (send, recv) = State::default().split();
+        let validator = Arc::new(Mutex::new(FetchValidator::new(
+            range,
+            request.params.group_order().ok().flatten(),
+        )));
         (
             Self {
                 subscriber,
                 state: send,
                 reader: None,
+                decoder: FetchRecordDecoder::default(),
+                payload_remaining: 0,
+                body_mode: FetchBodyMode::default(),
+                validator: validator.clone(),
+                session_lifetime,
                 stream_done: false,
                 id,
                 request,
             },
-            FetchRecv { state: recv, start },
+            FetchRecv {
+                state: recv,
+                validator,
+            },
         )
     }
 
@@ -80,7 +166,12 @@ impl Fetch {
                 state.modified()
             };
             match notify {
-                Some(notify) => notify.await,
+                Some(notify) => {
+                    tokio::select! {
+                        _ = session_closed(self.session_lifetime.clone()) => return Err(ServeError::Cancel),
+                        _ = notify => {},
+                    }
+                }
                 None => return Err(ServeError::Done),
             }
         }
@@ -90,14 +181,109 @@ impl Fetch {
         self.state.lock().request_error.clone()
     }
 
+    pub fn rejection(&self) -> Option<FetchRejection> {
+        self.state
+            .lock()
+            .request_error
+            .as_ref()
+            .map(FetchRejection::from_message)
+    }
+
+    /// Decode the next semantic record from the FETCH stream.
+    ///
+    /// Object payload bytes must be fully consumed with
+    /// [`Self::read_payload_chunk`] before requesting another record.
+    pub async fn next(&mut self) -> Result<Option<FetchRecord>, super::SessionError> {
+        if self.payload_remaining != 0 {
+            return Err(ServeError::Size.into());
+        }
+        match self.body_mode {
+            FetchBodyMode::Undecided => self.body_mode = FetchBodyMode::Records,
+            FetchBodyMode::Records => {}
+            FetchBodyMode::Raw => return Err(ServeError::Mode.into()),
+        }
+        self.ensure_reader().await?;
+        let state = self.state.clone();
+        let reader = self.reader.as_mut().ok_or(ServeError::Done)?;
+        let record = tokio::select! {
+            _ = session_closed(self.session_lifetime.clone()) => return Err(ServeError::Cancel.into()),
+            result = reader.decode_fetch(&mut self.decoder) => match result {
+                Ok(record) => record,
+                Err(error) => {
+                    if matches!(error, super::SessionError::Decode(_) | super::SessionError::WrongSize) {
+                        self.subscriber.report_fatal(error.clone());
+                    }
+                    return Err(error);
+                }
+            },
+            err = wait_closed(state) => return Err(err.into()),
+        };
+        let Some(record) = record else {
+            self.stream_done = true;
+            return Ok(None);
+        };
+        let validation = self
+            .validator
+            .lock()
+            .map_err(|_| super::SessionError::Internal)?
+            .validate_record(&record);
+        if let Err(error) = validation {
+            self.cancel_once();
+            return Err(error);
+        }
+        if let FetchRecord::Object(FetchRecordObject { payload_length, .. }) = &record {
+            self.payload_remaining = *payload_length;
+        }
+        Ok(Some(record))
+    }
+
+    /// Read at most `max` payload bytes for the current Object.
+    pub async fn read_payload_chunk(
+        &mut self,
+        max: usize,
+    ) -> Result<Option<bytes::Bytes>, super::SessionError> {
+        if self.payload_remaining == 0 {
+            return Ok(None);
+        }
+        if max == 0 {
+            return Err(ServeError::Size.into());
+        }
+        if !matches!(self.body_mode, FetchBodyMode::Records) {
+            return Err(ServeError::Mode.into());
+        }
+        self.ensure_reader().await?;
+        let limit = usize::try_from(self.payload_remaining.min(max as u64))
+            .map_err(|_| ServeError::Size)?;
+        let state = self.state.clone();
+        let reader = self.reader.as_mut().ok_or(ServeError::Done)?;
+        let chunk = tokio::select! {
+            _ = session_closed(self.session_lifetime.clone()) => return Err(ServeError::Cancel.into()),
+            result = reader.read_chunk(limit) => result?,
+            err = wait_closed(state) => return Err(err.into()),
+        };
+        let Some(chunk) = chunk else {
+            let error = super::SessionError::WrongSize;
+            self.subscriber.report_fatal(error.clone());
+            return Err(error);
+        };
+        self.payload_remaining -= chunk.len() as u64;
+        Ok(Some(chunk))
+    }
+
     pub(super) async fn read_stream_chunk(
         &mut self,
         max: usize,
     ) -> Result<Option<bytes::Bytes>, super::SessionError> {
+        match self.body_mode {
+            FetchBodyMode::Undecided => self.body_mode = FetchBodyMode::Raw,
+            FetchBodyMode::Raw => {}
+            FetchBodyMode::Records => return Err(ServeError::Mode.into()),
+        }
         self.ensure_reader().await?;
         let state = self.state.clone();
         let reader = self.reader.as_mut().ok_or(ServeError::Done)?;
         let chunk = tokio::select! {
+            _ = session_closed(self.session_lifetime.clone()) => return Err(ServeError::Cancel.into()),
             result = reader.read_chunk(max) => result?,
             err = wait_closed(state) => return Err(err.into()),
         };
@@ -118,9 +304,24 @@ impl Fetch {
                 }
                 state.modified().ok_or(ServeError::Done)?
             };
-            notify.await;
+            tokio::select! {
+                _ = session_closed(self.session_lifetime.clone()) => return Err(ServeError::Cancel),
+                _ = notify => {},
+            }
         }
         Ok(())
+    }
+
+    fn cancel_once(&mut self) {
+        let send = self.state.lock_mut().is_some_and(|mut state| {
+            let send = !state.cancel_sent;
+            state.cancel_sent = true;
+            send
+        });
+        if send {
+            self.subscriber
+                .send_message(message::FetchCancel { id: self.id });
+        }
     }
 }
 
@@ -142,19 +343,30 @@ impl Drop for Fetch {
 }
 
 impl FetchRecv {
-    pub fn recv_ok(&mut self, ok: &FetchOk) -> Result<(), ServeError> {
+    pub fn recv_ok(&mut self, ok: &FetchOk) -> Result<(), super::SessionError> {
+        self.validator
+            .lock()
+            .map_err(|_| super::SessionError::Internal)?
+            .validate_ok(ok.end_location, &ok.track_extensions)?;
         let mut state = self.state.lock_mut().ok_or(ServeError::Done)?;
-        if state.ok.is_some() {
-            return Err(ServeError::Duplicate);
+        if state.ok.is_some() || state.request_error.is_some() {
+            return Err(super::SessionError::ProtocolViolation(
+                "received multiple terminal FETCH responses".to_string(),
+            ));
         }
         state.ok = Some(ok.clone());
         Ok(())
     }
 
-    pub fn recv_error(&mut self, error: &message::RequestError) -> Result<(), ServeError> {
+    pub fn recv_error(&mut self, error: &message::RequestError) -> Result<(), super::SessionError> {
         let Some(mut state) = self.state.lock_mut() else {
             return Ok(());
         };
+        if state.ok.is_some() || state.request_error.is_some() {
+            return Err(super::SessionError::ProtocolViolation(
+                "received multiple terminal FETCH responses".to_string(),
+            ));
+        }
         state.request_error = Some(error.clone());
         state.closed = Err(ServeError::Closed(error.error_code));
         Ok(())
@@ -197,6 +409,16 @@ async fn wait_closed(state: State<FetchState>) -> ServeError {
     }
 }
 
+async fn session_closed(state: State<()>) {
+    loop {
+        let state = state.lock();
+        match state.modified() {
+            Some(changed) => changed.await,
+            None => return,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
@@ -211,11 +433,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejection_metadata_is_bounded_before_use() {
+        assert!(FetchRejection::new(
+            message::RequestErrorCode::DoesNotExist,
+            VarInt::MAX.into_inner() + 1,
+            "retry",
+        )
+        .is_err());
+        assert!(FetchRejection::new(
+            message::RequestErrorCode::DoesNotExist,
+            0,
+            "x".repeat(ReasonPhrase::MAX_LEN + 1),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_wakes_fetch_waiting_for_stream() {
+        let subscriber = Subscriber::new(
+            Queue::default(),
+            Queue::default(),
+            None,
+            RequestId::new(0, 100, 100, 0),
+            PendingRequests::default(),
+            SessionId::generate(),
+        );
+        let request = message::Fetch {
+            id: 0,
+            fetch_type: message::FetchType::Standalone,
+            standalone_fetch: Some(StandaloneFetch {
+                track_namespace: TrackNamespace::from_utf8_path("test"),
+                track_name: "video".into(),
+                start_location: Location::new(0, 0),
+                end_location: Location::new(1, 0),
+            }),
+            joining_fetch: None,
+            params: KeyValuePairs::default(),
+        };
+        let (lifetime, owner) = State::<()>::default().split();
+        let (mut fetch, _recv) = Fetch::new(
+            subscriber,
+            request,
+            Some((Location::new(0, 0), Location::new(1, 0))),
+            lifetime,
+        );
+
+        drop(owner);
+
+        assert!(matches!(
+            fetch.next().await,
+            Err(crate::session::SessionError::Serve(ServeError::Cancel))
+        ));
+    }
+
+    #[test]
     fn request_error_after_fetch_drop_is_benign() {
         let (fetch, state) = State::<FetchState>::default().split();
         let mut recv = FetchRecv {
             state,
-            start: Default::default(),
+            validator: Arc::new(Mutex::new(FetchValidator::new(None, None))),
         };
         drop(fetch);
 
@@ -229,7 +505,7 @@ mod tests {
         let (fetch, state) = State::<FetchState>::default().split();
         let mut recv = FetchRecv {
             state,
-            start: Default::default(),
+            validator: Arc::new(Mutex::new(FetchValidator::new(None, None))),
         };
         drop(fetch);
 

@@ -16,7 +16,7 @@ use crate::{
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
 };
 
-use crate::watch::Queue;
+use crate::watch::{Queue, State};
 
 use super::{
     split_published_state, FetchRequested, FetchRequestedRecv, JoiningAssociation,
@@ -152,6 +152,8 @@ pub struct Publisher {
 
     /// Correlation id of the owning session, tagged onto this publisher's log records.
     session_id: SessionId,
+
+    session_lifetime: State<()>,
 }
 
 impl Publisher {
@@ -162,6 +164,7 @@ impl Publisher {
         request_id: RequestId,
         pending_requests: PendingRequests,
         session_id: SessionId,
+        session_lifetime: State<()>,
     ) -> Self {
         Self {
             webtransport,
@@ -181,6 +184,7 @@ impl Publisher {
             pending_requests,
             mlog,
             session_id,
+            session_lifetime,
         }
     }
 
@@ -723,6 +727,7 @@ impl Publisher {
             self.fetches.clone(),
             msg,
             joining,
+            self.session_lifetime.clone(),
         );
         self.fetches
             .lock()

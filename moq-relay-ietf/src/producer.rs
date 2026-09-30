@@ -763,13 +763,16 @@ mod tests {
     use moq_native_ietf::quic;
     use moq_transport::{
         coding::{Decode, DecodeError, Encode, KeyValuePairs, Location, TrackName, TrackNamespace},
-        data::{Datagram as WireDatagram, FetchHeader, StreamHeader, StreamHeaderType},
+        data::{
+            Datagram as WireDatagram, ExtensionHeaders, FetchHeader, FetchRecord,
+            FetchRecordObject, StreamHeader, StreamHeaderType,
+        },
         message::{
             self, parameter_type, FetchType, FilterType, GroupOrder, JoiningFetch, Message,
             RequestErrorCode, SubscriptionFilter,
         },
         serve::{Datagram, ServeError, Track},
-        session::{Session, SessionError},
+        session::{FetchOkInfo, FetchRejection, Session, SessionError},
         setup,
     };
 
@@ -920,6 +923,42 @@ mod tests {
         server_subscriber: moq_transport::session::Subscriber,
         _client: quic::Client,
         _server: quic::Server,
+    }
+
+    struct ApiPeer {
+        client_session: Session,
+        subscriber: moq_transport::session::Subscriber,
+        server_session: Session,
+        publisher: moq_transport::session::Publisher,
+        _client: quic::Client,
+        _server: quic::Server,
+    }
+
+    async fn api_peer() -> ApiPeer {
+        let TestEndpoint {
+            client,
+            mut server,
+            url,
+            addr,
+        } = test_endpoint();
+        let (client_connection, server_connection) =
+            tokio::join!(client.connect(&url, Some(addr)), server.accept());
+        let (client_transport, _, client_kind) = client_connection.unwrap();
+        let (server_transport, server_info) = server_connection.unwrap();
+        let (client_parts, server_parts) = tokio::join!(
+            Session::connect(client_transport, None, client_kind),
+            Session::accept(server_transport, None, server_info.transport),
+        );
+        let (client_session, _, subscriber) = client_parts.unwrap();
+        let (server_session, publisher, _) = server_parts.unwrap();
+        ApiPeer {
+            client_session,
+            subscriber,
+            server_session,
+            publisher: publisher.unwrap(),
+            _client: client,
+            _server: server,
+        }
     }
 
     async fn manual_peer() -> ManualPeer {
@@ -1192,6 +1231,375 @@ mod tests {
             recv.decode::<Message>().await,
             Message::RequestOk(message::RequestOk { id: 2, .. })
         ));
+    }
+
+    fn public_fetch_object(group_id: u64, object_id: u64, payload_length: u64) -> FetchRecord {
+        FetchRecord::Object(FetchRecordObject {
+            group_id,
+            subgroup_id: Some(0),
+            object_id,
+            publisher_priority: 7,
+            extension_headers: ExtensionHeaders::default(),
+            payload_length,
+        })
+    }
+
+    #[tokio::test]
+    async fn public_fetch_api_supports_both_success_orderings_and_rejection() {
+        let ApiPeer {
+            client_session,
+            mut subscriber,
+            server_session,
+            mut publisher,
+            _client,
+            _server,
+        } = api_peer().await;
+        let namespace = TrackNamespace::from_utf8_path("test/public-fetch-api");
+
+        let scenario = async {
+            let request = message::StandaloneFetch {
+                track_namespace: namespace.clone(),
+                track_name: "video".into(),
+                start_location: Location::new(0, 0),
+                end_location: Location::new(1, 0),
+            };
+
+            let mut ok_first = subscriber
+                .fetch(request.clone(), KeyValuePairs::default())
+                .unwrap();
+            let requested = publisher.fetch_requested().await.unwrap();
+            let mut writer = requested
+                .prepare_response(FetchOkInfo {
+                    end_of_track: false,
+                    end_location: Location::new(0, 3),
+                    params: KeyValuePairs::default(),
+                    track_extensions: Default::default(),
+                })
+                .await
+                .unwrap();
+            writer
+                .write_record(&public_fetch_object(0, 0, 5))
+                .await
+                .unwrap();
+            assert_eq!(
+                ok_first.ok().await.unwrap().end_location,
+                Location::new(0, 3)
+            );
+            writer
+                .write_payload(Vec::from(&b"first"[..]).into())
+                .await
+                .unwrap();
+            writer
+                .write_record(&FetchRecord::NotExist {
+                    end: Location::new(0, 2),
+                })
+                .await
+                .unwrap();
+            writer.finish().await.unwrap();
+            assert!(matches!(
+                ok_first.next().await.unwrap(),
+                Some(FetchRecord::Object(_))
+            ));
+            assert_eq!(
+                ok_first
+                    .read_payload_chunk(64)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                b"first"
+            );
+            assert_eq!(
+                ok_first.next().await.unwrap(),
+                Some(FetchRecord::NotExist {
+                    end: Location::new(0, 2),
+                })
+            );
+            assert!(ok_first.next().await.unwrap().is_none());
+
+            let mut stream_first = subscriber
+                .fetch(request.clone(), KeyValuePairs::default())
+                .unwrap();
+            let requested = publisher.fetch_requested().await.unwrap();
+            let mut writer = requested.stream().await.unwrap();
+            writer
+                .write_record(&public_fetch_object(0, 0, 6))
+                .await
+                .unwrap();
+            writer
+                .write_payload(Vec::from(&b"second"[..]).into())
+                .await
+                .unwrap();
+            assert!(matches!(
+                stream_first.next().await.unwrap(),
+                Some(FetchRecord::Object(_))
+            ));
+            assert_eq!(
+                stream_first
+                    .read_payload_chunk(64)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                b"second"
+            );
+            writer
+                .respond(FetchOkInfo {
+                    end_of_track: false,
+                    end_location: Location::new(0, 1),
+                    params: KeyValuePairs::default(),
+                    track_extensions: Default::default(),
+                })
+                .await
+                .unwrap();
+            writer.finish().await.unwrap();
+            assert!(stream_first.next().await.unwrap().is_none());
+            assert_eq!(
+                stream_first.ok().await.unwrap().end_location,
+                Location::new(0, 1)
+            );
+
+            let mut empty = subscriber
+                .fetch(request.clone(), KeyValuePairs::default())
+                .unwrap();
+            let requested = publisher.fetch_requested().await.unwrap();
+            let writer = requested
+                .prepare_response(FetchOkInfo {
+                    end_of_track: false,
+                    end_location: Location::new(0, 0),
+                    params: KeyValuePairs::default(),
+                    track_extensions: Default::default(),
+                })
+                .await
+                .unwrap();
+            writer.finish().await.unwrap();
+            assert!(empty.next().await.unwrap().is_none());
+            assert_eq!(empty.ok().await.unwrap().end_location, Location::new(0, 0));
+
+            let rejected = subscriber
+                .fetch(request.clone(), KeyValuePairs::default())
+                .unwrap();
+            publisher
+                .fetch_requested()
+                .await
+                .unwrap()
+                .reject_with(
+                    FetchRejection::new(RequestErrorCode::DoesNotExist, 42, "not retained")
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(rejected.ok().await.is_err());
+            let rejection = rejected.rejection().unwrap();
+            assert_eq!(
+                rejection.error_code(),
+                RequestErrorCode::DoesNotExist as u64
+            );
+            assert_eq!(rejection.retry_interval(), 42);
+            assert_eq!(rejection.reason().0, "not retained");
+
+            let incomplete = subscriber
+                .fetch(request.clone(), KeyValuePairs::default())
+                .unwrap();
+            let requested = publisher.fetch_requested().await.unwrap();
+            let mut writer = requested
+                .prepare_response(FetchOkInfo {
+                    end_of_track: false,
+                    end_location: Location::new(0, 1),
+                    params: KeyValuePairs::default(),
+                    track_extensions: Default::default(),
+                })
+                .await
+                .unwrap();
+            writer
+                .write_record(&public_fetch_object(0, 0, 2))
+                .await
+                .unwrap();
+            writer
+                .write_payload(Vec::from(&b"x"[..]).into())
+                .await
+                .unwrap();
+            assert!(writer.finish().await.is_err());
+            drop(incomplete);
+
+            let overflow = subscriber
+                .fetch(request.clone(), KeyValuePairs::default())
+                .unwrap();
+            let requested = publisher.fetch_requested().await.unwrap();
+            let mut writer = requested
+                .prepare_response(FetchOkInfo {
+                    end_of_track: false,
+                    end_location: Location::new(0, 1),
+                    params: KeyValuePairs::default(),
+                    track_extensions: Default::default(),
+                })
+                .await
+                .unwrap();
+            writer
+                .write_record(&public_fetch_object(0, 0, 1))
+                .await
+                .unwrap();
+            assert!(writer
+                .write_payload(Vec::from(&b"xx"[..]).into())
+                .await
+                .is_err());
+            drop(overflow);
+
+            let mut abandoned = subscriber
+                .fetch(request.clone(), KeyValuePairs::default())
+                .unwrap();
+            let requested = publisher.fetch_requested().await.unwrap();
+            let writer = requested
+                .prepare_response(FetchOkInfo {
+                    end_of_track: false,
+                    end_location: Location::new(0, 1),
+                    params: KeyValuePairs::default(),
+                    track_extensions: Default::default(),
+                })
+                .await
+                .unwrap();
+            drop(writer);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), abandoned.next())
+                    .await
+                    .expect("dropped response did not settle the FETCH")
+                    .is_err()
+            );
+
+            let canceled_before_write = subscriber
+                .fetch(request.clone(), KeyValuePairs::default())
+                .unwrap();
+            let requested = publisher.fetch_requested().await.unwrap();
+            let writer = requested
+                .prepare_response(FetchOkInfo {
+                    end_of_track: false,
+                    end_location: Location::new(0, 1),
+                    params: KeyValuePairs::default(),
+                    track_extensions: Default::default(),
+                })
+                .await
+                .unwrap();
+            drop(canceled_before_write);
+            assert!(matches!(writer.closed().await, Err(ServeError::Cancel)));
+
+            let canceled = subscriber.fetch(request, KeyValuePairs::default()).unwrap();
+            let requested = publisher.fetch_requested().await.unwrap();
+            let writer = requested.stream().await.unwrap();
+            drop(canceled);
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), writer.closed())
+                    .await
+                    .expect("FETCH_CANCEL did not wake the writer"),
+                Err(ServeError::Cancel)
+            ));
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scenario => {},
+                result = client_session.run() => panic!("client session ended: {result:?}"),
+                result = server_session.run() => panic!("server session ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_api_issues_relative_and_absolute_joining_fetches() {
+        let ApiPeer {
+            client_session,
+            mut subscriber,
+            server_session,
+            mut publisher,
+            _client,
+            _server,
+        } = api_peer().await;
+        let namespace = TrackNamespace::from_utf8_path("test/public-joining-api");
+        let (subscribe_writer, _subscribe_reader) =
+            Track::new(namespace.clone(), "video").produce();
+        let (source_writer, source_reader) = Track::new(namespace.clone(), "video").produce();
+        let mut source = source_writer.datagrams().unwrap();
+        source
+            .write(Datagram {
+                group_id: 7,
+                object_id: 11,
+                priority: 1,
+                payload: Vec::from(&b"live"[..]).into(),
+                extension_headers: Default::default(),
+            })
+            .unwrap();
+
+        let scenario = async {
+            let mut subscribe_params = KeyValuePairs::default();
+            subscribe_params
+                .set_subscription_filter(&SubscriptionFilter::largest_object())
+                .unwrap();
+            let subscribe =
+                subscriber.subscribe_open_with_params(subscribe_writer, subscribe_params);
+            tokio::pin!(subscribe);
+            let subscribed = tokio::select! {
+                _ = &mut subscribe => panic!("SUBSCRIBE completed before serving"),
+                subscribed = publisher.subscribed() => subscribed.unwrap(),
+            };
+            let serve = tokio::spawn(async move { subscribed.serve(source_reader).await });
+            let subscribe = subscribe.await.unwrap();
+
+            let relative = subscribe
+                .fetch_joining(
+                    moq_transport::session::JoiningStart::Relative(3),
+                    KeyValuePairs::default(),
+                )
+                .unwrap();
+            let relative_request = publisher.fetch_requested().await.unwrap();
+            assert_eq!(
+                relative_request.resolve().await.unwrap(),
+                Some(message::StandaloneFetch {
+                    track_namespace: namespace.clone(),
+                    track_name: "video".into(),
+                    start_location: Location::new(4, 0),
+                    end_location: Location::new(7, 12),
+                })
+            );
+            relative_request
+                .reject(RequestErrorCode::DoesNotExist, "relative tested")
+                .unwrap();
+            assert!(relative.ok().await.is_err());
+
+            let absolute = subscribe
+                .fetch_joining(
+                    moq_transport::session::JoiningStart::Absolute(5),
+                    KeyValuePairs::default(),
+                )
+                .unwrap();
+            let absolute_request = publisher.fetch_requested().await.unwrap();
+            assert_eq!(
+                absolute_request.resolve().await.unwrap(),
+                Some(message::StandaloneFetch {
+                    track_namespace: namespace,
+                    track_name: "video".into(),
+                    start_location: Location::new(5, 0),
+                    end_location: Location::new(7, 12),
+                })
+            );
+            absolute_request
+                .reject(RequestErrorCode::DoesNotExist, "absolute tested")
+                .unwrap();
+            assert!(absolute.ok().await.is_err());
+
+            drop(subscribe);
+            drop(source);
+            serve.await.unwrap().unwrap();
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scenario => {},
+                result = client_session.run() => panic!("client session ended: {result:?}"),
+                result = server_session.run() => panic!("server session ended: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

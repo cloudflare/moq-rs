@@ -6,7 +6,10 @@ use std::{cmp, io};
 
 use bytes::{Buf, Bytes, BytesMut};
 
-use crate::coding::{Decode, DecodeError};
+use crate::{
+    coding::{Decode, DecodeError},
+    data::{FetchRecord, FetchRecordDecoder, MAX_FETCH_RECORD_HEADER_SIZE},
+};
 
 use super::{SessionError, SessionId};
 
@@ -132,6 +135,42 @@ impl Reader {
             tracing::trace!("[READER] read_chunk: stream returned None");
         }
         Ok(chunk)
+    }
+
+    pub(super) async fn decode_fetch(
+        &mut self,
+        decoder: &mut FetchRecordDecoder,
+    ) -> Result<Option<FetchRecord>, SessionError> {
+        loop {
+            let available = self.buffer.len().min(MAX_FETCH_RECORD_HEADER_SIZE);
+            let mut cursor = io::Cursor::new(&self.buffer[..available]);
+            let mut candidate = decoder.clone();
+            match candidate.decode(&mut cursor) {
+                Ok(record) => {
+                    let consumed = cursor.position() as usize;
+                    if consumed > MAX_FETCH_RECORD_HEADER_SIZE {
+                        return Err(SessionError::WrongSize);
+                    }
+                    self.buffer.advance(consumed);
+                    *decoder = candidate;
+                    return Ok(Some(record));
+                }
+                Err(DecodeError::More(required)) => {
+                    if available == MAX_FETCH_RECORD_HEADER_SIZE
+                        || self.buffer.len().saturating_add(required) > MAX_FETCH_RECORD_HEADER_SIZE
+                    {
+                        return Err(SessionError::WrongSize);
+                    }
+                    if self.stream.read_buf(&mut self.buffer).await?.is_none() {
+                        if self.buffer.is_empty() {
+                            return Ok(None);
+                        }
+                        return Err(SessionError::WrongSize);
+                    }
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     pub async fn done(&mut self) -> Result<bool, SessionError> {
