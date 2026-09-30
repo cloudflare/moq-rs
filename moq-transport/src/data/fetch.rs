@@ -111,6 +111,11 @@ pub struct FetchRecordObject {
 }
 
 /// One semantic record on a FETCH stream.
+///
+/// Calling [`Encode::encode`] directly emits a valid explicit, uncompressed
+/// record with all inheritable Object fields present. `FetchRecordEncoder`,
+/// used by [`crate::session::FetchWriter::write_record`], applies compact
+/// stateful encoding across consecutive records on a FETCH stream.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum FetchRecord {
     Object(FetchRecordObject),
@@ -225,6 +230,8 @@ impl FetchRecordDecoder {
         };
 
         let subgroup_id = if flags & DATAGRAM != 0 {
+            // Draft-16 section 10.4.4.1 says publishers SHOULD clear the two
+            // low bits for Datagrams, but subscribers MUST ignore them.
             None
         } else {
             Some(match flags & SUBGROUP_MASK {
@@ -397,7 +404,7 @@ impl FetchRecordEncoder {
 
 #[cfg(test)]
 mod tests {
-    use bytes::{BufMut, BytesMut};
+    use bytes::{Buf, BufMut, BytesMut};
 
     use super::*;
 
@@ -563,6 +570,49 @@ mod tests {
     }
 
     #[test]
+    fn datagram_ignores_every_subgroup_bit_pattern() {
+        let expected = FetchRecord::Object(FetchRecordObject {
+            group_id: 3,
+            subgroup_id: None,
+            object_id: 7,
+            publisher_priority: 5,
+            extension_headers: ExtensionHeaders::default(),
+            payload_length: 0,
+        });
+
+        for subgroup_bits in 0..=SUBGROUP_MASK {
+            let mut encoded = BytesMut::new();
+            (DATAGRAM | GROUP_ID_PRESENT | OBJECT_ID_PRESENT | PRIORITY_PRESENT | subgroup_bits)
+                .encode(&mut encoded)
+                .unwrap();
+            3_u64.encode(&mut encoded).unwrap();
+            7_u64.encode(&mut encoded).unwrap();
+            5_u8.encode(&mut encoded).unwrap();
+            0_u64.encode(&mut encoded).unwrap();
+
+            assert_eq!(
+                decode(&mut FetchRecordDecoder::default(), &encoded),
+                expected,
+                "subgroup bits {subgroup_bits:#04x} were not ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn datagram_encoder_clears_ignored_subgroup_bits() {
+        let mut encoded = BytesMut::new();
+        FetchRecord::Object(FetchRecordObject {
+            subgroup_id: None,
+            payload_length: 0,
+            ..object()
+        })
+        .encode(&mut encoded)
+        .unwrap();
+
+        assert_eq!(u64::decode(&mut encoded).unwrap() & SUBGROUP_MASK, 0);
+    }
+
+    #[test]
     fn first_object_cannot_reference_previous_fields() {
         let mut encoded = BytesMut::new();
         encoded.put_u8(0);
@@ -632,5 +682,114 @@ mod tests {
                 payload_length: 0,
             })
         );
+    }
+
+    #[test]
+    fn every_record_prefix_is_retryable_without_state_change() {
+        let mut extensions = ExtensionHeaders::new();
+        extensions.set_bytesvalue(1, vec![1, 2, 3, 4]);
+        extensions.set_intvalue(128, 16_384);
+        let expected = FetchRecord::Object(FetchRecordObject {
+            group_id: 64,
+            subgroup_id: Some(65),
+            object_id: 16_384,
+            publisher_priority: 5,
+            extension_headers: extensions,
+            payload_length: 0,
+        });
+        let mut encoded = BytesMut::new();
+        expected.encode(&mut encoded).unwrap();
+
+        for prefix_len in 0..encoded.len() {
+            let mut decoder = FetchRecordDecoder::default();
+            let mut prefix = std::io::Cursor::new(&encoded[..prefix_len]);
+            assert!(matches!(
+                decoder.decode(&mut prefix),
+                Err(DecodeError::More(_))
+            ));
+
+            let mut complete = std::io::Cursor::new(encoded.as_ref());
+            assert_eq!(decoder.decode(&mut complete).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn decoder_handles_every_fragment_size() {
+        let mut extensions = ExtensionHeaders::new();
+        extensions.set_bytesvalue(1, vec![1, 2, 3, 4]);
+        extensions.set_intvalue(128, 16_384);
+        let records = vec![
+            FetchRecord::Object(FetchRecordObject {
+                group_id: 64,
+                subgroup_id: Some(65),
+                object_id: 16_384,
+                publisher_priority: 5,
+                extension_headers: extensions,
+                payload_length: 0,
+            }),
+            FetchRecord::Object(FetchRecordObject {
+                group_id: 64,
+                subgroup_id: Some(65),
+                object_id: 16_385,
+                publisher_priority: 5,
+                extension_headers: ExtensionHeaders::default(),
+                payload_length: 0,
+            }),
+            FetchRecord::Object(FetchRecordObject {
+                group_id: 64,
+                subgroup_id: Some(66),
+                object_id: 16_386,
+                publisher_priority: 5,
+                extension_headers: ExtensionHeaders::default(),
+                payload_length: 0,
+            }),
+            FetchRecord::Unknown {
+                end: Location::new(64, 20_000),
+            },
+            FetchRecord::NotExist {
+                end: Location::new(64, 20_100),
+            },
+            FetchRecord::Object(FetchRecordObject {
+                group_id: 65,
+                subgroup_id: None,
+                object_id: 0,
+                publisher_priority: 7,
+                extension_headers: ExtensionHeaders::default(),
+                payload_length: 0,
+            }),
+        ];
+        let mut encoded = BytesMut::new();
+        let mut encoder = FetchRecordEncoder::default();
+        for record in &records {
+            encoder.encode(record, &mut encoded).unwrap();
+        }
+
+        for chunk_size in 1..=encoded.len() {
+            let mut decoder = FetchRecordDecoder::default();
+            let mut buffered = BytesMut::new();
+            let mut decoded = Vec::new();
+
+            for chunk in encoded.chunks(chunk_size) {
+                buffered.extend_from_slice(chunk);
+                loop {
+                    let mut cursor = std::io::Cursor::new(buffered.as_ref());
+                    let mut candidate = decoder.clone();
+                    match candidate.decode(&mut cursor) {
+                        Ok(record) => {
+                            buffered.advance(cursor.position() as usize);
+                            decoder = candidate;
+                            decoded.push(record);
+                        }
+                        Err(DecodeError::More(_)) => break,
+                        Err(error) => {
+                            panic!("fragment size {chunk_size} produced decode error: {error}")
+                        }
+                    }
+                }
+            }
+
+            assert!(buffered.is_empty(), "fragment size {chunk_size}");
+            assert_eq!(decoded, records, "fragment size {chunk_size}");
+        }
     }
 }

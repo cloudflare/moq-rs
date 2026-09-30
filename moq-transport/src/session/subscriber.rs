@@ -22,8 +22,8 @@ use crate::{
 use crate::watch::{Queue, State};
 
 use super::{
-    fetch_requested::inclusive_end, Fetch, FetchRecv, OpenSubscribeNamespace, PendingRequest,
-    PendingRequests, PendingResponse, PublishReceived, PublishReceivedRecv, PublishedNamespace,
+    inclusive_end, Fetch, FetchRecv, OpenSubscribeNamespace, PendingRequest, PendingRequests,
+    PendingResponse, PublishReceived, PublishReceivedRecv, PublishedNamespace,
     PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session, SessionConfig,
     SessionError, SessionId, Subscribe, SubscribeNamespace, SubscribeRecv,
 };

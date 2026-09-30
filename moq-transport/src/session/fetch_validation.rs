@@ -10,7 +10,7 @@ use crate::{
     serve::ServeError,
 };
 
-use super::SessionError;
+use super::{inclusive_end, SessionError};
 
 const MAX_SUBGROUPS_PER_GROUP: usize = 4096;
 
@@ -172,14 +172,6 @@ impl FetchValidator {
 
     fn invalid_ok(reason: &str) -> SessionError {
         SessionError::ProtocolViolation(reason.to_string())
-    }
-}
-
-pub(crate) fn inclusive_end(end: Location) -> Location {
-    if end.object_id == 0 {
-        Location::new(end.group_id, VarInt::MAX.into_inner())
-    } else {
-        Location::new(end.group_id, end.object_id - 1)
     }
 }
 

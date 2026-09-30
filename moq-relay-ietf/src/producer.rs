@@ -1505,6 +1505,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_fetch_serialization_ends_session_and_cancels_other_requests() {
+        let ManualPeer {
+            transport,
+            control_send: _control_send,
+            mut control_recv,
+            server_session,
+            server_publisher: _server_publisher,
+            mut server_subscriber,
+            _client,
+            _server,
+        } = manual_peer().await;
+        let session = tokio::spawn(server_session.run());
+        let namespace = TrackNamespace::from_utf8_path("test/malformed-fetch-session");
+        let request = message::StandaloneFetch {
+            track_namespace: namespace,
+            track_name: "video".into(),
+            start_location: Location::new(0, 0),
+            end_location: Location::new(1, 0),
+        };
+
+        let mut malformed = server_subscriber
+            .fetch(request.clone(), KeyValuePairs::default())
+            .unwrap();
+        let sibling = server_subscriber
+            .fetch(request, KeyValuePairs::default())
+            .unwrap();
+        let Message::Fetch(malformed_request) = control_recv.decode::<Message>().await else {
+            panic!("expected first FETCH");
+        };
+        let Message::Fetch(_sibling_request) = control_recv.decode::<Message>().await else {
+            panic!("expected sibling FETCH");
+        };
+        let sibling_ok = sibling.ok();
+        tokio::pin!(sibling_ok);
+        assert!(futures::poll!(&mut sibling_ok).is_pending());
+
+        // On the first Object, 0x01 references a prior Subgroup, Group, Object,
+        // and Priority that do not exist (draft-16 section 10.4.4.1).
+        send_fetch_stream(&transport, malformed_request.id, &[0x01]).await;
+        let fetch_error = malformed.next().await.unwrap_err();
+        assert!(matches!(
+            fetch_error,
+            SessionError::Decode(DecodeError::InvalidValue)
+        ));
+
+        let session_error = tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("malformed FETCH did not end the session")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            session_error,
+            SessionError::Decode(DecodeError::InvalidValue)
+        ));
+        assert_eq!(session_error.code(), 0x3);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), &mut sibling_ok)
+                .await
+                .expect("session shutdown did not cancel the sibling FETCH"),
+            Err(ServeError::Cancel)
+        ));
+
+        let peer_error = tokio::time::timeout(Duration::from_secs(5), transport.closed())
+            .await
+            .expect("peer did not receive the session close");
+        let web_transport::Error::Session(web_transport::quinn::SessionError::ConnectionError(
+            web_transport::quinn::quinn::ConnectionError::ApplicationClosed(close),
+        )) = peer_error
+        else {
+            panic!("expected peer PROTOCOL_VIOLATION, got {peer_error:?}");
+        };
+        assert_eq!(close.error_code.into_inner(), 0x3);
+    }
+
+    #[tokio::test]
     async fn public_api_issues_relative_and_absolute_joining_fetches() {
         let ApiPeer {
             client_session,

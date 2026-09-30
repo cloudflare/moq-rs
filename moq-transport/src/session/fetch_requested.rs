@@ -628,15 +628,7 @@ async fn run_fetch_writer(
                     }
                     Ok(())
                 };
-                let outcome = if request.closed().now_or_never().is_some()
-                    || state_dropped(request.session_lifetime.clone())
-                        .now_or_never()
-                        .is_some()
-                {
-                    Err(ServeError::Cancel.into())
-                } else {
-                    operation.await
-                };
+                let outcome = response_operation(&request, &lifetime, operation).await;
                 (send_write_result(result, outcome), false)
             }
             FetchWriteCommand::Reject(rejection, result) => {
@@ -804,14 +796,6 @@ impl FetchRequestedRecv {
         };
         state.closed = Err(ServeError::Cancel);
         Ok(())
-    }
-}
-
-pub(super) fn inclusive_end(end: Location) -> Location {
-    if end.object_id == 0 {
-        Location::new(end.group_id, VarInt::MAX.into_inner())
-    } else {
-        Location::new(end.group_id, end.object_id - 1)
     }
 }
 
@@ -1122,6 +1106,86 @@ mod tests {
 
         let result = request.stream().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn response_operation_prefers_request_cancel_over_ready_response() {
+        let Handles {
+            request,
+            mut recv,
+            _keepalive,
+            outgoing: _,
+            active: _,
+        } = handles(19);
+        let lifetime = State::default();
+        let operation_ran = std::cell::Cell::new(false);
+        recv.cancel().unwrap();
+
+        let result = response_operation(&request, &lifetime, async {
+            operation_ran.set(true);
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+        assert!(!operation_ran.get());
+    }
+
+    #[tokio::test]
+    async fn response_operation_prefers_writer_drop_over_ready_response() {
+        let Handles {
+            request,
+            recv: _recv,
+            _keepalive,
+            outgoing: _,
+            active: _,
+        } = handles(21);
+        let (lifetime, writer_lifetime) = State::<()>::default().split();
+        let operation_ran = std::cell::Cell::new(false);
+        drop(writer_lifetime);
+
+        let result = response_operation(&request, &lifetime, async {
+            operation_ran.set(true);
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+        assert!(!operation_ran.get());
+    }
+
+    #[tokio::test]
+    async fn response_operation_prefers_session_shutdown_over_ready_response() {
+        let Handles {
+            mut request,
+            recv: _recv,
+            _keepalive,
+            outgoing: _,
+            active: _,
+        } = handles(23);
+        let (session_lifetime, session) = State::<()>::default().split();
+        request.session_lifetime = session_lifetime;
+        let lifetime = State::default();
+        let operation_ran = std::cell::Cell::new(false);
+        drop(session);
+
+        let result = response_operation(&request, &lifetime, async {
+            operation_ran.set(true);
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+        assert!(!operation_ran.get());
     }
 
     struct Handles {

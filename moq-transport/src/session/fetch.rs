@@ -210,6 +210,9 @@ impl Fetch {
             result = reader.decode_fetch(&mut self.decoder) => match result {
                 Ok(record) => record,
                 Err(error) => {
+                    // Draft-16 section 10.4.4.1 requires a first FETCH Object
+                    // that references prior fields to close the session with
+                    // PROTOCOL_VIOLATION, so serialization failures are fatal.
                     if matches!(error, super::SessionError::Decode(_) | super::SessionError::WrongSize) {
                         self.subscriber.report_fatal(error.clone());
                     }

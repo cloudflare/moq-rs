@@ -68,6 +68,14 @@ pub(crate) fn joining_fetch_end_location(largest: Location) -> Option<Location> 
     }
 }
 
+pub(crate) fn inclusive_end(end: Location) -> Location {
+    if end.object_id == 0 {
+        Location::new(end.group_id, VarInt::MAX.into_inner())
+    } else {
+        Location::new(end.group_id, end.object_id - 1)
+    }
+}
+
 fn add_mlog_event<F>(mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>, make_event: F)
 where
     F: FnOnce(f64) -> mlog::Event,
@@ -982,6 +990,7 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         let _lifetime = self.lifetime;
+        let fatal_transport = self.webtransport.clone();
         tokio::select! {
             res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
             res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => res,
@@ -990,13 +999,20 @@ impl Session {
             res = Self::run_streams(self.session_id.clone(), self.webtransport.clone(), self.subscriber.clone()) => res,
             res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
             res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => res,
-            res = Self::run_fatal_errors(self.fatal_errors) => res,
+            res = Self::run_fatal_errors(fatal_transport, self.fatal_errors) => res,
         }
     }
 
-    async fn run_fatal_errors(mut errors: Queue<SessionError>) -> Result<(), SessionError> {
+    async fn run_fatal_errors(
+        webtransport: web_transport::Session,
+        mut errors: Queue<SessionError>,
+    ) -> Result<(), SessionError> {
         match errors.pop().await {
-            Some(error) => Err(error),
+            Some(error) => {
+                let code = u32::try_from(error.code()).unwrap_or(0x1);
+                webtransport.close(code, &error.to_string());
+                Err(error)
+            }
             None => Ok(()),
         }
     }
@@ -1569,6 +1585,15 @@ mod tests {
         assert_eq!(Session::normalize_connection_path("").unwrap(), None);
         assert_eq!(Session::normalize_connection_path("/").unwrap(), None);
         assert_eq!(Session::normalize_connection_path("///").unwrap(), None);
+    }
+
+    #[test]
+    fn inclusive_end_converts_exclusive_location_sentinels() {
+        assert_eq!(inclusive_end(Location::new(4, 8)), Location::new(4, 7));
+        assert_eq!(
+            inclusive_end(Location::new(4, 0)),
+            Location::new(4, VarInt::MAX.into_inner())
+        );
     }
 
     #[test]
