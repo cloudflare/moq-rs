@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -3076,12 +3075,16 @@ mod tests {
         let coordinator: Arc<dyn Coordinator> = Arc::new(test_coordinator);
         let locals = Locals::new();
         let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
-        let producer = Producer::new(
+        let (upstream_namespaces, runner) =
+            UpstreamNamespaces::new(locals.clone(), remotes.clone(), coordinator.clone());
+        tokio::spawn(runner.run());
+        let producer = Producer::new_with_upstream_namespaces(
             downstream.server_publisher,
             locals.clone(),
             remotes.clone(),
-            coordinator.clone(),
+            upstream_namespaces,
             SessionContext::public(None),
+            None, // auth: no token enforcement for this FETCH test
         );
         let consumer = Consumer::new(
             upstream.server_subscriber,
@@ -3090,6 +3093,7 @@ mod tests {
             remotes,
             None,
             SessionContext::public(None),
+            None, // auth: no token enforcement for this FETCH test
         );
         let namespace = TrackNamespace::from_utf8_path("test/fetch");
 
@@ -3344,12 +3348,16 @@ mod tests {
         let origin_locals = Locals::new();
         let edge_remotes = RemoteManager::new(edge_coordinator.clone(), Vec::new());
         let origin_remotes = RemoteManager::new(origin_coordinator.clone(), Vec::new());
-        let edge = Producer::new(
+        let (edge_upstream_namespaces, edge_runner) =
+            UpstreamNamespaces::new(edge_locals.clone(), edge_remotes.clone(), edge_coordinator.clone());
+        tokio::spawn(edge_runner.run());
+        let edge = Producer::new_with_upstream_namespaces(
             downstream.server_publisher,
             edge_locals,
             edge_remotes,
-            edge_coordinator,
+            edge_upstream_namespaces,
             SessionContext::public(Some("scope-a".to_string())),
+            None, // auth: no token enforcement for this FETCH test
         );
         let origin_consumer = Consumer::new(
             publisher.server_subscriber,
@@ -3358,6 +3366,7 @@ mod tests {
             origin_remotes.clone(),
             None,
             SessionContext::public(Some("scope-a".to_string())),
+            None, // auth: no token enforcement for this FETCH test
         );
         let origin_locals_for_connection = origin_locals.clone();
         let origin_remotes_for_connection = origin_remotes.clone();
@@ -3367,12 +3376,19 @@ mod tests {
             let (session, relay_publisher, _) = Session::accept(transport, None, info.transport)
                 .await
                 .unwrap();
-            let origin = Producer::new(
+            let (origin_upstream_namespaces, origin_runner) = UpstreamNamespaces::new(
+                origin_locals_for_connection.clone(),
+                origin_remotes_for_connection.clone(),
+                origin_coordinator_for_connection.clone(),
+            );
+            tokio::spawn(origin_runner.run());
+            let origin = Producer::new_with_upstream_namespaces(
                 relay_publisher.unwrap(),
                 origin_locals_for_connection,
                 origin_remotes_for_connection,
-                origin_coordinator_for_connection,
+                origin_upstream_namespaces,
                 SessionContext::internal(Some("scope-a".to_string()), None),
+                None, // auth: no token enforcement for this FETCH test
             );
             tokio::select! {
                 result = session.run() => panic!("origin relay session ended: {result:?}"),
