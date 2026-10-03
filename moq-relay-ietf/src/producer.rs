@@ -763,7 +763,7 @@ mod tests {
     use moq_native_ietf::quic;
     use moq_transport::{
         coding::{Decode, DecodeError, Encode, KeyValuePairs, Location, TrackName, TrackNamespace},
-        data::{FetchHeader, StreamHeader, StreamHeaderType},
+        data::{Datagram as WireDatagram, FetchHeader, StreamHeader, StreamHeaderType},
         message::{
             self, parameter_type, FetchType, FilterType, GroupOrder, JoiningFetch, Message,
             RequestErrorCode, SubscriptionFilter,
@@ -1195,7 +1195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_joining_fetch_resolves_to_fresh_standalone_with_exact_identity() {
+    async fn local_joining_fetch_handoff_is_contiguous_and_non_overlapping() {
         let mut downstream = manual_peer().await;
         let mut upstream = manual_peer().await;
         let coordinator: Arc<dyn Coordinator> = Arc::new(MockCoordinator::without_route());
@@ -1217,7 +1217,7 @@ mod tests {
                 group_id: 7,
                 object_id: 11,
                 priority: 9,
-                payload: Vec::from(&b"live"[..]).into(),
+                payload: Vec::from(&b"saved"[..]).into(),
                 extension_headers: Default::default(),
             })
             .unwrap();
@@ -1244,6 +1244,15 @@ mod tests {
             assert_eq!(
                 ok.params.largest_object().unwrap(),
                 Some(Location::new(7, 11))
+            );
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    downstream.transport.recv_datagram()
+                )
+                .await
+                .is_err(),
+                "SUBSCRIBE delivered the saved Largest Object"
             );
 
             let mut params = KeyValuePairs::default();
@@ -1273,7 +1282,7 @@ mod tests {
                 Some(GroupOrder::Descending)
             );
 
-            let body = fetch_object(4, 0, b"history");
+            let body = fetch_object(7, 11, b"saved");
             send_fetch_success(
                 &upstream.transport,
                 &mut upstream.control_send,
@@ -1284,6 +1293,43 @@ mod tests {
             .await;
             assert_eq!(receive_fetch_stream(&downstream.transport).await, (2, body));
             receive_fetch_ok(&mut downstream.control_recv, 2).await;
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    downstream.transport.accept_uni()
+                )
+                .await
+                .is_err(),
+                "FETCH delivered more than one stream"
+            );
+
+            datagrams
+                .write(Datagram {
+                    group_id: 7,
+                    object_id: 12,
+                    priority: 9,
+                    payload: Vec::from(&b"next"[..]).into(),
+                    extension_headers: Default::default(),
+                })
+                .unwrap();
+            let mut encoded =
+                tokio::time::timeout(Duration::from_secs(1), downstream.transport.recv_datagram())
+                    .await
+                    .expect("SUBSCRIBE did not deliver the next Object")
+                    .unwrap();
+            let next = WireDatagram::decode(&mut encoded).unwrap();
+            assert_eq!(next.group_id, 7);
+            assert_eq!(next.object_id, Some(12));
+            assert_eq!(next.payload.as_deref(), Some(&b"next"[..]));
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    downstream.transport.recv_datagram()
+                )
+                .await
+                .is_err(),
+                "SUBSCRIBE delivered more than one object"
+            );
 
             drop(namespace_requests);
             drop(namespace_registration);

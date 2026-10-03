@@ -19,8 +19,8 @@ use crate::{
 };
 
 use super::{
-    Fetch, JoiningAssociation, JoiningSnapshot, JoiningSnapshotError, SessionError, SessionId,
-    Writer,
+    joining_fetch_end_location, Fetch, JoiningAssociation, JoiningSnapshot, JoiningSnapshotError,
+    SessionError, SessionId, Writer,
 };
 
 const COPY_CHUNK_SIZE: usize = 64 * 1024;
@@ -314,18 +314,12 @@ fn resolve_joining_range(
         return Err(JoiningRangeError::InvalidRange);
     }
 
-    let end_object = snapshot
-        .largest
-        .object_id
-        .checked_add(1)
-        .filter(|object_id| *object_id <= VarInt::MAX.into_inner())
-        .ok_or(JoiningRangeError::InvalidRange)?;
-
     Ok(message::StandaloneFetch {
         track_namespace: snapshot.track_namespace.clone(),
         track_name: snapshot.track_name.clone(),
         start_location,
-        end_location: Location::new(snapshot.largest.group_id, end_object),
+        end_location: joining_fetch_end_location(snapshot.largest)
+            .ok_or(JoiningRangeError::InvalidRange)?,
     })
 }
 
@@ -511,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn joining_range_rejects_underflow_future_start_and_object_overflow() {
+    fn joining_range_rejects_underflow_and_future_start() {
         assert_eq!(
             resolve_joining_range(&joining_snapshot(2, 3), FetchType::RelativeJoining, 3,),
             Err(JoiningRangeError::InvalidRange)
@@ -522,19 +516,35 @@ mod tests {
         );
         assert_eq!(
             resolve_joining_range(
-                &joining_snapshot(2, VarInt::MAX.into_inner()),
-                FetchType::RelativeJoining,
-                0,
-            ),
-            Err(JoiningRangeError::InvalidRange)
-        );
-        assert_eq!(
-            resolve_joining_range(
                 &joining_snapshot(VarInt::MAX.into_inner() + 1, 0),
                 FetchType::RelativeJoining,
                 0,
             ),
             Err(JoiningRangeError::InvalidRange)
+        );
+        for object_id in [VarInt::MAX.into_inner() + 1, u64::MAX] {
+            assert_eq!(
+                resolve_joining_range(
+                    &joining_snapshot(2, object_id),
+                    FetchType::RelativeJoining,
+                    0,
+                ),
+                Err(JoiningRangeError::InvalidRange)
+            );
+        }
+    }
+
+    #[test]
+    fn joining_range_uses_whole_group_sentinel_at_max_object() {
+        let snapshot = joining_snapshot(2, VarInt::MAX.into_inner());
+        assert_eq!(
+            resolve_joining_range(&snapshot, FetchType::RelativeJoining, 0).unwrap(),
+            StandaloneFetch {
+                track_namespace: snapshot.track_namespace.clone(),
+                track_name: snapshot.track_name.clone(),
+                start_location: Location::new(2, 0),
+                end_location: Location::new(2, 0),
+            }
         );
     }
 
