@@ -16,9 +16,7 @@ const MAX_SUBGROUPS_PER_GROUP: usize = 4096;
 
 pub(crate) struct FetchValidator {
     range: Option<(Location, Location)>,
-    requested_order: Option<GroupOrder>,
-    effective_order: Option<GroupOrder>,
-    inferred_order: Option<GroupOrder>,
+    effective_order: GroupOrder,
     previous: Option<Location>,
     largest: Option<Location>,
     priority_group: Option<u64>,
@@ -30,15 +28,11 @@ impl FetchValidator {
     pub fn new(range: Option<(Location, Location)>, order: Option<GroupOrder>) -> Self {
         Self {
             range,
-            requested_order: match order {
-                Some(GroupOrder::Ascending | GroupOrder::Descending) => order,
-                Some(GroupOrder::Publisher) | None => None,
-            },
+            // Draft-16 §9.2.2.4 defaults an omitted FETCH Group Order to Ascending.
             effective_order: match order {
-                Some(GroupOrder::Ascending | GroupOrder::Descending) => order,
-                Some(GroupOrder::Publisher) | None => Some(GroupOrder::Ascending),
+                Some(order @ (GroupOrder::Ascending | GroupOrder::Descending)) => order,
+                Some(GroupOrder::Publisher) | None => GroupOrder::Ascending,
             },
-            inferred_order: None,
             previous: None,
             largest: None,
             priority_group: None,
@@ -113,16 +107,6 @@ impl FetchValidator {
         }
 
         extensions.validate()?;
-        let effective = self.requested_order.unwrap_or(GroupOrder::Ascending);
-        if self
-            .inferred_order
-            .is_some_and(|inferred| inferred != effective)
-        {
-            return Err(Self::invalid_ok(
-                "records do not use the effective group order",
-            ));
-        }
-        self.effective_order = Some(effective);
         self.response_end = Some(end);
         Ok(())
     }
@@ -151,12 +135,8 @@ impl FetchValidator {
                 } else {
                     GroupOrder::Descending
                 };
-                if let Some(order) = self.effective_order.or(self.inferred_order) {
-                    if direction != order {
-                        return Err(Self::malformed("groups are not in the effective order"));
-                    }
-                } else {
-                    self.inferred_order = Some(direction);
+                if direction != self.effective_order {
+                    return Err(Self::malformed("groups are not in the effective order"));
                 }
             }
         }
@@ -206,6 +186,17 @@ mod tests {
 
     #[test]
     fn explicit_order_is_enforced_before_fetch_ok() {
+        let mut valid_ascending = FetchValidator::new(
+            Some((Location::new(0, 0), Location::new(3, 0))),
+            Some(GroupOrder::Ascending),
+        );
+        valid_ascending
+            .validate_record(&object(1, 0, 0, 1))
+            .unwrap();
+        valid_ascending
+            .validate_record(&object(2, 0, 0, 1))
+            .unwrap();
+
         let mut ascending = FetchValidator::new(
             Some((Location::new(0, 0), Location::new(3, 0))),
             Some(GroupOrder::Ascending),
@@ -219,6 +210,17 @@ mod tests {
         );
         descending.validate_record(&object(1, 0, 0, 1)).unwrap();
         assert!(descending.validate_record(&object(2, 0, 0, 1)).is_err());
+
+        let mut valid_descending = FetchValidator::new(
+            Some((Location::new(0, 0), Location::new(3, 0))),
+            Some(GroupOrder::Descending),
+        );
+        valid_descending
+            .validate_record(&object(2, 0, 0, 1))
+            .unwrap();
+        valid_descending
+            .validate_record(&object(1, 0, 0, 1))
+            .unwrap();
     }
 
     #[test]
@@ -263,6 +265,14 @@ mod tests {
         validator
             .validate_ok(Location::new(2, 1), &extensions)
             .unwrap();
+
+        let mut ok_first =
+            FetchValidator::new(Some((Location::new(0, 0), Location::new(3, 0))), None);
+        ok_first
+            .validate_ok(Location::new(2, 1), &extensions)
+            .unwrap();
+        ok_first.validate_record(&object(1, 0, 0, 1)).unwrap();
+        ok_first.validate_record(&object(2, 0, 0, 1)).unwrap();
     }
 
     #[test]
