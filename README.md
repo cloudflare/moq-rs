@@ -34,7 +34,7 @@ This repository provides:
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
-- Native hop-by-hop Joining FETCH forwarding, exact PUBLISH origins, and cached FETCH responses
+- Native hop-by-hop Joining FETCH forwarding, exact-PUBLISH-origin FETCH expansion, and cached FETCH responses
 - GOAWAY
 
 ## Interoperability

@@ -378,12 +378,14 @@ impl Subscribed {
 
     pub async fn serve(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
         let res = self.serve_inner(track).await;
-        if let Err(err) = &res {
-            self.close(err.clone().into())?;
-        } else {
-            self.forwarder.publisher.complete_subscribe(self.info.id)?;
-        }
+        let close = match &res {
+            Err(err) => self.forwarder.close(err.clone().into()),
+            Ok(()) => Ok(()),
+        };
+        let complete = self.forwarder.publisher.complete_subscribe(self.info.id);
 
+        close?;
+        complete?;
         res
     }
 
