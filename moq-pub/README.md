@@ -24,6 +24,12 @@ Add `--publish` to push each created track with PUBLISH after announcing the nam
 $ ffmpeg -hide_banner -v quiet -stream_loop -1 -re -i bbb_source.mp4 -an -f mp4 -movflags empty_moov+frag_every_frame+separate_moof+omit_tfhd_offset - | RUST_LOG=moq_pub=info moq-pub --name bbb --publish https://localhost:4443
 ```
 
+Add `--fetch-groups N` to retain the newest `N` whole groups per media track and serve inbound FETCH requests. The current group counts toward the limit. Without this option, inbound FETCH requests are still drained and rejected with `NOT_SUPPORTED`. Catalog and initialization tracks keep their existing SUBSCRIBE delivery and are not available through FETCH.
+
+```
+$ ffmpeg -hide_banner -v quiet -stream_loop -1 -re -i bbb_source.mp4 -an -f mp4 -movflags empty_moov+frag_every_frame+separate_moof+omit_tfhd_offset - | RUST_LOG=moq_pub=info moq-pub --name bbb --fetch-groups 3 https://localhost:4443
+```
+
 Note also that we're dropping the audio track (`-an`) above until audio playback is stabilized on the `moq-js` side.
 
 ### Known issues

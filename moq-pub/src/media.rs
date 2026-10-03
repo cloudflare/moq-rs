@@ -6,7 +6,8 @@ use anyhow::{self, Context};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use moq_transport::{
     coding::TrackName,
-    serve::{SubgroupWriter, SubgroupsWriter, TrackWriter, TracksWriter},
+    data::ExtensionHeaders,
+    serve::{FullTrackName, SubgroupWriter, SubgroupsWriter, TrackWriter, TracksWriter},
 };
 use mp4::{self, ReadBox, TrackType};
 use std::cmp::max;
@@ -14,6 +15,8 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::time;
 use tokio::sync::mpsc;
+
+use crate::{ArchivedObject, FetchHistory};
 
 pub struct Media {
     // Tracks based on their track ID.
@@ -35,12 +38,22 @@ pub struct Media {
 
     // Optional notification for tracks as they become available.
     track_tx: Option<mpsc::UnboundedSender<TrackName>>,
+
+    fetch_history: Option<FetchHistory>,
 }
 
 impl Media {
     pub fn new(
+        broadcast: TracksWriter,
+        track_tx: Option<mpsc::UnboundedSender<TrackName>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_fetch(broadcast, track_tx, None)
+    }
+
+    pub fn new_with_fetch(
         mut broadcast: TracksWriter,
         track_tx: Option<mpsc::UnboundedSender<TrackName>>,
+        fetch_history: Option<FetchHistory>,
     ) -> anyhow::Result<Self> {
         let catalog = broadcast
             .create(".catalog")
@@ -65,6 +78,7 @@ impl Media {
             moov: None,
             current: None,
             track_tx,
+            fetch_history,
         })
     }
 
@@ -270,7 +284,7 @@ impl Media {
             if let Some(tx) = &self.track_tx {
                 let _ = tx.send(TrackName::from(name.clone()));
             }
-            let track = Track::new(track, handler, timescale);
+            let track = Track::new(track, handler, timescale, self.fetch_history.clone());
             self.tracks.insert(id, track);
         }
 
@@ -356,16 +370,33 @@ struct Track {
 
     // The type of track, ex. "vide" or "soun"
     handler: TrackType,
+
+    fetch_history: Option<FetchHistory>,
+    full_name: FullTrackName,
 }
 
 impl Track {
-    fn new(track: TrackWriter, handler: TrackType, timescale: u64) -> Self {
+    fn new(
+        track: TrackWriter,
+        handler: TrackType,
+        timescale: u64,
+        fetch_history: Option<FetchHistory>,
+    ) -> Self {
+        let full_name = FullTrackName {
+            namespace: track.namespace.clone(),
+            name: track.name.clone(),
+        };
+        if let Some(history) = &fetch_history {
+            history.add_track(full_name.clone());
+        }
         Self {
             track: track.subgroups().unwrap(),
             current: None,
             pending_moof: None,
             timescale,
             handler,
+            fetch_history,
+            full_name,
         }
     }
 
@@ -413,13 +444,34 @@ impl Track {
         let mut combined = BytesMut::with_capacity(moof.len() + raw.len());
         combined.put_slice(&moof);
         combined.put_slice(&raw);
-        segment.write(combined.freeze())?;
+        let combined = combined.freeze();
+        if let Some(history) = &self.fetch_history {
+            let object_id = segment
+                .len()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("object ID exceeds u64"))?;
+            let archived = ArchivedObject {
+                group_id: segment.info.group_id,
+                subgroup_id: segment.info.subgroup_id,
+                object_id,
+                publisher_priority: segment.info.priority,
+                extension_headers: ExtensionHeaders::default(),
+                payload: combined.clone(),
+            };
+            history.write_object(&self.full_name, archived, || segment.write(combined))?;
+        } else {
+            segment.write(combined)?;
+        }
 
         Ok(())
     }
 
     pub fn end_group(&mut self) {
-        self.current = None;
+        if let Some(segment) = self.current.take() {
+            if let Some(history) = &self.fetch_history {
+                history.complete_group(&self.full_name, segment.info.group_id);
+            }
+        }
         self.pending_moof = None;
     }
 }
@@ -507,4 +559,85 @@ fn track_timescale(moov: &mp4::MoovBox, track_id: u32) -> u64 {
         .expect("failed to find trak");
 
     trak.mdia.mdhd.timescale as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use moq_transport::{
+        coding::{Location, TrackNamespace},
+        data::ExtensionHeaders,
+        message::GroupOrder,
+        serve::{FullTrackName, Tracks},
+    };
+
+    use super::*;
+    use crate::FetchHistory;
+
+    #[test]
+    fn legacy_media_constructor_remains_available() {
+        let namespace = TrackNamespace::from_utf8_path("test/compatibility");
+        let (broadcast, _requests, _reader) = Tracks::new(namespace).produce();
+
+        Media::new(broadcast, None).unwrap();
+    }
+
+    #[test]
+    fn archives_exact_complete_live_cmaf_object() {
+        let namespace = TrackNamespace::from_utf8_path("test/archive");
+        let (mut broadcast, _requests, _reader) = Tracks::new(namespace.clone()).produce();
+        let writer = broadcast.create("1.m4s").unwrap();
+        let name = FullTrackName {
+            namespace,
+            name: "1.m4s".into(),
+        };
+        let history = FetchHistory::new(NonZeroUsize::new(2).unwrap());
+        let mut track = Track::new(writer, TrackType::Video, 1_000, Some(history.clone()));
+        let moof = Bytes::from_static(b"complete-moof");
+        let mdat = Bytes::from_static(b"complete-mdat");
+
+        track
+            .header(
+                moof.clone(),
+                Fragment {
+                    track: 1,
+                    timestamp: 0,
+                    keyframe: true,
+                },
+            )
+            .unwrap();
+
+        assert!(history
+            .snapshot(
+                &name,
+                Location::new(0, 0),
+                Location::new(0, 0),
+                GroupOrder::Ascending,
+            )
+            .is_err());
+
+        track.data(mdat.clone()).unwrap();
+
+        let snapshot = history
+            .snapshot(
+                &name,
+                Location::new(0, 0),
+                Location::new(0, 0),
+                GroupOrder::Ascending,
+            )
+            .unwrap();
+        assert_eq!(snapshot.objects.len(), 1);
+        let archived = &snapshot.objects[0];
+        assert_eq!(archived.group_id, 0);
+        assert_eq!(archived.subgroup_id, 0);
+        assert_eq!(archived.object_id, 0);
+        assert_eq!(archived.publisher_priority, 127);
+        assert_eq!(archived.extension_headers, ExtensionHeaders::default());
+
+        let mut expected = BytesMut::new();
+        expected.put_slice(&moof);
+        expected.put_slice(&mdat);
+        assert_eq!(archived.payload, expected.freeze());
+    }
 }
