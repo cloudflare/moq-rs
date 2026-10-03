@@ -24,6 +24,8 @@ use tokio::{
 use tracing::{debug, info, trace, warn};
 
 const FETCH_CHUNK_SIZE: usize = 64 * 1024;
+const FETCH_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const FETCH_BUFFER_OBJECTS: usize = 32;
 const LIVE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const LIVE_BUFFER_OBJECTS: usize = 32;
 
@@ -34,36 +36,61 @@ pub enum FetchMode {
 }
 
 #[derive(Clone)]
-struct LiveBuffer {
-    available: Arc<Semaphore>,
-    capacity: usize,
+struct BufferBudget {
+    bytes: Arc<Semaphore>,
+    objects: Arc<Semaphore>,
+    byte_capacity: usize,
 }
 
-impl LiveBuffer {
-    fn new(capacity: usize) -> Self {
+impl BufferBudget {
+    fn new(byte_capacity: usize, object_capacity: usize) -> Self {
         Self {
-            available: Arc::new(Semaphore::new(capacity)),
-            capacity,
+            bytes: Arc::new(Semaphore::new(byte_capacity)),
+            objects: Arc::new(Semaphore::new(object_capacity)),
+            byte_capacity,
         }
     }
 
-    fn reserve(&self, bytes: usize) -> anyhow::Result<OwnedSemaphorePermit> {
+    async fn reserve(&self, bytes: usize) -> anyhow::Result<BufferPermit> {
         anyhow::ensure!(
-            bytes <= self.capacity,
-            "object size {bytes} exceeds live buffer capacity {}",
-            self.capacity
+            bytes <= self.byte_capacity,
+            "object size {bytes} exceeds buffer byte capacity {}",
+            self.byte_capacity
         );
-        let bytes = u32::try_from(bytes).context("live object is too large to account for")?;
-        self.available
+        let bytes = u32::try_from(bytes).context("object is too large to account for")?;
+        let object = self
+            .objects
             .clone()
-            .try_acquire_many_owned(bytes)
-            .context("live buffer capacity exceeded")
+            .acquire_owned()
+            .await
+            .context("buffer object budget closed")?;
+        let bytes = self
+            .bytes
+            .clone()
+            .acquire_many_owned(bytes)
+            .await
+            .context("buffer byte budget closed")?;
+        Ok(BufferPermit {
+            _bytes: bytes,
+            _object: object,
+        })
     }
+
+    fn close(&self) {
+        self.bytes.close();
+        self.objects.close();
+    }
+}
+
+#[derive(Debug)]
+struct BufferPermit {
+    _bytes: OwnedSemaphorePermit,
+    _object: OwnedSemaphorePermit,
 }
 
 struct BufferedObject {
     payload: Vec<u8>,
-    _permit: OwnedSemaphorePermit,
+    _permit: BufferPermit,
 }
 
 pub struct Media<O> {
@@ -250,7 +277,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                     .with_context(|| format!("failed to play track {name}"))
             });
         }
-        Self::wait_for_tasks(&mut tasks, "live media", &self.output).await?;
+        Self::wait_for_tasks(&mut tasks, "live media", &[]).await?;
         drop(subscriptions);
         Ok(())
     }
@@ -279,10 +306,15 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             fetches.push((name, fetch));
         }
 
-        let budget = LiveBuffer::new(LIVE_BUFFER_BYTES);
-        let mut tasks = Self::spawn_fetches(fetches, self.output.clone(), budget);
-        Self::wait_for_tasks(&mut tasks, "FETCH", &self.output).await?;
-        self.output.lock().await.flush().await?;
+        let budget = BufferBudget::new(FETCH_BUFFER_BYTES, FETCH_BUFFER_OBJECTS);
+        let mut tasks = Self::spawn_fetches(fetches, self.output.clone(), budget.clone());
+        Self::wait_for_tasks(&mut tasks, "FETCH", &[&budget]).await?;
+        self.output
+            .lock()
+            .await
+            .flush()
+            .await
+            .context("failed to flush fetched media")?;
         Ok(())
     }
 
@@ -292,7 +324,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         start: JoiningStart,
     ) -> anyhow::Result<()> {
         let (send, receive) = mpsc::channel(LIVE_BUFFER_OBJECTS);
-        let buffer = LiveBuffer::new(LIVE_BUFFER_BYTES);
+        let live_budget = BufferBudget::new(LIVE_BUFFER_BYTES, LIVE_BUFFER_OBJECTS);
         let mut collectors = JoinSet::new();
         let mut subscriptions: Vec<(String, Subscribe)> = Vec::with_capacity(track_names.len());
 
@@ -300,10 +332,10 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             let (writer, reader) = self.create_track(&name, "media")?;
             let (started_send, started_receive) = oneshot::channel();
             let collector_send = send.clone();
-            let collector_buffer = buffer.clone();
+            let collector_budget = live_budget.clone();
             let collector_name = name.clone();
             collectors.spawn(async move {
-                Self::collect_live(reader, collector_send, collector_buffer, started_send)
+                Self::collect_live(reader, collector_send, collector_budget, started_send)
                     .await
                     .with_context(|| format!("failed to collect live track {collector_name}"))
             });
@@ -337,17 +369,25 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                 .with_context(|| format!("failed to request joining FETCH for track {name}"))?;
             fetches.push((name.clone(), fetch));
         }
-        let mut fetch_tasks = Self::spawn_fetches(fetches, self.output.clone(), buffer.clone());
-        Self::wait_for_fetches(&mut fetch_tasks, &mut collectors, &self.output).await?;
-        self.output
-            .lock()
-            .await
-            .flush()
-            .await
-            .context("failed to flush fetched media")?;
+        let fetch_budget = BufferBudget::new(FETCH_BUFFER_BYTES, FETCH_BUFFER_OBJECTS);
+        let mut fetch_tasks =
+            Self::spawn_fetches(fetches, self.output.clone(), fetch_budget.clone());
+        Self::wait_for_fetches(
+            &mut fetch_tasks,
+            &mut collectors,
+            &fetch_budget,
+            &live_budget,
+        )
+        .await?;
+        if let Err(error) = self.output.lock().await.flush().await {
+            live_budget.close();
+            collectors.abort_all();
+            while collectors.join_next().await.is_some() {}
+            return Err(error).context("failed to flush fetched media");
+        }
 
         info!("joining FETCH complete; releasing buffered live media");
-        Self::drain_live(receive, &mut collectors, self.output.clone()).await?;
+        Self::drain_live(receive, &mut collectors, self.output.clone(), live_budget).await?;
         drop(subscriptions);
         Ok(())
     }
@@ -355,7 +395,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
     fn spawn_fetches(
         fetches: Vec<(String, Fetch)>,
         output: Arc<Mutex<O>>,
-        budget: LiveBuffer,
+        budget: BufferBudget,
     ) -> JoinSet<anyhow::Result<()>> {
         let mut tasks = JoinSet::new();
         for (name, fetch) in fetches {
@@ -373,7 +413,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
     async fn drain_fetch(
         mut fetch: Fetch,
         output: Arc<Mutex<O>>,
-        budget: LiveBuffer,
+        budget: BufferBudget,
     ) -> anyhow::Result<()> {
         loop {
             let record = match fetch.next().await {
@@ -391,7 +431,8 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                         .context("FETCH object payload does not fit in memory")?;
                     let _permit = budget
                         .reserve(capacity)
-                        .context("FETCH object exceeds the shared byte budget")?;
+                        .await
+                        .context("failed to reserve FETCH object budget")?;
                     let mut payload = Vec::new();
                     payload
                         .try_reserve_exact(capacity)
@@ -410,7 +451,12 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                         "FETCH object payload length mismatch: expected {capacity}, received {}",
                         payload.len()
                     );
-                    output.lock().await.write_all(&payload).await?;
+                    output
+                        .lock()
+                        .await
+                        .write_all(&payload)
+                        .await
+                        .context("failed to write FETCH object payload")?;
                 }
                 FetchRecord::NotExist { end } => {
                     warn!(
@@ -439,7 +485,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
     async fn collect_live(
         track: TrackReader,
         send: mpsc::Sender<BufferedObject>,
-        buffer: LiveBuffer,
+        budget: BufferBudget,
         started: oneshot::Sender<()>,
     ) -> anyhow::Result<()> {
         let name = track.name.to_string();
@@ -453,8 +499,9 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                 let object_id = object.object_id;
                 let status = object.status;
                 let size = object.size;
-                let permit = buffer
+                let permit = budget
                     .reserve(size)
+                    .await
                     .with_context(|| format!("failed to buffer {name} {group_id}:{object_id}"))?;
                 let payload = Self::recv_object(object).await?;
                 anyhow::ensure!(
@@ -473,11 +520,12 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                     );
                     continue;
                 }
-                send.try_send(BufferedObject {
+                send.send(BufferedObject {
                     payload,
                     _permit: permit,
                 })
-                .context("live object buffer capacity exceeded")?;
+                .await
+                .map_err(|_| anyhow::anyhow!("live object buffer closed"))?;
             }
         }
         Ok(())
@@ -486,7 +534,8 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
     async fn wait_for_fetches(
         fetches: &mut JoinSet<anyhow::Result<()>>,
         collectors: &mut JoinSet<anyhow::Result<()>>,
-        output: &Arc<Mutex<O>>,
+        fetch_budget: &BufferBudget,
+        live_budget: &BufferBudget,
     ) -> anyhow::Result<()> {
         while !fetches.is_empty() {
             let result = if collectors.is_empty() {
@@ -509,7 +558,9 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                 }
             };
             if let Err(error) = result {
-                Self::abort_joining_tasks(fetches, collectors, output).await;
+                fetch_budget.close();
+                live_budget.close();
+                Self::abort_joining_tasks(fetches, collectors).await;
                 return Err(error);
             }
         }
@@ -520,59 +571,98 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         mut receive: mpsc::Receiver<BufferedObject>,
         collectors: &mut JoinSet<anyhow::Result<()>>,
         output: Arc<Mutex<O>>,
+        budget: BufferBudget,
     ) -> anyhow::Result<()> {
-        let mut buffer_closed = false;
-        loop {
-            if buffer_closed {
-                let Some(result) = collectors.join_next().await else {
-                    output.lock().await.flush().await?;
-                    return Ok(());
-                };
-                result.context("live collector task was cancelled")??;
-                continue;
-            }
-            if collectors.is_empty() {
-                match receive.recv().await {
-                    Some(object) => output.lock().await.write_all(&object.payload).await?,
-                    None => {
-                        output.lock().await.flush().await?;
+        let result = async {
+            let mut buffer_closed = false;
+            loop {
+                if buffer_closed {
+                    let Some(result) = collectors.join_next().await else {
+                        Self::flush_live_output(&output, &budget).await?;
                         return Ok(());
-                    }
-                }
-                continue;
-            }
-            tokio::select! {
-                object = receive.recv() => match object {
-                    Some(object) => output.lock().await.write_all(&object.payload).await?,
-                    None => buffer_closed = true,
-                },
-                result = collectors.join_next() => {
-                    let result = result.context("live collector task set closed")?;
+                    };
                     result.context("live collector task was cancelled")??;
+                    continue;
+                }
+                if collectors.is_empty() {
+                    match receive.recv().await {
+                        Some(object) => Self::write_live_object(&output, &object, &budget).await?,
+                        None => {
+                            Self::flush_live_output(&output, &budget).await?;
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    object = receive.recv() => match object {
+                        Some(object) => {
+                            Self::write_live_object(&output, &object, &budget).await?
+                        }
+                        None => buffer_closed = true,
+                    },
+                    result = collectors.join_next() => {
+                        let result = result.context("live collector task set closed")?;
+                        result.context("live collector task was cancelled")??;
+                    }
                 }
             }
         }
+        .await;
+
+        if result.is_err() {
+            receive.close();
+            budget.close();
+            collectors.abort_all();
+            while collectors.join_next().await.is_some() {}
+        }
+        result
+    }
+
+    async fn write_live_object(
+        output: &Arc<Mutex<O>>,
+        object: &BufferedObject,
+        budget: &BufferBudget,
+    ) -> anyhow::Result<()> {
+        if let Err(error) = output.lock().await.write_all(&object.payload).await {
+            budget.close();
+            return Err(error).context("failed to write live object payload");
+        }
+        Ok(())
+    }
+
+    async fn flush_live_output(
+        output: &Arc<Mutex<O>>,
+        budget: &BufferBudget,
+    ) -> anyhow::Result<()> {
+        if let Err(error) = output.lock().await.flush().await {
+            budget.close();
+            return Err(error).context("failed to flush live media");
+        }
+        Ok(())
     }
 
     async fn wait_for_tasks(
         tasks: &mut JoinSet<anyhow::Result<()>>,
         kind: &str,
-        output: &Arc<Mutex<O>>,
+        budgets: &[&BufferBudget],
     ) -> anyhow::Result<()> {
         while let Some(result) = tasks.join_next().await {
             let result = result
                 .with_context(|| format!("{kind} task was cancelled"))
                 .and_then(|result| result);
             if let Err(error) = result {
-                Self::abort_tasks(tasks, output).await;
+                for budget in budgets {
+                    budget.close();
+                }
+                Self::abort_tasks(tasks).await;
                 return Err(error);
             }
         }
         Ok(())
     }
 
-    async fn abort_tasks(tasks: &mut JoinSet<anyhow::Result<()>>, output: &Arc<Mutex<O>>) {
-        let _output = output.lock().await;
+    async fn abort_tasks(tasks: &mut JoinSet<anyhow::Result<()>>) {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
@@ -580,9 +670,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
     async fn abort_joining_tasks(
         fetches: &mut JoinSet<anyhow::Result<()>>,
         collectors: &mut JoinSet<anyhow::Result<()>>,
-        output: &Arc<Mutex<O>>,
     ) {
-        let _output = output.lock().await;
         fetches.abort_all();
         collectors.abort_all();
         while fetches.join_next().await.is_some() {}
@@ -691,7 +779,65 @@ async fn read_atom<R: AsyncReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moq_transport::message::RequestErrorCode;
+    use moq_transport::{
+        coding::TrackNamespace, message::RequestErrorCode, reexports::bytes::Bytes, serve::Track,
+    };
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context as TaskContext, Poll},
+        time::Duration,
+    };
+
+    struct FailingWriter;
+
+    struct PendingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("condition did not become true");
+    }
 
     #[test]
     fn legacy_media_constructor_remains_available() {
@@ -713,21 +859,167 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_buffer_is_bounded_by_payload_bytes() {
-        let buffer = LiveBuffer::new(4);
-        let first = buffer.reserve(3).unwrap();
+    async fn concurrent_budget_contention_waits_then_progresses_within_aggregate_limits() {
+        let budget = BufferBudget::new(5, 2);
+        let first = budget.reserve(3).await.unwrap();
 
-        assert!(buffer.reserve(2).is_err());
+        let second_budget = budget.clone();
+        let (second_started_send, second_started_receive) = oneshot::channel();
+        let second = tokio::spawn(async move {
+            let _ = second_started_send.send(());
+            second_budget.reserve(3).await
+        });
+        second_started_receive.await.unwrap();
+        wait_until(|| budget.objects.available_permits() == 0).await;
+        assert!(!second.is_finished(), "byte budget did not block producer");
+
+        let third_budget = budget.clone();
+        let (third_started_send, third_started_receive) = oneshot::channel();
+        let third = tokio::spawn(async move {
+            let _ = third_started_send.send(());
+            third_budget.reserve(1).await
+        });
+        third_started_receive.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!third.is_finished(), "third object exceeded object budget");
+
         drop(first);
-        assert!(buffer.reserve(2).is_ok());
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("byte waiter did not progress")
+            .unwrap()
+            .unwrap();
+        let third = tokio::time::timeout(Duration::from_secs(1), third)
+            .await
+            .expect("object waiter did not progress")
+            .unwrap()
+            .unwrap();
+        drop(second);
+        drop(third);
+
+        let exact = budget.reserve(5).await.unwrap();
+        drop(exact);
+        assert_eq!(budget.bytes.available_permits(), 5);
+        assert_eq!(budget.objects.available_permits(), 2);
     }
 
     #[tokio::test]
-    async fn live_buffer_rejects_an_oversized_object() {
-        let buffer = LiveBuffer::new(4);
+    async fn buffer_budget_rejects_an_oversized_object_without_consuming_capacity() {
+        let budget = BufferBudget::new(4, 1);
 
-        let error = buffer.reserve(5).expect_err("reserve should fail");
-        assert!(error.to_string().contains("exceeds live buffer capacity"));
+        let error = budget.reserve(5).await.expect_err("reserve should fail");
+        assert!(error.to_string().contains("exceeds buffer byte capacity"));
+        assert_eq!(budget.bytes.available_permits(), 4);
+        assert_eq!(budget.objects.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_live_blocks_the_33rd_object_then_resumes_after_long_fetch() {
+        let fetch_budget = BufferBudget::new(4, 1);
+        let fetch = fetch_budget.reserve(4).await.unwrap();
+        let live_budget = BufferBudget::new(LIVE_BUFFER_BYTES, LIVE_BUFFER_OBJECTS);
+        let (send, mut receive) = mpsc::channel(LIVE_BUFFER_OBJECTS);
+        let total = LIVE_BUFFER_OBJECTS + 8;
+        let (writer, reader) = Track::new(
+            TrackNamespace::from_utf8_path("test/backpressure"),
+            "video.m4s",
+        )
+        .produce();
+        let mut groups = writer.subgroups().unwrap();
+        let mut group = groups.append(127).unwrap();
+        let (started_send, started_receive) = oneshot::channel();
+        let collector_budget = live_budget.clone();
+        let collector = tokio::spawn(async move {
+            Media::<tokio::io::Sink>::collect_live(reader, send, collector_budget, started_send)
+                .await
+        });
+        started_receive.await.unwrap();
+
+        for value in 0..total {
+            group
+                .write(Bytes::from(vec![u8::try_from(value).unwrap()]))
+                .unwrap();
+        }
+
+        wait_until(|| {
+            receive.len() == LIVE_BUFFER_OBJECTS && live_budget.objects.available_permits() == 0
+        })
+        .await;
+        assert_eq!(fetch_budget.bytes.available_permits(), 0);
+        assert_eq!(live_budget.objects.available_permits(), 0);
+
+        let mut values = Vec::with_capacity(total);
+        for _ in 0..total {
+            let object = tokio::time::timeout(Duration::from_secs(1), receive.recv())
+                .await
+                .expect("live producer did not resume")
+                .expect("live buffer closed early");
+            values.push(object.payload[0]);
+        }
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            (0..u8::try_from(total).unwrap()).collect::<Vec<_>>()
+        );
+
+        drop(group);
+        drop(groups);
+        tokio::time::timeout(Duration::from_secs(1), collector)
+            .await
+            .expect("live collector did not finish")
+            .unwrap()
+            .unwrap();
+        assert!(receive.recv().await.is_none());
+        drop(fetch);
+        assert_eq!(fetch_budget.bytes.available_permits(), 4);
+        assert_eq!(live_budget.bytes.available_permits(), LIVE_BUFFER_BYTES);
+        assert_eq!(live_budget.objects.available_permits(), LIVE_BUFFER_OBJECTS);
+
+        let continued = live_budget.reserve(LIVE_BUFFER_BYTES).await.unwrap();
+        drop(continued);
+    }
+
+    #[tokio::test]
+    async fn output_failure_closes_budget_and_wakes_blocked_producer() {
+        let budget = BufferBudget::new(1, 1);
+        let (send, receive) = mpsc::channel(1);
+        let first = budget.reserve(1).await.unwrap();
+        send.send(BufferedObject {
+            payload: vec![1],
+            _permit: first,
+        })
+        .await
+        .unwrap();
+        drop(send);
+
+        let waiting_budget = budget.clone();
+        let (waiting_send, waiting_receive) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _ = waiting_send.send(());
+            waiting_budget.reserve(1).await
+        });
+        waiting_receive.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        let output = Arc::new(Mutex::new(FailingWriter));
+        let mut collectors = JoinSet::new();
+        let error =
+            Media::<FailingWriter>::drain_live(receive, &mut collectors, output, budget.clone())
+                .await
+                .expect_err("output should fail");
+        assert!(error
+            .to_string()
+            .contains("failed to write live object payload"));
+
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("budget waiter did not wake")
+            .unwrap()
+            .expect_err("closed budget should fail");
+        assert!(error.to_string().contains("buffer object budget closed"));
+        assert!(budget.bytes.is_closed());
+        assert!(budget.objects.is_closed());
     }
 
     #[tokio::test]
@@ -736,42 +1028,55 @@ mod tests {
         fetches.spawn(async { std::future::pending::<anyhow::Result<()>>().await });
         let mut collectors = JoinSet::new();
         collectors.spawn(async { anyhow::bail!("collector failed") });
-        let output = Arc::new(Mutex::new(tokio::io::sink()));
+        let fetch_budget = BufferBudget::new(1, 1);
+        let live_budget = BufferBudget::new(1, 1);
 
-        let error =
-            Media::<tokio::io::Sink>::wait_for_fetches(&mut fetches, &mut collectors, &output)
-                .await
-                .expect_err("collector failure should cross the FETCH gate");
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            Media::<tokio::io::Sink>::wait_for_fetches(
+                &mut fetches,
+                &mut collectors,
+                &fetch_budget,
+                &live_budget,
+            ),
+        )
+        .await
+        .expect("collector failure did not cross FETCH gate")
+        .expect_err("collector failure should cross the FETCH gate");
 
         assert_eq!(error.to_string(), "collector failed");
+        assert!(fetch_budget.bytes.is_closed());
+        assert!(live_budget.bytes.is_closed());
     }
 
     #[tokio::test]
-    async fn task_failure_waits_for_in_progress_object_before_aborting_siblings() {
-        let output = Arc::new(Mutex::new(tokio::io::sink()));
+    async fn permanently_pending_write_is_aborted_after_sibling_failure() {
+        let output = Arc::new(Mutex::new(PendingWriter));
         let writer_output = output.clone();
-        let (locked_send, locked_receive) = oneshot::channel();
-        let (release_send, release_receive) = oneshot::channel();
+        let (started_send, started_receive) = oneshot::channel();
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {
-            let _object_write = writer_output.lock().await;
-            let _ = locked_send.send(());
-            let _ = release_receive.await;
-            Ok(())
+            let mut output = writer_output.lock().await;
+            let _ = started_send.send(());
+            output
+                .write_all(b"pending object")
+                .await
+                .context("pending write failed")
         });
-        locked_receive.await.unwrap();
+        started_receive.await.unwrap();
         tasks.spawn(async { anyhow::bail!("sibling failed") });
 
-        let wait = Media::<tokio::io::Sink>::wait_for_tasks(&mut tasks, "test", &output);
-        tokio::pin!(wait);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), &mut wait)
-                .await
-                .is_err()
-        );
-
-        release_send.send(()).unwrap();
-        let error = wait.await.expect_err("sibling error should propagate");
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            Media::<PendingWriter>::wait_for_tasks(&mut tasks, "test", &[]),
+        )
+        .await
+        .expect("pending writer was not aborted")
+        .expect_err("sibling error should propagate");
         assert_eq!(error.to_string(), "sibling failed");
+        assert!(
+            output.try_lock().is_ok(),
+            "aborted writer retained output lock"
+        );
     }
 }

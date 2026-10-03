@@ -14,7 +14,7 @@ use moq_transport::{
     data::{ExtensionHeaders, FetchRecord, FetchRecordObject},
     message::{GroupOrder, RequestErrorCode},
     serve::{FullTrackName, ServeError},
-    session::{FetchOkInfo, FetchRejection, FetchRequested, Publisher},
+    session::{FetchOkInfo, FetchRejection, FetchRequested, Publisher, SessionError},
 };
 use tokio::task::JoinSet;
 
@@ -290,25 +290,64 @@ pub async fn serve_fetches(
             request = publisher.fetch_requested(), if accepting => match request {
                 Some(request) => {
                     let history = history.clone();
-                    handlers.spawn(async move {
-                        if let Err(error) = serve_fetch(request, history).await {
-                            tracing::debug!(error = %error, "failed serving FETCH");
-                        }
-                    });
+                    handlers.spawn(serve_fetch(request, history));
                 }
                 None => accepting = false,
             },
-            Some(result) = handlers.join_next(), if !handlers.is_empty() => {
-                result.context("FETCH handler panicked")?;
-            },
+            _ = join_fetch_handler(&mut handlers), if !handlers.is_empty() => {},
             else => return Ok(()),
         }
     }
 }
 
+async fn join_fetch_handler(handlers: &mut JoinSet<anyhow::Result<()>>) {
+    let Some(result) = handlers.join_next().await else {
+        return;
+    };
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if is_expected_fetch_shutdown(&error) => {
+            tracing::debug!("stopped serving FETCH: {error:#}");
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("failed serving FETCH: {error:#}");
+        }
+        Err(error) if error.is_cancelled() => {
+            tracing::debug!(error = %error, "FETCH handler cancelled during shutdown");
+        }
+        Err(error) if error.is_panic() => {
+            tracing::error!(error = %error, "FETCH handler panicked");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "FETCH handler failed");
+        }
+    }
+}
+
+fn is_expected_fetch_shutdown(error: &anyhow::Error) -> bool {
+    if let Some(error) = error.downcast_ref::<SessionError>() {
+        return error.is_graceful_close()
+            || matches!(
+                error,
+                SessionError::Serve(ServeError::Cancel | ServeError::Done)
+            );
+    }
+
+    matches!(
+        error.downcast_ref::<ServeError>(),
+        Some(ServeError::Cancel | ServeError::Done)
+    )
+}
+
 async fn serve_fetch(request: FetchRequested, history: Option<FetchHistory>) -> anyhow::Result<()> {
     let Some(history) = history else {
-        request.reject_with(FetchError::Disabled.rejection()?)?;
+        let rejection = FetchError::Disabled
+            .rejection()
+            .context("creating disabled FETCH rejection")?;
+        request
+            .reject_with(rejection)
+            .context("rejecting FETCH because history is disabled")?;
         return Ok(());
     };
     let order = request
@@ -317,7 +356,7 @@ async fn serve_fetch(request: FetchRequested, history: Option<FetchHistory>) -> 
         .group_order()
         .context("invalid FETCH group order")?
         .unwrap_or(GroupOrder::Ascending);
-    let Some(range) = request.resolve().await? else {
+    let Some(range) = request.resolve().await.context("resolving FETCH range")? else {
         return Ok(());
     };
     let track = FullTrackName {
@@ -327,7 +366,12 @@ async fn serve_fetch(request: FetchRequested, history: Option<FetchHistory>) -> 
     let snapshot = match history.snapshot(&track, range.start_location, range.end_location, order) {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            request.reject_with(error.rejection()?)?;
+            let rejection = error
+                .rejection()
+                .context("creating unavailable FETCH range rejection")?;
+            request
+                .reject_with(rejection)
+                .context("rejecting unavailable FETCH range")?;
             return Ok(());
         }
     };
@@ -338,7 +382,8 @@ async fn serve_fetch(request: FetchRequested, history: Option<FetchHistory>) -> 
             params: Default::default(),
             track_extensions: Default::default(),
         })
-        .await?;
+        .await
+        .context("preparing FETCH response")?;
 
     for object in snapshot.objects {
         let payload = object.payload;
@@ -351,10 +396,21 @@ async fn serve_fetch(request: FetchRequested, history: Option<FetchHistory>) -> 
                 extension_headers: object.extension_headers,
                 payload_length: payload.len() as u64,
             }))
-            .await?;
-        writer.write_payload(payload).await?;
+            .await
+            .with_context(|| {
+                format!(
+                    "writing FETCH record for group {} object {}",
+                    object.group_id, object.object_id
+                )
+            })?;
+        writer.write_payload(payload).await.with_context(|| {
+            format!(
+                "writing FETCH payload for group {} object {}",
+                object.group_id, object.object_id
+            )
+        })?;
     }
-    writer.finish().await?;
+    writer.finish().await.context("finishing FETCH response")?;
     Ok(())
 }
 
@@ -706,20 +762,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn raw_quic_blocked_then_cancelled_fetch_does_not_block_siblings() {
+    async fn raw_quic_failed_and_cancelled_fetches_do_not_stop_later_requests() {
         with_deadlock_guard(async {
             let history = history(1);
+            let failed_track = track_named("failed.m4s");
             let blocked_track = track_named("blocked.m4s");
             let sibling_track = track_named("sibling.m4s");
+            history.add_track(failed_track.clone());
             history.add_track(blocked_track.clone());
             history.add_track(sibling_track.clone());
 
+            let mut failed_object = object(0, 0);
+            failed_object.extension_headers.set_intvalue(1, 0);
+            insert_group(&history, &failed_track, 0, [failed_object], true);
             let mut blocked_object = object(0, 0);
             blocked_object.payload = Bytes::from(vec![0x5a; BLOCKED_PAYLOAD_SIZE]);
             insert_group(&history, &blocked_track, 0, [blocked_object], true);
             append_group(&history, &sibling_track, 0, 1, true);
 
             let mut peer = RawSession::start(Some(history)).await;
+            let failed = peer
+                .subscriber
+                .fetch(
+                    fetch_request(&failed_track, Location::new(0, 0), Location::new(1, 0)),
+                    KeyValuePairs::default(),
+                )
+                .unwrap();
+            assert!(failed.ok().await.is_err());
+
             let blocked = peer
                 .subscriber
                 .fetch(
@@ -757,6 +827,53 @@ mod tests {
             peer.shutdown().await;
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn panicking_fetch_handler_does_not_stop_draining_other_handlers() {
+        with_deadlock_guard(async {
+            let mut handlers: JoinSet<anyhow::Result<()>> = JoinSet::new();
+            let (panic_started, panic_observed) = oneshot::channel();
+            let (release_sibling, sibling_released) = oneshot::channel();
+            let (sibling_finished, sibling_observed) = oneshot::channel();
+
+            handlers.spawn(async move {
+                panic_started.send(()).unwrap();
+                panic!("injected FETCH handler panic")
+            });
+            handlers.spawn(async move {
+                sibling_released.await.unwrap();
+                sibling_finished.send(()).unwrap();
+                Ok(())
+            });
+
+            panic_observed.await.unwrap();
+            join_fetch_handler(&mut handlers).await;
+            release_sibling.send(()).unwrap();
+            join_fetch_handler(&mut handlers).await;
+
+            sibling_observed.await.unwrap();
+            assert!(handlers.is_empty());
+        })
+        .await;
+    }
+
+    #[test]
+    fn fetch_shutdown_classification_distinguishes_expected_and_unexpected_errors() {
+        for error in [ServeError::Cancel, ServeError::Done] {
+            assert!(is_expected_fetch_shutdown(&anyhow::Error::new(error)));
+        }
+        assert!(is_expected_fetch_shutdown(
+            &anyhow::Error::new(SessionError::Serve(ServeError::Cancel))
+                .context("writing FETCH payload")
+        ));
+
+        for error in [ServeError::NotFound, ServeError::Internal("boom".into())] {
+            assert!(!is_expected_fetch_shutdown(&anyhow::Error::new(error)));
+        }
+        assert!(!is_expected_fetch_shutdown(
+            &anyhow::Error::new(SessionError::Internal).context("preparing FETCH response")
+        ));
     }
 
     async fn run_joining_case(start: JoiningStart) {
