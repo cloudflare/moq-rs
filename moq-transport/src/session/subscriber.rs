@@ -10,6 +10,7 @@ use std::{
 };
 
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     coding::{Decode, KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix},
@@ -19,11 +20,11 @@ use crate::{
     serve::{self, FullTrackName, ServeError},
 };
 
-use crate::watch::{Queue, State};
+use crate::watch::Queue;
 
 use super::{
-    inclusive_end, Fetch, FetchRecv, OpenSubscribeNamespace, PendingRequest, PendingRequests,
-    PendingResponse, PublishReceived, PublishReceivedRecv, PublishedNamespace,
+    inclusive_end, validate_fetch_params, Fetch, FetchRecv, OpenSubscribeNamespace, PendingRequest,
+    PendingRequests, PendingResponse, PublishReceived, PublishReceivedRecv, PublishedNamespace,
     PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session, SessionConfig,
     SessionError, SessionId, Subscribe, SubscribeNamespace, SubscribeRecv,
 };
@@ -103,7 +104,7 @@ pub struct Subscriber {
     /// Fatal data-plane errors discovered by lazy application readers.
     fatal_errors: Queue<SessionError>,
 
-    session_lifetime: State<()>,
+    session_lifetime: CancellationToken,
 }
 
 /// RAII guard that rolls back a SUBSCRIBE_NAMESPACE prefix reservation on failure.
@@ -251,7 +252,7 @@ impl Subscriber {
             pending_requests,
             session_id,
             Queue::default(),
-            State::default(),
+            CancellationToken::new(),
         )
     }
 
@@ -264,7 +265,7 @@ impl Subscriber {
         pending_requests: PendingRequests,
         session_id: SessionId,
         fatal_errors: Queue<SessionError>,
-        session_lifetime: State<()>,
+        session_lifetime: CancellationToken,
     ) -> Self {
         Self {
             published_namespaces: Default::default(),
@@ -733,6 +734,7 @@ impl Subscriber {
         mut request: message::Fetch,
         range: Option<(crate::coding::Location, crate::coding::Location)>,
     ) -> Result<Fetch, ServeError> {
+        validate_fetch_params(&request.params).map_err(|_| ServeError::Size)?;
         let id = self.get_next_request_id().map_err(ServeError::from)?;
         self.pending_requests
             .insert(id, PendingRequest::Fetch)
@@ -1943,6 +1945,26 @@ mod tests {
         assert!(observer.subscribes.lock().unwrap().is_empty());
         assert!(observer.subscriber_names.lock().unwrap().by_name.is_empty());
         assert!(observer.pending_requests.remove(0).unwrap().is_none());
+        assert!(outgoing.close().is_empty());
+    }
+
+    #[test]
+    fn invalid_fetch_parameters_are_rejected_before_reserving_state() {
+        let mut subscriber = subscriber();
+        let outgoing = subscriber.outgoing.clone();
+        let mut invalid_priority = KeyValuePairs::default();
+        invalid_priority.set_intvalue(message::parameter_type::SUBSCRIBER_PRIORITY, 256);
+        let mut invalid_order = KeyValuePairs::default();
+        invalid_order.set_intvalue(message::parameter_type::GROUP_ORDER, 0);
+
+        for params in [invalid_priority, invalid_order] {
+            assert!(matches!(
+                subscriber.fetch(standalone_fetch("video"), params),
+                Err(ServeError::Size)
+            ));
+        }
+        assert!(subscriber.fetches.lock().unwrap().is_empty());
+        assert!(subscriber.pending_requests.remove(0).unwrap().is_none());
         assert!(outgoing.close().is_empty());
     }
 

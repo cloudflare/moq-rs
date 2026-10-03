@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     coding::{ReasonPhrase, VarInt},
@@ -102,7 +103,7 @@ pub struct Fetch {
     payload_remaining: u64,
     body_mode: FetchBodyMode,
     validator: Arc<Mutex<FetchValidator>>,
-    session_lifetime: State<()>,
+    session_lifetime: CancellationToken,
     stream_done: bool,
     id: u64,
     pub request: message::Fetch,
@@ -126,7 +127,7 @@ impl Fetch {
         subscriber: Subscriber,
         request: message::Fetch,
         range: Option<(crate::coding::Location, crate::coding::Location)>,
-        session_lifetime: State<()>,
+        session_lifetime: CancellationToken,
     ) -> (Self, FetchRecv) {
         let id = request.id;
         let (send, recv) = State::default().split();
@@ -168,7 +169,7 @@ impl Fetch {
             match notify {
                 Some(notify) => {
                     tokio::select! {
-                        _ = session_closed(self.session_lifetime.clone()) => return Err(ServeError::Cancel),
+                        _ = self.session_lifetime.cancelled() => return Err(ServeError::Cancel),
                         _ = notify => {},
                     }
                 }
@@ -206,7 +207,7 @@ impl Fetch {
         let state = self.state.clone();
         let reader = self.reader.as_mut().ok_or(ServeError::Done)?;
         let record = tokio::select! {
-            _ = session_closed(self.session_lifetime.clone()) => return Err(ServeError::Cancel.into()),
+            _ = self.session_lifetime.cancelled() => return Err(ServeError::Cancel.into()),
             result = reader.decode_fetch(&mut self.decoder) => match result {
                 Ok(record) => record,
                 Err(error) => {
@@ -260,7 +261,7 @@ impl Fetch {
         let state = self.state.clone();
         let reader = self.reader.as_mut().ok_or(ServeError::Done)?;
         let chunk = tokio::select! {
-            _ = session_closed(self.session_lifetime.clone()) => return Err(ServeError::Cancel.into()),
+            _ = self.session_lifetime.cancelled() => return Err(ServeError::Cancel.into()),
             result = reader.read_chunk(limit) => result?,
             err = wait_closed(state) => return Err(err.into()),
         };
@@ -286,7 +287,7 @@ impl Fetch {
         let state = self.state.clone();
         let reader = self.reader.as_mut().ok_or(ServeError::Done)?;
         let chunk = tokio::select! {
-            _ = session_closed(self.session_lifetime.clone()) => return Err(ServeError::Cancel.into()),
+            _ = self.session_lifetime.cancelled() => return Err(ServeError::Cancel.into()),
             result = reader.read_chunk(max) => result?,
             err = wait_closed(state) => return Err(err.into()),
         };
@@ -308,7 +309,7 @@ impl Fetch {
                 state.modified().ok_or(ServeError::Done)?
             };
             tokio::select! {
-                _ = session_closed(self.session_lifetime.clone()) => return Err(ServeError::Cancel),
+                _ = self.session_lifetime.cancelled() => return Err(ServeError::Cancel),
                 _ = notify => {},
             }
         }
@@ -412,16 +413,6 @@ async fn wait_closed(state: State<FetchState>) -> ServeError {
     }
 }
 
-async fn session_closed(state: State<()>) {
-    loop {
-        let state = state.lock();
-        match state.modified() {
-            Some(changed) => changed.await,
-            None => return,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
@@ -473,7 +464,8 @@ mod tests {
             joining_fetch: None,
             params: KeyValuePairs::default(),
         };
-        let (lifetime, owner) = State::<()>::default().split();
+        let lifetime = CancellationToken::new();
+        let owner = lifetime.clone().drop_guard();
         let (mut fetch, _recv) = Fetch::new(
             subscriber,
             request,

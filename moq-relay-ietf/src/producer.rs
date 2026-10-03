@@ -762,7 +762,9 @@ mod tests {
     use async_trait::async_trait;
     use moq_native_ietf::quic;
     use moq_transport::{
-        coding::{Decode, DecodeError, Encode, KeyValuePairs, Location, TrackName, TrackNamespace},
+        coding::{
+            Decode, DecodeError, Encode, KeyValuePairs, Location, TrackName, TrackNamespace, VarInt,
+        },
         data::{
             Datagram as WireDatagram, ExtensionHeaders, FetchHeader, FetchRecord,
             FetchRecordObject, StreamHeader, StreamHeaderType,
@@ -1505,7 +1507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_fetch_serialization_ends_session_and_cancels_other_requests() {
+    async fn actual_session_run_exit_cancels_existing_and_late_fetches() {
         let ManualPeer {
             transport,
             control_send: _control_send,
@@ -1524,6 +1526,7 @@ mod tests {
             start_location: Location::new(0, 0),
             end_location: Location::new(1, 0),
         };
+        let late_request = request.clone();
 
         let mut malformed = server_subscriber
             .fetch(request.clone(), KeyValuePairs::default())
@@ -1566,6 +1569,15 @@ mod tests {
                 .expect("session shutdown did not cancel the sibling FETCH"),
             Err(ServeError::Cancel)
         ));
+        let late = server_subscriber
+            .fetch(late_request, KeyValuePairs::default())
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::ZERO, late.ok())
+                .await
+                .expect("late FETCH did not observe session cancellation"),
+            Err(ServeError::Cancel)
+        ));
 
         let peer_error = tokio::time::timeout(Duration::from_secs(5), transport.closed())
             .await
@@ -1603,67 +1615,149 @@ mod tests {
                 extension_headers: Default::default(),
             })
             .unwrap();
+        let (max_subscribe_writer, _max_subscribe_reader) =
+            Track::new(namespace.clone(), "max").produce();
+        let (max_source_writer, max_source_reader) = Track::new(namespace.clone(), "max").produce();
+        let mut max_source = max_source_writer.datagrams().unwrap();
+        max_source
+            .write(Datagram {
+                group_id: 8,
+                object_id: VarInt::MAX.into_inner(),
+                priority: 1,
+                payload: Vec::from(&b"max"[..]).into(),
+                extension_headers: Default::default(),
+            })
+            .unwrap();
 
         let scenario = async {
             let mut subscribe_params = KeyValuePairs::default();
             subscribe_params
                 .set_subscription_filter(&SubscriptionFilter::largest_object())
                 .unwrap();
-            let subscribe =
-                subscriber.subscribe_open_with_params(subscribe_writer, subscribe_params);
-            tokio::pin!(subscribe);
-            let subscribed = tokio::select! {
-                _ = &mut subscribe => panic!("SUBSCRIBE completed before serving"),
+            {
+                let subscribe = subscriber
+                    .subscribe_open_with_params(subscribe_writer, subscribe_params.clone());
+                tokio::pin!(subscribe);
+                let subscribed = tokio::select! {
+                    _ = &mut subscribe => panic!("SUBSCRIBE completed before serving"),
+                    subscribed = publisher.subscribed() => subscribed.unwrap(),
+                };
+                let serve = tokio::spawn(async move { subscribed.serve(source_reader).await });
+                let subscribe = subscribe.await.unwrap();
+
+                let relative = subscribe
+                    .fetch_joining(
+                        moq_transport::session::JoiningStart::Relative(3),
+                        KeyValuePairs::default(),
+                    )
+                    .unwrap();
+                let relative_request = publisher.fetch_requested().await.unwrap();
+                assert_eq!(
+                    relative_request.resolve().await.unwrap(),
+                    Some(message::StandaloneFetch {
+                        track_namespace: namespace.clone(),
+                        track_name: "video".into(),
+                        start_location: Location::new(4, 0),
+                        end_location: Location::new(7, 12),
+                    })
+                );
+                relative_request
+                    .reject(RequestErrorCode::DoesNotExist, "relative tested")
+                    .unwrap();
+                assert!(relative.ok().await.is_err());
+
+                let absolute = subscribe
+                    .fetch_joining(
+                        moq_transport::session::JoiningStart::Absolute(5),
+                        KeyValuePairs::default(),
+                    )
+                    .unwrap();
+                let absolute_request = publisher.fetch_requested().await.unwrap();
+                assert_eq!(
+                    absolute_request.resolve().await.unwrap(),
+                    Some(message::StandaloneFetch {
+                        track_namespace: namespace.clone(),
+                        track_name: "video".into(),
+                        start_location: Location::new(5, 0),
+                        end_location: Location::new(7, 12),
+                    })
+                );
+                absolute_request
+                    .reject(RequestErrorCode::DoesNotExist, "absolute tested")
+                    .unwrap();
+                assert!(absolute.ok().await.is_err());
+
+                drop(subscribe);
+                drop(source);
+                serve.await.unwrap().unwrap();
+            }
+
+            let max_subscribe =
+                subscriber.subscribe_open_with_params(max_subscribe_writer, subscribe_params);
+            tokio::pin!(max_subscribe);
+            let max_subscribed = tokio::select! {
+                _ = &mut max_subscribe => panic!("max SUBSCRIBE completed before serving"),
                 subscribed = publisher.subscribed() => subscribed.unwrap(),
             };
-            let serve = tokio::spawn(async move { subscribed.serve(source_reader).await });
-            let subscribe = subscribe.await.unwrap();
-
-            let relative = subscribe
+            let max_serve =
+                tokio::spawn(async move { max_subscribed.serve(max_source_reader).await });
+            let max_subscribe = max_subscribe.await.unwrap();
+            let mut max_fetch = max_subscribe
                 .fetch_joining(
-                    moq_transport::session::JoiningStart::Relative(3),
+                    moq_transport::session::JoiningStart::Relative(0),
                     KeyValuePairs::default(),
                 )
                 .unwrap();
-            let relative_request = publisher.fetch_requested().await.unwrap();
+            let max_request = publisher.fetch_requested().await.unwrap();
             assert_eq!(
-                relative_request.resolve().await.unwrap(),
-                Some(message::StandaloneFetch {
-                    track_namespace: namespace.clone(),
-                    track_name: "video".into(),
-                    start_location: Location::new(4, 0),
-                    end_location: Location::new(7, 12),
-                })
-            );
-            relative_request
-                .reject(RequestErrorCode::DoesNotExist, "relative tested")
-                .unwrap();
-            assert!(relative.ok().await.is_err());
-
-            let absolute = subscribe
-                .fetch_joining(
-                    moq_transport::session::JoiningStart::Absolute(5),
-                    KeyValuePairs::default(),
-                )
-                .unwrap();
-            let absolute_request = publisher.fetch_requested().await.unwrap();
-            assert_eq!(
-                absolute_request.resolve().await.unwrap(),
+                max_request.resolve().await.unwrap(),
                 Some(message::StandaloneFetch {
                     track_namespace: namespace,
-                    track_name: "video".into(),
-                    start_location: Location::new(5, 0),
-                    end_location: Location::new(7, 12),
+                    track_name: "max".into(),
+                    start_location: Location::new(8, 0),
+                    end_location: Location::new(8, 0),
                 })
             );
-            absolute_request
-                .reject(RequestErrorCode::DoesNotExist, "absolute tested")
+            let mut max_writer = max_request
+                .prepare_response(FetchOkInfo {
+                    end_of_track: false,
+                    end_location: Location::new(8, 0),
+                    params: KeyValuePairs::default(),
+                    track_extensions: Default::default(),
+                })
+                .await
                 .unwrap();
-            assert!(absolute.ok().await.is_err());
-
-            drop(subscribe);
-            drop(source);
-            serve.await.unwrap().unwrap();
+            max_writer
+                .write_record(&public_fetch_object(8, VarInt::MAX.into_inner(), 3))
+                .await
+                .unwrap();
+            max_writer
+                .write_payload(Vec::from(&b"max"[..]).into())
+                .await
+                .unwrap();
+            max_writer.finish().await.unwrap();
+            assert_eq!(
+                max_fetch.ok().await.unwrap().end_location,
+                Location::new(8, 0)
+            );
+            let Some(FetchRecord::Object(max_object)) = max_fetch.next().await.unwrap() else {
+                panic!("expected max Object");
+            };
+            assert_eq!(max_object.group_id, 8);
+            assert_eq!(max_object.object_id, VarInt::MAX.into_inner());
+            assert_eq!(
+                max_fetch
+                    .read_payload_chunk(64)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                b"max"
+            );
+            assert!(max_fetch.next().await.unwrap().is_none());
+            drop(max_subscribe);
+            drop(max_source);
+            max_serve.await.unwrap().unwrap();
         };
 
         tokio::time::timeout(Duration::from_secs(5), async {

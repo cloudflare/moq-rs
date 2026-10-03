@@ -151,6 +151,17 @@ impl TrackExtensions {
     pub fn set_dynamic_groups(&mut self, enabled: bool) {
         self.set_int_extension(extension_type::DYNAMIC_GROUPS, if enabled { 1 } else { 0 });
     }
+
+    pub(crate) fn validate(&self) -> Result<(), DecodeError> {
+        if self.delivery_timeout()? == Some(0) {
+            return Err(DecodeError::InvalidParameter);
+        }
+        self.max_cache_duration()?;
+        self.default_publisher_priority()?;
+        self.default_publisher_group_order()?;
+        self.dynamic_groups()?;
+        Ok(())
+    }
 }
 
 impl Decode for TrackExtensions {

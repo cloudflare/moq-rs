@@ -1403,6 +1403,7 @@ dependencies = [
  "serde_with",
  "thiserror 1.0.61",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",

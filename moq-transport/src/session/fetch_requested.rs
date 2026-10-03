@@ -11,6 +11,7 @@ use std::{
 };
 
 use futures::FutureExt;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     coding::{Encode, KeyValuePairs, Location, VarInt},
@@ -55,7 +56,7 @@ pub struct FetchRequested {
     state: State<FetchRequestedState>,
     id: u64,
     joining: Option<JoiningAssociation>,
-    session_lifetime: State<()>,
+    session_lifetime: CancellationToken,
     pub request: message::Fetch,
 }
 
@@ -112,9 +113,11 @@ impl Default for FetchWriterState {
 /// Typed, backpressured writer for one successful FETCH response.
 #[must_use = "finish the FETCH response stream"]
 pub struct FetchWriter {
+    _lifetime: DropGuard,
     commands: tokio::sync::mpsc::Sender<FetchWriteCommand>,
     state: State<FetchWriterState>,
-    _lifetime: State<()>,
+    request_state: State<FetchRequestedState>,
+    session_lifetime: CancellationToken,
 }
 
 impl FetchWriter {
@@ -124,16 +127,25 @@ impl FetchWriter {
     ) -> Result<(), SessionError> {
         let (result, recv) = tokio::sync::oneshot::channel();
         if self.commands.send(make(result)).await.is_err() {
-            let error = self
-                .state
-                .lock()
-                .closed
-                .clone()
-                .err()
-                .unwrap_or(ServeError::Done);
-            return Err(error.into());
+            return Err(self.terminal_error().into());
         }
-        recv.await.map_err(|_| ServeError::Done)?
+        match recv.await {
+            Ok(result) => result,
+            Err(_) => Err(self.terminal_error().into()),
+        }
+    }
+
+    fn terminal_error(&self) -> ServeError {
+        if let Err(error) = self.request_state.lock().closed.clone() {
+            return error;
+        }
+        if let Err(error) = self.state.lock().closed.clone() {
+            return error;
+        }
+        if self.session_lifetime.is_cancelled() {
+            return ServeError::Cancel;
+        }
+        ServeError::Done
     }
 
     async fn open(&self) -> Result<(), SessionError> {
@@ -196,7 +208,7 @@ impl FetchRequested {
         active: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
         request: message::Fetch,
         joining: Option<JoiningAssociation>,
-        session_lifetime: State<()>,
+        session_lifetime: CancellationToken,
     ) -> (Self, FetchRequestedRecv) {
         let id = request.id;
         let (send, recv) = State::default().split();
@@ -226,7 +238,7 @@ impl FetchRequested {
             match notify {
                 Some(notify) => {
                     tokio::select! {
-                        _ = state_dropped(self.session_lifetime.clone()) => return Err(ServeError::Cancel),
+                        _ = self.session_lifetime.cancelled() => return Err(ServeError::Cancel),
                         _ = notify => {},
                     }
                 }
@@ -319,7 +331,10 @@ impl FetchRequested {
         let order = self.request.params.group_order()?;
         let (commands, recv) = tokio::sync::mpsc::channel(1);
         let (writer_state, driver_state) = State::<FetchWriterState>::default().split();
-        let (writer_lifetime, driver_lifetime) = State::<()>::default().split();
+        let request_state = self.state.clone();
+        let session_lifetime = self.session_lifetime.clone();
+        let driver_lifetime = CancellationToken::new();
+        let writer_lifetime = driver_lifetime.clone().drop_guard();
         tokio::spawn(run_fetch_writer(
             self,
             range,
@@ -329,9 +344,11 @@ impl FetchRequested {
             driver_lifetime,
         ));
         Ok(FetchWriter {
+            _lifetime: writer_lifetime,
             commands,
             state: writer_state,
-            _lifetime: writer_lifetime,
+            request_state,
+            session_lifetime,
         })
     }
 
@@ -524,7 +541,7 @@ async fn run_fetch_writer(
     order: Option<GroupOrder>,
     mut commands: tokio::sync::mpsc::Receiver<FetchWriteCommand>,
     state: State<FetchWriterState>,
-    lifetime: State<()>,
+    lifetime: CancellationToken,
 ) {
     let reset = FetchReset::default();
     let mut stream: Option<FetchStream> = None;
@@ -545,11 +562,11 @@ async fn run_fetch_writer(
                 terminal = closed.err().unwrap_or(ServeError::Done);
                 break;
             }
-            _ = state_dropped(lifetime.clone()) => {
+            _ = lifetime.cancelled() => {
                 terminal = ServeError::Cancel;
                 break;
             }
-            _ = state_dropped(request.session_lifetime.clone()) => {
+            _ = request.session_lifetime.cancelled() => {
                 terminal = ServeError::Cancel;
                 break;
             }
@@ -696,7 +713,7 @@ async fn run_fetch_writer(
         tokio::select! {
             biased;
             _ = request.closed() => reset.set(DataStreamResetCode::Cancelled),
-            _ = state_dropped(request.session_lifetime.clone()) => {},
+            _ = request.session_lifetime.cancelled() => {},
             _ = &mut settle => {},
         }
     }
@@ -741,25 +758,15 @@ fn session_to_serve_error(error: &SessionError) -> ServeError {
 
 async fn response_operation<T>(
     request: &FetchRequested,
-    lifetime: &State<()>,
+    lifetime: &CancellationToken,
     operation: impl std::future::Future<Output = Result<T, SessionError>>,
 ) -> Result<T, SessionError> {
     tokio::select! {
         biased;
         closed = request.closed() => Err(closed.err().unwrap_or(ServeError::Done).into()),
-        _ = state_dropped(lifetime.clone()) => Err(ServeError::Cancel.into()),
-        _ = state_dropped(request.session_lifetime.clone()) => Err(ServeError::Cancel.into()),
+        _ = lifetime.cancelled() => Err(ServeError::Cancel.into()),
+        _ = request.session_lifetime.cancelled() => Err(ServeError::Cancel.into()),
         result = operation => result,
-    }
-}
-
-async fn state_dropped(state: State<()>) {
-    loop {
-        let state = state.lock();
-        match state.modified() {
-            Some(changed) => changed.await,
-            None => return,
-        }
     }
 }
 
@@ -1026,7 +1033,7 @@ mod tests {
             active.clone(),
             joining_request(7, FetchType::RelativeJoining, 1),
             Some(association.association()),
-            State::default(),
+            CancellationToken::new(),
         );
         active.lock().unwrap().insert(
             7,
@@ -1071,7 +1078,7 @@ mod tests {
             active.clone(),
             joining_request(13, FetchType::AbsoluteJoining, 0),
             Some(association.association()),
-            State::default(),
+            CancellationToken::new(),
         );
         active.lock().unwrap().insert(13, recv);
 
@@ -1091,7 +1098,8 @@ mod tests {
     async fn session_shutdown_wakes_response_writer() {
         let (outgoing, _receiver) = Queue::default().split();
         let active = Arc::new(Mutex::new(HashMap::new()));
-        let (lifetime, owner) = State::<()>::default().split();
+        let lifetime = CancellationToken::new();
+        let owner = lifetime.clone().drop_guard();
         let (request, recv) = FetchRequested::new(
             None,
             SessionId::generate(),
@@ -1117,7 +1125,7 @@ mod tests {
             outgoing: _,
             active: _,
         } = handles(19);
-        let lifetime = State::default();
+        let lifetime = CancellationToken::new();
         let operation_ran = std::cell::Cell::new(false);
         recv.cancel().unwrap();
 
@@ -1143,7 +1151,8 @@ mod tests {
             outgoing: _,
             active: _,
         } = handles(21);
-        let (lifetime, writer_lifetime) = State::<()>::default().split();
+        let lifetime = CancellationToken::new();
+        let writer_lifetime = lifetime.clone().drop_guard();
         let operation_ran = std::cell::Cell::new(false);
         drop(writer_lifetime);
 
@@ -1169,9 +1178,10 @@ mod tests {
             outgoing: _,
             active: _,
         } = handles(23);
-        let (session_lifetime, session) = State::<()>::default().split();
+        let session_lifetime = CancellationToken::new();
+        let session = session_lifetime.clone().drop_guard();
         request.session_lifetime = session_lifetime;
-        let lifetime = State::default();
+        let lifetime = CancellationToken::new();
         let operation_ran = std::cell::Cell::new(false);
         drop(session);
 
@@ -1186,6 +1196,102 @@ mod tests {
             Err(SessionError::Serve(ServeError::Cancel))
         ));
         assert!(!operation_ran.get());
+    }
+
+    #[tokio::test]
+    async fn actual_writer_drop_cancels_before_command_channel_closure() {
+        let Handles {
+            request,
+            recv: _recv,
+            _keepalive,
+            outgoing: _,
+            active: _,
+        } = handles(25);
+        let writer = request.start_writer().await.unwrap();
+        let state = writer.state.clone();
+
+        drop(writer);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let notify = {
+                    let state = state.lock();
+                    if let Err(error) = state.closed.clone() {
+                        break error;
+                    }
+                    state.modified().expect("writer driver disappeared")
+                };
+                notify.await;
+            }
+        })
+        .await
+        .expect("writer drop did not stop its driver");
+        assert!(matches!(terminal, ServeError::Cancel));
+    }
+
+    fn queued_command_writer(
+        session_lifetime: CancellationToken,
+    ) -> (
+        FetchWriter,
+        tokio::sync::mpsc::Receiver<FetchWriteCommand>,
+        FetchRequestedRecv,
+        State<FetchWriterState>,
+    ) {
+        let (commands, recv) = tokio::sync::mpsc::channel(1);
+        let (writer_state, driver_state) = State::<FetchWriterState>::default().split();
+        let (request_state, request_recv) = State::<FetchRequestedState>::default().split();
+        let writer_lifetime = CancellationToken::new();
+        (
+            FetchWriter {
+                _lifetime: writer_lifetime.clone().drop_guard(),
+                commands,
+                state: writer_state,
+                request_state,
+                session_lifetime,
+            },
+            recv,
+            FetchRequestedRecv {
+                state: request_recv,
+            },
+            driver_state,
+        )
+    }
+
+    #[tokio::test]
+    async fn queued_command_ack_drop_reports_request_cancellation() {
+        let (writer, mut commands, mut request, _driver_state) =
+            queued_command_writer(CancellationToken::new());
+        let send = writer.open();
+        tokio::pin!(send);
+        assert!(futures::poll!(&mut send).is_pending());
+        let command = commands.recv().await.unwrap();
+
+        request.cancel().unwrap();
+        drop(command);
+
+        assert!(matches!(
+            send.await,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_command_ack_drop_reports_session_cancellation() {
+        let session_lifetime = CancellationToken::new();
+        let (writer, mut commands, _request, _driver_state) =
+            queued_command_writer(session_lifetime.clone());
+        let send = writer.open();
+        tokio::pin!(send);
+        assert!(futures::poll!(&mut send).is_pending());
+        let command = commands.recv().await.unwrap();
+
+        session_lifetime.cancel();
+        drop(command);
+
+        assert!(matches!(
+            send.await,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
     }
 
     struct Handles {
@@ -1207,7 +1313,7 @@ mod tests {
             active.clone(),
             request(id),
             None,
-            State::default(),
+            CancellationToken::new(),
         );
         Handles {
             request,
@@ -1345,7 +1451,7 @@ mod tests {
             super::super::SessionId::generate(),
         );
         let (upstream, mut upstream_recv) =
-            super::super::Fetch::new(subscriber, request(64), None, State::default());
+            super::super::Fetch::new(subscriber, request(64), None, CancellationToken::new());
         let Handles {
             request,
             recv: _recv,

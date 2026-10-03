@@ -52,11 +52,12 @@ use writer::*;
 use futures::{stream::FuturesUnordered, StreamExt};
 use request_id::max_request_id_from_params;
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::coding::{KeyValuePairs, Location, Value, VarInt};
 use crate::message::Message;
 use crate::mlog;
-use crate::watch::{Queue, State};
+use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
 
@@ -74,6 +75,15 @@ pub(crate) fn inclusive_end(end: Location) -> Location {
     } else {
         Location::new(end.group_id, end.object_id - 1)
     }
+}
+
+pub(crate) fn validate_fetch_params(
+    params: &KeyValuePairs,
+) -> Result<(), crate::coding::DecodeError> {
+    crate::message::validate_message_parameter_types(params)?;
+    params.subscriber_priority()?;
+    params.group_order()?;
+    Ok(())
 }
 
 fn add_mlog_event<F>(mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>, make_event: F)
@@ -175,6 +185,10 @@ impl Default for SessionConfig {
 /// Session object for managing all communications in a single QUIC connection.
 #[must_use = "run() must be called"]
 pub struct Session {
+    /// Cancels request handles before the session's channels and transport drop.
+    lifetime: DropGuard,
+    lifetime_cancel: CancellationToken,
+
     webtransport: web_transport::Session,
 
     /// Control Stream Reader and Writer (QUIC bi-directional stream)
@@ -192,9 +206,6 @@ pub struct Session {
 
     /// Fatal errors discovered by lazily consumed data streams.
     fatal_errors: Queue<SessionError>,
-
-    /// Dropping this half wakes request handles that outlive Session::run.
-    lifetime: State<()>,
 
     /// Session-level request ID manager.
     /// Publisher and Subscriber share one outbound request ID sequence.
@@ -611,7 +622,9 @@ impl Session {
         let pending_requests = PendingRequests::default();
         let subscribe_namespace_open = Queue::default().split();
         let fatal_errors = Queue::default().split();
-        let (session_lifetime, handle_lifetime) = State::<()>::default().split();
+        let handle_lifetime = CancellationToken::new();
+        let lifetime_cancel = handle_lifetime.clone();
+        let session_lifetime = lifetime_cancel.clone().drop_guard();
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
@@ -637,6 +650,8 @@ impl Session {
         ));
 
         let session = Self {
+            lifetime: session_lifetime,
+            lifetime_cancel,
             webtransport,
             sender,
             recver,
@@ -645,7 +660,6 @@ impl Session {
             outgoing: outgoing.1,
             subscribe_namespace_open: subscribe_namespace_open.1,
             fatal_errors: fatal_errors.1,
-            lifetime: session_lifetime,
             request_id,
             pending_requests,
             mlog: mlog_shared,
@@ -990,16 +1004,17 @@ impl Session {
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
         let _lifetime = self.lifetime;
+        let lifetime_cancel = self.lifetime_cancel;
         let fatal_transport = self.webtransport.clone();
         tokio::select! {
-            res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
-            res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_open(self.session_id.clone(), self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_accept(self.session_id.clone(), self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
-            res = Self::run_streams(self.session_id.clone(), self.webtransport.clone(), self.subscriber.clone()) => res,
-            res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
-            res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => res,
-            res = Self::run_fatal_errors(fatal_transport, self.fatal_errors) => res,
+            res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_subscribe_namespace_open(self.session_id.clone(), self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_subscribe_namespace_accept(self.session_id.clone(), self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_streams(self.session_id.clone(), self.webtransport.clone(), self.subscriber.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => { lifetime_cancel.cancel(); res },
+            res = Self::run_fatal_errors(fatal_transport, self.fatal_errors) => { lifetime_cancel.cancel(); res },
         }
     }
 
@@ -1593,6 +1608,30 @@ mod tests {
         assert_eq!(
             inclusive_end(Location::new(4, 0)),
             Location::new(4, VarInt::MAX.into_inner())
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cancellation_wakes_multiple_and_late_waiters() {
+        let lifetime = CancellationToken::new();
+        let owner = lifetime.clone().drop_guard();
+        let first = lifetime.clone();
+        let second = lifetime.clone();
+        let first = first.cancelled();
+        let second = second.cancelled();
+        tokio::pin!(first, second);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+
+        drop(owner);
+        tokio::join!(&mut first, &mut second);
+
+        let late = lifetime.clone();
+        assert!(late.is_cancelled());
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, late.cancelled())
+                .await
+                .is_ok()
         );
     }
 

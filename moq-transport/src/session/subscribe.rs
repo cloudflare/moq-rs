@@ -13,8 +13,7 @@ use crate::{
 
 use crate::watch::State;
 
-use super::SessionError;
-use super::Subscriber;
+use super::{joining_fetch_end_location, SessionError, Subscriber};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFilter {
@@ -515,17 +514,8 @@ impl Subscribe {
         if start_location > largest {
             return Err(ServeError::Size);
         }
-        let end_object = largest
-            .object_id
-            .checked_add(1)
-            .filter(|object| *object <= crate::coding::VarInt::MAX.into_inner())
-            .ok_or(ServeError::Size)?;
-        subscriber.fetch_joining_id(
-            self.info.id,
-            start,
-            (start_location, Location::new(largest.group_id, end_object)),
-            params,
-        )
+        let end_location = joining_fetch_end_location(largest).ok_or(ServeError::Size)?;
+        subscriber.fetch_joining_id(self.info.id, start, (start_location, end_location), params)
     }
 }
 

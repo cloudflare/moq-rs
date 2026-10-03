@@ -36,7 +36,7 @@ impl FetchValidator {
             },
             effective_order: match order {
                 Some(GroupOrder::Ascending | GroupOrder::Descending) => order,
-                Some(GroupOrder::Publisher) | None => None,
+                Some(GroupOrder::Publisher) | None => Some(GroupOrder::Ascending),
             },
             inferred_order: None,
             previous: None,
@@ -112,10 +112,8 @@ impl FetchValidator {
             return Err(Self::invalid_ok("FETCH_OK does not cover streamed records"));
         }
 
-        let publisher_order = extensions
-            .default_publisher_group_order()?
-            .unwrap_or(GroupOrder::Ascending);
-        let effective = self.requested_order.unwrap_or(publisher_order);
+        extensions.validate()?;
+        let effective = self.requested_order.unwrap_or(GroupOrder::Ascending);
         if self
             .inferred_order
             .is_some_and(|inferred| inferred != effective)
@@ -248,11 +246,16 @@ mod tests {
     }
 
     #[test]
-    fn publisher_default_descending_order_is_honored() {
+    fn omitted_fetch_order_defaults_to_ascending() {
         let mut validator =
             FetchValidator::new(Some((Location::new(0, 0), Location::new(3, 0))), None);
         validator.validate_record(&object(2, 0, 0, 1)).unwrap();
+        assert!(validator.validate_record(&object(1, 0, 0, 1)).is_err());
+
+        let mut validator =
+            FetchValidator::new(Some((Location::new(0, 0), Location::new(3, 0))), None);
         validator.validate_record(&object(1, 0, 0, 1)).unwrap();
+        validator.validate_record(&object(2, 0, 0, 1)).unwrap();
         let mut extensions = TrackExtensions::default();
         extensions
             .set_default_publisher_group_order(GroupOrder::Descending)
@@ -260,6 +263,40 @@ mod tests {
         validator
             .validate_ok(Location::new(2, 1), &extensions)
             .unwrap();
+    }
+
+    #[test]
+    fn fetch_ok_rejects_invalid_known_track_extensions() {
+        let mut invalid = Vec::new();
+
+        let mut timeout = TrackExtensions::default();
+        timeout.set_delivery_timeout(0);
+        invalid.push(timeout);
+
+        let mut priority = TrackExtensions::default();
+        priority.set_int_extension(
+            crate::message::extension_type::DEFAULT_PUBLISHER_PRIORITY,
+            256,
+        );
+        invalid.push(priority);
+
+        let mut order = TrackExtensions::default();
+        order.set_int_extension(
+            crate::message::extension_type::DEFAULT_PUBLISHER_GROUP_ORDER,
+            0,
+        );
+        invalid.push(order);
+
+        let mut dynamic = TrackExtensions::default();
+        dynamic.set_int_extension(crate::message::extension_type::DYNAMIC_GROUPS, 2);
+        invalid.push(dynamic);
+
+        for extensions in invalid {
+            let mut validator = FetchValidator::new(None, None);
+            assert!(validator
+                .validate_ok(Location::new(0, 1), &extensions)
+                .is_err());
+        }
     }
 
     #[test]
