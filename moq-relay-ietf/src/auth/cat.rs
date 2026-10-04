@@ -14,13 +14,16 @@
 //! namespace matches and track match. A token is required to carry `exp`, and
 //! its lifetime is capped, because the relay has no revocation mechanism.
 //!
-//! Claims the relay can neither enforce nor safely ignore are **refused**.
-//! Identity and informational claims (`sub`, `iat`, `cti`) are permitted.
-//! Constraint claims the relay has not been designed for are refused, because
+//! Claims the relay can neither enforce nor safely ignore are **refused**:
 //! honouring a token while ignoring a restriction its issuer attached would
-//! grant more than was authorized. The check is an allowlist over the claim
-//! keys present in the raw payload, not a walk over the decoded token — see
-//! [`unenforceable_claim`] for why that distinction is load-bearing.
+//! grant more than was authorized. The permitted set consists of the enforced
+//! claims (`iss`, `aud`, `exp`, `nbf`, `moqt`), a small number of identity and
+//! informational claims (`sub`, `iat`, `cti`) that carry no authorization
+//! constraint, and a few CAT claims whose semantics are relay-compatible
+//! (`catv`, `catifdata`, `catr`, `moqt-reval`). See [`unenforceable_claim`]
+//! for the full list and the rationale for each entry. The check is an allowlist
+//! over the claim keys present in the raw payload, not a walk over the decoded
+//! token — see [`unenforceable_claim`] for why that distinction is load-bearing.
 //!
 //! Composite claims (`and` / `or` / `nor`) are refused by the same rule.
 
