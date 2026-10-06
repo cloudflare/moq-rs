@@ -3348,8 +3348,11 @@ mod tests {
         let origin_locals = Locals::new();
         let edge_remotes = RemoteManager::new(edge_coordinator.clone(), Vec::new());
         let origin_remotes = RemoteManager::new(origin_coordinator.clone(), Vec::new());
-        let (edge_upstream_namespaces, edge_runner) =
-            UpstreamNamespaces::new(edge_locals.clone(), edge_remotes.clone(), edge_coordinator.clone());
+        let (edge_upstream_namespaces, edge_runner) = UpstreamNamespaces::new(
+            edge_locals.clone(),
+            edge_remotes.clone(),
+            edge_coordinator.clone(),
+        );
         tokio::spawn(edge_runner.run());
         let edge = Producer::new_with_upstream_namespaces(
             downstream.server_publisher,

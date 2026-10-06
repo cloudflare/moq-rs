@@ -365,6 +365,15 @@ impl CatAuthHook {
         })?;
 
         // MOQT claim well-formedness, including the revalidation contract.
+        //
+        // Note: the library's `authorize_precommit` enforces `catv <= 1`, but
+        // this relay calls `validate_moqt_claims`, which does not include that
+        // check. This is intentional: any restriction semantics introduced by a
+        // future catv would appear as new claim keys, which `unenforceable_claim`
+        // above would reject. A catv=2 token whose claim keys are all on the relay's
+        // allowlist would be accepted; this is a known forward-compatibility trade-off
+        // and is acceptable because (a) catv=2 does not exist, and (b) the
+        // `unenforceable_claim` allowlist is the primary enforcement gate, not catv.
         self.moqt_validator
             .validate_moqt_claims(validated.claims())
             .map_err(|err| {
@@ -2236,12 +2245,24 @@ mod tests {
     }
 
     /// Permitting a claim because it is enforced is only sound if the decoder
-    /// understood it.
+    /// actually understood and enforced it, not just silently skipped it.
     ///
-    /// RFC 8392 types `nbf` as "integer or floating-point number" and
-    /// `cat-token` accepts only the integer form, so a conformant issuer's
-    /// float `nbf` would otherwise be dropped and the not-before silently
-    /// ignored — a post-dated token usable before its window opens.
+    /// Each case below uses a CBOR encoding that the cat-token library would
+    /// reject or, for some claim/encoding pairs, accept and correctly enforce.
+    /// In all cases the token must be denied:
+    ///
+    /// - `nbf` as `Float` (claim 5): the library accepts float NumericDate per
+    ///   RFC 8392 and enforces it via `validate()`. The token has a future `nbf`,
+    ///   so it is refused as "not yet valid" — not by `unenforceable_claim`, but
+    ///   by the library's own `validate()` path.
+    /// - `nbf` as `Text`: the library's `_ =>` arm returns `Err` — parse-fail.
+    /// - `moqt-reval` (328) as `Text` or `Bool`: library `_ =>` — parse-fail.
+    /// - `moqt-reval` (328) as `Integer`: library decodes it; `validate_moqt_claims`
+    ///   rejects a revalidation-demanded token.
+    ///
+    /// The test pins library behavior: if the library ever silently drops one of
+    /// these encodings rather than erroring or enforcing it, this test would fail
+    /// and the relay would need a raw-CBOR fallback for that specific claim.
     #[tokio::test]
     async fn a_load_bearing_claim_in_an_unsupported_encoding_is_refused() {
         let key = generate_key();
@@ -2270,8 +2291,7 @@ mod tests {
 
             assert!(
                 !decision.is_allowed(),
-                "claim {claim_key} as {value:?} was dropped by the decoder and \
-                 must not be treated as absent"
+                "claim {claim_key} as {value:?} must be refused regardless of encoding"
             );
         }
     }
