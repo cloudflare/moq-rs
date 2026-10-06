@@ -308,6 +308,18 @@ impl CatAuthHook {
             return Err(DenyReason::TokenInvalid);
         }
 
+        // Two-pass `nbf` design (Manish Kumar review, 2026-08-26):
+        //
+        // This block is a *sanity guard only*. It rejects tokens whose `nbf`
+        // is implausibly distant in either direction (outside the supported
+        // lifetime window) or whose total `exp - nbf` span is unreasonably
+        // large. These are structural checks that can be made before calling
+        // into the library, so they catch obviously broken tokens early.
+        //
+        // The *authoritative* `nbf` enforcement — the check that the current
+        // time is actually past `nbf`, and that the token is not used before
+        // its stated start — is performed by `verified.validate()` below via
+        // `token_validator`. This relay never skips or weakens that check.
         if let Some(not_before) = verified.claims().core.nbf {
             if !(now.saturating_sub(MAX_TOKEN_LIFETIME_SECS)..=horizon).contains(&not_before) {
                 tracing::debug!(
@@ -2843,6 +2855,97 @@ mod tests {
         };
 
         assert!(hook.on_request(&request).await.unwrap().is_allowed());
+    }
+
+    /// A scope of `["sports"]` (no nil terminator) is a prefix grant and must
+    /// authorise subscribing to namespace `["sports", "football"]`.
+    ///
+    /// This closes Manish Kumar's review comment 13383462 ("VERIFY prefix
+    /// direction"). A nil terminator (`namespace_nil()`) caps the scope to an
+    /// exact depth; without one the scope element is a prefix that matches any
+    /// namespace whose first field equals `"sports"`, including deeper ones.
+    ///
+    /// The inverse is already tested by
+    /// `a_nil_terminated_scope_hides_deeper_namespaces`: a scope of
+    /// `["sports", nil]` must NOT authorise `["sports", "football"]`.
+    ///
+    /// If this test fails the prefix-direction logic is inverted and no code
+    /// should be merged until the bug is reported to Suhas and fixed.
+    #[tokio::test]
+    async fn scope_without_nil_prefix_matches_deeper_namespace() {
+        let key = generate_key();
+        let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
+
+        // Build a token whose scope is exactly `["sports"]` — one namespace
+        // element, no nil terminator — plus CLIENT_SETUP. This is the minimal
+        // shape that exercises the prefix-matching direction in isolation.
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(
+                MoqtScopeBuilder::new()
+                    .subscriber()
+                    .namespace_exact(b"sports")
+                    // No .namespace_nil() — this is the key difference from
+                    // a_nil_terminated_scope_hides_deeper_namespaces.
+                    .build(),
+            )
+            .with_moqt_scope(MoqtScopeBuilder::new().action(MoqtAction::ClientSetup).build());
+        let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
+        let principal = principal_for(&hook, encoded).await;
+
+        // Scope `["sports"]` (no nil) must match namespace `["sports", "football"]`.
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+        let track = TrackName::from("video");
+        assert!(
+            decide(
+                &hook,
+                &principal,
+                AuthzOperation::Subscribe {
+                    namespace: &namespace,
+                    track: &track,
+                }
+            )
+            .await
+            .is_allowed(),
+            "scope [\"sports\"] (no nil) must authorise subscribe to [\"sports\", \"football\"] — \
+             if this fails the prefix direction is wrong; file a bug with the cat-token \
+             maintainer before merging"
+        );
+
+        // Exact namespace still authorised (trivially).
+        let exact = TrackNamespace::from_utf8_path("sports");
+        assert!(
+            decide(
+                &hook,
+                &principal,
+                AuthzOperation::Subscribe {
+                    namespace: &exact,
+                    track: &track,
+                }
+            )
+            .await
+            .is_allowed(),
+            "scope [\"sports\"] must authorise subscribe to [\"sports\"] itself"
+        );
+
+        // Unrelated namespace must still be denied.
+        let other = TrackNamespace::from_utf8_path("news/politics");
+        assert!(
+            !decide(
+                &hook,
+                &principal,
+                AuthzOperation::Subscribe {
+                    namespace: &other,
+                    track: &track,
+                }
+            )
+            .await
+            .is_allowed(),
+            "scope [\"sports\"] must not authorise subscribe to [\"news\", \"politics\"]"
+        );
     }
 
     #[test]
