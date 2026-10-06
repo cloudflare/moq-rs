@@ -4,8 +4,12 @@
 # Temporary: disable release-plz semver-checks for moq-relay-ietf while the
 # published baseline (0.7.26) still depends on the abandoned hyper-serve 0.6.2
 # crate, which fails to compile against current hyper/hyper-util transitive
-# versions under fresh dependency resolution. Remove this override once a clean
-# release is published and becomes the crates.io baseline.
+# versions under fresh dependency resolution.
+#
+# Removal: delete this block after `moq-relay-ietf` publishes a version that
+# depends on axum-server (i.e., any version >= 0.7.27 that includes the
+# hyper-serve → axum-server fix). Verify with:
+#   cargo semver-checks check-release -p moq-relay-ietf
 [[package]]
 name = "moq-relay-ietf"
 semver_check = false
@@ -13,8 +17,12 @@ semver_check = false
 # Temporary: disable release-plz semver-checks for moq-api while the
 # published baseline (0.2.13) declares serde = "1" without features = ["derive"],
 # causing cargo-semver-checks rustdoc compilation to fail under isolated fresh
-# resolution (Serialize/Deserialize macros unavailable). This commit fixes the
-# declaration in source; remove this override once the fixed release is published.
+# resolution (Serialize/Deserialize macros unavailable).
+#
+# Removal: delete this block after `moq-api` publishes a version that declares
+# serde with features = ["derive"] (i.e., any version >= 0.2.14 that includes
+# this fix). Verify with:
+#   cargo semver-checks check-release -p moq-api
 [[package]]
 name = "moq-api"
 semver_check = false
