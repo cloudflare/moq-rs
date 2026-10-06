@@ -51,12 +51,20 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use request_id::max_request_id_from_params;
 use std::sync::{Arc, Mutex};
 
-use crate::coding::{KeyValuePairs, Value};
+use crate::coding::{KeyValuePairs, Location, Value, VarInt};
 use crate::message::Message;
 use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
+
+pub(crate) fn joining_fetch_end_location(largest: Location) -> Option<Location> {
+    match largest.object_id.cmp(&VarInt::MAX.into_inner()) {
+        std::cmp::Ordering::Less => Some(Location::new(largest.group_id, largest.object_id + 1)),
+        std::cmp::Ordering::Equal => Some(Location::new(largest.group_id, 0)),
+        std::cmp::Ordering::Greater => None,
+    }
+}
 
 fn add_mlog_event<F>(mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>, make_event: F)
 where

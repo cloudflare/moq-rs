@@ -16,7 +16,10 @@ use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
 
-use super::{DeliveryFilter, Publisher, SessionError, SessionId, SubscribeInfo, Writer};
+use super::{
+    DeliveryFilter, JoiningAssociation, JoiningAssociationEntry, Publisher, SessionError,
+    SessionId, SubscribeInfo, Writer,
+};
 
 // This file defines Publisher handling of inbound Subscriptions
 
@@ -63,6 +66,7 @@ pub struct Subscribed {
     pub info: SubscribeInfo,
 
     forwarder: ObjectForwarder,
+    joining: JoiningAssociation,
 
     /// Tracks if SubscribeOk has been sent yet or not. Used to send
     /// PUBLISH_DONE vs REQUEST_ERROR on drop.
@@ -353,31 +357,42 @@ impl Subscribed {
         publisher: Publisher,
         msg: message::Subscribe,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
-    ) -> Result<(Self, ObjectForwarderRecv), SessionError> {
+    ) -> Result<(Self, ObjectForwarderRecv, JoiningAssociationEntry), SessionError> {
         let info = SubscribeInfo::new_from_subscribe(&msg)?;
+        let joining = JoiningAssociationEntry::pending_subscriber(
+            info.track_namespace.clone(),
+            info.track_name.clone(),
+            info.filter.as_ref().map(|filter| filter.filter_type),
+        );
         let track_alias = info.id;
         let (forwarder, recv) = ObjectForwarder::new(publisher, track_alias, mlog);
         let send = Self {
             info,
             forwarder,
+            joining: joining.association(),
             ok: false,
         };
 
-        Ok((send, recv))
+        Ok((send, recv, joining))
     }
 
     pub async fn serve(mut self, track: serve::TrackReader) -> Result<(), SessionError> {
         let res = self.serve_inner(track).await;
-        if let Err(err) = &res {
-            self.close(err.clone().into())?;
-        }
+        let close = match &res {
+            Err(err) => self.forwarder.close(err.clone().into()),
+            Ok(()) => Ok(()),
+        };
+        let complete = self.forwarder.publisher.complete_subscribe(self.info.id);
 
+        close?;
+        complete?;
         res
     }
 
     async fn serve_inner(&mut self, track: serve::TrackReader) -> Result<(), SessionError> {
         // Update largest location before sending SubscribeOk
         let largest_location = track.largest_location();
+        self.joining.establish_subscriber(largest_location)?;
         self.forwarder.set_largest_location(largest_location)?;
 
         // Send SubscribeOk using send_message_and_wait to ensure it is sent at least to the QUIC stack before
@@ -950,11 +965,11 @@ pub(super) struct ObjectForwarderRecv {
 impl ObjectForwarderRecv {
     pub fn recv_unsubscribe(&mut self) -> Result<(), ServeError> {
         let state = self.state.lock();
-        state.closed.clone()?;
-
         if let Some(mut state) = state.into_mut() {
             state.unsubscribed = true;
-            state.closed = Err(ServeError::Cancel);
+            if state.closed.is_ok() {
+                state.closed = Err(ServeError::Cancel);
+            }
         }
 
         Ok(())
@@ -990,6 +1005,20 @@ mod tests {
         let locked = recv.state.lock();
         assert!(locked.unsubscribed);
         assert!(matches!(locked.closed, Err(ServeError::Cancel)));
+    }
+
+    #[test]
+    fn recv_unsubscribe_is_benign_after_forwarder_error() {
+        let state = State::<ObjectForwarderState>::default();
+        let (send_state, recv_state) = state.split();
+        let mut recv = ObjectForwarderRecv { state: recv_state };
+        send_state.lock_mut().unwrap().closed = Err(ServeError::Internal("failed".to_string()));
+
+        recv.recv_unsubscribe().unwrap();
+
+        let locked = recv.state.lock();
+        assert!(locked.unsubscribed);
+        assert!(matches!(locked.closed, Err(ServeError::Internal(_))));
     }
 
     #[tokio::test]

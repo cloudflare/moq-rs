@@ -3,6 +3,7 @@
 A server that connects publishing clients to subscribing clients.
 SUBSCRIBE requests are deduplicated and cached, so that a single publisher can serve many subscribers.
 Standalone FETCH requests always create a fresh upstream request and are never cached or deduplicated.
+Relative and Absolute Joining FETCH requests are accepted from downstream clients, resolved from an active SUBSCRIBE or established PUBLISH association, and forwarded upstream as fresh Standalone FETCH requests. V1 does not forward Joining FETCH natively between hops or serve FETCH responses from the track cache.
 
 ## Usage
 
