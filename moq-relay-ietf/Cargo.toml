@@ -39,7 +39,6 @@ secrecy = "0.10"
 # Pinned to the exact alpha that was reviewed and audited. A caret on a
 # pre-release permits later alpha and RC versions whose APIs are still changing;
 # an exact pin prevents silent breakage between `cargo update` runs.
-# Pin rationale: exact version pin prevents cargo update from pulling in an unreviewed pre-release.
 cat-token = { version = "=0.3.0-alpha.2", optional = true }
 # Reading the untrusted `kid` header to select a verification key. Already in
 # cat-token's own tree, so the feature adds no new crates.

@@ -9,8 +9,9 @@
 //! [`Coordinator::resolve_scope`] identifies which scope a connection belongs
 //! to, [`Coordinator::get_scope_config`] supplies that scope's
 //! [`ScopeAuthConfig`], including the public keys used to verify tokens. A
-//! scope that returns no policy runs exactly as it did before this module
-//! existed.
+//! scope that returns no policy carries no token enforcement; AUTHORIZATION
+//! TOKEN parameters are still validated for wire-format conformance (§9.2.2.1)
+//! but do not gate admission.
 //!
 //! Where a policy is present, enforcement happens at two points:
 //!
