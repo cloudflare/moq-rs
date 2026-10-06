@@ -8,6 +8,7 @@ use std::{
 };
 
 use futures::{stream::FuturesUnordered, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
@@ -19,12 +20,12 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, FetchRequested, FetchRequestedRecv, JoiningAssociation,
-    JoiningAssociationEntry, JoiningEligibility, ObjectForwarderRecv, PendingRequest,
-    PendingRequests, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
-    PublishedRecv, RequestId, RequestIdAllocation, Session, SessionConfig, SessionError, SessionId,
-    Subscribed, SubscribedNamespace, SubscribedNamespaceInfo, SubscribedNamespaceRecv,
-    TrackStatusRequested,
+    split_published_state, validate_fetch_params, FetchRequested, FetchRequestedRecv,
+    JoiningAssociation, JoiningAssociationEntry, JoiningEligibility, ObjectForwarderRecv,
+    PendingRequest, PendingRequests, PublishNamespace, PublishNamespaceRecv, Published,
+    PublishedInfo, PublishedRecv, RequestId, RequestIdAllocation, Session, SessionConfig,
+    SessionError, SessionId, Subscribed, SubscribedNamespace, SubscribedNamespaceInfo,
+    SubscribedNamespaceRecv, TrackStatusRequested,
 };
 use crate::message::RequestErrorCode;
 
@@ -152,6 +153,8 @@ pub struct Publisher {
 
     /// Correlation id of the owning session, tagged onto this publisher's log records.
     session_id: SessionId,
+
+    session_lifetime: CancellationToken,
 }
 
 impl Publisher {
@@ -162,6 +165,7 @@ impl Publisher {
         request_id: RequestId,
         pending_requests: PendingRequests,
         session_id: SessionId,
+        session_lifetime: CancellationToken,
     ) -> Self {
         Self {
             webtransport,
@@ -181,6 +185,7 @@ impl Publisher {
             pending_requests,
             mlog,
             session_id,
+            session_lifetime,
         }
     }
 
@@ -656,8 +661,7 @@ impl Publisher {
                     .as_ref()
                     .ok_or(SessionError::Internal)?;
                 if standalone.start_location != standalone.end_location
-                    && standalone.start_location
-                        > super::fetch_requested::inclusive_end(standalone.end_location)
+                    && standalone.start_location > super::inclusive_end(standalone.end_location)
                 {
                     self.send_request_error(
                         "fetch",
@@ -723,6 +727,7 @@ impl Publisher {
             self.fetches.clone(),
             msg,
             joining,
+            self.session_lifetime.clone(),
         );
         self.fetches
             .lock()
@@ -1224,13 +1229,6 @@ fn remove_published_from_maps(
     }
 
     Ok(published)
-}
-
-fn validate_fetch_params(params: &KeyValuePairs) -> Result<(), crate::coding::DecodeError> {
-    crate::message::validate_message_parameter_types(params)?;
-    params.subscriber_priority()?;
-    params.group_order()?;
-    Ok(())
 }
 
 #[cfg(test)]

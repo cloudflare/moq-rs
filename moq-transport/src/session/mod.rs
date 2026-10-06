@@ -5,6 +5,7 @@
 mod error;
 mod fetch;
 mod fetch_requested;
+mod fetch_validation;
 mod pending_requests;
 mod publish_namespace;
 mod publish_received;
@@ -23,10 +24,11 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
-pub use fetch::Fetch;
 pub(crate) use fetch::FetchRecv;
-pub use fetch_requested::FetchRequested;
+pub use fetch::{Fetch, FetchRejection};
 pub(crate) use fetch_requested::FetchRequestedRecv;
+pub use fetch_requested::{FetchOkInfo, FetchRequested, FetchWriter};
+pub(crate) use fetch_validation::FetchValidator;
 pub(crate) use pending_requests::{PendingRequest, PendingRequests, PendingResponse};
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
@@ -50,6 +52,7 @@ use writer::*;
 use futures::{stream::FuturesUnordered, StreamExt};
 use request_id::max_request_id_from_params;
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::coding::{KeyValuePairs, Location, Value, VarInt};
 use crate::message::Message;
@@ -64,6 +67,23 @@ pub(crate) fn joining_fetch_end_location(largest: Location) -> Option<Location> 
         std::cmp::Ordering::Equal => Some(Location::new(largest.group_id, 0)),
         std::cmp::Ordering::Greater => None,
     }
+}
+
+pub(crate) fn inclusive_end(end: Location) -> Location {
+    if end.object_id == 0 {
+        Location::new(end.group_id, VarInt::MAX.into_inner())
+    } else {
+        Location::new(end.group_id, end.object_id - 1)
+    }
+}
+
+pub(crate) fn validate_fetch_params(
+    params: &KeyValuePairs,
+) -> Result<(), crate::coding::DecodeError> {
+    crate::message::validate_message_parameter_types(params)?;
+    params.subscriber_priority()?;
+    params.group_order()?;
+    Ok(())
 }
 
 fn add_mlog_event<F>(mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>, make_event: F)
@@ -165,6 +185,10 @@ impl Default for SessionConfig {
 /// Session object for managing all communications in a single QUIC connection.
 #[must_use = "run() must be called"]
 pub struct Session {
+    /// Cancels request handles before the session's channels and transport drop.
+    lifetime: DropGuard,
+    lifetime_cancel: CancellationToken,
+
     webtransport: web_transport::Session,
 
     /// Control Stream Reader and Writer (QUIC bi-directional stream)
@@ -179,6 +203,9 @@ pub struct Session {
 
     /// Queue used by Subscriber to request opening SUBSCRIBE_NAMESPACE bidi streams.
     subscribe_namespace_open: Queue<OpenSubscribeNamespace>,
+
+    /// Fatal errors discovered by lazily consumed data streams.
+    fatal_errors: Queue<SessionError>,
 
     /// Session-level request ID manager.
     /// Publisher and Subscriber share one outbound request ID sequence.
@@ -594,6 +621,10 @@ impl Session {
         let outgoing = Queue::default().split();
         let pending_requests = PendingRequests::default();
         let subscribe_namespace_open = Queue::default().split();
+        let fatal_errors = Queue::default().split();
+        let handle_lifetime = CancellationToken::new();
+        let lifetime_cancel = handle_lifetime.clone();
+        let session_lifetime = lifetime_cancel.clone().drop_guard();
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
@@ -605,17 +636,22 @@ impl Session {
             request_id.clone(),
             pending_requests.clone(),
             session_id.clone(),
+            handle_lifetime.clone(),
         ));
-        let subscriber = Some(Subscriber::new(
+        let subscriber = Some(Subscriber::new_with_fatal(
             outgoing.0,
             subscribe_namespace_open.0,
             mlog_shared.clone(),
             request_id.clone(),
             pending_requests.clone(),
             session_id.clone(),
+            fatal_errors.0,
+            handle_lifetime,
         ));
 
         let session = Self {
+            lifetime: session_lifetime,
+            lifetime_cancel,
             webtransport,
             sender,
             recver,
@@ -623,6 +659,7 @@ impl Session {
             subscriber: subscriber.clone(),
             outgoing: outgoing.1,
             subscribe_namespace_open: subscribe_namespace_open.1,
+            fatal_errors: fatal_errors.1,
             request_id,
             pending_requests,
             mlog: mlog_shared,
@@ -966,14 +1003,32 @@ impl Session {
     /// inbound control messages, receiving and processing new inbound uni-directional QUIC streams,
     /// and receiving and processing QUIC datagrams received
     pub async fn run(self) -> Result<(), SessionError> {
+        let _lifetime = self.lifetime;
+        let lifetime_cancel = self.lifetime_cancel;
+        let fatal_transport = self.webtransport.clone();
         tokio::select! {
-            res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => res,
-            res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_open(self.session_id.clone(), self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => res,
-            res = Self::run_subscribe_namespace_accept(self.session_id.clone(), self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => res,
-            res = Self::run_streams(self.session_id.clone(), self.webtransport.clone(), self.subscriber.clone()) => res,
-            res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => res,
-            res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => res,
+            res = Self::run_recv(self.session_id.clone(), self.recver, self.publisher.clone(), self.subscriber.clone(), self.mlog.clone(), self.request_id.clone(), self.pending_requests.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_send(self.session_id.clone(), self.sender, self.outgoing, self.mlog.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_subscribe_namespace_open(self.session_id.clone(), self.webtransport.clone(), self.subscribe_namespace_open, self.mlog.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_subscribe_namespace_accept(self.session_id.clone(), self.webtransport.clone(), self.publisher.clone(), self.request_id.clone(), self.mlog.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_streams(self.session_id.clone(), self.webtransport.clone(), self.subscriber.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_datagrams(self.webtransport, self.subscriber.clone()) => { lifetime_cancel.cancel(); res },
+            res = Self::run_pending_timeouts(self.session_id, self.publisher, self.subscriber, self.pending_requests) => { lifetime_cancel.cancel(); res },
+            res = Self::run_fatal_errors(fatal_transport, self.fatal_errors) => { lifetime_cancel.cancel(); res },
+        }
+    }
+
+    async fn run_fatal_errors(
+        webtransport: web_transport::Session,
+        mut errors: Queue<SessionError>,
+    ) -> Result<(), SessionError> {
+        match errors.pop().await {
+            Some(error) => {
+                let code = u32::try_from(error.code()).unwrap_or(0x1);
+                webtransport.close(code, &error.to_string());
+                Err(error)
+            }
+            None => Ok(()),
         }
     }
 
@@ -1344,6 +1399,11 @@ impl Session {
                 .ok_or(SessionError::RoleViolation)?
                 .recv_request_error(&msg),
             None => {
+                if let Some(subscriber) = subscriber.as_mut() {
+                    if subscriber.recv_late_fetch_error(&msg)? {
+                        return Ok(());
+                    }
+                }
                 tracing::debug!(
                     target: "moq_transport::control",
                     session_id = %session_id,
@@ -1540,6 +1600,39 @@ mod tests {
         assert_eq!(Session::normalize_connection_path("").unwrap(), None);
         assert_eq!(Session::normalize_connection_path("/").unwrap(), None);
         assert_eq!(Session::normalize_connection_path("///").unwrap(), None);
+    }
+
+    #[test]
+    fn inclusive_end_converts_exclusive_location_sentinels() {
+        assert_eq!(inclusive_end(Location::new(4, 8)), Location::new(4, 7));
+        assert_eq!(
+            inclusive_end(Location::new(4, 0)),
+            Location::new(4, VarInt::MAX.into_inner())
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cancellation_wakes_multiple_and_late_waiters() {
+        let lifetime = CancellationToken::new();
+        let owner = lifetime.clone().drop_guard();
+        let first = lifetime.clone();
+        let second = lifetime.clone();
+        let first = first.cancelled();
+        let second = second.cancelled();
+        tokio::pin!(first, second);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+
+        drop(owner);
+        tokio::join!(&mut first, &mut second);
+
+        let late = lifetime.clone();
+        assert!(late.is_cancelled());
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, late.cancelled())
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

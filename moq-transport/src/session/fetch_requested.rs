@@ -10,28 +10,39 @@ use std::{
     time::Duration,
 };
 
+use futures::FutureExt;
+use tokio_util::sync::{CancellationToken, DropGuard};
+
 use crate::{
-    coding::{KeyValuePairs, Location, VarInt},
-    data::{DataStreamResetCode, FetchHeader, StreamHeaderType},
-    message::{self, Message, RequestErrorCode},
+    coding::{Encode, KeyValuePairs, Location, VarInt},
+    data::{
+        DataStreamResetCode, FetchHeader, FetchRecord, FetchRecordEncoder, StreamHeaderType,
+        MAX_FETCH_RECORD_HEADER_SIZE,
+    },
+    message::{self, GroupOrder, Message, RequestErrorCode, TrackExtensions},
     serve::ServeError,
     watch::{Queue, State},
 };
 
 use super::{
-    joining_fetch_end_location, Fetch, JoiningAssociation, JoiningSnapshot, JoiningSnapshotError,
-    SessionError, SessionId, Writer,
+    joining_fetch_end_location, Fetch, FetchRejection, FetchValidator, JoiningAssociation,
+    JoiningSnapshot, JoiningSnapshotError, SessionError, SessionId, Writer,
 };
 
 const COPY_CHUNK_SIZE: usize = 64 * 1024;
+const RESPONSE_CHUNK_SIZE: usize = 64 * 1024;
 
 struct FetchRequestedState {
     closed: Result<(), ServeError>,
+    responded: bool,
 }
 
 impl Default for FetchRequestedState {
     fn default() -> Self {
-        Self { closed: Ok(()) }
+        Self {
+            closed: Ok(()),
+            responded: false,
+        }
     }
 }
 
@@ -45,11 +56,148 @@ pub struct FetchRequested {
     state: State<FetchRequestedState>,
     id: u64,
     joining: Option<JoiningAssociation>,
+    session_lifetime: CancellationToken,
     pub request: message::Fetch,
 }
 
 pub(crate) struct FetchRequestedRecv {
     state: State<FetchRequestedState>,
+}
+
+/// FETCH_OK fields supplied by an application. The request ID is owned by the
+/// transport and cannot be overridden.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchOkInfo {
+    /// Whether the response reaches the final Object in the Track.
+    pub end_of_track: bool,
+    /// Exclusive/sentinel end Location encoded in FETCH_OK.
+    pub end_location: Location,
+    /// FETCH_OK parameters.
+    pub params: KeyValuePairs,
+    /// Track extensions accompanying FETCH_OK.
+    pub track_extensions: TrackExtensions,
+}
+
+enum FetchWriteCommand {
+    Open(tokio::sync::oneshot::Sender<Result<(), SessionError>>),
+    Record(
+        FetchRecord,
+        tokio::sync::oneshot::Sender<Result<(), SessionError>>,
+    ),
+    Payload(
+        bytes::Bytes,
+        tokio::sync::oneshot::Sender<Result<(), SessionError>>,
+    ),
+    Respond(
+        FetchOkInfo,
+        tokio::sync::oneshot::Sender<Result<(), SessionError>>,
+    ),
+    Reject(
+        FetchRejection,
+        tokio::sync::oneshot::Sender<Result<(), SessionError>>,
+    ),
+    Finish(tokio::sync::oneshot::Sender<Result<(), SessionError>>),
+}
+
+#[derive(Debug)]
+struct FetchWriterState {
+    closed: Result<(), ServeError>,
+}
+
+impl Default for FetchWriterState {
+    fn default() -> Self {
+        Self { closed: Ok(()) }
+    }
+}
+
+/// Typed, backpressured writer for one successful FETCH response.
+#[must_use = "finish the FETCH response stream"]
+pub struct FetchWriter {
+    _lifetime: DropGuard,
+    commands: tokio::sync::mpsc::Sender<FetchWriteCommand>,
+    state: State<FetchWriterState>,
+    request_state: State<FetchRequestedState>,
+    session_lifetime: CancellationToken,
+}
+
+impl FetchWriter {
+    async fn send(
+        &self,
+        make: impl FnOnce(tokio::sync::oneshot::Sender<Result<(), SessionError>>) -> FetchWriteCommand,
+    ) -> Result<(), SessionError> {
+        let (result, recv) = tokio::sync::oneshot::channel();
+        if self.commands.send(make(result)).await.is_err() {
+            return Err(self.terminal_error().into());
+        }
+        match recv.await {
+            Ok(result) => result,
+            Err(_) => Err(self.terminal_error().into()),
+        }
+    }
+
+    fn terminal_error(&self) -> ServeError {
+        if let Err(error) = self.request_state.lock().closed.clone() {
+            return error;
+        }
+        if let Err(error) = self.state.lock().closed.clone() {
+            return error;
+        }
+        if self.session_lifetime.is_cancelled() {
+            return ServeError::Cancel;
+        }
+        ServeError::Done
+    }
+
+    async fn open(&self) -> Result<(), SessionError> {
+        self.send(FetchWriteCommand::Open).await
+    }
+
+    /// Write one typed FETCH record. Object payload bytes follow separately.
+    pub async fn write_record(&mut self, record: &FetchRecord) -> Result<(), SessionError> {
+        self.send(|result| FetchWriteCommand::Record(record.clone(), result))
+            .await
+    }
+
+    /// Write payload bytes for the current Object with QUIC backpressure.
+    pub async fn write_payload(&mut self, mut payload: bytes::Bytes) -> Result<(), SessionError> {
+        while !payload.is_empty() {
+            let chunk = payload.split_to(payload.len().min(RESPONSE_CHUNK_SIZE));
+            self.send(|result| FetchWriteCommand::Payload(chunk, result))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Send FETCH_OK after opening the stream in a stream-first response.
+    pub async fn respond(&mut self, info: FetchOkInfo) -> Result<(), SessionError> {
+        self.send(|result| FetchWriteCommand::Respond(info, result))
+            .await
+    }
+
+    /// Reset a partial stream and send REQUEST_ERROR if FETCH_OK was not sent.
+    pub async fn reject_with(self, rejection: FetchRejection) -> Result<(), SessionError> {
+        self.send(|result| FetchWriteCommand::Reject(rejection, result))
+            .await
+    }
+
+    /// Finish the FETCH stream after FETCH_OK and all payload bytes.
+    pub async fn finish(self) -> Result<(), SessionError> {
+        self.send(FetchWriteCommand::Finish).await
+    }
+
+    pub async fn closed(&self) -> Result<(), ServeError> {
+        loop {
+            let notify = {
+                let state = self.state.lock();
+                state.closed.clone()?;
+                state.modified()
+            };
+            match notify {
+                Some(notify) => notify.await,
+                None => return Ok(()),
+            }
+        }
+    }
 }
 
 impl FetchRequested {
@@ -60,6 +208,7 @@ impl FetchRequested {
         active: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
         request: message::Fetch,
         joining: Option<JoiningAssociation>,
+        session_lifetime: CancellationToken,
     ) -> (Self, FetchRequestedRecv) {
         let id = request.id;
         let (send, recv) = State::default().split();
@@ -72,6 +221,7 @@ impl FetchRequested {
                 state: send,
                 id,
                 joining,
+                session_lifetime,
                 request,
             },
             FetchRequestedRecv { state: recv },
@@ -86,7 +236,12 @@ impl FetchRequested {
                 state.modified()
             };
             match notify {
-                Some(notify) => notify.await,
+                Some(notify) => {
+                    tokio::select! {
+                        _ = self.session_lifetime.cancelled() => return Err(ServeError::Cancel),
+                        _ = notify => {},
+                    }
+                }
                 None => return Ok(()),
             }
         }
@@ -153,13 +308,64 @@ impl FetchRequested {
         }
     }
 
+    /// Prepare an OK-first response.
+    ///
+    /// FETCH_OK is committed atomically before the first successful
+    /// [`FetchWriter::write_record`] or an empty [`FetchWriter::finish`].
+    /// Dropping the writer before either operation sends one REQUEST_ERROR.
+    pub async fn prepare_response(self, info: FetchOkInfo) -> Result<FetchWriter, SessionError> {
+        let mut writer = self.start_writer().await?;
+        writer.respond(info).await?;
+        Ok(writer)
+    }
+
+    /// Open the FETCH stream before claiming FETCH_OK.
+    pub async fn stream(self) -> Result<FetchWriter, SessionError> {
+        let writer = self.start_writer().await?;
+        writer.open().await?;
+        Ok(writer)
+    }
+
+    async fn start_writer(self) -> Result<FetchWriter, SessionError> {
+        let range = self.resolve().await?.ok_or(ServeError::Done)?;
+        let order = self.request.params.group_order()?;
+        let (commands, recv) = tokio::sync::mpsc::channel(1);
+        let (writer_state, driver_state) = State::<FetchWriterState>::default().split();
+        let request_state = self.state.clone();
+        let session_lifetime = self.session_lifetime.clone();
+        let driver_lifetime = CancellationToken::new();
+        let writer_lifetime = driver_lifetime.clone().drop_guard();
+        tokio::spawn(run_fetch_writer(
+            self,
+            range,
+            order,
+            recv,
+            driver_state,
+            driver_lifetime,
+        ));
+        Ok(FetchWriter {
+            _lifetime: writer_lifetime,
+            commands,
+            state: writer_state,
+            request_state,
+            session_lifetime,
+        })
+    }
+
     pub fn reject(
         self,
         code: RequestErrorCode,
         reason: impl Into<String>,
     ) -> Result<(), ServeError> {
+        self.reject_with(FetchRejection::new(code, 0, reason)?)
+    }
+
+    pub fn reject_with(self, rejection: FetchRejection) -> Result<(), ServeError> {
         self.claim_response()?;
-        self.send_error(code, reason);
+        self.outgoing
+            .clone()
+            .push(rejection.into_message(self.id).into())
+            .map_err(|_| ServeError::Cancel)?;
         Ok(())
     }
 
@@ -184,7 +390,7 @@ impl FetchRequested {
         };
 
         match result {
-            Some(Ok(response)) => self.respond(response),
+            Some(Ok(response)) => self.respond_message(response),
             None => {
                 self.reject(RequestErrorCode::Timeout, "fetch proxy timed out")?;
                 Err(ServeError::Cancel.into())
@@ -192,7 +398,7 @@ impl FetchRequested {
             Some(Err(err)) => {
                 if let Some(error) = self.wait_for_request_error(&upstream, deadline).await? {
                     let request_id = self.id;
-                    self.respond(proxied_error(error, request_id))?;
+                    self.respond_message(proxied_error(error, request_id))?;
                     return Err(err);
                 }
                 self.reject(RequestErrorCode::InternalError, "fetch proxy failed")?;
@@ -206,18 +412,7 @@ impl FetchRequested {
         upstream: &mut Fetch,
         reset: FetchReset,
     ) -> Result<message::FetchOk, SessionError> {
-        let webtransport = self.webtransport.as_ref().ok_or(SessionError::Internal)?;
-        let mut stream = FetchStream::new(
-            Writer::new(self.session_id.clone(), webtransport.open_uni().await?),
-            reset.clone(),
-        );
-        stream
-            .writer
-            .encode(&FetchHeader {
-                header_type: StreamHeaderType::Fetch,
-                request_id: self.id,
-            })
-            .await?;
+        let mut stream = self.open_stream(reset.clone()).await?;
 
         loop {
             match upstream.read_stream_chunk(COPY_CHUNK_SIZE).await {
@@ -235,6 +430,20 @@ impl FetchRequested {
         let response = upstream.ok().await?;
         stream.finish()?;
         Ok(proxied_response(response, self.id))
+    }
+
+    async fn open_stream(&self, reset: FetchReset) -> Result<FetchStream, SessionError> {
+        let mut stream = self.reserve_stream(reset).await?;
+        stream.write_header(self.id).await?;
+        Ok(stream)
+    }
+
+    async fn reserve_stream(&self, reset: FetchReset) -> Result<FetchStream, SessionError> {
+        let webtransport = self.webtransport.as_ref().ok_or(SessionError::Internal)?;
+        Ok(FetchStream::new(
+            Writer::new(self.session_id.clone(), webtransport.open_uni().await?),
+            reset,
+        ))
     }
 
     async fn wait_for_request_error(
@@ -255,7 +464,7 @@ impl FetchRequested {
         }
     }
 
-    fn respond(self, response: impl Into<Message>) -> Result<(), SessionError> {
+    fn respond_message(self, response: impl Into<Message>) -> Result<(), SessionError> {
         self.claim_response()?;
         let _ = self.outgoing.clone().push(response.into());
         Ok(())
@@ -264,8 +473,11 @@ impl FetchRequested {
     fn claim_response(&self) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;
+        if state.responded {
+            return Err(ServeError::Done);
+        }
         let mut state = state.into_mut().ok_or(ServeError::Done)?;
-        state.closed = Err(ServeError::Done);
+        state.responded = true;
         Ok(())
     }
 
@@ -323,6 +535,254 @@ fn resolve_joining_range(
     })
 }
 
+async fn run_fetch_writer(
+    request: FetchRequested,
+    range: message::StandaloneFetch,
+    order: Option<GroupOrder>,
+    mut commands: tokio::sync::mpsc::Receiver<FetchWriteCommand>,
+    state: State<FetchWriterState>,
+    lifetime: CancellationToken,
+) {
+    let reset = FetchReset::default();
+    let mut stream: Option<FetchStream> = None;
+    let mut encoder = FetchRecordEncoder::default();
+    let mut validator =
+        FetchValidator::new(Some((range.start_location, range.end_location)), order);
+    let mut payload_remaining = 0_u64;
+    let mut responded = false;
+    let mut pending_response: Option<message::FetchOk> = None;
+    let mut finished = false;
+    let mut terminal = ServeError::Done;
+
+    loop {
+        let command = tokio::select! {
+            biased;
+            closed = request.closed() => {
+                reset.set(DataStreamResetCode::Cancelled);
+                terminal = closed.err().unwrap_or(ServeError::Done);
+                break;
+            }
+            _ = lifetime.cancelled() => {
+                terminal = ServeError::Cancel;
+                break;
+            }
+            _ = request.session_lifetime.cancelled() => {
+                terminal = ServeError::Cancel;
+                break;
+            }
+            command = commands.recv() => match command {
+                Some(command) => command,
+                None => break,
+            },
+        };
+        let (result, done) = match command {
+            FetchWriteCommand::Open(result) => {
+                let operation = async {
+                    ensure_response_stream(&request, &mut stream, reset.clone()).await?;
+                    Ok(())
+                };
+                let outcome = response_operation(&request, &lifetime, operation).await;
+                (send_write_result(result, outcome), false)
+            }
+            FetchWriteCommand::Record(record, result) => {
+                let operation = async {
+                    if payload_remaining != 0 {
+                        return Err(ServeError::Size.into());
+                    }
+                    validator.validate_record(&record)?;
+                    let mut encoded = bytes::BytesMut::new();
+                    encoder.encode(&record, &mut encoded)?;
+                    if encoded.len() > MAX_FETCH_RECORD_HEADER_SIZE {
+                        return Err(SessionError::WrongSize);
+                    }
+                    let stream =
+                        ensure_response_stream(&request, &mut stream, reset.clone()).await?;
+                    if let Some(response) = pending_response.take() {
+                        commit_fetch_ok(&request, &mut responded, response)?;
+                    }
+                    stream.writer.write(&encoded).await?;
+                    if let FetchRecord::Object(object) = record {
+                        payload_remaining = object.payload_length;
+                    }
+                    Ok(())
+                };
+                let outcome = response_operation(&request, &lifetime, operation).await;
+                (send_write_result(result, outcome), false)
+            }
+            FetchWriteCommand::Payload(payload, result) => {
+                let operation = async {
+                    if payload.is_empty() || payload.len() as u64 > payload_remaining {
+                        return Err(ServeError::Size.into());
+                    }
+                    let stream =
+                        ensure_response_stream(&request, &mut stream, reset.clone()).await?;
+                    stream.writer.write(&payload).await?;
+                    payload_remaining -= payload.len() as u64;
+                    Ok(())
+                };
+                let outcome = response_operation(&request, &lifetime, operation).await;
+                (send_write_result(result, outcome), false)
+            }
+            FetchWriteCommand::Respond(info, result) => {
+                let operation = async {
+                    if responded || pending_response.is_some() {
+                        return Err(ServeError::Duplicate.into());
+                    }
+                    validator.validate_ok(info.end_location, &info.track_extensions)?;
+                    let response = message::FetchOk {
+                        id: request.id,
+                        end_of_track: info.end_of_track,
+                        end_location: info.end_location,
+                        params: info.params,
+                        track_extensions: info.track_extensions,
+                    };
+                    let mut encoded = bytes::BytesMut::new();
+                    response.encode(&mut encoded)?;
+                    if stream.as_ref().is_some_and(|stream| stream.header_written) {
+                        commit_fetch_ok(&request, &mut responded, response)?;
+                    } else {
+                        pending_response = Some(response);
+                    }
+                    Ok(())
+                };
+                let outcome = response_operation(&request, &lifetime, operation).await;
+                (send_write_result(result, outcome), false)
+            }
+            FetchWriteCommand::Reject(rejection, result) => {
+                let outcome = if responded || pending_response.is_some() {
+                    Err(ServeError::Duplicate.into())
+                } else {
+                    request
+                        .claim_response()
+                        .map_err(SessionError::from)
+                        .and_then(|_| {
+                            request
+                                .outgoing
+                                .clone()
+                                .push(rejection.into_message(request.id).into())
+                                .map_err(|_| SessionError::Internal)
+                        })
+                };
+                (send_write_result(result, outcome), true)
+            }
+            FetchWriteCommand::Finish(result) => {
+                let operation = async {
+                    if payload_remaining != 0 {
+                        return Err(ServeError::Size.into());
+                    }
+                    if let Some(response) = pending_response.take() {
+                        ensure_response_stream(&request, &mut stream, reset.clone()).await?;
+                        commit_fetch_ok(&request, &mut responded, response)?;
+                    }
+                    if !responded {
+                        return Err(ServeError::Size.into());
+                    }
+                    let stream =
+                        ensure_response_stream(&request, &mut stream, reset.clone()).await?;
+                    stream.finish()?;
+                    Ok(())
+                };
+                let outcome = response_operation(&request, &lifetime, operation).await;
+                let success = outcome.is_ok();
+                (send_write_result(result, outcome), success)
+            }
+        };
+
+        if result.is_err() {
+            terminal = result.err().unwrap_or(ServeError::Done);
+            if matches!(terminal, ServeError::Cancel) {
+                reset.set(DataStreamResetCode::Cancelled);
+            } else if matches!(terminal, ServeError::Size | ServeError::Mode) {
+                reset.set(DataStreamResetCode::MalformedTrack);
+            }
+            break;
+        }
+        if done {
+            finished = true;
+            break;
+        }
+    }
+
+    if !finished && request.closed().now_or_never().is_some() {
+        reset.set(DataStreamResetCode::Cancelled);
+        terminal = ServeError::Cancel;
+    }
+    if !finished && responded && stream.as_ref().is_none_or(|stream| !stream.header_written) {
+        let settle = ensure_response_stream(&request, &mut stream, reset.clone());
+        tokio::pin!(settle);
+        tokio::select! {
+            biased;
+            _ = request.closed() => reset.set(DataStreamResetCode::Cancelled),
+            _ = request.session_lifetime.cancelled() => {},
+            _ = &mut settle => {},
+        }
+    }
+    if let Some(mut writer_state) = state.lock_mut() {
+        writer_state.closed = Err(terminal);
+    }
+}
+
+fn send_write_result(
+    sender: tokio::sync::oneshot::Sender<Result<(), SessionError>>,
+    result: Result<(), SessionError>,
+) -> Result<(), ServeError> {
+    let terminal = result.as_ref().err().map(session_to_serve_error);
+    let _ = sender.send(result);
+    terminal.map_or(Ok(()), Err)
+}
+
+fn commit_fetch_ok(
+    request: &FetchRequested,
+    responded: &mut bool,
+    response: message::FetchOk,
+) -> Result<(), SessionError> {
+    request.claim_response()?;
+    request
+        .outgoing
+        .clone()
+        .push(response.into())
+        .map_err(|_| SessionError::Internal)?;
+    *responded = true;
+    Ok(())
+}
+
+fn session_to_serve_error(error: &SessionError) -> ServeError {
+    match error {
+        SessionError::Serve(error) => error.clone(),
+        SessionError::Decode(_) | SessionError::ProtocolViolation(_) | SessionError::WrongSize => {
+            ServeError::Size
+        }
+        _ => ServeError::Internal(error.to_string()),
+    }
+}
+
+async fn response_operation<T>(
+    request: &FetchRequested,
+    lifetime: &CancellationToken,
+    operation: impl std::future::Future<Output = Result<T, SessionError>>,
+) -> Result<T, SessionError> {
+    tokio::select! {
+        biased;
+        closed = request.closed() => Err(closed.err().unwrap_or(ServeError::Done).into()),
+        _ = lifetime.cancelled() => Err(ServeError::Cancel.into()),
+        _ = request.session_lifetime.cancelled() => Err(ServeError::Cancel.into()),
+        result = operation => result,
+    }
+}
+
+async fn ensure_response_stream<'a>(
+    request: &FetchRequested,
+    stream: &'a mut Option<FetchStream>,
+    reset: FetchReset,
+) -> Result<&'a mut FetchStream, SessionError> {
+    if stream.is_none() {
+        *stream = Some(request.reserve_stream(reset).await?);
+    }
+    let stream = stream.as_mut().ok_or(SessionError::Internal)?;
+    stream.write_header(request.id).await?;
+    Ok(stream)
+}
+
 impl Drop for FetchRequested {
     fn drop(&mut self) {
         if self.claim_response().is_ok() {
@@ -343,14 +803,6 @@ impl FetchRequestedRecv {
         };
         state.closed = Err(ServeError::Cancel);
         Ok(())
-    }
-}
-
-pub(super) fn inclusive_end(end: Location) -> Location {
-    if end.object_id == 0 {
-        Location::new(end.group_id, VarInt::MAX.into_inner())
-    } else {
-        Location::new(end.group_id, end.object_id - 1)
     }
 }
 
@@ -383,6 +835,7 @@ fn upstream_reset_code(_err: &SessionError) -> Option<u32> {
 struct FetchStream {
     writer: Writer,
     reset: FetchReset,
+    header_written: bool,
     finished: bool,
 }
 
@@ -391,8 +844,23 @@ impl FetchStream {
         Self {
             writer,
             reset,
+            header_written: false,
             finished: false,
         }
+    }
+
+    async fn write_header(&mut self, request_id: u64) -> Result<(), SessionError> {
+        if self.header_written {
+            return Ok(());
+        }
+        self.writer
+            .encode(&FetchHeader {
+                header_type: StreamHeaderType::Fetch,
+                request_id,
+            })
+            .await?;
+        self.header_written = true;
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<(), SessionError> {
@@ -565,6 +1033,7 @@ mod tests {
             active.clone(),
             joining_request(7, FetchType::RelativeJoining, 1),
             Some(association.association()),
+            CancellationToken::new(),
         );
         active.lock().unwrap().insert(
             7,
@@ -609,6 +1078,7 @@ mod tests {
             active.clone(),
             joining_request(13, FetchType::AbsoluteJoining, 0),
             Some(association.association()),
+            CancellationToken::new(),
         );
         active.lock().unwrap().insert(13, recv);
 
@@ -622,6 +1092,206 @@ mod tests {
         assert!(receiver.close().is_empty());
         assert!(active.lock().unwrap().is_empty());
         drop(keepalive);
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_wakes_response_writer() {
+        let (outgoing, _receiver) = Queue::default().split();
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        let lifetime = CancellationToken::new();
+        let owner = lifetime.clone().drop_guard();
+        let (request, recv) = FetchRequested::new(
+            None,
+            SessionId::generate(),
+            outgoing,
+            active.clone(),
+            request(17),
+            None,
+            lifetime,
+        );
+        active.lock().unwrap().insert(17, recv);
+        drop(owner);
+
+        let result = request.stream().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn response_operation_prefers_request_cancel_over_ready_response() {
+        let Handles {
+            request,
+            mut recv,
+            _keepalive,
+            outgoing: _,
+            active: _,
+        } = handles(19);
+        let lifetime = CancellationToken::new();
+        let operation_ran = std::cell::Cell::new(false);
+        recv.cancel().unwrap();
+
+        let result = response_operation(&request, &lifetime, async {
+            operation_ran.set(true);
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+        assert!(!operation_ran.get());
+    }
+
+    #[tokio::test]
+    async fn response_operation_prefers_writer_drop_over_ready_response() {
+        let Handles {
+            request,
+            recv: _recv,
+            _keepalive,
+            outgoing: _,
+            active: _,
+        } = handles(21);
+        let lifetime = CancellationToken::new();
+        let writer_lifetime = lifetime.clone().drop_guard();
+        let operation_ran = std::cell::Cell::new(false);
+        drop(writer_lifetime);
+
+        let result = response_operation(&request, &lifetime, async {
+            operation_ran.set(true);
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+        assert!(!operation_ran.get());
+    }
+
+    #[tokio::test]
+    async fn response_operation_prefers_session_shutdown_over_ready_response() {
+        let Handles {
+            mut request,
+            recv: _recv,
+            _keepalive,
+            outgoing: _,
+            active: _,
+        } = handles(23);
+        let session_lifetime = CancellationToken::new();
+        let session = session_lifetime.clone().drop_guard();
+        request.session_lifetime = session_lifetime;
+        let lifetime = CancellationToken::new();
+        let operation_ran = std::cell::Cell::new(false);
+        drop(session);
+
+        let result = response_operation(&request, &lifetime, async {
+            operation_ran.set(true);
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+        assert!(!operation_ran.get());
+    }
+
+    #[tokio::test]
+    async fn actual_writer_drop_cancels_before_command_channel_closure() {
+        let Handles {
+            request,
+            recv: _recv,
+            _keepalive,
+            outgoing: _,
+            active: _,
+        } = handles(25);
+        let writer = request.start_writer().await.unwrap();
+        let state = writer.state.clone();
+
+        drop(writer);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let notify = {
+                    let state = state.lock();
+                    if let Err(error) = state.closed.clone() {
+                        break error;
+                    }
+                    state.modified().expect("writer driver disappeared")
+                };
+                notify.await;
+            }
+        })
+        .await
+        .expect("writer drop did not stop its driver");
+        assert!(matches!(terminal, ServeError::Cancel));
+    }
+
+    fn queued_command_writer(
+        session_lifetime: CancellationToken,
+    ) -> (
+        FetchWriter,
+        tokio::sync::mpsc::Receiver<FetchWriteCommand>,
+        FetchRequestedRecv,
+        State<FetchWriterState>,
+    ) {
+        let (commands, recv) = tokio::sync::mpsc::channel(1);
+        let (writer_state, driver_state) = State::<FetchWriterState>::default().split();
+        let (request_state, request_recv) = State::<FetchRequestedState>::default().split();
+        let writer_lifetime = CancellationToken::new();
+        (
+            FetchWriter {
+                _lifetime: writer_lifetime.clone().drop_guard(),
+                commands,
+                state: writer_state,
+                request_state,
+                session_lifetime,
+            },
+            recv,
+            FetchRequestedRecv {
+                state: request_recv,
+            },
+            driver_state,
+        )
+    }
+
+    #[tokio::test]
+    async fn queued_command_ack_drop_reports_request_cancellation() {
+        let (writer, mut commands, mut request, _driver_state) =
+            queued_command_writer(CancellationToken::new());
+        let send = writer.open();
+        tokio::pin!(send);
+        assert!(futures::poll!(&mut send).is_pending());
+        let command = commands.recv().await.unwrap();
+
+        request.cancel().unwrap();
+        drop(command);
+
+        assert!(matches!(
+            send.await,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_command_ack_drop_reports_session_cancellation() {
+        let session_lifetime = CancellationToken::new();
+        let (writer, mut commands, _request, _driver_state) =
+            queued_command_writer(session_lifetime.clone());
+        let send = writer.open();
+        tokio::pin!(send);
+        assert!(futures::poll!(&mut send).is_pending());
+        let command = commands.recv().await.unwrap();
+
+        session_lifetime.cancel();
+        drop(command);
+
+        assert!(matches!(
+            send.await,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
     }
 
     struct Handles {
@@ -643,6 +1313,7 @@ mod tests {
             active.clone(),
             request(id),
             None,
+            CancellationToken::new(),
         );
         Handles {
             request,
@@ -779,7 +1450,8 @@ mod tests {
             super::super::PendingRequests::default(),
             super::super::SessionId::generate(),
         );
-        let (upstream, mut upstream_recv) = super::super::Fetch::new(subscriber, request(64));
+        let (upstream, mut upstream_recv) =
+            super::super::Fetch::new(subscriber, request(64), None, CancellationToken::new());
         let Handles {
             request,
             recv: _recv,

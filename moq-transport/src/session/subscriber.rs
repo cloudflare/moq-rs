@@ -10,6 +10,7 @@ use std::{
 };
 
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     coding::{Decode, KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix},
@@ -22,7 +23,7 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    fetch_requested::inclusive_end, Fetch, FetchRecv, OpenSubscribeNamespace, PendingRequest,
+    inclusive_end, validate_fetch_params, Fetch, FetchRecv, OpenSubscribeNamespace, PendingRequest,
     PendingRequests, PendingResponse, PublishReceived, PublishReceivedRecv, PublishedNamespace,
     PublishedNamespaceRecv, Reader, RequestId, RequestIdAllocation, Session, SessionConfig,
     SessionError, SessionId, Subscribe, SubscribeNamespace, SubscribeRecv,
@@ -99,6 +100,11 @@ pub struct Subscriber {
 
     /// Correlation id of the owning session, tagged onto this subscriber's log records.
     session_id: SessionId,
+
+    /// Fatal data-plane errors discovered by lazy application readers.
+    fatal_errors: Queue<SessionError>,
+
+    session_lifetime: CancellationToken,
 }
 
 /// RAII guard that rolls back a SUBSCRIBE_NAMESPACE prefix reservation on failure.
@@ -229,6 +235,7 @@ impl SubscriberNameRegistry {
 }
 
 impl Subscriber {
+    #[cfg(test)]
     pub(super) fn new(
         outgoing: Queue<Message>,
         subscribe_namespace_open: Queue<OpenSubscribeNamespace>,
@@ -236,6 +243,29 @@ impl Subscriber {
         request_id: RequestId,
         pending_requests: PendingRequests,
         session_id: SessionId,
+    ) -> Self {
+        Self::new_with_fatal(
+            outgoing,
+            subscribe_namespace_open,
+            mlog,
+            request_id,
+            pending_requests,
+            session_id,
+            Queue::default(),
+            CancellationToken::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_fatal(
+        outgoing: Queue<Message>,
+        subscribe_namespace_open: Queue<OpenSubscribeNamespace>,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        request_id: RequestId,
+        pending_requests: PendingRequests,
+        session_id: SessionId,
+        fatal_errors: Queue<SessionError>,
+        session_lifetime: CancellationToken,
     ) -> Self {
         Self {
             published_namespaces: Default::default(),
@@ -255,7 +285,13 @@ impl Subscriber {
             pending_requests,
             mlog,
             session_id,
+            fatal_errors,
+            session_lifetime,
         }
+    }
+
+    pub(super) fn report_fatal(&self, error: SessionError) {
+        let _ = self.fatal_errors.clone().push(error);
     }
 
     /// Correlation id of the session this subscriber belongs to.
@@ -565,6 +601,17 @@ impl Subscriber {
         &mut self,
         track: serve::TrackWriter,
     ) -> Result<Subscribe, ServeError> {
+        self.subscribe_open_with_params(track, KeyValuePairs::default())
+            .await
+    }
+
+    /// Subscribe to a track with explicit message parameters and wait until the
+    /// publisher acknowledges it.
+    pub async fn subscribe_open_with_params(
+        &mut self,
+        track: serve::TrackWriter,
+        params: KeyValuePairs,
+    ) -> Result<Subscribe, ServeError> {
         let request_id = self
             .get_next_request_id()
             .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {}", e)))?;
@@ -600,7 +647,19 @@ impl Subscriber {
             )));
         }
 
-        let (mut send, recv) = Subscribe::new(self.clone(), request_id, track);
+        let (mut send, recv) =
+            match Subscribe::new_with_params(self.clone(), request_id, track, params) {
+                Ok(handles) => handles,
+                Err(err) => {
+                    let _ = self.pending_requests.remove(request_id);
+                    if let Ok(mut names) = self.subscriber_names.lock() {
+                        names.remove_by_request_id(request_id);
+                    }
+                    return Err(ServeError::internal_ctx(format!(
+                        "invalid SUBSCRIBE parameters: {err}"
+                    )));
+                }
+            };
         match self.subscribes.lock() {
             Ok(mut subscribes) => {
                 subscribes.insert(request_id, recv);
@@ -628,17 +687,59 @@ impl Subscriber {
         {
             return Err(ServeError::Size);
         }
-        let id = self.get_next_request_id().map_err(ServeError::from)?;
-        self.pending_requests
-            .insert(id, PendingRequest::Fetch)
-            .map_err(ServeError::from)?;
         let request = message::Fetch {
-            id,
+            id: 0,
             fetch_type: message::FetchType::Standalone,
             standalone_fetch: Some(standalone),
             joining_fetch: None,
             params,
         };
+        let range = request
+            .standalone_fetch
+            .as_ref()
+            .map(|fetch| (fetch.start_location, fetch.end_location));
+        self.fetch_request(request, range)
+    }
+
+    pub(super) fn fetch_joining_id(
+        &mut self,
+        joining_request_id: u64,
+        start: super::JoiningStart,
+        range: (crate::coding::Location, crate::coding::Location),
+        params: KeyValuePairs,
+    ) -> Result<Fetch, ServeError> {
+        let (fetch_type, joining_start) = match start {
+            super::JoiningStart::Relative(start) => (message::FetchType::RelativeJoining, start),
+            super::JoiningStart::Absolute(start) => (message::FetchType::AbsoluteJoining, start),
+        };
+        crate::coding::VarInt::try_from(joining_request_id).map_err(|_| ServeError::Size)?;
+        crate::coding::VarInt::try_from(joining_start).map_err(|_| ServeError::Size)?;
+        self.fetch_request(
+            message::Fetch {
+                id: 0,
+                fetch_type,
+                standalone_fetch: None,
+                joining_fetch: Some(message::JoiningFetch {
+                    joining_request_id,
+                    joining_start,
+                }),
+                params,
+            },
+            Some(range),
+        )
+    }
+
+    fn fetch_request(
+        &mut self,
+        mut request: message::Fetch,
+        range: Option<(crate::coding::Location, crate::coding::Location)>,
+    ) -> Result<Fetch, ServeError> {
+        validate_fetch_params(&request.params).map_err(|_| ServeError::Size)?;
+        let id = self.get_next_request_id().map_err(ServeError::from)?;
+        self.pending_requests
+            .insert(id, PendingRequest::Fetch)
+            .map_err(ServeError::from)?;
+        request.id = id;
         let mut fetches = match self.fetches.lock() {
             Ok(fetches) => fetches,
             Err(_) => {
@@ -646,7 +747,12 @@ impl Subscriber {
                 return Err(SessionError::Internal.into());
             }
         };
-        let (fetch, recv) = Fetch::new(self.clone(), request.clone());
+        let (fetch, recv) = Fetch::new(
+            self.clone(),
+            request.clone(),
+            range,
+            self.session_lifetime.clone(),
+        );
         fetches.insert(id, recv);
         drop(fetches);
         self.send_message(request);
@@ -693,19 +799,6 @@ impl Subscriber {
 
     fn recv_fetch_ok(&mut self, msg: &message::FetchOk) -> Result<(), SessionError> {
         message::validate_message_parameter_types(&msg.params)?;
-        if self
-            .fetches
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .get(&msg.id)
-            .is_some_and(|fetch| {
-                msg.end_location != fetch.start && inclusive_end(msg.end_location) < fetch.start
-            })
-        {
-            return Err(SessionError::ProtocolViolation(
-                "FETCH_OK end location precedes the requested start".to_string(),
-            ));
-        }
         let request = self
             .pending_requests
             .complete(msg.id, PendingResponse::FetchOk)?;
@@ -810,7 +903,8 @@ impl Subscriber {
             self.track_alias_notify.notify_waiters();
 
             // Notify the subscribe of the successful subscription.
-            subscribe.ok(msg.track_alias)?;
+            let largest_location = msg.params.largest_object()?;
+            subscribe.ok(msg.track_alias, largest_location)?;
         }
 
         Ok(())
@@ -1065,15 +1159,12 @@ impl Subscriber {
         &mut self,
         msg: &message::RequestError,
     ) -> Result<(), SessionError> {
-        let fetch = self
-            .fetches
-            .lock()
-            .map_err(|_| SessionError::Internal)?
-            .remove(&msg.id);
-        if let Some(mut fetch) = fetch {
+        let mut fetches = self.fetches.lock().map_err(|_| SessionError::Internal)?;
+        if let Some(fetch) = fetches.get_mut(&msg.id) {
             fetch.recv_error(msg)?;
             return Ok(());
         }
+        drop(fetches);
 
         // Route to a matching SUBSCRIBE if present.
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
@@ -1117,6 +1208,18 @@ impl Subscriber {
             "received REQUEST_ERROR"
         );
         Ok(())
+    }
+
+    pub(super) fn recv_late_fetch_error(
+        &mut self,
+        msg: &message::RequestError,
+    ) -> Result<bool, SessionError> {
+        let mut fetches = self.fetches.lock().map_err(|_| SessionError::Internal)?;
+        let Some(fetch) = fetches.get_mut(&msg.id) else {
+            return Ok(false);
+        };
+        fetch.recv_error(msg)?;
+        Ok(true)
     }
 
     pub(super) fn recv_request_timeout(
@@ -1738,6 +1841,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parameterized_subscribe_can_issue_both_joining_fetch_types() {
+        let mut subscriber = subscriber();
+        let mut observer = subscriber.clone();
+        let mut outgoing = subscriber.outgoing.clone();
+        let (writer, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "video").produce();
+        let mut subscribe_params = KeyValuePairs::default();
+        subscribe_params
+            .set_subscription_filter(&message::SubscriptionFilter::largest_object())
+            .unwrap();
+
+        let subscribe = subscriber.subscribe_open_with_params(writer, subscribe_params.clone());
+        futures::pin_mut!(subscribe);
+        assert!(matches!(futures::poll!(&mut subscribe), Poll::Pending));
+        let Message::Subscribe(request) = outgoing.pop().await.unwrap() else {
+            panic!("expected SUBSCRIBE");
+        };
+        assert_eq!(request.params, subscribe_params);
+        let mut ok_params = KeyValuePairs::default();
+        ok_params
+            .set_largest_object(crate::coding::Location::new(7, 11))
+            .unwrap();
+        observer
+            .recv_subscribe_ok(&message::SubscribeOk {
+                id: request.id,
+                track_alias: 10,
+                params: ok_params,
+                track_extensions: Default::default(),
+            })
+            .unwrap();
+        let subscribe = match futures::poll!(&mut subscribe) {
+            Poll::Ready(Ok(subscribe)) => subscribe,
+            Poll::Ready(Err(err)) => panic!("SUBSCRIBE failed: {err}"),
+            Poll::Pending => panic!("SUBSCRIBE remained pending"),
+        };
+
+        let mut fetch_params = KeyValuePairs::default();
+        fetch_params.set_subscriber_priority(7);
+        let relative = subscribe
+            .fetch_joining(
+                super::super::JoiningStart::Relative(2),
+                fetch_params.clone(),
+            )
+            .unwrap();
+        let absolute = subscribe
+            .fetch_joining(
+                super::super::JoiningStart::Absolute(3),
+                fetch_params.clone(),
+            )
+            .unwrap();
+
+        let Message::Fetch(relative_request) = outgoing.pop().await.unwrap() else {
+            panic!("expected Relative Joining FETCH");
+        };
+        assert_eq!(
+            relative_request.fetch_type,
+            message::FetchType::RelativeJoining
+        );
+        assert_eq!(
+            relative_request.joining_fetch,
+            Some(message::JoiningFetch {
+                joining_request_id: request.id,
+                joining_start: 2,
+            })
+        );
+        assert_eq!(relative_request.params, fetch_params);
+        assert_eq!(relative_request.id, relative.request.id);
+
+        let Message::Fetch(absolute_request) = outgoing.pop().await.unwrap() else {
+            panic!("expected Absolute Joining FETCH");
+        };
+        assert_eq!(
+            absolute_request.fetch_type,
+            message::FetchType::AbsoluteJoining
+        );
+        assert_eq!(
+            absolute_request.joining_fetch,
+            Some(message::JoiningFetch {
+                joining_request_id: request.id,
+                joining_start: 3,
+            })
+        );
+        assert_eq!(absolute_request.params, fetch_params);
+        assert_eq!(absolute_request.id, absolute.request.id);
+        assert_ne!(relative_request.id, absolute_request.id);
+    }
+
+    #[tokio::test]
+    async fn invalid_parameterized_subscribe_rolls_back_reserved_state() {
+        let mut subscriber = subscriber();
+        let observer = subscriber.clone();
+        let outgoing = subscriber.outgoing.clone();
+        let (writer, _reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "video").produce();
+        let mut params = KeyValuePairs::default();
+        params.set_intvalue(message::parameter_type::SUBSCRIBER_PRIORITY, 256);
+
+        assert!(subscriber
+            .subscribe_open_with_params(writer, params)
+            .await
+            .is_err());
+        assert!(observer.subscribes.lock().unwrap().is_empty());
+        assert!(observer.subscriber_names.lock().unwrap().by_name.is_empty());
+        assert!(observer.pending_requests.remove(0).unwrap().is_none());
+        assert!(outgoing.close().is_empty());
+    }
+
+    #[test]
+    fn invalid_fetch_parameters_are_rejected_before_reserving_state() {
+        let mut subscriber = subscriber();
+        let outgoing = subscriber.outgoing.clone();
+        let mut invalid_priority = KeyValuePairs::default();
+        invalid_priority.set_intvalue(message::parameter_type::SUBSCRIBER_PRIORITY, 256);
+        let mut invalid_order = KeyValuePairs::default();
+        invalid_order.set_intvalue(message::parameter_type::GROUP_ORDER, 0);
+
+        for params in [invalid_priority, invalid_order] {
+            assert!(matches!(
+                subscriber.fetch(standalone_fetch("video"), params),
+                Err(ServeError::Size)
+            ));
+        }
+        assert!(subscriber.fetches.lock().unwrap().is_empty());
+        assert!(subscriber.pending_requests.remove(0).unwrap().is_none());
+        assert!(outgoing.close().is_empty());
+    }
+
+    #[tokio::test]
     async fn fetch_exhaustion_sends_requests_blocked_once_without_state() {
         let mut subscriber = Subscriber::new(
             Queue::default(),
@@ -1953,6 +2184,69 @@ mod tests {
         assert!(fetch.ok().await.is_err());
         drop(fetch);
         assert!(outgoing.close().is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_fetch_rejects_cross_terminal_and_duplicate_errors() {
+        let mut subscriber = subscriber();
+        let mut outgoing = subscriber.outgoing.clone();
+        let ok_fetch = subscriber
+            .fetch(standalone_fetch("ok"), KeyValuePairs::default())
+            .unwrap();
+        let Message::Fetch(ok_request) = outgoing.pop().await.unwrap() else {
+            panic!("expected FETCH");
+        };
+        subscriber
+            .recv_fetch_ok(&message::FetchOk {
+                id: ok_request.id,
+                end_of_track: false,
+                end_location: crate::coding::Location::new(1, 0),
+                params: Default::default(),
+                track_extensions: Default::default(),
+            })
+            .unwrap();
+        assert!(matches!(
+            subscriber.recv_late_fetch_error(&message::RequestError::new(
+                ok_request.id,
+                RequestErrorCode::InternalError,
+                0,
+                "late",
+            )),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+        let error_fetch = subscriber
+            .fetch(standalone_fetch("error"), KeyValuePairs::default())
+            .unwrap();
+        let Message::Fetch(error_request) = outgoing.pop().await.unwrap() else {
+            panic!("expected FETCH");
+        };
+        subscriber
+            .pending_requests
+            .complete(error_request.id, PendingResponse::RequestError)
+            .unwrap();
+        let error = message::RequestError::new(
+            error_request.id,
+            RequestErrorCode::DoesNotExist,
+            0,
+            "missing",
+        );
+        subscriber.recv_request_error(&error).unwrap();
+        assert!(matches!(
+            subscriber.recv_late_fetch_error(&error),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+        assert!(matches!(
+            subscriber.recv_fetch_ok(&message::FetchOk {
+                id: error_request.id,
+                end_of_track: false,
+                end_location: crate::coding::Location::new(1, 0),
+                params: Default::default(),
+                track_extensions: Default::default(),
+            }),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+        drop(ok_fetch);
+        drop(error_fetch);
     }
 
     #[tokio::test]
