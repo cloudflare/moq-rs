@@ -6,6 +6,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.3](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.2...moq-transport-v0.16.3) - 2026-10-06
+
+### Added
+
+- *(moq-transport)* add public FETCH APIs
+- *(moq-relay)* proxy joining fetches as standalone
+- *(moq-relay)* add local fetch passthrough
+- *(moq-transport)* add standalone fetch proxying
+
+### Fixed
+
+- *(moq-transport)* simplify FETCH order validation
+- *(moq-transport)* harden FETCH lifecycle boundaries
+- *(moq-transport)* harden FETCH protocol handling
+- *(moq-transport)* re-export public dependency
+- *(moq-transport)* retire failed joining subscriptions
+- *(moq-transport)* preserve joining fetch boundary
+- *(moq-transport)* retire completed joining associations
+- *(moq-transport)* clean published names on failure
+- *(moq-transport)* tolerate closed joining establishment
+- *(moq-relay)* harden concurrent fetch handling
+- *(moq-relay)* harden standalone fetch passthrough
+- *(moq-relay)* minimize fetch plumbing
+- *(moq-relay)* simplify remote fetch routing
+- *(moq-transport)* isolate benign stream errors
+- *(moq-relay)* harden remote fetch lifecycle
+- *(moq-transport)* tighten fetch proxy lifecycle
+
+### Other
+
+- *(moq-transport)* cover reset error ordering
+- *(moq-relay)* consolidate fetch passthrough coverage
+
 ## [0.16.2](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.1...moq-transport-v0.16.2) - 2026-08-28
 
 ### Added

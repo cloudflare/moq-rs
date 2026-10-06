@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.22](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.21...moq-clock-ietf-v0.6.22) - 2026-10-06
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.6.21](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.20...moq-clock-ietf-v0.6.21) - 2026-08-28
 
 ### Added

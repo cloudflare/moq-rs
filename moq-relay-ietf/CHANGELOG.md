@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.27](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.26...moq-relay-ietf-v0.7.27) - 2026-10-06
+
+### Added
+
+- *(moq-relay)* proxy fetches one remote hop
+- *(moq-relay)* add local fetch passthrough
+
+### Fixed
+
+- *(moq-relay-ietf)* replace abandoned hyper-serve with axum-server 0.7.3
+- *(moq-relay-ietf)* suppress double_must_use on Coordinator trait
+- *(moq-relay)* harden concurrent fetch handling
+- *(moq-relay)* harden standalone fetch passthrough
+- *(moq-relay)* minimize fetch plumbing
+- *(moq-relay)* simplify remote fetch routing
+- *(moq-relay)* harden remote fetch lifecycle
+- *(moq-transport)* tighten fetch proxy lifecycle
+
+### Other
+
+- Merge pull request #246 from itzmanish/feat/public-fetch-api-v2
+- Merge pull request #237 from itzmanish/feat/joining-fetch-v1
+- *(moq-relay)* rename producer coordinator fixture
+- *(moq-transport)* cover reset error ordering
+- *(moq-relay)* consolidate fetch passthrough coverage
+
 ## [0.7.26](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.25...moq-relay-ietf-v0.7.26) - 2026-08-28
 
 ### Added
