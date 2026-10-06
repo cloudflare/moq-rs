@@ -2016,8 +2016,7 @@ mod tests {
         // Single-use, and geographically pinned: both are constraints this
         // relay never evaluates, so both must deny.
         for token in [
-            base()
-                .with_replay_protection(cat_token::ReplayProtection::Prohibited),
+            base().with_replay_protection(cat_token::ReplayProtection::Prohibited),
             base().with_geohash("9q8yy"),
         ] {
             let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
