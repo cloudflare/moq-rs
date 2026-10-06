@@ -904,12 +904,31 @@ async fn may_serve_track_in_fanout(
 /// denying every operation under `sports/football`, so announcing that
 /// namespace would disclose the existence of something the token cannot touch.
 /// The reasoning that gates the media fan-out applies to the metadata too.
+///
+/// **Auth flow (Manish Kumar review, 2026-08-26):**
+/// Announcement authorization uses `AuthzOperation::SubscribeNamespace`, not
+/// `AuthzOperation::Subscribe`, because disclosing that a namespace *exists*
+/// is a discovery operation — the same kind of disclosure a SUBSCRIBE_NAMESPACE
+/// response makes. Using Subscribe would be wrong: it would require a token
+/// to hold track-level grants just to see namespace listings, which is too
+/// restrictive. Using SubscribeNamespace is correct: it requires the token to
+/// be permitted to discover the namespace, which is exactly what announcement
+/// implies.
+///
+/// The `TrackNamespace` is converted to a `TrackNamespacePrefix` with the same
+/// fields so that the prefix-matching logic in the authorization layer can
+/// compare the token scope against this concrete namespace as if it were the
+/// prefix naming exactly it. This is the same reasoning `a_namespace_below_the_
+/// granted_prefix_is_announceable` tests: a prefix grant of `["sports"]` must
+/// allow announcing `["sports"]`, `["sports", "football"]`, etc.
 async fn may_announce_namespace(
     auth: Option<&SessionAuth>,
     context: &SessionContext,
     namespace: &TrackNamespace,
 ) -> bool {
-    // A concrete namespace viewed as the prefix naming exactly it.
+    // Convert the concrete namespace to the prefix that names exactly it,
+    // so that the SubscribeNamespace authorization check can apply its
+    // prefix-matching logic correctly.
     let prefix = TrackNamespacePrefix {
         fields: namespace.fields.clone(),
     };

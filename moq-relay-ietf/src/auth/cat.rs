@@ -2892,7 +2892,11 @@ mod tests {
                     // a_nil_terminated_scope_hides_deeper_namespaces.
                     .build(),
             )
-            .with_moqt_scope(MoqtScopeBuilder::new().action(MoqtAction::ClientSetup).build());
+            .with_moqt_scope(
+                MoqtScopeBuilder::new()
+                    .action(MoqtAction::ClientSetup)
+                    .build(),
+            );
         let encoded = Bytes::from(encode_token(&token, &key.signer).unwrap());
         let principal = principal_for(&hook, encoded).await;
 
