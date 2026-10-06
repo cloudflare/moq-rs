@@ -29,6 +29,19 @@ use crate::SessionContext;
 /// [`ScopeConfig::auth`]: crate::ScopeConfig::auth
 /// [`on_setup`]: Self::on_setup
 /// [`on_request`]: Self::on_request
+// `clippy::double_must_use` fires when a function carries an explicit
+// `#[must_use]` annotation AND its return type is also `#[must_use]`.
+// Both conditions hold for every async method here:
+//   1. `async_trait` injects `#[must_use]` on each generated method signature
+//      so that callers must `.await` the returned future (see async-trait
+//      expand.rs, `Item::Trait` branch; impl blocks are not annotated).
+//   2. `std::future::Future` is `#[must_use]`, so the generated return type
+//      `Pin<Box<dyn Future<...>>>` is also `#[must_use]`.
+// This became a hard error in CI under Rust 1.99 stable with
+// `RUSTFLAGS=-D warnings` (injected by `actions-rust-lang/setup-rust-toolchain`).
+// Remove this allow when async-trait drops its `#[must_use]` injection or
+// when rustc/clippy gains an exemption for proc-macro-generated annotations.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AuthHook: Send + Sync {
     /// Authorize session establishment and establish the peer's identity.
