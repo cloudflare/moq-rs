@@ -886,7 +886,6 @@ impl Publisher {
         let info = SubscribedNamespaceInfo {
             request_id: msg.id,
             namespace_prefix: msg.track_namespace_prefix,
-            subscribe_options: msg.subscribe_options,
             forward,
         };
         let (mut send, recv) =

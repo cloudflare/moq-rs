@@ -13,7 +13,7 @@ use futures::channel::oneshot;
 
 use crate::{
     coding::{TrackNamespace, TrackNamespacePrefix},
-    message::{self, Message, SubscribeOptions},
+    message::{self, Message},
     mlog,
     serve::ServeError,
     watch::State,
@@ -53,7 +53,6 @@ enum ResponseFlow {
 pub struct SubscribeNamespaceInfo {
     pub request_id: u64,
     pub namespace_prefix: TrackNamespacePrefix,
-    pub subscribe_options: SubscribeOptions,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -96,13 +95,12 @@ impl SubscribeNamespaceState {
     }
 }
 
-/// Outbound SUBSCRIBE_NAMESPACE request.
+/// Outbound SUBSCRIBE_NAMESPACE request (draft-18 §10.18).
 ///
-/// This handle only exposes `NAMESPACE` / `NAMESPACE_DONE` updates from the
-/// request's dedicated bidirectional stream. If the request used
-/// `SubscribeOptions::Publish` or `SubscribeOptions::Both`, matching `PUBLISH`
-/// messages arrive on their own request streams and are surfaced via
-/// [`Subscriber::publish_received`].
+/// This handle exposes `NAMESPACE` / `NAMESPACE_DONE` updates from the
+/// request's dedicated bidirectional stream. SUBSCRIBE_NAMESPACE covers
+/// namespace discovery only; PUBLISH messages for tracks arrive on their own
+/// request streams and are surfaced via [`Subscriber::publish_received`].
 #[must_use = "cancels SUBSCRIBE_NAMESPACE on drop"]
 pub struct SubscribeNamespace {
     state: State<SubscribeNamespaceState>,
@@ -451,7 +449,6 @@ mod tests {
         let info = SubscribeNamespaceInfo {
             request_id: 0,
             namespace_prefix: TrackNamespacePrefix::from_utf8_path(prefix),
-            subscribe_options: SubscribeOptions::Namespace,
         };
         SubscribeNamespaceRecv {
             state: State::<SubscribeNamespaceState>::default(),
@@ -469,7 +466,6 @@ mod tests {
         let info = SubscribeNamespaceInfo {
             request_id: 0,
             namespace_prefix: TrackNamespacePrefix::from_utf8_path(prefix),
-            subscribe_options: SubscribeOptions::Namespace,
         };
         let subscriber = subscriber().await;
         let (send_state, recv_state) = State::default().split();

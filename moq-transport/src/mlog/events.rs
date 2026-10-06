@@ -330,7 +330,6 @@ fn subscribe_namespace_to_json(msg: &message::SubscribeNamespace) -> JsonValue {
     json!({
         "request_id": msg.id,
         "track_namespace_prefix": msg.track_namespace_prefix.to_string(),
-        "subscribe_options": format!("{:?}", msg.subscribe_options),
         "parameters": key_value_pairs_to_vec(&msg.params.0),
     })
 }
@@ -813,15 +812,14 @@ mod tests {
     use crate::coding::{KeyValuePairs, TrackNamespacePrefix};
     use crate::{
         data::{StreamHeaderType, SubgroupHeader, SubgroupIdMode},
-        message::{SubscribeNamespace, SubscribeOptions},
+        message::SubscribeNamespace,
     };
 
     #[test]
-    fn subscribe_namespace_event_includes_prefix_and_options() {
+    fn subscribe_namespace_event_includes_prefix() {
         let msg = SubscribeNamespace {
             id: 10,
             track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("example.com/meeting"),
-            subscribe_options: SubscribeOptions::Both,
             params: KeyValuePairs::default(),
         };
 
@@ -837,7 +835,6 @@ mod tests {
             data.message["track_namespace_prefix"],
             "/example.com/meeting"
         );
-        assert_eq!(data.message["subscribe_options"], "Both");
     }
 
     #[test]

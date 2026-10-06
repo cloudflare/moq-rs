@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     coding::{ReasonPhrase, TrackNamespace, TrackNamespacePrefix},
-    message::{self, Message, RequestErrorCode, SubscribeOptions},
+    message::{self, Message, RequestErrorCode},
     mlog,
     serve::ServeError,
     watch::State,
@@ -29,7 +29,6 @@ const OUTGOING_QUEUE_CAPACITY: usize = 8192;
 pub struct SubscribedNamespaceInfo {
     pub request_id: u64,
     pub namespace_prefix: TrackNamespacePrefix,
-    pub subscribe_options: SubscribeOptions,
     pub forward: bool,
 }
 
@@ -377,7 +376,6 @@ mod tests {
         SubscribedNamespaceInfo {
             request_id: 0,
             namespace_prefix: TrackNamespacePrefix::from_utf8_path("example.com/meeting=123"),
-            subscribe_options: SubscribeOptions::Namespace,
             forward: true,
         }
     }

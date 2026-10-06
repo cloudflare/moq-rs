@@ -358,7 +358,6 @@ mod tests {
             Message::SubscribeNamespace(SubscribeNamespace {
                 id: 8,
                 track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("test/ns"),
-                subscribe_options: SubscribeOptions::Both,
                 params: KeyValuePairs::default(),
             }),
             8,
@@ -611,14 +610,15 @@ mod tests {
             vec![0x18, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00]
         );
 
+        // Draft-18 §10.18: Request ID, Track Namespace Prefix, Parameters.
+        // Type=0x50, Length=3, id=0x00, pfc=0x00 (empty prefix), params_count=0x00.
         assert_eq!(
             encoded(Message::SubscribeNamespace(SubscribeNamespace {
                 id: 0,
                 track_namespace_prefix: prefix,
-                subscribe_options: SubscribeOptions::Both,
                 params: KeyValuePairs::default(),
             })),
-            vec![0x50, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00]
+            vec![0x50, 0x00, 0x03, 0x00, 0x00, 0x00]
         );
 
         assert_eq!(
