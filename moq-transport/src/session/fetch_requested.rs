@@ -1414,9 +1414,13 @@ mod tests {
         assert!(outgoing.close().is_empty());
     }
 
-    /// After FETCH_OK is committed, reject_with must return Duplicate.
+    /// A fresh request (FETCH_OK never sent) can be rejected directly via
+    /// `FetchRequested::reject`. This guards against the pre-fix regression
+    /// where even a fresh reject could return Duplicate when pending_response
+    /// was set. (The Duplicate path — reject after FETCH_OK *committed* — requires
+    /// a live QUIC stream and is covered at the integration-test level.)
     #[tokio::test]
-    async fn reject_after_committed_fetch_ok_returns_duplicate() {
+    async fn reject_fresh_request_sends_request_error() {
         let Handles {
             request,
             recv,
@@ -1426,10 +1430,6 @@ mod tests {
         } = handles(13);
         active.lock().unwrap().insert(13, recv);
 
-        // reject() takes self without going through the FetchWriter, so
-        // responded stays false. The Duplicate path requires responded=true
-        // which only happens after commit_fetch_ok. Testing that the guard
-        // is preserved: reject_with on a fresh writer succeeds (not Duplicate).
         request
             .reject(RequestErrorCode::Unauthorized, "unauthorized")
             .unwrap();
