@@ -143,9 +143,12 @@ impl fmt::Debug for Principal {
 
 /// The operation being authorized.
 ///
-/// Each variant corresponds to a live authorization point in the relay. FETCH
-/// is absent because the transport answers it with NOT_SUPPORTED, so no
-/// authorization decision is ever reached for it.
+/// Each variant corresponds to a live authorization point in the relay.
+/// Standalone FETCH is not a separate variant: `serve_fetch` maps it to
+/// `AuthzOperation::Subscribe` with the same namespace and track, because
+/// FETCH retrieves the same track content a SUBSCRIBE does and warrants the
+/// same grant. (Note: joining FETCH is still refused by the transport with
+/// NOT_SUPPORTED and never reaches the application layer.)
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AuthzOperation<'a> {

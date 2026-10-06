@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
-    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
+    coding::{KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix},
     message::{RequestErrorCode, SubscribeOptions},
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{
@@ -183,6 +183,30 @@ impl Producer {
                 None => return Ok(()),
             },
         };
+
+        // Authorize before any lookup: a standalone FETCH retrieves track
+        // content and requires the same Subscribe grant as a SUBSCRIBE for the
+        // same track. Deciding afterwards would make response timing an
+        // existence oracle for tracks the peer may not access.
+        if let Err(reason) = may_fetch_track(
+            self.auth.as_ref(),
+            &self.context,
+            &standalone.track_namespace,
+            &standalone.track_name,
+            fetch.request.id,
+        )
+        .await
+        {
+            metrics::counter!("moq_relay_fetch_errors_total", "phase" => "auth").increment(1);
+            let code = match reason {
+                DenyReason::TokenMalformed => RequestErrorCode::MalformedAuthToken,
+                DenyReason::TokenExpired => RequestErrorCode::ExpiredAuthToken,
+                _ => RequestErrorCode::Unauthorized,
+            };
+            fetch.reject(code, "unauthorized")?;
+            return Err(anyhow::anyhow!("unauthorized fetch"));
+        }
+
         let params = match upstream_fetch_params(&fetch.request.params) {
             Ok(params) => params,
             Err(err) => {
@@ -861,6 +885,33 @@ fn upstream_fetch_params(
     Ok(upstream)
 }
 
+/// Whether the peer may FETCH `track` in `namespace`.
+///
+/// Standalone FETCH retrieves track content — the same content a SUBSCRIBE
+/// delivers — so it requires the same grant. This is the authorization gate
+/// for `serve_fetch`; it is a free function so the decision is unit-testable
+/// without constructing a live transport session.
+///
+/// The tests therefore pin this decision and its operation, but not that
+/// `serve_fetch` still consults it — removing the call site produces a
+/// dead-code warning rather than a failing test. An end-to-end FETCH session
+/// harness would close that gap.
+async fn may_fetch_track(
+    auth: Option<&SessionAuth>,
+    context: &SessionContext,
+    namespace: &TrackNamespace,
+    track: &TrackName,
+    request_id: u64,
+) -> Result<(), DenyReason> {
+    authorize(
+        auth,
+        context,
+        AuthzOperation::Subscribe { namespace, track },
+        Some(request_id),
+    )
+    .await
+}
+
 /// Whether a track may be delivered through the SUBSCRIBE_NAMESPACE fan-out.
 ///
 /// That path pushes PUBLISH and then streams the track's objects, so it needs
@@ -1148,6 +1199,52 @@ mod tests {
             "a namespace the token cannot touch must not be announced"
         );
         assert_eq!(hook.seen().len(), 1);
+    }
+
+    /// FETCH requires the same grant as SUBSCRIBE: fetching track content is
+    /// the same operation, just without a streaming subscription.
+    #[tokio::test]
+    async fn fetch_is_authorized_as_subscribe() {
+        let hook = RecordingHook::new(allow);
+        let auth = session_auth(hook.clone());
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+        let track = TrackName::from("video");
+
+        may_fetch_track(Some(&auth), &context(), &namespace, &track, 9)
+            .await
+            .expect("allowed");
+
+        // The decision asked about is Subscribe — same grant as a SUBSCRIBE.
+        assert_eq!(hook.seen(), vec!["subscribe /sports/football video"]);
+    }
+
+    /// A FETCH for a track outside the token's scope must be denied.
+    #[tokio::test]
+    async fn fetch_is_withheld_for_unauthorized_track() {
+        let hook = RecordingHook::new(deny);
+        let auth = session_auth(hook.clone());
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+        let track = TrackName::from("video");
+
+        let result = may_fetch_track(Some(&auth), &context(), &namespace, &track, 9).await;
+
+        assert!(result.is_err(), "unauthorized FETCH must be denied");
+        assert_eq!(
+            hook.seen().len(),
+            1,
+            "the authorization decision must actually be sought"
+        );
+    }
+
+    /// A scope with no policy allows FETCH unconditionally.
+    #[tokio::test]
+    async fn fetch_permits_everything_when_no_policy_applies() {
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+        let track = TrackName::from("video");
+
+        assert!(may_fetch_track(None, &context(), &namespace, &track, 9)
+            .await
+            .is_ok());
     }
 
     type LookupRequest = (Option<String>, TrackNamespace);

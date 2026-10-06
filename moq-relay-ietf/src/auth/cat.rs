@@ -2269,8 +2269,9 @@ mod tests {
         let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
 
         let future = (now_unix() + 3600) as f64;
-        // Claims the base token does not already carry, so these are genuinely
-        // "present on the wire, dropped by the decoder" rather than duplicates.
+        // Claims the base token does not already carry, so each is refused on
+        // its own merits (not because it is a duplicate key). See the doc
+        // comment above for the distinct protection path each case exercises.
         let unsupported = [
             // nbf: RFC 8392 permits a float NumericDate.
             (5, ciborium::Value::Float(future)),
