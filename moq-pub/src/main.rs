@@ -4,6 +4,7 @@
 
 use bytes::BytesMut;
 use std::net;
+use std::num::NonZeroUsize;
 use url::Url;
 
 use anyhow::Context;
@@ -13,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use moq_native_ietf::quic;
-use moq_pub::Media;
+use moq_pub::{serve_fetches, FetchHistory, Media};
 use moq_transport::{
     coding::{KeyValuePairs, TrackName, TrackNamespace},
     serve,
@@ -51,6 +52,10 @@ pub struct Cli {
     /// Push tracks with PUBLISH after sending PUBLISH_NAMESPACE.
     #[arg(long)]
     pub publish: bool,
+
+    /// Retain the newest N media groups per track for FETCH.
+    #[arg(long)]
+    pub fetch_groups: Option<NonZeroUsize>,
 }
 
 #[tokio::main]
@@ -78,7 +83,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         (None, None)
     };
-    let media = Media::new(writer, track_tx)?;
+    let fetch_history = cli.fetch_groups.map(FetchHistory::new);
+    let media = Media::new_with_fetch(writer, track_tx, fetch_history.clone())?;
 
     let tls = cli.tls.load()?;
 
@@ -107,7 +113,8 @@ async fn main() -> anyhow::Result<()> {
     .context("failed to create MoQ Transport publisher")?;
 
     let mut namespace_publisher = publisher.clone();
-    let publish_publisher = publisher;
+    let publish_publisher = publisher.clone();
+    let fetch_publisher = publisher;
     let namespace_reader = reader.clone();
     let publish_reader = reader.clone();
 
@@ -117,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
             res.context("media error")?
         },
         res = namespace_publisher.publish_namespace(namespace_reader) => res.context("publisher error")?,
+        res = serve_fetches(fetch_publisher, fetch_history) => res.context("FETCH publisher error")?,
         res = async {
             if let Some(track_rx) = track_rx {
                 publish_created_tracks(publish_publisher, publish_reader, track_rx).await?;
@@ -165,6 +173,18 @@ async fn publish_created_tracks(
     }
 }
 
+async fn run_media(mut media: Media) -> anyhow::Result<()> {
+    let mut input = tokio::io::stdin();
+    let mut buf = BytesMut::new();
+    loop {
+        input
+            .read_buf(&mut buf)
+            .await
+            .context("failed to read from stdin")?;
+        media.parse(&mut buf).context("failed to parse media")?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,16 +208,38 @@ mod tests {
         .unwrap();
         assert!(cli.publish);
     }
-}
 
-async fn run_media(mut media: Media) -> anyhow::Result<()> {
-    let mut input = tokio::io::stdin();
-    let mut buf = BytesMut::new();
-    loop {
-        input
-            .read_buf(&mut buf)
-            .await
-            .context("failed to read from stdin")?;
-        media.parse(&mut buf).context("failed to parse media")?;
+    #[test]
+    fn fetch_groups_defaults_disabled() {
+        let cli = Cli::try_parse_from(["moq-pub", "https://example.com/watch", "--name", "test"])
+            .unwrap();
+        assert_eq!(cli.fetch_groups, None);
+    }
+
+    #[test]
+    fn fetch_groups_accepts_nonzero_capacity() {
+        let cli = Cli::try_parse_from([
+            "moq-pub",
+            "https://example.com/watch",
+            "--name",
+            "test",
+            "--fetch-groups",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(cli.fetch_groups, std::num::NonZeroUsize::new(3));
+    }
+
+    #[test]
+    fn fetch_groups_rejects_zero() {
+        assert!(Cli::try_parse_from([
+            "moq-pub",
+            "https://example.com/watch",
+            "--name",
+            "test",
+            "--fetch-groups",
+            "0",
+        ])
+        .is_err());
     }
 }
