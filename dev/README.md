@@ -75,3 +75,13 @@ And run the subscriber in a separate terminal:
 ```bash
 ./dev/clock
 ```
+
+To test against a scope that requires CAT bearer-token authentication, pass one or more tokens with the `--auth-token` flag:
+
+```bash
+./dev/clock --publish --auth-token 1:BASE64URL_ENCODED_TOKEN
+./dev/clock --auth-token 1:BASE64URL_ENCODED_TOKEN
+```
+
+The format is `TYPE:VALUE` where `TYPE` is a decimal or hexadecimal QUIC varint token type and `VALUE` is URL-safe base64. The flag may be repeated for multiple tokens. **This flag is for testing only**: the token value is visible in process arguments on the host.
+

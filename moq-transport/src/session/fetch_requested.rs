@@ -649,9 +649,16 @@ async fn run_fetch_writer(
                 (send_write_result(result, outcome), false)
             }
             FetchWriteCommand::Reject(rejection, result) => {
-                let outcome = if responded || pending_response.is_some() {
+                let outcome = if responded {
+                    // FETCH_OK was already committed — data is flowing.
+                    // REQUEST_ERROR cannot be sent after the response stream starts.
                     Err(ServeError::Duplicate.into())
                 } else {
+                    // FETCH_OK has not been sent yet even if it was staged in
+                    // pending_response. Rejection takes precedence: discard the
+                    // pending response (it was never committed to the wire) and
+                    // send REQUEST_ERROR instead.
+                    pending_response = None;
                     request
                         .claim_response()
                         .map_err(SessionError::from)
@@ -1354,6 +1361,84 @@ mod tests {
         assert_eq!(error.id, 7);
         assert_eq!(error.error_code, RequestErrorCode::NotSupported as u64);
         assert!(active.lock().unwrap().is_empty());
+        assert!(outgoing.close().is_empty());
+    }
+
+    /// Regression: `FetchWriter::reject_with` must send REQUEST_ERROR even
+    /// after `respond()` has been called, as long as FETCH_OK was not yet
+    /// committed to the wire. Before the fix, `pending_response.is_some()`
+    /// caused the Reject arm to return `Duplicate` instead of sending the
+    /// caller's code and reason.
+    #[tokio::test]
+    async fn reject_after_respond_sends_request_error_not_duplicate() {
+        let Handles {
+            request,
+            recv,
+            _keepalive,
+            mut outgoing,
+            active,
+        } = handles(7);
+        active.lock().unwrap().insert(7, recv);
+
+        // start_writer spawns the driver task and resolves the standalone range.
+        let mut writer = request.start_writer().await.unwrap();
+
+        // Stage a FETCH_OK. Because there is no QUIC stream yet, the driver
+        // parks it in pending_response without committing anything to the wire.
+        writer
+            .respond(FetchOkInfo {
+                end_of_track: false,
+                end_location: Location::new(1, 0),
+                params: Default::default(),
+                track_extensions: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        // Reject after staging (but before committing) FETCH_OK.
+        // Should send REQUEST_ERROR with the caller's code, not ServeError::Duplicate.
+        writer
+            .reject_with(
+                FetchRejection::new(RequestErrorCode::DoesNotExist, 0, "not found").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let Message::RequestError(error) = outgoing.pop().await.unwrap() else {
+            panic!("expected REQUEST_ERROR, got something else");
+        };
+        assert_eq!(error.id, 7);
+        assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
+        assert_eq!(error.reason.0, "not found");
+        // No further messages (no InternalError from Drop, no Duplicate).
+        assert!(outgoing.close().is_empty());
+    }
+
+    /// A fresh request (FETCH_OK never sent) can be rejected directly via
+    /// `FetchRequested::reject`. This guards against the pre-fix regression
+    /// where even a fresh reject could return Duplicate when pending_response
+    /// was set. (The Duplicate path — reject after FETCH_OK *committed* — requires
+    /// a live QUIC stream and is covered at the integration-test level.)
+    #[tokio::test]
+    async fn reject_fresh_request_sends_request_error() {
+        let Handles {
+            request,
+            recv,
+            _keepalive,
+            mut outgoing,
+            active,
+        } = handles(13);
+        active.lock().unwrap().insert(13, recv);
+
+        request
+            .reject(RequestErrorCode::Unauthorized, "unauthorized")
+            .unwrap();
+
+        let Message::RequestError(error) = outgoing.pop().await.unwrap() else {
+            panic!("expected REQUEST_ERROR");
+        };
+        assert_eq!(error.id, 13);
+        assert_eq!(error.error_code, RequestErrorCode::Unauthorized as u64);
         assert!(outgoing.close().is_empty());
     }
 

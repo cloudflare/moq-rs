@@ -54,7 +54,7 @@ use request_id::max_request_id_from_params;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::coding::{KeyValuePairs, Location, Value, VarInt};
+use crate::coding::{KeyValuePair, KeyValuePairs, Location, Value, VarInt};
 use crate::message::Message;
 use crate::mlog;
 use crate::watch::Queue;
@@ -231,6 +231,15 @@ pub struct Session {
     /// Normally the QUIC connection ID hex, which the peer also observes and which names this
     /// connection's qlog and mlog files.
     session_id: SessionId,
+
+    /// Setup parameters the peer sent in CLIENT_SETUP.
+    ///
+    /// Retained in decoded form so the application layer can read parameters the
+    /// transport does not interpret itself — notably AUTHORIZATION TOKEN
+    /// (draft-16 §9.3.1.5), which the relay's authorization hook decodes.
+    /// Empty for sessions created via `connect()`, which receive
+    /// SERVER_SETUP rather than sending CLIENT_SETUP.
+    setup_params: KeyValuePairs,
 }
 
 impl Session {
@@ -349,6 +358,26 @@ impl Session {
     /// files and matches what the peer observes.
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// Returns the CLIENT_SETUP parameters sent by the peer.
+    ///
+    /// Only populated for server-side sessions created via [`accept`]; sessions
+    /// created via [`connect`] return an empty set. Parameters the transport
+    /// interprets itself (PATH, MAX_REQUEST_ID) are present here too, but the
+    /// primary consumer is the application layer reading parameters the
+    /// transport deliberately does not act on, such as AUTHORIZATION TOKEN
+    /// (draft-16 §9.3.1.5).
+    ///
+    /// The parameter list is returned as decoded, so repeated keys — which
+    /// AUTHORIZATION TOKEN explicitly permits (§9.2.2.1) — are all present.
+    /// Use direct iteration rather than [`KeyValuePairs::get`], which returns
+    /// only the first match.
+    ///
+    /// [`accept`]: Self::accept
+    /// [`connect`]: Self::connect
+    pub fn setup_params(&self) -> &KeyValuePairs {
+        &self.setup_params
     }
 
     /// Log a control message with structured fields for observability.
@@ -607,6 +636,8 @@ impl Session {
         }
     }
 
+    // Every argument is independent session state with no natural grouping;
+    // bundling them into a struct would only move the same list one level out.
     #[allow(clippy::too_many_arguments)]
     fn new(
         webtransport: web_transport::Session,
@@ -616,6 +647,7 @@ impl Session {
         mlog: Option<mlog::MlogWriter>,
         transport: Transport,
         connection_path: Option<String>,
+        setup_params: KeyValuePairs,
         request_id: RequestId,
     ) -> (Self, Option<Publisher>, Option<Subscriber>) {
         let outgoing = Queue::default().split();
@@ -666,6 +698,7 @@ impl Session {
             transport,
             connection_path,
             session_id,
+            setup_params,
         };
 
         (session, publisher, subscriber)
@@ -713,6 +746,25 @@ impl Session {
         .await
     }
 
+    /// Create an outbound/client connection carrying authorization tokens in
+    /// CLIENT_SETUP.
+    pub async fn connect_with_tokens(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        tokens: Vec<setup::AuthorizationToken>,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_config_and_session_id_and_tokens(
+            session,
+            SessionId::generate(),
+            mlog_path,
+            transport,
+            SessionConfig::default(),
+            tokens,
+        )
+        .await
+    }
+
     /// Create an outbound/client QUIC connection with explicit session configuration.
     ///
     /// Generates a local [`SessionId`] fallback. Use
@@ -726,12 +778,13 @@ impl Session {
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
         // `connect_with_config` accept it and remove `connect_with_config_and_session_id`.
-        Self::connect_with_config_and_session_id(
+        Self::connect_with_config_and_session_id_and_tokens(
             session,
             SessionId::generate(),
             mlog_path,
             transport,
             config,
+            Vec::new(),
         )
         .await
     }
@@ -745,6 +798,47 @@ impl Session {
         mlog_path: Option<PathBuf>,
         transport: Transport,
         config: SessionConfig,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_config_and_session_id_and_tokens(
+            session,
+            session_id,
+            mlog_path,
+            transport,
+            config,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Create an outbound/client connection with explicit session
+    /// configuration and authorization tokens.
+    pub async fn connect_with_config_and_tokens(
+        session: web_transport::Session,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        config: SessionConfig,
+        tokens: Vec<setup::AuthorizationToken>,
+    ) -> Result<(Session, Publisher, Subscriber), SessionError> {
+        Self::connect_with_config_and_session_id_and_tokens(
+            session,
+            SessionId::generate(),
+            mlog_path,
+            transport,
+            config,
+            tokens,
+        )
+        .await
+    }
+
+    /// Create an outbound/client connection with explicit configuration,
+    /// correlation ID, and authorization tokens.
+    pub async fn connect_with_config_and_session_id_and_tokens(
+        session: web_transport::Session,
+        session_id: SessionId,
+        mlog_path: Option<PathBuf>,
+        transport: Transport,
+        config: SessionConfig,
+        tokens: Vec<setup::AuthorizationToken>,
     ) -> Result<(Session, Publisher, Subscriber), SessionError> {
         let url = session.url().clone();
         let url_path = url.path();
@@ -798,6 +892,13 @@ impl Session {
             our_max_request_id,
         );
 
+        for token in tokens {
+            params.0.push(KeyValuePair::new_bytes(
+                setup::ParameterType::AuthorizationToken.into(),
+                token.encode_value()?,
+            ));
+        }
+
         let client = setup::Client { params };
 
         tracing::debug!(
@@ -828,7 +929,17 @@ impl Session {
         let request_id =
             RequestId::new_with_session_id(session_id.clone(), 0, peer_max, our_max_request_id, 1);
         let session = Session::new(
-            session, session_id, sender, recver, mlog, transport, path, request_id,
+            session,
+            session_id,
+            sender,
+            recver,
+            mlog,
+            transport,
+            path,
+            // Outbound sessions send CLIENT_SETUP rather than receiving one,
+            // so there are no peer setup parameters to retain.
+            KeyValuePairs::default(),
+            request_id,
         );
         let publisher = session.1.ok_or(SessionError::Internal)?;
         let subscriber = session.2.ok_or(SessionError::Internal)?;
@@ -995,6 +1106,7 @@ impl Session {
             mlog,
             transport,
             connection_path,
+            client.params,
             request_id,
         ))
     }
