@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.4](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.3...moq-transport-v0.16.4) - 2026-10-06
+
+### Added
+
+- *(auth)* add generic client token presentation
+- *(auth)* add scope-configured CAT bearer authorization
+- *(moq-transport)* retain CLIENT_SETUP parameters and allow explicit PUBLISH_NAMESPACE rejection
+
+### Fixed
+
+- *(moq-transport)* use .0 to compare ReasonPhrase in reject_with test
+- *(auth)* update AuthzOperation doc for joining FETCH; add reject_with regression tests
+- *(moq-transport)* allow FetchWriter::reject_with after prepare_response; declare tokio rt
+
+### Other
+
+- *(moq-transport)* rename misleading Duplicate test; clarify scope
+
 ## [0.16.3](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.2...moq-transport-v0.16.3) - 2026-10-06
 
 ### Added
