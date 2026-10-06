@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Temporary: disable release-plz semver-checks for moq-relay-ietf while the
+# published baseline (0.7.26) still depends on the abandoned hyper-serve 0.6.2
+# crate, which fails to compile against current hyper/hyper-util transitive
+# versions under fresh dependency resolution. Remove this override once a clean
+# release is published and becomes the crates.io baseline.
+[[package]]
+name = "moq-relay-ietf"
+semver_check = false
