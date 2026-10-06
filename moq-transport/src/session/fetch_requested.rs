@@ -1409,7 +1409,7 @@ mod tests {
         };
         assert_eq!(error.id, 7);
         assert_eq!(error.error_code, RequestErrorCode::DoesNotExist as u64);
-        assert_eq!(error.reason, "not found");
+        assert_eq!(error.reason.0, "not found");
         // No further messages (no InternalError from Drop, no Duplicate).
         assert!(outgoing.close().is_empty());
     }
