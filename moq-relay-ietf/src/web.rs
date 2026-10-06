@@ -10,7 +10,7 @@ use axum::{
     routing::get,
     Router,
 };
-use hyper_serve::tls_rustls::RustlsAcceptor;
+use axum_server::tls_rustls::RustlsAcceptor;
 use tower_http::cors::{Any, CorsLayer};
 
 pub struct WebConfig {
@@ -31,7 +31,7 @@ struct WebState {
 // TODO remove this when Chrome adds support for self-signed certificates using WebTransport
 pub struct Web {
     app: Router,
-    server: hyper_serve::Server<RustlsAcceptor>,
+    server: axum_server::Server<RustlsAcceptor>,
 }
 
 impl Web {
@@ -47,7 +47,7 @@ impl Web {
 
         let mut tls = config.tls.server.expect("missing server configuration");
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let tls = hyper_serve::tls_rustls::RustlsConfig::from_config(Arc::new(tls));
+        let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls));
 
         // Create shared state
         let state = WebState {
@@ -78,7 +78,7 @@ impl Web {
                 .allow_methods([Method::GET]),
         );
 
-        let server = hyper_serve::bind_rustls(config.bind, tls);
+        let server = axum_server::bind_rustls(config.bind, tls);
 
         Self { app, server }
     }
