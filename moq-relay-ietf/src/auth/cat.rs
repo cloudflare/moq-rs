@@ -14,10 +14,12 @@
 //! namespace matches and track match. A token is required to carry `exp`, and
 //! its lifetime is capped, because the relay has no revocation mechanism.
 //!
-//! Any *other* claim causes the token to be **refused**: honouring a token
-//! while ignoring a constraint its issuer attached would grant more than was
-//! authorized. The check is an allowlist over the claim keys present in the
-//! raw payload, not a walk over the decoded token — see
+//! Claims the relay can neither enforce nor safely ignore are **refused**.
+//! Identity and informational claims (`sub`, `iat`, `cti`) are permitted.
+//! Constraint claims the relay has not been designed for are refused, because
+//! honouring a token while ignoring a restriction its issuer attached would
+//! grant more than was authorized. The check is an allowlist over the claim
+//! keys present in the raw payload, not a walk over the decoded token — see
 //! [`unenforceable_claim`] for why that distinction is load-bearing.
 //!
 //! Composite claims (`and` / `or` / `nor`) are refused by the same rule.
@@ -188,6 +190,12 @@ impl CatAuthHook {
         token_validator = token_validator
             .with_clock_skew_tolerance(clock_skew)
             .map_err(|err| AuthError::Configuration(err.to_string()))?
+            // Safe here because the raw-claim allowlist (`PERMITTED_CLAIM_KEYS`
+            // and `unenforceable_claim`) rejects any privacy claim *before*
+            // `validate()` runs — claim keys like `cnf`/`catdpop` are not in
+            // the allowlist and cause the token to be refused earlier in
+            // `verify`. Permitting unencrypted privacy claims at the library
+            // level therefore never reaches a token that carries one.
             .dangerously_allow_unencrypted_privacy_claims();
         if !config.audiences.is_empty() {
             token_validator = token_validator.with_expected_audiences(config.audiences.clone());

@@ -56,10 +56,13 @@ pub struct AuthToken {
 
     /// The token payload. Its serialization is defined by `token_type`.
     ///
-    /// Read with `token.value.expose_secret()`, or [`expose_value`].
+    /// Not public: callers must go through [`expose_value`] so every read of
+    /// a bearer credential is visible at the call site. The `secrecy` type is
+    /// not re-exported; making this field `pub` would put an unreexported type
+    /// in the public API (violates RFC-047 §6).
     ///
     /// [`expose_value`]: Self::expose_value
-    pub value: SecretSlice<u8>,
+    value: SecretSlice<u8>,
 }
 
 impl AuthToken {

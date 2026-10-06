@@ -101,13 +101,17 @@ policy is unauthenticated by design and must keep working exactly as before.
 
 Enforcement points are `AuthHook::on_setup` (once, before either session half
 exists) and `AuthHook::on_request` (before SUBSCRIBE, SUBSCRIBE_NAMESPACE,
-TRACK_STATUS, PUBLISH_NAMESPACE, PUBLISH). Each runs *before* the corresponding
-lookup or registration; for SUBSCRIBE and TRACK_STATUS that ordering is a
-correctness property, since deciding afterwards turns them into existence
-oracles.
+TRACK_STATUS, PUBLISH_NAMESPACE, PUBLISH). Standalone FETCH is also gated:
+`serve_fetch` calls `may_fetch_track` under the `Subscribe` grant before any
+local or remote lookup (a standalone FETCH retrieves track content, so it
+warrants the same grant). Each enforcement point runs *before* the
+corresponding lookup or registration; for SUBSCRIBE, TRACK_STATUS and FETCH
+that ordering is a correctness property, since deciding afterwards turns them
+into existence oracles.
 
 Adding an enforcement point means adding an `AuthzOperation` variant, which is
-deliberately a compile error everywhere it must be handled.
+deliberately a compile error everywhere it must be handled. FETCH re-uses the
+`Subscribe` variant rather than having its own; see `may_fetch_track`.
 
 ## Gotchas
 

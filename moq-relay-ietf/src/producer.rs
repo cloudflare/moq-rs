@@ -949,28 +949,24 @@ async fn may_serve_track_in_fanout(
 /// Whether the peer may be told that `namespace` exists.
 ///
 /// A prefix subscription is not a grant over everything beneath it. The `nil`
-/// terminator makes the distinction concrete: a scope of
-/// `[exact("sports"), nil]` authorizes SUBSCRIBE_NAMESPACE for `sports` while
-/// denying every operation under `sports/football`, so announcing that
-/// namespace would disclose the existence of something the token cannot touch.
-/// The reasoning that gates the media fan-out applies to the metadata too.
+/// terminator is what decides: a scope of `[exact("sports"), nil]` authorizes
+/// SUBSCRIBE_NAMESPACE for `["sports"]` while denying every operation under
+/// `["sports", "football"]`, so announcing that deeper namespace would disclose
+/// the existence of something the token cannot touch. A scope without the nil
+/// terminator — just `[exact("sports")]` — is a prefix grant and does allow
+/// announcing `["sports", "football"]`. The nil terminator is the distinction.
 ///
-/// **Auth flow (Manish Kumar review, 2026-08-26):**
 /// Announcement authorization uses `AuthzOperation::SubscribeNamespace`, not
 /// `AuthzOperation::Subscribe`, because disclosing that a namespace *exists*
-/// is a discovery operation — the same kind of disclosure a SUBSCRIBE_NAMESPACE
-/// response makes. Using Subscribe would be wrong: it would require a token
-/// to hold track-level grants just to see namespace listings, which is too
-/// restrictive. Using SubscribeNamespace is correct: it requires the token to
-/// be permitted to discover the namespace, which is exactly what announcement
-/// implies.
+/// is a discovery operation — the same kind of disclosure SUBSCRIBE_NAMESPACE
+/// makes. Subscribe would be too restrictive: it would require track-level
+/// grants just to see namespace listings. SubscribeNamespace is correct: it
+/// requires the token to permit discovery of the namespace, which is exactly
+/// what announcement implies.
 ///
 /// The `TrackNamespace` is converted to a `TrackNamespacePrefix` with the same
-/// fields so that the prefix-matching logic in the authorization layer can
-/// compare the token scope against this concrete namespace as if it were the
-/// prefix naming exactly it. This is the same reasoning `a_namespace_below_the_
-/// granted_prefix_is_announceable` tests: a prefix grant of `["sports"]` must
-/// allow announcing `["sports"]`, `["sports", "football"]`, etc.
+/// fields so that the prefix-matching logic in the authorization layer checks
+/// this concrete namespace as the prefix naming exactly it.
 async fn may_announce_namespace(
     auth: Option<&SessionAuth>,
     context: &SessionContext,

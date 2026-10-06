@@ -19,9 +19,11 @@
 //!   [`AuthHook::on_setup`]. A denial terminates the session before either
 //!   half of it is constructed.
 //! * **Request.** Every SUBSCRIBE, SUBSCRIBE_NAMESPACE, TRACK_STATUS,
-//!   PUBLISH_NAMESPACE and PUBLISH is checked with [`AuthHook::on_request`]
-//!   before the relay acts on it. A denial rejects that request and leaves the
-//!   session running.
+//!   PUBLISH_NAMESPACE, PUBLISH and standalone FETCH is checked before the
+//!   relay acts on it. The first five use [`AuthHook::on_request`]; FETCH is
+//!   checked via [`may_fetch_track`] under the `Subscribe` grant (a standalone
+//!   FETCH retrieves track content and warrants the same authorization). A
+//!   denial rejects that request and leaves the session running.
 //!
 //! Cryptography is confined to setup. The identity established there is
 //! carried in a [`Principal`], so per-request checks are pure claim
