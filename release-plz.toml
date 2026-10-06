@@ -6,9 +6,9 @@
 # crate, which fails to compile against current hyper/hyper-util transitive
 # versions under fresh dependency resolution.
 #
+# Tracked: https://github.com/cloudflare/moq-rs/issues/251
 # Removal: delete this block after `moq-relay-ietf` publishes a version that
-# depends on axum-server (i.e., any version >= 0.7.27 that includes the
-# hyper-serve → axum-server fix). Verify with:
+# depends on axum-server (i.e., any version >= 0.7.27). Verify with:
 #   cargo semver-checks check-release -p moq-relay-ietf
 [[package]]
 name = "moq-relay-ietf"
@@ -19,9 +19,9 @@ semver_check = false
 # causing cargo-semver-checks rustdoc compilation to fail under isolated fresh
 # resolution (Serialize/Deserialize macros unavailable).
 #
+# Tracked: https://github.com/cloudflare/moq-rs/issues/251
 # Removal: delete this block after `moq-api` publishes a version that declares
-# serde with features = ["derive"] (i.e., any version >= 0.2.14 that includes
-# this fix). Verify with:
+# serde with features = ["derive"] (i.e., any version >= 0.2.14). Verify with:
 #   cargo semver-checks check-release -p moq-api
 [[package]]
 name = "moq-api"
