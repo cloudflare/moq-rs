@@ -319,7 +319,7 @@ impl CatAuthHook {
             return Err(DenyReason::TokenInvalid);
         }
 
-        // Two-pass `nbf` design (Manish Kumar review, 2026-08-26):
+        // Two-pass `nbf` design:
         //
         // This block is a *sanity guard only*. It rejects tokens whose `nbf`
         // is implausibly distant in either direction (outside the supported
@@ -2892,10 +2892,9 @@ mod tests {
     /// A scope of `["sports"]` (no nil terminator) is a prefix grant and must
     /// authorise subscribing to namespace `["sports", "football"]`.
     ///
-    /// This closes Manish Kumar's review comment 13383462 ("VERIFY prefix
-    /// direction"). A nil terminator (`namespace_nil()`) caps the scope to an
-    /// exact depth; without one the scope element is a prefix that matches any
-    /// namespace whose first field equals `"sports"`, including deeper ones.
+    /// A nil terminator (`namespace_nil()`) caps the scope to an exact depth;
+    /// without one the scope element is a prefix that matches any namespace
+    /// whose first field equals `"sports"`, including deeper ones.
     ///
     /// The inverse is already tested by
     /// `a_nil_terminated_scope_hides_deeper_namespaces`: a scope of

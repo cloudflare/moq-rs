@@ -17,3 +17,9 @@ The specification allows a `both` role but you'll get an error.
 
 You can have one publisher and any number of subscribers connected to the same path.
 If the publisher disconnects, then all subscribers receive an error and will not get updates, even if a new publisher reuses the path.
+
+## Authorization
+
+Per-scope bearer-token authorization is supported via `ScopeConfig.auth`. When a scope has an auth policy, every session must present a valid Common Access Token (CAT, draft-ietf-moq-c4m) in the CLIENT_SETUP AUTHORIZATION TOKEN parameter.
+
+The `auth-cat` crate feature is off by default. Embedders that want token enforcement enable it and supply `ScopeAuthConfig` through `Coordinator::get_scope_config`. The enforcement model and fail-closed contract are documented in `src/auth/mod.rs`.

@@ -32,6 +32,7 @@
 //! | `moq_relay_subscribe_errors_total` | `phase` | SUBSCRIBE rejected by the relay (phase: auth) |
 //! | `moq_relay_subscribe_namespace_errors_total` | `phase` | SUBSCRIBE_NAMESPACE rejected by the relay (phase: auth) |
 //! | `moq_relay_track_status_errors_total` | `phase` | TRACK_STATUS rejected by the relay (phase: auth) |
+//! | `moq_relay_fetch_errors_total` | `phase` | Standalone FETCH rejected by the relay (phase: auth) |
 //! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
 //! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
 //! | `moq_relay_subscribe_upstream_errors_total` | - | Upstream subscription could not be established, so the downstream SUBSCRIBE was rejected |
@@ -200,7 +201,11 @@ pub fn describe_metrics() {
     describe_histogram!(
         "moq_relay_subscribe_latency_seconds",
         Unit::Seconds,
-        "Time to resolve subscription by source (local, remote, not_found, route_error, upstream_error, downstream_left)"
+        "Time to resolve subscription by source (local, remote, not_found, unauthorized, route_error, upstream_error, downstream_left)"
+    );
+    describe_counter!(
+        "moq_relay_fetch_errors_total",
+        "Standalone FETCH requests rejected by the relay, by phase (phase: auth)"
     );
 }
 

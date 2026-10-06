@@ -63,6 +63,11 @@ impl Producer {
     /// must be a compile error rather than a silent grant. `None` states that
     /// the session needs no authorization — its scope has no policy, or the
     /// relay dialled the peer itself.
+    ///
+    /// **Breaking change** (SemVer `0.7.x` → `0.8.x`): the old `Producer::new`
+    /// public convenience constructor has been removed because it could only
+    /// produce an unauthenticated producer. External embedders must supply the
+    /// `auth` state explicitly. See the `feat(auth)!` commit for the rationale.
     pub(crate) fn new_with_upstream_namespaces(
         publisher: Publisher,
         locals: Locals,
