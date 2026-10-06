@@ -9,3 +9,12 @@
 [[package]]
 name = "moq-relay-ietf"
 semver_check = false
+
+# Temporary: disable release-plz semver-checks for moq-api while the
+# published baseline (0.2.13) declares serde = "1" without features = ["derive"],
+# causing cargo-semver-checks rustdoc compilation to fail under isolated fresh
+# resolution (Serialize/Deserialize macros unavailable). This commit fixes the
+# declaration in source; remove this override once the fixed release is published.
+[[package]]
+name = "moq-api"
+semver_check = false
