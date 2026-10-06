@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.28](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.27...moq-relay-ietf-v0.7.28) - 2026-10-06
+
+### Added
+
+- *(auth)* add generic client token presentation
+- *(auth)* add scope-configured CAT bearer authorization
+
+### Fixed
+
+- *(auth)* suppress clippy::double_must_use on AuthHook trait
+- *(test)* update joining-FETCH tests to use new Producer/Consumer constructors
+- *(auth)* replace broken intra-doc link to private may_fetch_track
+- *(auth)* update AuthzOperation doc for joining FETCH; add reject_with regression tests
+- *(auth)* gate standalone FETCH on CAT authorization
+- *(test)* update FETCH tests to use new Producer/Consumer constructors
+- *(auth-cat)* pin cat-token to exact =0.3.0-alpha.2
+- *(auth-cat)* format cat.rs to pass cargo fmt
+
+### Other
+
+- *(auth)* clarify no-policy scope behavior in mod.rs
+- *(relay)* qualify authorization README — add announce forward-link caveat
+- *(auth)* fix attribution in comments; add metrics; breaking-change marker note
+- *(auth-cat)* complete allowlist description in cat.rs module doc
+- *(auth)* document enforcement points; harden AuthToken API
+- *(auth-cat)* correct load-bearing-claim test rationale and document catv gap
+- *(auth-cat)* document nbf two-pass design and may_announce auth flow
+- *(auth-cat)* assert scope without nil prefix matches deeper namespace
+- *(auth-cat)* align with cat-token 0.3.0-alpha.2
+
 ## [0.7.27](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.26...moq-relay-ietf-v0.7.27) - 2026-10-06
 
 ### Added
