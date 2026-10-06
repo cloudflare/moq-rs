@@ -58,7 +58,7 @@ const RENDEZVOUS_RETRY_INTERVAL_STRIDE: u64 = 577;
 const NAMESPACE_CHANGE_CHANNEL_CAPACITY: usize = 1024;
 
 /// Capacity of the PUBLISH track add/remove notification broadcast channel used
-/// by Publish/Both fan-out.
+/// by SUBSCRIBE_TRACKS fan-out.
 const TRACK_CHANGE_CHANNEL_CAPACITY: usize = 1024;
 
 #[derive(Clone)]
@@ -446,7 +446,7 @@ pub struct Locals {
     /// Namespace add/remove notifications for SUBSCRIBE_NAMESPACE handlers.
     namespace_changes: broadcast::Sender<NamespaceChange>,
 
-    /// Actual PUBLISH track add/remove notifications for Publish/Both fan-out.
+    /// PUBLISH track add/remove notifications for SUBSCRIBE_TRACKS fan-out.
     track_changes: broadcast::Sender<TrackChange>,
 
     /// Generation- and origin-aware PUBLISH changes for SUBSCRIBE_TRACKS.
@@ -605,6 +605,10 @@ impl Locals {
             .collect()
     }
 
+    /// Returns all live tracks whose namespace starts with `prefix`.
+    ///
+    /// Primarily used in tests and diagnostics. Production fan-out for
+    /// SUBSCRIBE_TRACKS uses [`Locals::list_tracks_matching_for_session`] instead.
     pub fn list_tracks_matching(
         &self,
         scope: Option<&str>,
@@ -612,8 +616,7 @@ impl Locals {
     ) -> Vec<TrackReader> {
         let scope_key = scope.unwrap_or(UNSCOPED);
 
-        // Collect matching readers under a shared read lock so concurrent
-        // SUBSCRIBE_NAMESPACE fan-outs don't serialize against each other. Note any
+        // Collect matching readers under a shared read lock. Note any
         // closed entries and handle them afterwards under a brief write lock, keeping
         // the common (no-stale) path read-only.
         let mut matches = Vec::new();
@@ -2936,6 +2939,52 @@ mod tests {
         assert!(
             locals.retrieve_track(None, &key).is_none(),
             "a stale guard must not pin a replacement entry"
+        );
+    }
+
+    /// SUBSCRIBE_NAMESPACE is namespace-discovery only (draft-18 §10.18).
+    ///
+    /// Verifies that `subscribe_namespace_changes` and `subscribe_track_changes`
+    /// are independent: a PUBLISH_NAMESPACE registration delivers namespace events
+    /// but does NOT deliver track-change events. Before removing the
+    /// `wants_publish` path from `serve_subscribe_namespace`, SUBSCRIBE_NAMESPACE
+    /// with `SubscribeOptions::Publish` or `::Both` would consume the
+    /// `subscribe_track_changes` channel and emit PUBLISH messages to the
+    /// downstream subscriber — spec-incorrect behavior that this test guards
+    /// against at the Locals layer.
+    #[tokio::test]
+    async fn namespace_changes_and_track_changes_are_independent_channels() {
+        let mut locals = Locals::new();
+        let mut ns_rx = locals.subscribe_namespace_changes();
+        let mut track_rx = locals.subscribe_track_changes();
+
+        let namespace = ns("collab/session1");
+
+        // Register a namespace (simulates PUBLISH_NAMESPACE from an origin).
+        let (_registration, _requests) = locals
+            .register_namespace(None, namespace.clone())
+            .await
+            .expect("namespace should register");
+
+        // The namespace channel delivers the NAMESPACE_ADDED event.
+        let event = tokio::time::timeout(std::time::Duration::from_millis(50), ns_rx.recv())
+            .await
+            .expect("namespace change should arrive promptly")
+            .expect("channel should be open");
+        assert!(
+            matches!(event, NamespaceChange::Added { .. }),
+            "expected NamespaceChange::Added, got {event:?}"
+        );
+
+        // The track channel receives NO event — publishing a namespace does not
+        // fan out track changes, and SUBSCRIBE_NAMESPACE must not consult this
+        // channel (draft-18 §10.18 is namespace-discovery only; SUBSCRIBE_TRACKS
+        // §10.19 owns track fan-out).
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), track_rx.recv())
+                .await
+                .is_err(),
+            "a PUBLISH_NAMESPACE must not deliver a TrackChange to SUBSCRIBE_NAMESPACE subscribers"
         );
     }
 }
