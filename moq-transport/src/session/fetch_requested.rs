@@ -649,9 +649,16 @@ async fn run_fetch_writer(
                 (send_write_result(result, outcome), false)
             }
             FetchWriteCommand::Reject(rejection, result) => {
-                let outcome = if responded || pending_response.is_some() {
+                let outcome = if responded {
+                    // FETCH_OK was already committed — data is flowing.
+                    // REQUEST_ERROR cannot be sent after the response stream starts.
                     Err(ServeError::Duplicate.into())
                 } else {
+                    // FETCH_OK has not been sent yet even if it was staged in
+                    // pending_response. Rejection takes precedence: discard the
+                    // pending response (it was never committed to the wire) and
+                    // send REQUEST_ERROR instead.
+                    pending_response = None;
                     request
                         .claim_response()
                         .map_err(SessionError::from)
