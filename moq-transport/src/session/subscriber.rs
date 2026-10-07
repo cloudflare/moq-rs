@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{hash_map, HashMap, HashSet, VecDeque},
     io,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -29,6 +32,16 @@ use super::{
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
 const DEFAULT_ALIAS_WAIT_TIME_MS: u64 = 1000;
+
+/// How many aliases of ended outbound subscriptions and inbound PUBLISH tracks
+/// to remember, so that their late datagrams are dropped at once instead of
+/// waited on.
+const MAX_ENDED_ALIASES: usize = 1024;
+
+/// How many datagrams with a not-yet-known alias may wait for it at once.
+/// Beyond this they are dropped: they are unreliable anyway, and the bound
+/// keeps a peer from holding unbounded state with made-up aliases.
+const MAX_PENDING_DATAGRAMS: usize = 64;
 
 /// How long to keep a subscription alive after PUBLISH_DONE when the announced
 /// Stream Count has not been reached (draft-18 §10.11).
@@ -251,6 +264,12 @@ impl TrackOrigin {
 struct TrackAliasRegistry {
     by_alias: HashMap<u64, TrackOrigin>,
     by_request_id: HashMap<u64, u64>,
+    /// Aliases whose outbound subscription or inbound PUBLISH track has ended,
+    /// most recent last, bounded by `MAX_ENDED_ALIASES`. Datagrams for these
+    /// are expected (in flight or queued when the track ended) and are dropped
+    /// without waiting.
+    ended: HashSet<u64>,
+    ended_order: VecDeque<u64>,
 }
 
 impl TrackAliasRegistry {
@@ -262,6 +281,12 @@ impl TrackAliasRegistry {
         self.by_alias.get(&alias).copied()
     }
 
+    /// Whether `alias` belonged to an outbound subscription or inbound PUBLISH
+    /// track that has since ended.
+    fn has_ended(&self, alias: u64) -> bool {
+        self.ended.contains(&alias)
+    }
+
     fn insert(&mut self, alias: u64, origin: TrackOrigin) -> Result<(), SessionError> {
         if self.by_alias.contains_key(&alias) {
             return Err(SessionError::Duplicate);
@@ -269,6 +294,12 @@ impl TrackAliasRegistry {
 
         if let Some(old_alias) = self.by_request_id.insert(origin.request_id(), alias) {
             self.by_alias.remove(&old_alias);
+            self.mark_ended(old_alias);
+        }
+        // A publisher may assign an alias again once its old subscription is
+        // gone; from here on it is live.
+        if self.ended.remove(&alias) {
+            self.ended_order.retain(|&a| a != alias);
         }
         self.by_alias.insert(alias, origin);
         Ok(())
@@ -276,12 +307,38 @@ impl TrackAliasRegistry {
 
     fn remove_by_request_id(&mut self, request_id: u64) -> Option<TrackOrigin> {
         let alias = self.by_request_id.remove(&request_id)?;
-        self.by_alias.remove(&alias)
+        let origin = self.by_alias.remove(&alias);
+        self.mark_ended(alias);
+        origin
+    }
+
+    fn mark_ended(&mut self, alias: u64) {
+        if self.ended.insert(alias) {
+            self.ended_order.push_back(alias);
+            if self.ended_order.len() > MAX_ENDED_ALIASES {
+                if let Some(oldest) = self.ended_order.pop_front() {
+                    self.ended.remove(&oldest);
+                }
+            }
+        }
     }
 
     #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.by_alias.is_empty() && self.by_request_id.is_empty()
+    }
+}
+
+/// RAII guard that decrements `pending_datagrams` when dropped.
+///
+/// Placed in a task spawned by [`Subscriber::defer_datagram`] so that the
+/// slot is released whether the task completes normally, panics, or is
+/// cancelled via [`tokio::task::JoinHandle::abort`].
+struct PendingSlot(Arc<AtomicUsize>);
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -308,6 +365,10 @@ pub struct Subscriber {
     /// Notify when `track_alias_map` is updated, for stream and datagram
     /// routing that can arrive before the alias is registered.
     track_alias_notify: Arc<Notify>,
+
+    /// Datagrams currently waiting off the receive loop for their alias to be
+    /// registered; bounded by `MAX_PENDING_DATAGRAMS`.
+    pending_datagrams: Arc<AtomicUsize>,
 
     /// Tracks this endpoint subscribes to, for the §5.1 duplicate check.
     subscriber_names: Arc<Mutex<NameRegistry>>,
@@ -403,6 +464,7 @@ impl Subscriber {
             mlog,
             track_alias_map: Default::default(),
             track_alias_notify: Arc::new(Notify::new()),
+            pending_datagrams: Default::default(),
             subscriber_names: Default::default(),
             publishes_received: Default::default(),
             publish_received_queue: Default::default(),
@@ -2199,10 +2261,87 @@ impl Subscriber {
         }
 
         // Route to whichever subscription owns this track alias.
-        let origin = self
-            .get_track_origin_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-            .await?;
+        //
+        // One loop reads every datagram on the session, so nothing here may
+        // wait: a datagram held up behind another track's lookup is late for
+        // every track. A datagram for an ended subscription is ordinary (it was
+        // in flight, or queued, when the subscription closed) and is dropped.
+        // One whose alias is not known yet may have overtaken its SUBSCRIBE_OK,
+        // so it waits for the alias on its own task.
+        let lookup = match self.track_alias_map.lock() {
+            Ok(aliases) => match aliases.get(datagram.track_alias) {
+                Some(origin) => Ok(origin),
+                None => Err(aliases.has_ended(datagram.track_alias)),
+            },
+            Err(_) => return Err(SessionError::Internal),
+        };
 
+        match lookup {
+            Ok(origin) => self.deliver_datagram(Some(origin), datagram)?,
+            Err(true) => {
+                tracing::debug!(
+                    track_alias = datagram.track_alias,
+                    group_id = datagram.group_id,
+                    object_id = datagram.object_id.unwrap_or(0),
+                    "[SUBSCRIBER] recv_datagram: dropped datagram for ended subscription"
+                );
+            }
+            Err(false) => self.defer_datagram(datagram),
+        }
+
+        Ok(())
+    }
+
+    /// Wait for an unknown alias off the receive loop, then deliver.
+    ///
+    /// A datagram whose alias is not yet in the registry may simply have
+    /// overtaken its SUBSCRIBE_OK. Spawning an off-loop task lets every other
+    /// track's datagrams proceed immediately. The number of concurrent waiters
+    /// is bounded; datagrams beyond the cap are dropped (they are unreliable
+    /// anyway).
+    ///
+    /// Each spawned task holds a clone of `Self`, which in turn holds an `Arc`
+    /// reference to the underlying `web_transport::Session`. Up to
+    /// `MAX_PENDING_DATAGRAMS` (64) such clones can exist simultaneously. After
+    /// session teardown, `get_track_origin_by_alias` runs until its timeout
+    /// (up to `DEFAULT_ALIAS_WAIT_TIME_MS`, 1 s) before the task exits — the
+    /// loop does not propagate a teardown signal. This is a bounded, known cost.
+    fn defer_datagram(&self, datagram: data::Datagram) {
+        let pending = self.pending_datagrams.fetch_add(1, Ordering::AcqRel);
+        if pending >= MAX_PENDING_DATAGRAMS {
+            self.pending_datagrams.fetch_sub(1, Ordering::AcqRel);
+            tracing::debug!(
+                track_alias = datagram.track_alias,
+                "[SUBSCRIBER] recv_datagram: discarded, too many datagrams waiting for unknown aliases"
+            );
+            return;
+        }
+
+        let subscriber = self.clone();
+        // `PendingSlot` decrements the counter when dropped — whether the
+        // task completes normally, panics, or is cancelled via `.abort()`.
+        let _slot = PendingSlot(subscriber.pending_datagrams.clone());
+        tokio::spawn(async move {
+            let _slot = _slot; // move into task; drop releases the slot
+            let origin = subscriber
+                .get_track_origin_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
+                .await;
+            let res = match origin {
+                Ok(origin) => subscriber.deliver_datagram(origin, datagram),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = res {
+                tracing::warn!(%err, "[SUBSCRIBER] recv_datagram: late datagram not delivered");
+            }
+        });
+    }
+
+    /// Hand a decoded datagram to the subscription that owns its alias.
+    fn deliver_datagram(
+        &self,
+        origin: Option<TrackOrigin>,
+        datagram: data::Datagram,
+    ) -> Result<(), SessionError> {
         match origin {
             Some(TrackOrigin::Subscribe(subscribe_id)) => {
                 if let Some(subscribe) = self
@@ -2253,7 +2392,6 @@ impl Subscriber {
                     datagram.payload.as_ref().map_or(0, |p| p.len()));
             }
         }
-
         Ok(())
     }
 }
@@ -2344,6 +2482,132 @@ mod tests {
     async fn receives_compact_datagram_over_raw_quic() {
         let (receiver, peer) = loopback_raw_session_pair().await;
         assert_compact_datagram_ingress(receiver, peer, super::super::Transport::RawQuic).await;
+    }
+
+    // ── Datagram receive-loop non-blocking tests (M1) ──────────────────────
+
+    /// A compact datagram: payload, EOG, Object ID zero, inherited priority.
+    fn compact_datagram(track_alias: u8, group_id: u8) -> bytes::Bytes {
+        bytes::Bytes::from(vec![0x0e, track_alias, group_id, b'x'])
+    }
+
+    /// Subscribe to a datagram track under `track_alias` and return its reader.
+    fn live_datagram_track(
+        subscriber: &Subscriber,
+        request_id: u64,
+        track_alias: u64,
+    ) -> (Subscribe, serve::TrackReader) {
+        let (writer, reader) = serve::Track::new(
+            TrackNamespace::from_utf8_path("test/ns"),
+            format!("track{request_id}"),
+        )
+        .produce();
+        let subscribe = register_test_subscribe(subscriber, writer, request_id, track_alias);
+        (subscribe, reader)
+    }
+
+    /// Read one datagram from `reader`, failing if it takes longer than `within`.
+    async fn next_datagram(
+        reader: serve::TrackReader,
+        within: std::time::Duration,
+    ) -> serve::Datagram {
+        let read = async {
+            let serve::TrackReaderMode::Datagrams(mut datagrams) = reader.mode().await.unwrap()
+            else {
+                panic!("expected datagram delivery");
+            };
+            datagrams.read().await.unwrap().unwrap()
+        };
+        tokio::time::timeout(within, read)
+            .await
+            .unwrap_or_else(|_| panic!("datagram not delivered within {within:?}"))
+    }
+
+    /// One session-wide loop reads every datagram. A datagram for a
+    /// subscription that has already ended is ordinary (it was in flight, or
+    /// queued behind other datagrams, when the subscription closed) and must not
+    /// hold up the datagrams queued behind it for other tracks.
+    ///
+    /// Before the fix, each such datagram blocked the loop for the full alias
+    /// wait (1 s). A relay releasing several upstream subscriptions in quick
+    /// succession queued enough of them to hold every datagram track on that
+    /// upstream session to about one object per second for tens of seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn datagrams_for_ended_subscription_do_not_stall_other_tracks() {
+        let (receiver, peer) = loopback_raw_session_pair().await;
+        let subscriber =
+            test_subscriber_for_transport(receiver.clone(), super::super::Transport::RawQuic);
+
+        let (_ended, _ended_reader) = live_datagram_track(&subscriber, 0, 10);
+        let (_live, live_reader) = live_datagram_track(&subscriber, 2, 12);
+        // End the first subscription — alias 10 is now in the tombstone set.
+        assert!(subscriber.remove_subscribe(0).is_some());
+
+        let receive = tokio::spawn(super::super::Session::run_datagrams(
+            receiver,
+            Some(subscriber),
+        ));
+
+        // Three late datagrams for the ended subscription, then one for the
+        // live track.
+        for group in 0..3 {
+            peer.send_datagram(compact_datagram(10, group))
+                .await
+                .unwrap();
+        }
+        peer.send_datagram(compact_datagram(12, 7)).await.unwrap();
+
+        let datagram = next_datagram(live_reader, std::time::Duration::from_millis(300)).await;
+        assert_eq!(datagram.group_id, 7);
+        receive.abort();
+    }
+
+    /// A datagram whose alias this session has never seen may be a peer bug, or
+    /// may simply have overtaken its SUBSCRIBE_OK. Either way, waiting for it
+    /// must not hold up other tracks' datagrams.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn datagram_with_unknown_alias_does_not_stall_other_tracks() {
+        let (receiver, peer) = loopback_raw_session_pair().await;
+        let subscriber =
+            test_subscriber_for_transport(receiver.clone(), super::super::Transport::RawQuic);
+        let (_live, live_reader) = live_datagram_track(&subscriber, 2, 12);
+
+        let receive = tokio::spawn(super::super::Session::run_datagrams(
+            receiver,
+            Some(subscriber),
+        ));
+        // Unknown alias 50 first, then the live alias 12.
+        peer.send_datagram(compact_datagram(50, 0)).await.unwrap();
+        peer.send_datagram(compact_datagram(12, 7)).await.unwrap();
+
+        let datagram = next_datagram(live_reader, std::time::Duration::from_millis(300)).await;
+        assert_eq!(datagram.group_id, 7);
+        receive.abort();
+    }
+
+    /// The alias wait still serves its purpose: a datagram that overtakes its
+    /// SUBSCRIBE_OK is delivered once the alias is registered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn datagram_overtaking_subscribe_ok_is_delivered_once_alias_registered() {
+        let (receiver, peer) = loopback_raw_session_pair().await;
+        let subscriber =
+            test_subscriber_for_transport(receiver.clone(), super::super::Transport::RawQuic);
+
+        let receive = tokio::spawn(super::super::Session::run_datagrams(
+            receiver,
+            Some(subscriber.clone()),
+        ));
+        // Datagram arrives before the subscription.
+        peer.send_datagram(compact_datagram(20, 4)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Now register the subscription and wake the waiter.
+        let (_late, late_reader) = live_datagram_track(&subscriber, 4, 20);
+        subscriber.track_alias_notify.notify_waiters();
+
+        let datagram = next_datagram(late_reader, std::time::Duration::from_millis(900)).await;
+        assert_eq!(datagram.group_id, 4);
+        receive.abort();
     }
 
     async fn assert_compact_publish_datagram_ingress(
@@ -4006,6 +4270,194 @@ mod tests {
             "draining subscriptions must stay bounded, got {}",
             subscriber.draining_count()
         );
+    }
+
+    // ── TrackAliasRegistry bounded-state unit tests ────────────────────────
+
+    /// Aliases of removed subscriptions enter the tombstone set so late
+    /// datagrams are dropped immediately rather than waited on.
+    #[test]
+    fn removed_alias_is_tombstoned() {
+        let mut reg = TrackAliasRegistry::default();
+        reg.insert(1, TrackOrigin::Subscribe(10)).unwrap();
+        assert!(!reg.has_ended(1));
+        reg.remove_by_request_id(10);
+        assert!(
+            reg.has_ended(1),
+            "removed alias must be in the tombstone set"
+        );
+        assert!(!reg.by_alias.contains_key(&1), "alias must not remain live");
+    }
+
+    /// When a request-id gets a new alias, the old alias is tombstoned and the
+    /// new alias is removed from the tombstone if it was there.
+    #[test]
+    fn reused_alias_cleared_from_tombstone_on_reassignment() {
+        let mut reg = TrackAliasRegistry::default();
+        // Subscription 10 on alias 1, then ended.
+        reg.insert(1, TrackOrigin::Subscribe(10)).unwrap();
+        reg.remove_by_request_id(10);
+        assert!(reg.has_ended(1));
+
+        // A new subscription (id 20) reuses the same alias 1.
+        reg.insert(1, TrackOrigin::Subscribe(20)).unwrap();
+        assert!(
+            !reg.has_ended(1),
+            "reassigned alias must leave the tombstone set"
+        );
+        assert!(
+            reg.by_alias.contains_key(&1),
+            "reassigned alias must be live"
+        );
+    }
+
+    /// When a request-id receives a SUBSCRIBE_OK on a second alias (replacing
+    /// the first), the first alias is tombstoned.
+    #[test]
+    fn old_alias_tombstoned_when_request_id_gets_new_alias() {
+        let mut reg = TrackAliasRegistry::default();
+        reg.insert(5, TrackOrigin::Subscribe(99)).unwrap();
+        // Same request-id gets a new alias — simulates SUBSCRIBE_OK arriving twice.
+        reg.insert(6, TrackOrigin::Subscribe(99)).unwrap();
+        assert!(reg.has_ended(5), "replaced alias must be tombstoned");
+        assert!(!reg.has_ended(6), "new alias must not be in tombstone");
+    }
+
+    /// The `Slot` RAII guard must return the counter to 0 when the task
+    /// completes normally. Without the guard a panic or cancellation would leak
+    /// the slot permanently, shrinking the effective budget for all callers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_datagram_counter_returns_to_zero_when_task_completes() {
+        let (receiver, peer) = loopback_raw_session_pair().await;
+        let subscriber =
+            test_subscriber_for_transport(receiver.clone(), super::super::Transport::RawQuic);
+
+        // Start the datagram loop.
+        let receive = tokio::spawn(super::super::Session::run_datagrams(
+            receiver,
+            Some(subscriber.clone()),
+        ));
+
+        // Alias 50 is unknown → defer_datagram spawns a task, incrementing
+        // the counter. No subscription ever appears, so after 1 s the task
+        // exits and the Slot guard decrements.
+        peer.send_datagram(compact_datagram(50, 0)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            subscriber.pending_datagrams.load(Ordering::Relaxed),
+            1,
+            "counter must be 1 while the deferred task is waiting"
+        );
+
+        // Let the alias wait time out (1 s) plus margin.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            DEFAULT_ALIAS_WAIT_TIME_MS + 200,
+        ))
+        .await;
+        assert_eq!(
+            subscriber.pending_datagrams.load(Ordering::Relaxed),
+            0,
+            "Slot guard must decrement the counter when the task exits"
+        );
+        receive.abort();
+    }
+
+    /// `PendingSlot::drop` must decrement the counter even when the task that
+    /// holds the slot is cancelled via `JoinHandle::abort`. This is the RAII
+    /// contract: Drop fires on cancellation just as it does on normal exit.
+    #[tokio::test]
+    async fn pending_slot_drops_counter_on_task_abort() {
+        let counter = Arc::new(AtomicUsize::new(1));
+
+        // Spawn a task that holds a PendingSlot and sleeps indefinitely.
+        let slot = PendingSlot(counter.clone());
+        let handle = tokio::spawn(async move {
+            let _slot = slot;
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "counter live while task runs"
+        );
+
+        handle.abort();
+        // Drop propagates asynchronously; yield to the runtime.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "PendingSlot must decrement on task abort"
+        );
+    }
+
+    /// When `MAX_PENDING_DATAGRAMS` unknown-alias datagrams are already waiting,
+    /// the next one must be dropped without incrementing the counter past the cap.
+    ///
+    /// Aliases must be < 64 (0x3F) to encode as single-byte varints; aliases
+    /// ≥ 64 are multi-byte varints and would cause a ProtocolViolation that
+    /// shuts down the receive loop before the cap is reached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_datagram_cap_drops_excess_datagrams() {
+        let (receiver, peer) = loopback_raw_session_pair().await;
+        let subscriber =
+            test_subscriber_for_transport(receiver.clone(), super::super::Transport::RawQuic);
+
+        let receive = tokio::spawn(super::super::Session::run_datagrams(
+            receiver,
+            Some(subscriber.clone()),
+        ));
+
+        // Send MAX_PENDING_DATAGRAMS (64) datagrams with distinct unknown aliases
+        // 0–63, all valid 1-byte VarInts. Each spawns a deferred task that waits
+        // up to DEFAULT_ALIAS_WAIT_TIME_MS for alias registration.
+        for i in 0..MAX_PENDING_DATAGRAMS as u8 {
+            peer.send_datagram(compact_datagram(i, 0)).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            subscriber.pending_datagrams.load(Ordering::Relaxed),
+            MAX_PENDING_DATAGRAMS,
+            "counter must equal the cap after sending exactly cap datagrams"
+        );
+
+        // One more datagram (alias 0 again, still unknown) must be dropped;
+        // counter must stay at the cap.
+        peer.send_datagram(compact_datagram(0, 1)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            subscriber.pending_datagrams.load(Ordering::Relaxed),
+            MAX_PENDING_DATAGRAMS,
+            "counter must not exceed MAX_PENDING_DATAGRAMS after cap overflow"
+        );
+
+        receive.abort();
+    }
+
+    /// The tombstone set is bounded at MAX_ENDED_ALIASES (1024). The oldest
+    /// entry is evicted when the set is full.
+    #[test]
+    fn tombstone_evicts_oldest_when_full() {
+        let mut reg = TrackAliasRegistry::default();
+        // Fill the tombstone set to exactly MAX_ENDED_ALIASES.
+        for i in 0..MAX_ENDED_ALIASES as u64 {
+            reg.insert(i, TrackOrigin::Subscribe(i)).unwrap();
+            reg.remove_by_request_id(i);
+        }
+        assert_eq!(reg.ended.len(), MAX_ENDED_ALIASES);
+        assert!(reg.has_ended(0), "oldest entry must still be present");
+
+        // One more pushes 0 out.
+        let overflow = MAX_ENDED_ALIASES as u64;
+        reg.insert(overflow, TrackOrigin::Subscribe(overflow))
+            .unwrap();
+        reg.remove_by_request_id(overflow);
+        assert_eq!(reg.ended.len(), MAX_ENDED_ALIASES);
+        assert!(!reg.has_ended(0), "oldest entry must have been evicted");
+        assert!(reg.has_ended(overflow), "newest entry must be present");
     }
 
     /// The drain timeout is the backstop for a publisher that announced streams

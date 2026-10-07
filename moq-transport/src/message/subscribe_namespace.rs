@@ -82,7 +82,7 @@ mod tests {
         assert_eq!(decoded.id, 1);
         assert_eq!(decoded.track_namespace_prefix.fields.len(), 1);
         assert_eq!(&decoded.track_namespace_prefix.fields[0].value[..], b"ns");
-        assert!(decoded.params.is_empty());
+        assert!(decoded.params.0.is_empty());
         assert!(buf.is_empty(), "decoder must consume all 6 payload bytes");
     }
 }
