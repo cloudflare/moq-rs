@@ -66,6 +66,30 @@ struct SubgroupsState {
 }
 
 pub(crate) const MAX_PENDING_SUBGROUPS: usize = 1024;
+
+/// Subgroups kept for a first reader that hasn't arrived yet.
+///
+/// The template reader from [`Subgroups::produce`] keeps history so the first
+/// subscriber sees subgroups written just before it subscribed. Nobody may ever
+/// subscribe, so that history is a sliding window: the oldest subgroups are
+/// dropped rather than held until `MAX_PENDING_SUBGROUPS`, which for a track
+/// with large groups is a great deal of memory per track.
+///
+/// 8 subgroup streams at one subgroup per group — typical for MoQ live video
+/// — gives the first subscriber roughly 8 groups (≈8 s at 1 group/s) of join
+/// history without unbounded growth when a track runs unobserved. Tracks with
+/// multiple subgroups per group get proportionally fewer groups of history;
+/// increase this value if the application needs more backward reach at join
+/// time.
+///
+/// Note: clones of the template that haven't yet registered (i.e. have
+/// `claim_template = true` but have never polled) are not windowed by this
+/// bound — they carry a separate cursor that can fall behind just as the old
+/// template cursor did. In practice the normal subscription path registers
+/// immediately, so this is unlikely, but callers that clone without polling
+/// should not be held for long.
+const MAX_UNCLAIMED_HISTORY: usize = 8;
+
 const MAX_LIVE_SUBGROUPS: usize = 1024;
 const MAX_LOGICAL_SUBGROUPS: usize = 1024;
 
@@ -182,8 +206,27 @@ impl SubgroupsState {
     }
 
     fn isolate_lagging_readers(&mut self) {
+        let unclaimed_template = (!self.template_claimed)
+            .then(|| self.template_cursor.as_ref().and_then(Weak::upgrade))
+            .flatten();
         for cursor in self.reader_cursors.iter().filter_map(Weak::upgrade) {
             if !cursor.active.load(Ordering::Relaxed) {
+                continue;
+            }
+            if unclaimed_template
+                .as_ref()
+                .is_some_and(|template| Arc::ptr_eq(template, &cursor))
+            {
+                // Slide the window instead of failing the template: the reader
+                // that eventually claims it must start healthy. The subgroup
+                // being created takes `next_sequence`, so keep the newest
+                // `MAX_UNCLAIMED_HISTORY - 1` before it.
+                let oldest_kept = self
+                    .next_sequence
+                    .saturating_sub(MAX_UNCLAIMED_HISTORY.saturating_sub(1));
+                if cursor.sequence.load(Ordering::Relaxed) < oldest_kept {
+                    cursor.sequence.store(oldest_kept, Ordering::Relaxed);
+                }
                 continue;
             }
             let pending = self
@@ -1889,5 +1932,128 @@ mod tests {
             writer.create_with_id(6, 0, None),
             Err(ServeError::Duplicate)
         ));
+    }
+
+    // ── M2: unclaimed template memory bound ────────────────────────────────
+
+    /// A track nobody subscribes to must not accumulate all it publishes.
+    ///
+    /// The template reader from `produce` (held by `TrackReader` for the first
+    /// subscriber) used to pin every subgroup until `MAX_PENDING_SUBGROUPS`:
+    /// a 50-object group per second retained 1024 groups (~100 MB for 2 KB
+    /// objects per track). After the fix, only `MAX_UNCLAIMED_HISTORY` subgroups
+    /// are kept at any time.
+    ///
+    /// This test also verifies the queue-length invariant directly: after every
+    /// new subgroup is created (and the sliding window runs), `pending_subgroups`
+    /// must not exceed `MAX_UNCLAIMED_HISTORY`.
+    #[tokio::test]
+    async fn unread_template_retains_a_bounded_window() {
+        let (mut writer, _template) = subgroups();
+
+        for group_id in 0..(MAX_PENDING_SUBGROUPS as u64 * 2) {
+            // Create and immediately drop so the subgroup is closed, driving
+            // the normal prune_consumed path.
+            let mut sg = create_subgroup(&mut writer, group_id, 0);
+            sg.write(bytes::Bytes::from_static(&[0; 64])).unwrap();
+            drop(sg);
+
+            let state = writer.state.lock();
+            assert!(
+                state.pending_subgroups.len() <= MAX_UNCLAIMED_HISTORY,
+                "pending_subgroups at group {group_id}: {} > MAX_UNCLAIMED_HISTORY ({})",
+                state.pending_subgroups.len(),
+                MAX_UNCLAIMED_HISTORY,
+            );
+        }
+    }
+
+    /// The first reader to arrive after a long unread stretch must start
+    /// healthy — not lagged — and see the most recent history window rather
+    /// than failing with "subgroup reader exceeded its pending stream limit".
+    #[tokio::test]
+    async fn first_reader_after_unread_stretch_gets_recent_history() {
+        let (mut writer, template) = subgroups();
+
+        let total = MAX_PENDING_SUBGROUPS as u64 * 2;
+        for group_id in 0..total {
+            let _sg = create_subgroup(&mut writer, group_id, 0);
+        }
+
+        // The first subscriber arrives now — it must not be lagged.
+        let mut first = template.clone();
+        let oldest_kept = total - MAX_UNCLAIMED_HISTORY as u64;
+        let expected: Vec<(u64, u64)> = (oldest_kept..total).map(|g| (g, 0)).collect();
+        assert_subgroups(&mut first, &expected).await;
+
+        // After claiming, new subgroups flow normally.
+        let _new_sg = create_subgroup(&mut writer, total, 0);
+        assert_subgroups(&mut first, &[(total, 0)]).await;
+    }
+
+    /// Within the window, a subscriber still sees what was published just
+    /// before it subscribed — the purpose of the template.
+    #[tokio::test]
+    async fn first_reader_sees_subgroups_published_just_before_it() {
+        let (mut writer, template) = subgroups();
+
+        // Publish a few groups: well within the window.
+        for group_id in 0..3 {
+            let _sg = create_subgroup(&mut writer, group_id, 0);
+        }
+
+        let mut first = template.clone();
+        assert_subgroups(&mut first, &[(0, 0), (1, 0), (2, 0)]).await;
+    }
+
+    /// After a clean drop of the template (nobody ever subscribes), the
+    /// Weak reference in `template_cursor` becomes dead immediately.
+    /// No strong Arc holds the cursor, so no subgroups are pinned by it.
+    ///
+    /// This test also verifies that the sliding window kept `pending_subgroups`
+    /// bounded during publishing: after `MAX_UNCLAIMED_HISTORY + 3` groups the
+    /// queue holds exactly `MAX_UNCLAIMED_HISTORY` entries, not all 11.
+    #[tokio::test]
+    async fn dropped_unclaimed_template_releases_cursor() {
+        let (mut writer, template) = subgroups();
+
+        for group_id in 0..(MAX_UNCLAIMED_HISTORY as u64 + 3) {
+            let _sg = create_subgroup(&mut writer, group_id, 0);
+        }
+
+        // After publishing past the window, queue is bounded.
+        {
+            let state = writer.state.lock();
+            assert_eq!(
+                state.pending_subgroups.len(),
+                MAX_UNCLAIMED_HISTORY,
+                "pending_subgroups must be exactly MAX_UNCLAIMED_HISTORY after publishing past the window"
+            );
+        }
+
+        // Verify the Weak is alive while the reader lives.
+        {
+            let state = writer.state.lock();
+            assert!(
+                state
+                    .template_cursor
+                    .as_ref()
+                    .is_some_and(|w| w.upgrade().is_some()),
+                "template Weak must be alive while SubgroupsReader lives"
+            );
+        }
+
+        // Drop without ever subscribing.
+        drop(template);
+
+        // Now the Weak must be dead — no cursor holds a strong ref.
+        let state = writer.state.lock();
+        assert!(
+            state
+                .template_cursor
+                .as_ref()
+                .is_none_or(|w| w.upgrade().is_none()),
+            "template Weak must be dead after SubgroupsReader is dropped"
+        );
     }
 }
