@@ -1468,6 +1468,24 @@ impl Subscriber {
         Ok(())
     }
 
+    /// A subgroup that was open when a newer group became the track's latest is
+    /// no longer read by anyone, so writes into it return `ServeError::Cancel`.
+    /// That is not a track failure (it happens whenever an earlier group's
+    /// stream is still arriving after the next group starts, e.g. a
+    /// retransmitted audio group), so stop reading this stream and keep the
+    /// subscription. A track nobody reads at all still fails earlier, when the
+    /// subgroup is opened, and is handled by `recv_stream` as before.
+    fn log_superseded_subgroup(session_id: &SessionId, header: &data::SubgroupHeader) {
+        tracing::debug!(
+            session_id = %session_id,
+            "[SUBSCRIBER] recv_subgroup_objects: dropping superseded subgroup stream \
+             (track_alias={}, group_id={}, subgroup_id={})",
+            header.track_alias,
+            header.group_id,
+            header.subgroup_id.unwrap_or(0)
+        );
+    }
+
     /// Decode subgroup objects from a stream and write them via `get_writer`.
     ///
     /// This is the single implementation of the subgroup receive loop shared
@@ -1619,7 +1637,15 @@ impl Subscriber {
             // Write the object payload.
             // TODO SLG - object_id_delta and object status are still being ignored
             let subgroup_writer = subgroup_writer.as_mut().ok_or(SessionError::Internal)?;
-            let mut object_writer = subgroup_writer.create(remaining_bytes, extension_headers)?;
+            let mut object_writer = match subgroup_writer.create(remaining_bytes, extension_headers)
+            {
+                Ok(writer) => writer,
+                Err(ServeError::Cancel) => {
+                    Self::log_superseded_subgroup(&session_id, &subgroup_header);
+                    return Ok(());
+                }
+                Err(err) => return Err(err.into()),
+            };
 
             while remaining_bytes > 0 {
                 let chunk = reader.read_chunk(remaining_bytes).await?.ok_or_else(|| {
@@ -1631,7 +1657,14 @@ impl Subscriber {
                     SessionError::WrongSize
                 })?;
                 remaining_bytes -= chunk.len();
-                object_writer.write(chunk)?;
+                match object_writer.write(chunk) {
+                    Ok(()) => {}
+                    Err(ServeError::Cancel) => {
+                        Self::log_superseded_subgroup(&session_id, &subgroup_header);
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err.into()),
+                }
             }
 
             object_count += 1;

@@ -1022,3 +1022,54 @@ mod tests {
         assert_eq!(data1.len(), 3);
     }
 }
+
+#[cfg(test)]
+mod superseded_tests {
+    use super::*;
+    use crate::coding::TrackNamespace;
+
+    fn subgroup(group_id: u64) -> Subgroup {
+        Subgroup {
+            group_id,
+            subgroup_id: 0,
+            priority: 0,
+        }
+    }
+
+    /// An earlier group that is still being written when a newer group becomes
+    /// the track's latest is cancelled, but the track itself stays open: the
+    /// session layer relies on this to drop just that stream.
+    #[test]
+    fn superseded_subgroup_is_cancelled_but_track_stays_open() {
+        let (track_writer, _track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("ns"), "audio").produce();
+        let mut subgroups = track_writer.subgroups().unwrap();
+
+        let mut g1 = subgroups.create(subgroup(1)).unwrap();
+        g1.write(Bytes::from_static(b"g1-o0")).unwrap();
+
+        let mut g2 = subgroups.create(subgroup(2)).unwrap();
+        g2.write(Bytes::from_static(b"g2-o0")).unwrap();
+
+        assert_eq!(
+            g1.write(Bytes::from_static(b"g1-o1")),
+            Err(ServeError::Cancel)
+        );
+        assert!(subgroups.create(subgroup(3)).is_ok());
+    }
+
+    /// When nobody reads the track any more, opening a subgroup fails, so the
+    /// session layer still ends the subscription in that case.
+    #[test]
+    fn unread_track_fails_when_opening_a_subgroup() {
+        let (track_writer, track_reader) =
+            Track::new(TrackNamespace::from_utf8_path("ns"), "audio").produce();
+        let mut subgroups = track_writer.subgroups().unwrap();
+        drop(track_reader);
+
+        assert!(matches!(
+            subgroups.create(subgroup(1)),
+            Err(ServeError::Cancel)
+        ));
+    }
+}
