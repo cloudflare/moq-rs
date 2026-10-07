@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 use crate::{
     coding::{Decode, KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix},
     data,
-    message::{self, Message, SubscribeOptions},
+    message::{self, Message},
     mlog,
     serve::{self, FullTrackName, ServeError},
 };
@@ -804,7 +804,6 @@ impl Subscriber {
     pub async fn subscribe_namespace(
         &mut self,
         namespace_prefix: TrackNamespacePrefix,
-        subscribe_options: SubscribeOptions,
         params: KeyValuePairs,
     ) -> Result<SubscribeNamespace, SessionError> {
         let request_id = self.get_next_request_id()?;
@@ -827,7 +826,6 @@ impl Subscriber {
         let msg = message::SubscribeNamespace {
             id: request_id,
             track_namespace_prefix: namespace_prefix.clone(),
-            subscribe_options,
             params,
         };
         self.add_mlog_event(|time| mlog::events::subscribe_namespace_created(time, 0, &msg));
@@ -839,7 +837,6 @@ impl Subscriber {
         let info = SubscribeNamespaceInfo {
             request_id,
             namespace_prefix,
-            subscribe_options,
         };
         let (send, recv) = SubscribeNamespace::new(self.clone(), info, writer);
 

@@ -92,9 +92,6 @@ pub enum DecodeError {
 
     #[error("invalid datagram type")]
     InvalidDatagramType,
-
-    #[error("invalid subscribe namespace option: {0}")]
-    InvalidSubscribeOptions(u64),
 }
 
 impl From<io::Error> for DecodeError {

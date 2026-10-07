@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use moq_native_ietf::quic;
 use moq_transport::coding::{KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix};
-use moq_transport::message::SubscribeOptions;
+
 use moq_transport::serve::{ServeError, Track, TrackReader, TracksReader};
 use moq_transport::session::{Publisher, SessionConfig, Subscribe, SubscribeNamespace};
 use tokio::sync::Mutex;
@@ -357,7 +357,6 @@ mod tests {
             .subscribe_namespace(
                 &relay,
                 TrackNamespacePrefix::from_utf8_path("example.com"),
-                SubscribeOptions::Namespace,
             )
             .await;
 
@@ -682,7 +681,6 @@ impl RemoteManager {
         &self,
         relay: &RelayInfo,
         prefix: TrackNamespacePrefix,
-        options: SubscribeOptions,
     ) -> anyhow::Result<SubscribeNamespace> {
         let cache_key = (relay.url.clone(), relay.addr);
 
@@ -697,7 +695,7 @@ impl RemoteManager {
         // A namespace request owns a dedicated bidirectional stream. Its
         // rejection or reset must not evict the pooled session, which may still
         // carry exact-track subscriptions and other non-overlapping requests.
-        remote.subscribe_namespace(prefix, options).await
+        remote.subscribe_namespace(prefix).await
     }
 
     /// Forward a `PUBLISH_NAMESPACE` to a specific relay peer.
@@ -1331,7 +1329,6 @@ impl Remote {
     async fn subscribe_namespace(
         &self,
         prefix: TrackNamespacePrefix,
-        options: SubscribeOptions,
     ) -> anyhow::Result<SubscribeNamespace> {
         if !self.is_connected() {
             anyhow::bail!("remote connection to {} is closed", self.url);
@@ -1341,7 +1338,7 @@ impl Remote {
 
         let mut subscriber = self.subscriber.clone();
         let subscribe_namespace = tokio::select! {
-            result = subscriber.subscribe_namespace(prefix, options, KeyValuePairs::default()) => result?,
+            result = subscriber.subscribe_namespace(prefix, KeyValuePairs::default()) => result?,
             _ = self.cancel.cancelled() => {
                 anyhow::bail!("subscribe_namespace cancelled, remote connection to {} is closed", self.url);
             }

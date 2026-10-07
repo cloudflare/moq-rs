@@ -13,7 +13,6 @@ use std::{
 
 use moq_transport::{
     coding::{TrackNamespace, TrackNamespacePrefix},
-    message::SubscribeOptions,
     session::{NamespaceEvent, SubscribeNamespace},
 };
 use tokio::{
@@ -854,7 +853,7 @@ async fn run_pull_inner(
 ) -> PullOutcome {
     let handle = tokio::select! {
         _ = &mut *cancel => return PullOutcome::Intentional { timed_out: false },
-        result = remotes.subscribe_namespace(relay, prefix, SubscribeOptions::Namespace) => {
+        result = remotes.subscribe_namespace(relay, prefix) => {
             match result {
                 Ok(handle) => handle,
                 Err(error) => {
