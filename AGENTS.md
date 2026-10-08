@@ -22,6 +22,8 @@
 - Run a scenario against a local relay with `cargo run -p moq-test-client -- --relay https://localhost:4443 --tls-disable-verify --test moq-test-datagram` (any `--list` name works; omit `--test` to run them all).
 - Run an ad-hoc moq-test tuple with `cargo run -p moq-test-client -- --relay https://localhost:4443 --tls-disable-verify --moq-test-tuple "moq-test-00/0/0/0/2/4/5/64/32/2/1/1/0/-1/-1/0"` (16 `/`-separated fields; blanks select defaults).
 - When tests fail, diagnose from compiler/test output first and keep fixes scoped to the failing behavior.
+- Run the fuzz harness from `moq-relay-ietf/` with nightly:
+  `cargo +nightly fuzz run decode_setup_tokens fuzz/seeds/decode_setup_tokens -- -max_total_time=300`
 
 ## Draft-18 Terminology
 

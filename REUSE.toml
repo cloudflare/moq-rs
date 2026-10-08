@@ -47,3 +47,13 @@ path = [
 ]
 SPDX-FileCopyrightText = "2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# Fuzz infrastructure — binary/data files that cannot carry inline headers
+[[annotations]]
+path = [
+  "moq-relay-ietf/fuzz/.gitignore",
+  "moq-relay-ietf/fuzz/Cargo.lock",
+  "moq-relay-ietf/fuzz/seeds/**",
+]
+SPDX-FileCopyrightText = "2026 Cloudflare Inc."
+SPDX-License-Identifier = "MIT OR Apache-2.0"
