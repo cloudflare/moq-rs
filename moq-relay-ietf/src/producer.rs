@@ -2545,12 +2545,9 @@ mod tests {
 
         // No PUBLISH message must arrive within 100 ms.
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                subscriber.publish_received()
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(Duration::from_millis(100), subscriber.publish_received())
+                .await
+                .is_err(),
             "SUBSCRIBE_NAMESPACE must not deliver a PUBLISH message (§10.18); \
              use SUBSCRIBE_TRACKS (§10.19) for track fan-out"
         );

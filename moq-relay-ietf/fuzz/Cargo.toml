@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Cloudflare Inc.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "moq-relay-ietf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# Only depend on moq-transport (no hyper-serve/aws-lc-sys C build deps).
+# The fuzz target calls moq_transport::setup::decode_setup_tokens directly
+# — the production parser in moq-transport, with no C build deps.
+[dependencies.moq-transport]
+path = "../../moq-transport"
+
+[[bin]]
+name = "decode_setup_tokens"
+path = "fuzz_targets/decode_setup_tokens.rs"
+test = false
+doc = false
+bench = false
+
+# Excluded from the workspace: cargo-fuzz manages its own workspace.
+[workspace]

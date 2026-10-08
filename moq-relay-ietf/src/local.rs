@@ -2972,8 +2972,8 @@ mod tests {
             .expect("namespace change should arrive promptly")
             .expect("channel should be open");
         assert!(
-            matches!(event, NamespaceChange::Added { .. }),
-            "expected NamespaceChange::Added, got {event:?}"
+            event.added,
+            "expected NamespaceChange {{ added: true }}, got {event:?}"
         );
 
         // The track channel receives NO event — publishing a namespace does not

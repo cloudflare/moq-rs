@@ -354,10 +354,7 @@ mod tests {
         let relay = RelayInfo::new(Url::parse("https://relay.example.com/live").unwrap());
 
         let result = manager
-            .subscribe_namespace(
-                &relay,
-                TrackNamespacePrefix::from_utf8_path("example.com"),
-            )
+            .subscribe_namespace(&relay, TrackNamespacePrefix::from_utf8_path("example.com"))
             .await;
 
         // `SubscribeNamespace` is not `Debug`, so match rather than expect_err.
