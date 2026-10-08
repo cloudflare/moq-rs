@@ -206,6 +206,19 @@ pub struct ScopeConfig {
     /// Future: A `rendezvous_timeout` field may be added to control how long
     /// the relay waits for a publisher before giving up.
     pub lingering_subscribe: bool,
+
+    /// CAT bearer-token authorization policy for this scope.
+    ///
+    /// **C1 status: field exists but has no runtime effect.** All sessions are
+    /// currently admitted without token enforcement regardless of this value.
+    ///
+    /// When C2 is implemented: `None` will mean no enforcement (sessions
+    /// admitted, [`AllowAllAuthHook`] used); `Some(cfg)` will cause the relay
+    /// to build a `CatAuthHook` from `cfg` and enforce token presentation on
+    /// every session and request.
+    ///
+    /// [`AllowAllAuthHook`]: crate::auth::AllowAllAuthHook
+    pub auth: Option<crate::auth::ScopeAuthConfig>,
 }
 
 /// Result of subscribing to a namespace prefix via SUBSCRIBE_NAMESPACE.
@@ -1546,6 +1559,7 @@ mod tests {
         let config = ScopeConfig {
             origin_fallback: Some(Url::parse("https://origin.example.com").unwrap()),
             lingering_subscribe: true,
+            auth: None,
         };
         assert_eq!(
             config.origin_fallback.unwrap().as_str(),
@@ -1672,6 +1686,7 @@ mod tests {
             ScopeConfig {
                 origin_fallback: Some(Url::parse("https://ingest.example.com/origin").unwrap()),
                 lingering_subscribe: true,
+                auth: None,
             },
         );
 

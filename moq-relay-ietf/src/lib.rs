@@ -34,6 +34,7 @@
 //! ```
 
 mod api;
+pub mod auth;
 mod consumer;
 mod coordinator;
 mod covering_prefix_set;
@@ -48,9 +49,19 @@ mod upstream_namespaces;
 mod web;
 
 pub use api::*;
+pub use auth::decode_setup_tokens;
+pub use auth::{
+    AliasType, AllowAllAuthHook, AuthDecision, AuthError, AuthHook, AuthRequest, AuthToken,
+    AuthzOperation, DenyAllAuthHook, DenyReason, Principal, ResourceShape, ScopeAuthConfig,
+    ScopeAuthorizer, SetupTokens, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
+};
 pub use consumer::*;
 pub use coordinator::*;
 pub use local::*;
+// Re-export moq_transport so callers of the auth API (AuthHook, AuthzOperation,
+// decode_setup_tokens) can use Setup, TrackNamespace etc. without adding
+// moq_transport as a direct dependency. Per RFC-047 §6.
+pub use moq_transport;
 pub use moq_transport::session::SessionConfig;
 pub use producer::*;
 pub use relay::*;

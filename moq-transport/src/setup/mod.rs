@@ -7,10 +7,14 @@
 //! In draft-18, both peers open a unidirectional control stream and send a
 //! unified SETUP message. Version negotiation is handled entirely by ALPN.
 
+mod auth_token;
 mod param_types;
 mod setup;
 mod version;
 
+pub use auth_token::{
+    decode_setup_tokens, AliasType, AuthToken, SetupTokens, CAT_TOKEN_TYPE, MAX_SETUP_TOKENS,
+};
 pub use param_types::*;
 pub use setup::*;
 pub use version::*;
