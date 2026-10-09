@@ -937,20 +937,15 @@ async fn may_fetch_track(
 
     match fetch_result {
         Ok(()) => return Ok(()),
-        // ScopeMismatch means the token contains a Fetch(7) scope, but its
-        // namespace/track predicate does not cover this track.  That is an
-        // explicit denial by the issuer; do NOT fall back to Subscribe(4),
-        // since the issuer clearly knows about Fetch(7) and chose not to grant
-        // it for this track.
-        Err(DenyReason::ScopeMismatch) => return Err(DenyReason::ScopeMismatch),
-        // Any non-scope error (HookFault, TokenExpired, etc.) is an
-        // infrastructure or token-validity problem; falling back would violate
-        // fail-closed semantics.  Return immediately.
-        Err(e) if !matches!(e, DenyReason::ActionAbsent) => return Err(e),
-        // ActionAbsent means the token has no Fetch(7) grant at all.  This is
-        // the only case where the v0.1 compatibility fallback applies: the
-        // issuer predates the Fetch(7) action and issued Subscribe(4) instead.
+        // ActionAbsent: the token has no Fetch(7) scope at all.  This is the
+        // only case where the v0.1 fallback applies: the issuer predates the
+        // Fetch(7) action and issued Subscribe(4) instead.
         Err(DenyReason::ActionAbsent) => {}
+        // All other errors — ScopeMismatch, HookFault, TokenExpired, etc. —
+        // are definitive denials.  ScopeMismatch means the issuer explicitly
+        // configured Fetch(7) and excluded this track; the fallback must not
+        // apply.  HookFault and validity errors must fail closed.
+        Err(other) => return Err(other),
     }
 
     // V0.1 fallback: Subscribe(4). Remove once issuers emit Fetch(7).
