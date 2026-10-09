@@ -1409,12 +1409,16 @@ mod tests {
         );
     }
 
-    /// A denied FETCH must not reveal whether the track exists.  Even when the
-    /// token has no Fetch(7) grant and no Subscribe(4) grant, the error code
-    /// must not disclose track state.
+    /// A denied FETCH must not reveal whether the track exists.  The hook
+    /// returns `ScopeMismatch` for every operation (simulating a token that has
+    /// Fetch(7) configured but excludes this track).  The error code must be
+    /// `ScopeMismatch`, not any track-existence signal, and Subscribe(4) must
+    /// not be consulted (ScopeMismatch is a definitive stop).
     #[tokio::test]
     async fn fetch_denied_yields_no_existence_oracle() {
-        // ScopeMismatch on Fetch → immediate denial without Subscribe fallback.
+        // deny() returns ScopeMismatch — Fetch(7) present in token but wrong scope.
+        // The catch-all arm returns Err(ScopeMismatch) immediately; no Subscribe
+        // fallback, no track lookup.
         let hook = PerOpHook::new(|_| deny());
         let auth = per_op_session_auth(hook.clone());
         let namespace = TrackNamespace::from_utf8_path("sports/football");
