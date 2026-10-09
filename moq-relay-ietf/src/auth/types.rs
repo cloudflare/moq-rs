@@ -181,7 +181,7 @@ pub enum AuthzOperation<'a> {
         track: &'a TrackName,
     },
 
-    /// Inbound standalone FETCH (draft-16 §9.7).
+    /// Inbound standalone FETCH (draft-16 §9.16).
     ///
     /// FETCH retrieves a bounded range of archived track content.  It is
     /// distinct from SUBSCRIBE (which delivers live, unbounded content) and
