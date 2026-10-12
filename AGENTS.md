@@ -101,7 +101,7 @@ policy is unauthenticated by design and must keep working exactly as before.
 
 Enforcement points are `AuthHook::on_setup` (once, before either session half
 exists) and `AuthHook::on_request` (before SUBSCRIBE, SUBSCRIBE_NAMESPACE,
-TRACK_STATUS, PUBLISH_NAMESPACE, PUBLISH). Standalone FETCH is also gated:
+TRACK_STATUS, PUBLISH_NAMESPACE, PUBLISH). Standalone and joining FETCH are also gated:
 `serve_fetch` calls `may_fetch_track` which checks `AuthzOperation::Fetch`
 (CAT action 7) before any local or remote lookup. Each enforcement point runs
 *before* the corresponding lookup or registration; for SUBSCRIBE, TRACK_STATUS
