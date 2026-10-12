@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.29](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.28...moq-relay-ietf-v0.7.29) - 2026-10-12
+
+### Fixed
+
+- *(auth)* note joining FETCH also needs Fetch(7) in module docs
+- *(auth)* clarify Fetch(7) applies to both standalone and joining FETCH
+- *(auth)* reword oracle test and doc caveat per reviewer
+- *(auth)* remove stale fallback comments and duplicate test
+- *(auth)* FETCH requires Fetch(7); remove Subscribe(4) fallback
+- *(auth)* correct fetch_denied_yields_no_existence_oracle doc comment
+- *(auth)* replace guarded match arm with explicit ActionAbsent + catch-all
+- *(auth)* correct FETCH spec citation §9.7 → §9.16
+- *(auth)* address AI review nits — docs, HookFault test, dedup, metrics note
+- *(auth)* add real CAT token tests for token_has_action and map_operation Fetch
+- *(auth)* correct fallback scope — ActionAbsent only, not ScopeMismatch
+- *(auth)* authorize FETCH with Fetch(7) grant; Subscribe(4) v0.1 fallback
+
+### Other
+
+- *(auth)* add ActionAbsent to DenyReason test coverage
+
 ### Changed
 
 - *(auth)* FETCH now requires the `Fetch(7)` CAT `moqt` action (draft-16 §9.16).
