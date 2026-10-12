@@ -899,6 +899,10 @@ fn upstream_fetch_params(
 /// without constructing a live transport session. Tests pin *which operation
 /// is checked* as well as the yes/no outcome, so a silent regression (wrong
 /// operation asked, but same result) does not pass undetected.
+///
+/// Note: that `serve_fetch` calls this before any lookup is verified by
+/// code inspection rather than a unit test — constructing a live session
+/// with a populated coordinator would be needed to cover that ordering.
 async fn may_fetch_track(
     auth: Option<&SessionAuth>,
     context: &SessionContext,
@@ -1298,10 +1302,11 @@ mod tests {
         assert_eq!(hook.seen(), vec!["fetch"], "only Fetch(7) is consulted");
     }
 
-    /// A denied FETCH must not reveal whether the track exists.
-    /// `may_fetch_track` authorizes before any lookup; the error code is
-    /// `ScopeMismatch` (an auth decision), not a track-existence signal.
-    /// The hook is asked exactly once, confirming authorization happens first.
+    /// `may_fetch_track` returns a deny reason rather than track-existence
+    /// information.  This pins the function's output contract; whether
+    /// `serve_fetch` calls it before performing any lookup is verified by
+    /// code inspection — the call is at the top of `serve_fetch`, before
+    /// any coordinator or cache access.
     #[tokio::test]
     async fn fetch_denied_yields_no_existence_oracle() {
         let hook = PerOpHook::new(|_| deny());
