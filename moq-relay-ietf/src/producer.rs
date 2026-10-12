@@ -191,9 +191,6 @@ impl Producer {
 
         // Authorize before any lookup: deciding afterwards would make response
         // timing an existence oracle for tracks the peer may not access.
-        // Authorization checks Fetch(7) first; Subscribe(4) is accepted as a
-        // backward-compatible fallback only when the token has no Fetch(7)
-        // scope at all. See `may_fetch_track` for the two-step logic.
         if let Err(reason) = may_fetch_track(
             self.auth.as_ref(),
             &self.context,
@@ -1087,8 +1084,7 @@ mod tests {
     }
 
     /// A hook that makes decisions per operation label, allowing precise control
-    /// over which operations are allowed and which are denied.  Used to test the
-    /// Fetch(7)-primary / Subscribe(4)-fallback authorization chain.
+    /// over which operations are allowed and which are denied.
     struct PerOpHook {
         seen: Mutex<Vec<String>>,
         decide: Box<dyn Fn(&str) -> Result<AuthDecision, AuthError> + Send + Sync>,
@@ -1283,9 +1279,6 @@ mod tests {
         );
     }
 
-    /// Fetch(7) grant allows FETCH; only "fetch" is consulted.
-    // (already tested above as fetch_authorized_with_fetch_grant)
-
     /// Subscribe(4)-only token must be denied — FETCH requires Fetch(7).
     #[tokio::test]
     async fn fetch_denied_with_subscribe_only_token() {
@@ -1305,23 +1298,10 @@ mod tests {
         assert_eq!(hook.seen(), vec!["fetch"], "only Fetch(7) is consulted");
     }
 
-    /// Scope mismatch on Fetch(7) — right action, wrong track — is denied.
-    #[tokio::test]
-    async fn fetch_denied_on_scope_mismatch() {
-        let hook = PerOpHook::new(|_| deny()); // ScopeMismatch for every op
-        let auth = per_op_session_auth(hook.clone());
-        let namespace = TrackNamespace::from_utf8_path("sports/football");
-        let track = TrackName::from("video");
-
-        let result = may_fetch_track(Some(&auth), &context(), &namespace, &track, 9).await;
-
-        assert!(result.is_err(), "scope mismatch must deny");
-        assert_eq!(hook.seen(), vec!["fetch"], "only Fetch(7) is consulted");
-    }
-
     /// A denied FETCH must not reveal whether the track exists.
-    /// Authorization runs before any lookup; the error is ScopeMismatch,
-    /// not a track-existence signal.
+    /// `may_fetch_track` authorizes before any lookup; the error code is
+    /// `ScopeMismatch` (an auth decision), not a track-existence signal.
+    /// The hook is asked exactly once, confirming authorization happens first.
     #[tokio::test]
     async fn fetch_denied_yields_no_existence_oracle() {
         let hook = PerOpHook::new(|_| deny());
@@ -1337,6 +1317,7 @@ mod tests {
             matches!(err, DenyReason::ScopeMismatch),
             "must return ScopeMismatch, not track-existence info; got {err}"
         );
+        // Exactly one hook call — auth, not a lookup.
         assert_eq!(hook.seen(), vec!["fetch"]);
     }
 
