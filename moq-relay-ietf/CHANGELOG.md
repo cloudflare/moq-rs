@@ -8,25 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- *(auth)* FETCH now checks `Fetch(7)` (CAT `moqt` action) before `Subscribe(4)`.
-  Tokens with an explicit `Fetch(7)` scope are no longer permitted to fall back
-  to `Subscribe(4)` for tracks their `Fetch(7)` scope excludes.
-
-- *(auth)* New `DenyReason::ActionAbsent` replaces `ScopeMismatch` when the
-  token contains no grant for the requested action type at all (vs. has a grant
-  but the namespace/track predicate does not match).  **Dashboard owners**: the
-  `deny_reason` log field and the `action_absent` metric label will appear for
-  denials that were previously labelled `scope_mismatch`.  The wire error code
-  is unchanged (UNAUTHORIZED).
-
-### Added
-
-- *(auth)* `Subscribe(4)` backward-compatibility fallback: tokens issued before
-  `Fetch(7)` was a distinct CAT action and carrying only `Subscribe(4)` are
-  still accepted for FETCH during the v0.1 transition period (signalled by
-  `DenyReason::ActionAbsent`).  The fallback is logged at debug level and
-  isolated for removal once all pilots emit `Fetch(7)`.  It does **not** apply
-  when a `Fetch(7)` scope is present but excludes the requested track.
+- *(auth)* FETCH now requires the `Fetch(7)` CAT `moqt` action (draft-16 §9.16).
+  Tokens that do not grant `Fetch(7)` for the requested namespace and track are
+  denied. `Subscribe(4)` alone is not sufficient.
 
 ## [0.7.28](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.27...moq-relay-ietf-v0.7.28) - 2026-10-06
 

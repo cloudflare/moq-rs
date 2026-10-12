@@ -108,13 +108,10 @@ TRACK_STATUS, PUBLISH_NAMESPACE, PUBLISH). Standalone FETCH is also gated:
 and FETCH that ordering is a correctness property, since deciding afterwards
 turns them into existence oracles.
 
-**FETCH authorization chain.** `may_fetch_track` tries `Fetch(7)` first. If
-the token has no Fetch(7) grant at all (`DenyReason::ActionAbsent`) it falls
-back to `Subscribe(4)` for backward compatibility with v0.1 tokens issued
-before `Fetch` was a distinct action. If Fetch(7) is present in the token but
-excludes this track (`DenyReason::ScopeMismatch`) the fallback is suppressed:
-the issuer has explicitly excluded this track. The fallback is logged at debug
-level and the code is isolated for easy removal once all pilots emit Fetch(7).
+**FETCH authorization.** `may_fetch_track` calls `authorize` with
+`AuthzOperation::Fetch`, which maps to `MoqtAction::Fetch` (CAT action 7,
+draft-16 §9.16). Any outcome other than an explicit allow is a denial —
+no fallback to `Subscribe(4)` or any other action.
 
 Adding an enforcement point means adding an `AuthzOperation` variant, which is
 deliberately a compile error everywhere it must be handled. FETCH uses

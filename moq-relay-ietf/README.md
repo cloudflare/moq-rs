@@ -24,4 +24,4 @@ Per-scope bearer-token authorization is supported via `ScopeConfig.auth`. When a
 
 The `auth-cat` crate feature is off by default. Embedders that want token enforcement enable it and supply `ScopeAuthConfig` through `Coordinator::get_scope_config`. The enforcement model and fail-closed contract are documented in `src/auth/mod.rs`.
 
-**FETCH grant.** Standalone FETCH requires the CAT `moqt` claim to include a `Fetch(7)` scope covering the requested namespace and track. During the v0.1 transition period, a token that grants only `Subscribe(4)` and has no `Fetch(7)` entry at all is also accepted (the relay logs this at debug level). Once all token issuers have been updated to include `Fetch(7)`, the fallback will be removed. A token that explicitly grants `Fetch(7)` for a different track is not upgraded via Subscribe fallback; issuer scope intent is honoured.
+**FETCH grant.** Standalone FETCH requires the CAT `moqt` claim to include a `Fetch(7)` scope covering the requested namespace and track. Tokens that grant only `Subscribe(4)` are denied for FETCH.
