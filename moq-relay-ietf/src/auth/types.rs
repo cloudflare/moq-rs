@@ -178,12 +178,13 @@ pub enum AuthzOperation<'a> {
         track: &'a TrackName,
     },
 
-    /// Inbound standalone FETCH (draft-16 §9.16).
+    /// Inbound FETCH — standalone or joining (draft-16 §9.16).
     ///
-    /// FETCH retrieves a bounded range of archived track content.  It is
-    /// distinct from SUBSCRIBE (which delivers live, unbounded content) and
-    /// therefore carries its own CAT action code: `Fetch = 7` in the
-    /// `moqt` claim registry, versus `Subscribe = 4`.
+    /// `serve_fetch` resolves joining FETCH to a standalone request before
+    /// calling `may_fetch_track`, so both forms are authorized through this
+    /// variant. FETCH retrieves a bounded range of archived track content and
+    /// requires `Fetch = 7` in the CAT `moqt` claim (`Subscribe = 4` is not
+    /// accepted).
     Fetch {
         namespace: &'a TrackNamespace,
         track: &'a TrackName,
