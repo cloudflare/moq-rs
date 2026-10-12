@@ -101,17 +101,21 @@ policy is unauthenticated by design and must keep working exactly as before.
 
 Enforcement points are `AuthHook::on_setup` (once, before either session half
 exists) and `AuthHook::on_request` (before SUBSCRIBE, SUBSCRIBE_NAMESPACE,
-TRACK_STATUS, PUBLISH_NAMESPACE, PUBLISH). Standalone FETCH is also gated:
-`serve_fetch` calls `may_fetch_track` under the `Subscribe` grant before any
-local or remote lookup (a standalone FETCH retrieves track content, so it
-warrants the same grant). Each enforcement point runs *before* the
-corresponding lookup or registration; for SUBSCRIBE, TRACK_STATUS and FETCH
-that ordering is a correctness property, since deciding afterwards turns them
-into existence oracles.
+TRACK_STATUS, PUBLISH_NAMESPACE, PUBLISH). Standalone and joining FETCH are also gated:
+`serve_fetch` calls `may_fetch_track` which checks `AuthzOperation::Fetch`
+(CAT action 7) before any local or remote lookup. Each enforcement point runs
+*before* the corresponding lookup or registration; for SUBSCRIBE, TRACK_STATUS
+and FETCH that ordering is a correctness property, since deciding afterwards
+turns them into existence oracles.
+
+**FETCH authorization.** `may_fetch_track` calls `authorize` with
+`AuthzOperation::Fetch`, which maps to `MoqtAction::Fetch` (CAT action 7,
+draft-16 §9.16). Any outcome other than an explicit allow is a denial —
+no fallback to `Subscribe(4)` or any other action.
 
 Adding an enforcement point means adding an `AuthzOperation` variant, which is
-deliberately a compile error everywhere it must be handled. FETCH re-uses the
-`Subscribe` variant rather than having its own; see `may_fetch_track`.
+deliberately a compile error everywhere it must be handled. FETCH uses
+`AuthzOperation::Fetch`; see `may_fetch_track` in `producer.rs`.
 
 ## Gotchas
 

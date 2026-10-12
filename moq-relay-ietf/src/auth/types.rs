@@ -149,9 +149,8 @@ impl fmt::Debug for Principal {
 /// Each variant corresponds to a live authorization point in the relay.
 /// Standalone and joining FETCH are not separate variants: `serve_fetch`
 /// calls `fetch.resolve()` which converts both forms to a `StandaloneFetch`
-/// range, then authorises via `AuthzOperation::Subscribe` with the resolved
-/// namespace and track. FETCH retrieves the same track content a SUBSCRIBE
-/// does and warrants the same grant.
+/// range, then authorises via `AuthzOperation::Fetch` with the resolved
+/// namespace and track. FETCH requires `Fetch(7)` from the CAT `moqt` claim.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AuthzOperation<'a> {
@@ -178,6 +177,18 @@ pub enum AuthzOperation<'a> {
         namespace: &'a TrackNamespace,
         track: &'a TrackName,
     },
+
+    /// Inbound FETCH — standalone or joining (draft-16 §9.16).
+    ///
+    /// `serve_fetch` resolves joining FETCH to a standalone request before
+    /// calling `may_fetch_track`, so both forms are authorized through this
+    /// variant. FETCH retrieves a bounded range of archived track content and
+    /// requires `Fetch = 7` in the CAT `moqt` claim (`Subscribe = 4` is not
+    /// accepted).
+    Fetch {
+        namespace: &'a TrackNamespace,
+        track: &'a TrackName,
+    },
 }
 
 impl AuthzOperation<'_> {
@@ -189,6 +200,7 @@ impl AuthzOperation<'_> {
             Self::Subscribe { .. } => "subscribe",
             Self::SubscribeNamespace { .. } => "subscribe_namespace",
             Self::TrackStatus { .. } => "track_status",
+            Self::Fetch { .. } => "fetch",
         }
     }
 }

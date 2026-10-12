@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(auth)* FETCH now requires the `Fetch(7)` CAT `moqt` action (draft-16 §9.16).
+  Tokens that do not grant `Fetch(7)` for the requested namespace and track are
+  denied. `Subscribe(4)` alone is not sufficient.
+
 ## [0.7.28](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.27...moq-relay-ietf-v0.7.28) - 2026-10-06
 
 ### Added

@@ -23,3 +23,5 @@ If the publisher disconnects, then all subscribers receive an error and will not
 Per-scope bearer-token authorization is supported via `ScopeConfig.auth`. When a scope has an auth policy, every accepted client session must present a valid Common Access Token (CAT, draft-ietf-moq-c4m) in the CLIENT_SETUP AUTHORIZATION TOKEN parameter. Known gap: relay-to-relay `--announce` forward links are relay-initiated and currently do not present a token; they emit a warning when connecting to an auth-enabled scope.
 
 The `auth-cat` crate feature is off by default. Embedders that want token enforcement enable it and supply `ScopeAuthConfig` through `Coordinator::get_scope_config`. The enforcement model and fail-closed contract are documented in `src/auth/mod.rs`.
+
+**FETCH grant.** Standalone and joining FETCH both require the CAT `moqt` claim to include a `Fetch(7)` scope covering the requested namespace and track (joining FETCH is resolved to a standalone request before authorization). Tokens that grant only `Subscribe(4)` are denied.

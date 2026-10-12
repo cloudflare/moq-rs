@@ -467,7 +467,8 @@ impl CatAuthHook {
                 scope = self.scope.as_deref().unwrap_or(UNSCOPED),
                 subject = principal.token.informational.sub.as_deref(),
                 operation = operation.label(),
-                "CAT authorization denied: operation outside token scope"
+                deny_reason = DenyReason::ScopeMismatch.label(),
+                "CAT authorization denied"
             );
             AuthDecision::deny(DenyReason::ScopeMismatch)
         }
@@ -645,6 +646,11 @@ fn map_operation(operation: &AuthzOperation<'_>) -> (MoqtAction, Vec<Vec<u8>>, O
         }
         AuthzOperation::TrackStatus { namespace, track } => (
             MoqtAction::TrackStatus,
+            namespace_tuple(namespace),
+            Some(track.as_bytes().to_vec()),
+        ),
+        AuthzOperation::Fetch { namespace, track } => (
+            MoqtAction::Fetch,
             namespace_tuple(namespace),
             Some(track.as_bytes().to_vec()),
         ),
@@ -3013,5 +3019,125 @@ mod tests {
             map_cat_error(CatError::MoqtActionNotAuthorized("x".into())),
             DenyReason::ScopeMismatch
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // Fetch(7) authorization — map_operation coverage
+    // ------------------------------------------------------------------
+
+    /// `map_operation` maps `AuthzOperation::Fetch` to `MoqtAction::Fetch(7)`.
+    /// A token with Fetch(7) for the requested namespace+track is allowed.
+    #[tokio::test]
+    async fn fetch_grant_allows_fetch_via_cat_hook() {
+        let key = generate_key();
+        let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
+        let token = subscriber_token(&key.signer, &[b"sports"]); // includes Fetch(7)
+        let principal = principal_for(&hook, token).await;
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+        let track = TrackName::from("video");
+
+        let decision = decide(
+            &hook,
+            &principal,
+            AuthzOperation::Fetch {
+                namespace: &namespace,
+                track: &track,
+            },
+        )
+        .await;
+
+        assert!(decision.is_allowed(), "Fetch(7) grant must allow FETCH");
+    }
+
+    /// Token with Fetch(7) for namespace A is denied for namespace B —
+    /// scope mismatch, not a missing-action error.
+    #[tokio::test]
+    async fn fetch_wrong_namespace_is_denied() {
+        let key = generate_key();
+        let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
+
+        let token_bytes = {
+            let fetch_scope = MoqtScopeBuilder::new()
+                .action(MoqtAction::Fetch)
+                .namespace_prefix(b"sports")
+                .namespace_prefix(b"football")
+                .track_prefix(b"")
+                .build();
+            let setup_scope = MoqtScopeBuilder::new()
+                .action(MoqtAction::ClientSetup)
+                .build();
+            let token = CatToken::new()
+                .with_issuer("test-issuer")
+                .with_single_audience("test-relay")
+                .with_subject("test-subject")
+                .with_expires_in(3600)
+                .with_moqt_scope(fetch_scope)
+                .with_moqt_scope(setup_scope);
+            Bytes::from(encode_token(&token, &key.signer).expect("encode"))
+        };
+        let principal = principal_for(&hook, token_bytes).await;
+        let wrong_namespace = TrackNamespace::from_utf8_path("news/politics");
+        let track = TrackName::from("video");
+
+        let decision = decide(
+            &hook,
+            &principal,
+            AuthzOperation::Fetch {
+                namespace: &wrong_namespace,
+                track: &track,
+            },
+        )
+        .await;
+
+        assert!(!decision.is_allowed(), "wrong namespace must deny");
+        assert!(
+            matches!(decision.deny_reason(), Some(DenyReason::ScopeMismatch)),
+            "got {:?}",
+            decision.deny_reason()
+        );
+    }
+
+    /// Subscribe(4)-only token is denied for FETCH — Fetch(7) is required.
+    #[tokio::test]
+    async fn fetch_subscribe_only_token_is_denied() {
+        let key = generate_key();
+        let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
+
+        let token_bytes = {
+            let sub_scope = MoqtScopeBuilder::new()
+                .action(MoqtAction::Subscribe)
+                .namespace_prefix(b"sports")
+                .track_prefix(b"")
+                .build();
+            let setup_scope = MoqtScopeBuilder::new()
+                .action(MoqtAction::ClientSetup)
+                .build();
+            let token = CatToken::new()
+                .with_issuer("test-issuer")
+                .with_single_audience("test-relay")
+                .with_subject("test-subject")
+                .with_expires_in(3600)
+                .with_moqt_scope(sub_scope)
+                .with_moqt_scope(setup_scope);
+            Bytes::from(encode_token(&token, &key.signer).expect("encode"))
+        };
+        let principal = principal_for(&hook, token_bytes).await;
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+        let track = TrackName::from("video");
+
+        let decision = decide(
+            &hook,
+            &principal,
+            AuthzOperation::Fetch {
+                namespace: &namespace,
+                track: &track,
+            },
+        )
+        .await;
+
+        assert!(
+            !decision.is_allowed(),
+            "Subscribe(4)-only token must be denied for FETCH"
+        );
     }
 }
