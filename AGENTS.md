@@ -100,7 +100,8 @@ multiple tenants and rotates keys without restarting. A scope that returns no
 policy is unauthenticated by design and must keep working exactly as before.
 Sessions tagged `SessionInterface::Internal` are relay peers and skip token
 authorization; their setup tokens are still decoded and malformed ones
-rejected. Only an embedder that has authenticated the peer may tag it internal.
+rejected. Only an embedder that has authenticated the peer may tag it internal;
+a source subnet or listener address does not authenticate a peer on its own.
 
 Enforcement points are `AuthHook::on_setup` (once, before either session half
 exists) and `AuthHook::on_request` (before SUBSCRIBE, SUBSCRIBE_NAMESPACE,
