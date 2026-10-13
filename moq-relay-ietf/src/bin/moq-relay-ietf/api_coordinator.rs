@@ -11,6 +11,7 @@
 //! - Automatic TTL refresh to maintain registrations
 //! - High availability when using the moq-api server
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -22,8 +23,10 @@ use url::Url;
 
 use moq_relay_ietf::{
     Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceOrigin,
-    NamespaceRegistration,
+    NamespaceRegistration, ScopeConfig,
 };
+
+use crate::scope_config::{self, ScopeConfigSource};
 
 /// Default TTL for namespace registrations (in seconds)
 /// moq-api server uses 600 seconds (10 minutes) TTL
@@ -121,6 +124,8 @@ pub struct ApiCoordinator {
     client: Client,
     /// Configuration
     config: ApiCoordinatorConfig,
+    /// Per-scope token policy from `--scope-config`, if given.
+    scope_config: Option<Arc<ScopeConfigSource>>,
 }
 
 impl ApiCoordinator {
@@ -170,7 +175,17 @@ impl ApiCoordinator {
     pub fn new(config: ApiCoordinatorConfig) -> Self {
         let client = Client::new(config.api_url.clone());
 
-        Self { client, config }
+        Self {
+            client,
+            config,
+            scope_config: None,
+        }
+    }
+
+    /// Serve per-scope token policy from a `--scope-config` file.
+    pub fn with_scope_config(mut self, scope_config: Option<Arc<ScopeConfigSource>>) -> Self {
+        self.scope_config = scope_config;
+        self
     }
 
     /// Start a background task to refresh namespace registration
@@ -304,6 +319,10 @@ impl Coordinator for ApiCoordinator {
                 Err(CoordinatorError::NamespaceNotFound)
             }
         }
+    }
+
+    async fn get_scope_config(&self, scope: Option<&str>) -> CoordinatorResult<ScopeConfig> {
+        scope_config::get_scope_config(self.scope_config.as_ref(), scope).await
     }
 
     async fn shutdown(&self) -> CoordinatorResult<()> {
