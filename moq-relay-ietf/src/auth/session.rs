@@ -11,9 +11,9 @@ use crate::SessionContext;
 /// The authorization state of one established session.
 ///
 /// Created after [`AuthHook::on_setup`] allows the session, then cloned into
-/// the producer and consumer. Sessions in a scope that does not require
-/// authorization carry `None` instead, so the request path costs a single
-/// `Option` check.
+/// the producer and consumer. Internal relay peers and sessions in scopes
+/// without a policy carry `None`, so the request path costs a single `Option`
+/// check.
 #[derive(Clone)]
 pub(crate) struct SessionAuth {
     hook: Arc<dyn AuthHook>,
@@ -97,9 +97,9 @@ impl SessionAuth {
 
 /// Authorize an operation when the session may not require authorization.
 ///
-/// Sessions in scopes without an authorization policy carry no [`SessionAuth`]
-/// and are always permitted. Keeping that check in one place stops each call
-/// site from re-deriving the `None` case.
+/// Internal relay peers and sessions in scopes without a policy carry no
+/// [`SessionAuth`] and are always permitted. Keeping that check in one place
+/// stops each call site from re-deriving the `None` case.
 pub(crate) async fn authorize(
     auth: Option<&SessionAuth>,
     session: &SessionContext,

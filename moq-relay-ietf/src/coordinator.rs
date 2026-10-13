@@ -214,11 +214,12 @@ pub struct ScopeConfig {
     /// [`ScopeInfo::permissions`] alone, which is the behaviour of every relay
     /// whose coordinator does not populate this field.
     ///
-    /// `Some` — enforced. Sessions in this scope must present a valid
+    /// `Some`: enforced for public sessions. They must present a valid
     /// AUTHORIZATION TOKEN in CLIENT_SETUP, and every subsequent request is
     /// checked against the token's claims. The relay fails closed on anything
     /// it cannot positively authorize, including a configuration it cannot
     /// parse and a relay binary built without the corresponding feature.
+    /// Authenticated internal relay peers bypass token authorization.
     pub auth: Option<ScopeAuthConfig>,
 }
 

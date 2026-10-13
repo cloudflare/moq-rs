@@ -32,8 +32,8 @@ pub struct Consumer {
     forward: Option<Producer>, // Forward all announcements to this subscriber
     /// Relay-level context for this MoQT session.
     context: SessionContext,
-    /// Authorization state for this session. `None` when the scope has no
-    /// authorization policy, in which case every request is permitted.
+    /// Token authorization state. Internal relay peers and sessions in scopes
+    /// without a policy carry `None`, permitting every request.
     auth: Option<SessionAuth>,
     publish_track_permits: Arc<Semaphore>,
 }
@@ -45,8 +45,8 @@ impl Consumer {
     /// required argument rather than something attached afterwards: a consumer
     /// with no authorization accepts every publish, so forgetting to supply it
     /// must be a compile error rather than a silent grant. `None` states that
-    /// the session needs no authorization — its scope has no policy, or the
-    /// relay dialled the peer itself.
+    /// the session needs no token authorization because it is an internal
+    /// relay peer or its scope has no policy.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         subscriber: Subscriber,

@@ -13,7 +13,9 @@
 //! TOKEN parameters are still validated for wire-format conformance (§9.2.2.1)
 //! but do not gate admission.
 //!
-//! Where a policy is present, enforcement happens at two points:
+//! Internal relay peers bypass token authorization, relying on the embedder
+//! to authenticate them before tagging them internal. For public sessions
+//! where a policy is present, enforcement happens at two points:
 //!
 //! * **Setup.** The AUTHORIZATION TOKEN parameters from CLIENT_SETUP are
 //!   decoded (see [`decode_setup_tokens`]) and handed to
@@ -61,7 +63,8 @@
 //!
 //! # Failing closed
 //!
-//! Once a scope has opted in, anything short of an explicit allow denies:
+//! For public sessions on scopes with a policy, anything short of an explicit
+//! allow denies:
 //!
 //! * a coordinator that cannot be reached before this scope's policy has been
 //!   fetched, after the enforced policy's 12-TTL reuse cap, or whenever a fetch
@@ -71,11 +74,15 @@
 //! * a hook that returns an error,
 //! * a missing, malformed, expired or out-of-scope token.
 //!
+//! Scopes without a policy and authenticated internal relay peers bypass
+//! token authorization. Token wire-format validation applies to every session.
+//!
 //! By default, a failed refresh reuses a fetched policy within the cap, with
 //! token checks enforced. A cached configuration with no policy has no reuse
 //! limit because it does not require token authorization. A coordinator can
 //! turn this exception off with [`Coordinator::reuse_scope_config_on_error`],
-//! so every failed fetch denies admission even on scopes without a policy.
+//! so every failed fetch denies admission of public sessions, even on scopes
+//! without a policy.
 //!
 //! [`Coordinator::resolve_scope`]: crate::Coordinator::resolve_scope
 //! [`Coordinator::get_scope_config`]: crate::Coordinator::get_scope_config
