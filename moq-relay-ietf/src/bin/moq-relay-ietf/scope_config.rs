@@ -78,11 +78,13 @@ const MAX_KEY_FILE_BYTES: u64 = 16 * 1024;
 /// of a broken file, whose failures the library does not cache.
 const REVALIDATE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Largest accepted `ttl_secs`.
+/// `ttl_secs` above this draws a load-time warning.
 ///
-/// The TTL bounds how long a removed or rotated key keeps being accepted for
-/// new sessions, so an unbounded value would make key removal need a restart.
-const MAX_TTL_SECS: u64 = 3600;
+/// The TTL bounds how long a removed or rotated key keeps admitting new
+/// sessions. One hour is 12 times the library default, which leaves room for
+/// deliberate tuning while flagging values that would make a key removal
+/// effectively need a restart. It is a warning, not a limit.
+const WARN_TTL_SECS: u64 = 3600;
 
 const PUBLIC_KEY_BEGIN: &str = "-----BEGIN PUBLIC KEY-----";
 const PUBLIC_KEY_END: &str = "-----END PUBLIC KEY-----";
@@ -308,10 +310,13 @@ fn convert_scope(
     }
 
     if let Some(secs) = auth.ttl_secs {
-        if secs > MAX_TTL_SECS {
-            return Err(ScopeConfigError::new(format!(
-                "{label}: ttl_secs {secs} exceeds the maximum of {MAX_TTL_SECS}"
-            )));
+        if secs > WARN_TTL_SECS {
+            tracing::warn!(
+                scope = label,
+                ttl_secs = secs,
+                "ttl_secs is above {WARN_TTL_SECS}; a removed key keeps admitting new sessions \
+                 for up to this long"
+            );
         }
     }
 
@@ -857,18 +862,17 @@ mod tests {
         );
     }
 
+    /// A long TTL is allowed (with a warning), not rejected.
     #[test]
-    fn rejects_an_excessive_ttl() {
+    fn a_long_ttl_is_accepted() {
         let mut auth = auth_json(&pem());
-        auth["ttl_secs"] = serde_json::json!(MAX_TTL_SECS + 1);
-        expect_err(
-            serde_json::json!({ "default": { "auth": auth } }),
-            "ttl_secs",
+        auth["ttl_secs"] = serde_json::json!(WARN_TTL_SECS * 24);
+        let policies =
+            parse_str(&serde_json::json!({ "default": { "auth": auth } }).to_string()).unwrap();
+        assert_eq!(
+            policies.auth_for(None).unwrap().ttl,
+            Duration::from_secs(WARN_TTL_SECS * 24)
         );
-
-        let mut auth = auth_json(&pem());
-        auth["ttl_secs"] = serde_json::json!(MAX_TTL_SECS);
-        assert!(parse_str(&serde_json::json!({ "default": { "auth": auth } }).to_string()).is_ok());
     }
 
     /// `"auth": {}` is not an opt-out: an auth object needs keys. The empty
