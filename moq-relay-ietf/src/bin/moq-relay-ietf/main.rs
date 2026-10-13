@@ -131,6 +131,19 @@ async fn main() -> anyhow::Result<()> {
     // Checked before anything else so a relay that cannot enforce the
     // requested policy never starts listening.
     let scope_config = scope_config::from_cli(cli.scope_config.as_deref())?;
+    if scope_config.is_some()
+        && (cli.api.is_some() || cli.api_url.is_some() || cli.announce.is_some())
+    {
+        // Peer relays connect as ordinary clients and present no token, so
+        // in a scope that enforces tokens they are refused like any client
+        // without one. Not fatal: scopes with `"auth": null` work normally.
+        tracing::warn!(
+            "--scope-config is combined with multi-relay options (--api, --api-url or \
+             --announce). Relay-to-relay sessions present no token, so they are refused in \
+             every scope that enforces tokens; cross-relay delivery works only in scopes \
+             with no token policy"
+        );
+    }
 
     // Initialize Prometheus metrics exporter if --metrics-addr is provided
     #[cfg(feature = "metrics-prometheus")]

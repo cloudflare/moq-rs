@@ -78,6 +78,12 @@ const MAX_KEY_FILE_BYTES: u64 = 16 * 1024;
 /// of a broken file, whose failures the library does not cache.
 const REVALIDATE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Largest accepted `ttl_secs`.
+///
+/// The TTL bounds how long a removed or rotated key keeps being accepted for
+/// new sessions, so an unbounded value would make key removal need a restart.
+const MAX_TTL_SECS: u64 = 3600;
+
 const PUBLIC_KEY_BEGIN: &str = "-----BEGIN PUBLIC KEY-----";
 const PUBLIC_KEY_END: &str = "-----END PUBLIC KEY-----";
 
@@ -299,6 +305,25 @@ fn convert_scope(
     let mut keys = Vec::with_capacity(auth.keys.len());
     for (index, key) in auth.keys.into_iter().enumerate() {
         keys.push(convert_key(key, index, label, base_dir, read_key)?);
+    }
+
+    if let Some(secs) = auth.ttl_secs {
+        if secs > MAX_TTL_SECS {
+            return Err(ScopeConfigError::new(format!(
+                "{label}: ttl_secs {secs} exceeds the maximum of {MAX_TTL_SECS}"
+            )));
+        }
+    }
+
+    // Legal, but easy to do by accident when trimming the example down.
+    for (field, values) in [("issuers", &auth.issuers), ("audiences", &auth.audiences)] {
+        if values.is_empty() {
+            tracing::warn!(
+                scope = label,
+                "auth.{field} is empty, so tokens with any {} are accepted",
+                if field == "issuers" { "iss" } else { "aud" }
+            );
+        }
     }
 
     let mut config = ScopeAuthConfig::new(keys)
@@ -830,6 +855,39 @@ mod tests {
             ] } } }),
             "empty kid",
         );
+    }
+
+    #[test]
+    fn rejects_an_excessive_ttl() {
+        let mut auth = auth_json(&pem());
+        auth["ttl_secs"] = serde_json::json!(MAX_TTL_SECS + 1);
+        expect_err(
+            serde_json::json!({ "default": { "auth": auth } }),
+            "ttl_secs",
+        );
+
+        let mut auth = auth_json(&pem());
+        auth["ttl_secs"] = serde_json::json!(MAX_TTL_SECS);
+        assert!(parse_str(&serde_json::json!({ "default": { "auth": auth } }).to_string()).is_ok());
+    }
+
+    /// `"auth": {}` is not an opt-out: an auth object needs keys. The empty
+    /// scope entry `{}` is.
+    #[test]
+    fn an_empty_auth_object_is_rejected_but_an_empty_scope_entry_opts_out() {
+        expect_err(
+            serde_json::json!({ "scopes": { "/x": { "auth": {} } } }),
+            "missing field `keys`",
+        );
+        let policies = parse_str(
+            &serde_json::json!({
+                "default": { "auth": auth_json(&pem()) },
+                "scopes": { "/x": {} },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(policies.auth_for(Some("/x")).is_none());
     }
 
     #[test]
