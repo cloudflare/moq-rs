@@ -10,22 +10,40 @@ use std::time::{Duration, Instant};
 use super::{AuthError, AuthHook, DenyAllAuthHook, UNSCOPED};
 use crate::{Coordinator, ScopeAuthConfig};
 
-/// How long an unusable configuration is cached before it is retried.
+/// Retry interval for an unusable configuration, or for a failed refresh that
+/// reuses the cached state.
 ///
 /// Short enough that fixing a misconfiguration takes effect promptly, long
 /// enough that a broken scope under load does not turn into a retry storm
 /// against the coordinator.
 const BROKEN_CONFIG_TTL: Duration = Duration::from_secs(30);
 
+/// Maximum age of an enforced policy, in TTLs from the last successful fetch:
+/// one hour at the default TTL.
+///
+/// The cap trades availability for revocation. Without it, a key removed during
+/// an outage, for example a compromised one, would keep admitting new sessions
+/// until the coordinator came back. Token expiry does not bound that case,
+/// because whoever holds the key can sign fresh tokens.
+const MAX_STALE_TTLS: u32 = 12;
+
 /// Builds and caches the authorization hook for each scope.
 ///
 /// [`Coordinator::get_scope_config`] is the source of truth for a scope's
 /// keys, but calling it per connection would put a coordinator round-trip and
 /// a set of PEM parses on the accept path. Results are therefore cached for
-/// [`ScopeAuthConfig::ttl`], which also bounds how long a key rotation takes
-/// to reach new sessions.
+/// [`ScopeAuthConfig::ttl`], which bounds how long a key rotation takes to
+/// reach new sessions while the coordinator is reachable.
+///
+/// By default, during an outage, an enforced policy applies for at most 12 of
+/// its TTLs from the last successful fetch. After that, new sessions are refused
+/// until a refresh succeeds. Scopes without a policy can reuse their cached
+/// state without a limit. A coordinator can turn reuse off with
+/// [`Coordinator::reuse_scope_config_on_error`], so a failed refresh refuses new
+/// sessions as soon as the cached entry expires.
 pub(crate) struct ScopeAuthorizer {
     coordinator: Arc<dyn Coordinator>,
+    reuse_scope_config_on_error: bool,
     cache: RwLock<HashMap<Option<String>, CacheEntry>>,
 }
 
@@ -33,6 +51,10 @@ pub(crate) struct ScopeAuthorizer {
 struct CacheEntry {
     state: CacheState,
     expires_at: Instant,
+    last_success_at: Instant,
+    // The policy's effective TTL. Kept separately because a failed refresh
+    // moves expires_at by the retry interval instead.
+    policy_ttl: Duration,
 }
 
 #[derive(Clone)]
@@ -45,8 +67,10 @@ enum CacheState {
 
 impl ScopeAuthorizer {
     pub(crate) fn new(coordinator: Arc<dyn Coordinator>) -> Self {
+        let reuse_scope_config_on_error = coordinator.reuse_scope_config_on_error();
         Self {
             coordinator,
+            reuse_scope_config_on_error,
             cache: RwLock::new(HashMap::new()),
         }
     }
@@ -54,23 +78,78 @@ impl ScopeAuthorizer {
     /// The hook for a scope, or `None` if the scope does not require
     /// authorization.
     ///
-    /// Returns `Err` only when the scope's policy could not be determined at
-    /// all — the caller must fail closed, since it cannot know whether the
-    /// scope requires a token.
+    /// Returns `Err` when a fetch fails and either no cached entry exists or
+    /// the coordinator has turned reuse off with
+    /// [`Coordinator::reuse_scope_config_on_error`]. The caller must fail closed
+    /// because the scope's current token requirements cannot be determined.
     pub(crate) async fn resolve(
         &self,
         scope: Option<&str>,
     ) -> Result<Option<Arc<dyn AuthHook>>, AuthError> {
         if let Some(entry) = self.cached(scope) {
-            return Ok(entry.into_hook());
+            return Ok(entry.state.into_hook());
         }
 
-        let config = self
-            .coordinator
-            .get_scope_config(scope)
-            .await
-            .map_err(|err| AuthError::Backend(format!("get_scope_config failed: {err}")))?;
+        let config = match self.coordinator.get_scope_config(scope).await {
+            Ok(config) => config,
+            Err(err) if !self.reuse_scope_config_on_error => {
+                return Err(AuthError::Backend(format!(
+                    "get_scope_config failed: {err}"
+                )));
+            }
+            Err(err) => {
+                let mut cache = self.cache.write().unwrap_or_else(|err| err.into_inner());
+                let Some(entry) = cache.get_mut(&scope.map(str::to_string)) else {
+                    return Err(AuthError::Backend(format!(
+                        "get_scope_config failed: {err}"
+                    )));
+                };
 
+                // A concurrent refresh may have renewed this entry. Extend and
+                // report only if it is still expired, once per retry interval.
+                let now = Instant::now();
+                if entry.expires_at <= now {
+                    let enforced = matches!(entry.state, CacheState::Enforced(_));
+                    // None when the cap is beyond what Instant can represent.
+                    let reuse_until = entry
+                        .last_success_at
+                        .checked_add(entry.policy_ttl.saturating_mul(MAX_STALE_TTLS));
+                    let retry_at = now + BROKEN_CONFIG_TTL;
+                    if enforced && reuse_until.is_some_and(|until| now >= until) {
+                        entry.expires_at = retry_at;
+                        entry.state = CacheState::Enforced(Arc::new(DenyAllAuthHook::new(
+                            "scope authorization policy is too old",
+                        )));
+                        tracing::error!(
+                            scope = scope.unwrap_or(UNSCOPED),
+                            error = %err,
+                            "could not refresh the scope's authorization policy; reuse cap reached, \
+                             refusing new sessions in this scope"
+                        );
+                    } else {
+                        // Cache hits do not check the cap, so the retry
+                        // interval must not carry the policy past it.
+                        entry.expires_at = match reuse_until {
+                            Some(until) if enforced => retry_at.min(until),
+                            _ => retry_at,
+                        };
+                        tracing::warn!(
+                            scope = scope.unwrap_or(UNSCOPED),
+                            error = %err,
+                            "could not refresh the scope's authorization policy; retaining the cached state"
+                        );
+                    }
+                    metrics::counter!("moq_relay_auth_errors_total", "stage" => "scope_config")
+                        .increment(1);
+                }
+                return Ok(entry.state.clone().into_hook());
+            }
+        };
+
+        let policy_ttl = config.auth.as_ref().map_or(
+            super::DEFAULT_SCOPE_AUTH_TTL,
+            ScopeAuthConfig::effective_ttl,
+        );
         let (state, ttl) = match config.auth {
             None => {
                 // Logged once per TTL rather than per connection. "No policy"
@@ -86,9 +165,8 @@ impl ScopeAuthorizer {
                 (CacheState::Disabled, super::DEFAULT_SCOPE_AUTH_TTL)
             }
             Some(auth) => {
-                let ttl = auth.effective_ttl();
                 match build_hook(&auth, scope) {
-                    Ok(hook) => (CacheState::Enforced(hook), ttl),
+                    Ok(hook) => (CacheState::Enforced(hook), policy_ttl),
                     // A scope that asked for authorization but cannot have it
                     // must refuse every session, not run unauthenticated.
                     Err(err) => {
@@ -112,13 +190,9 @@ impl ScopeAuthorizer {
             }
         };
 
-        self.store(scope, state.clone(), ttl);
+        self.store(scope, state.clone(), ttl, policy_ttl);
 
-        Ok(CacheEntry {
-            state,
-            expires_at: Instant::now() + ttl,
-        }
-        .into_hook())
+        Ok(state.into_hook())
     }
 
     fn cached(&self, scope: Option<&str>) -> Option<CacheEntry> {
@@ -134,13 +208,16 @@ impl ScopeAuthorizer {
             .cloned()
     }
 
-    fn store(&self, scope: Option<&str>, state: CacheState, ttl: Duration) {
+    fn store(&self, scope: Option<&str>, state: CacheState, ttl: Duration, policy_ttl: Duration) {
         let mut cache = self.cache.write().unwrap_or_else(|err| err.into_inner());
+        let now = Instant::now();
         cache.insert(
             scope.map(str::to_string),
             CacheEntry {
                 state,
-                expires_at: Instant::now() + ttl,
+                expires_at: now + ttl,
+                last_success_at: now,
+                policy_ttl,
             },
         );
     }
@@ -153,9 +230,9 @@ impl ScopeAuthorizer {
     }
 }
 
-impl CacheEntry {
+impl CacheState {
     fn into_hook(self) -> Option<Arc<dyn AuthHook>> {
-        match self.state {
+        match self {
             CacheState::Enforced(hook) => Some(hook),
             CacheState::Disabled => None,
         }
@@ -223,9 +300,6 @@ mod tests {
             self.calls.load(Ordering::SeqCst)
         }
 
-        /// Only the key-rotation test needs to change the scripted config, and
-        /// that test requires a hook that actually builds.
-        #[cfg(feature = "auth-cat")]
         fn set_config(&self, config: ScopeConfig) {
             *self.config.lock().unwrap() = config;
         }
@@ -265,9 +339,49 @@ mod tests {
         async fn get_scope_config(&self, _scope: Option<&str>) -> CoordinatorResult<ScopeConfig> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
+                // Let concurrent resolves reach the coordinator before failing.
+                tokio::task::yield_now().await;
                 return Err(CoordinatorError::Other(anyhow::anyhow!("backend down")));
             }
             Ok(self.config.lock().unwrap().clone())
+        }
+    }
+
+    struct NonReusingCoordinator(Arc<ScriptedCoordinator>);
+
+    #[async_trait]
+    impl Coordinator for NonReusingCoordinator {
+        async fn register_namespace(
+            &self,
+            scope: Option<&str>,
+            namespace: &TrackNamespace,
+            context: &CoordinatorContext,
+        ) -> CoordinatorResult<NamespaceRegistration> {
+            self.0.register_namespace(scope, namespace, context).await
+        }
+
+        async fn unregister_namespace(
+            &self,
+            scope: Option<&str>,
+            namespace: &TrackNamespace,
+        ) -> CoordinatorResult<()> {
+            self.0.unregister_namespace(scope, namespace).await
+        }
+
+        async fn lookup(
+            &self,
+            scope: Option<&str>,
+            namespace: &TrackNamespace,
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+            self.0.lookup(scope, namespace).await
+        }
+
+        async fn get_scope_config(&self, scope: Option<&str>) -> CoordinatorResult<ScopeConfig> {
+            self.0.get_scope_config(scope).await
+        }
+
+        fn reuse_scope_config_on_error(&self) -> bool {
+            false
         }
     }
 
@@ -295,6 +409,46 @@ mod tests {
             ])),
             ..Default::default()
         }
+    }
+
+    #[cfg(feature = "auth-cat")]
+    fn enforced_config_and_setup_token(ttl: Duration) -> (ScopeConfig, crate::auth::AuthToken) {
+        use cat_token::{encode_token, CatToken, Es256Algorithm, MoqtAction, MoqtScopeBuilder};
+        use p256::pkcs8::EncodePublicKey;
+
+        use crate::auth::{AuthToken, CAT_TOKEN_TYPE};
+
+        let signer = Es256Algorithm::new_with_key_pair().unwrap();
+        let pem = signer
+            .verifying_key()
+            .to_public_key_pem(Default::default())
+            .unwrap();
+        let config = ScopeConfig {
+            auth: Some(ScopeAuthConfig::new(vec![AuthPublicKey::es256(pem)]).with_ttl(ttl)),
+            ..Default::default()
+        };
+        let token = AuthToken::new(
+            CAT_TOKEN_TYPE,
+            encode_token(
+                &CatToken::new().with_expires_in(3600).with_moqt_scope(
+                    MoqtScopeBuilder::new()
+                        .action(MoqtAction::ClientSetup)
+                        .build(),
+                ),
+                &signer,
+            )
+            .unwrap(),
+        );
+        (config, token)
+    }
+
+    // The cache uses std::time::Instant, which a paused tokio clock cannot
+    // advance. Age entries directly to exercise expiry without real waits.
+    fn advance_cache_age(authorizer: &ScopeAuthorizer, scope: Option<&str>, elapsed: Duration) {
+        let mut cache = authorizer.cache.write().unwrap();
+        let entry = cache.get_mut(&scope.map(str::to_string)).unwrap();
+        entry.expires_at -= elapsed;
+        entry.last_success_at -= elapsed;
     }
 
     #[tokio::test]
@@ -385,19 +539,403 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_coordinator_failure_fails_closed() {
-        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
-        coordinator.set_failing(true);
-        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+    async fn expired_scope_config_fails_closed_when_reuse_is_off() {
+        for config in [ScopeConfig::default(), enforced_config()] {
+            let requires_auth = config.auth.is_some();
+            let coordinator = Arc::new(ScriptedCoordinator::new(config));
+            let authorizer =
+                ScopeAuthorizer::new(Arc::new(NonReusingCoordinator(coordinator.clone())));
+            assert_eq!(
+                authorizer.resolve(Some("tenant")).await.unwrap().is_some(),
+                requires_auth,
+            );
 
-        // Not `Ok(None)`: the relay must not admit a session merely because it
-        // could not find out whether the scope requires a token.
+            coordinator.set_failing(true);
+            assert_eq!(
+                authorizer.resolve(Some("tenant")).await.unwrap().is_some(),
+                requires_auth,
+                "a backend failure must not affect an entry within its TTL",
+            );
+            assert_eq!(coordinator.calls(), 1);
+
+            advance_cache_age(&authorizer, Some("tenant"), crate::DEFAULT_SCOPE_AUTH_TTL);
+            for expected_calls in 2..=3 {
+                assert!(
+                    matches!(
+                        authorizer.resolve(Some("tenant")).await,
+                        Err(AuthError::Backend(_))
+                    ),
+                    "a failed refresh must surface, requires_auth={requires_auth}",
+                );
+                assert_eq!(coordinator.calls(), expected_calls, "retry on every lookup");
+            }
+            assert!(matches!(
+                authorizer.resolve(Some("cold")).await,
+                Err(AuthError::Backend(_))
+            ));
+            assert_eq!(coordinator.calls(), 4);
+
+            coordinator.set_config(if requires_auth {
+                ScopeConfig::default()
+            } else {
+                enforced_config()
+            });
+            coordinator.set_failing(false);
+            for _ in 0..2 {
+                assert_eq!(
+                    authorizer.resolve(Some("tenant")).await.unwrap().is_some(),
+                    !requires_auth,
+                    "a successful refresh must replace the expired state immediately",
+                );
+            }
+            assert_eq!(
+                coordinator.calls(),
+                5,
+                "cache the successfully fetched state"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_scope_past_twelve_ttls_survives_a_coordinator_failure() {
+        // No override in ScriptedCoordinator: this guards the trait's default.
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+        assert!(authorizer.resolve(Some("open")).await.unwrap().is_none());
+
+        advance_cache_age(
+            &authorizer,
+            Some("open"),
+            crate::DEFAULT_SCOPE_AUTH_TTL * 12 + Duration::from_secs(1),
+        );
+        coordinator.set_failing(true);
+
+        for _ in 0..3 {
+            assert!(authorizer.resolve(Some("open")).await.unwrap().is_none());
+        }
+        assert_eq!(
+            coordinator.calls(),
+            2,
+            "retry must be cached between sessions"
+        );
+    }
+
+    #[cfg(feature = "auth-cat")]
+    #[tokio::test]
+    async fn an_enforced_scope_is_reused_until_the_cap_after_a_coordinator_failure() {
+        use crate::auth::DenyReason;
+
+        let ttl = Duration::from_secs(60);
+        let (config, token) = enforced_config_and_setup_token(ttl);
+        let coordinator = Arc::new(ScriptedCoordinator::new(config));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+        let original = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        let session = crate::SessionContext::public(Some("tenant".to_string()));
+        assert!(original
+            .on_setup(&session, std::slice::from_ref(&token))
+            .await
+            .unwrap()
+            .is_allowed());
+
+        advance_cache_age(
+            &authorizer,
+            Some("tenant"),
+            ttl * 12 - Duration::from_secs(1),
+        );
+        coordinator.set_failing(true);
+
+        for _ in 0..3 {
+            let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+            assert!(Arc::ptr_eq(&hook, &original), "reuse the last fetched hook");
+            assert!(matches!(
+                hook.on_setup(&session, &[]).await.unwrap().deny_reason(),
+                Some(DenyReason::TokenMissing)
+            ));
+            assert!(hook
+                .on_setup(&session, std::slice::from_ref(&token))
+                .await
+                .unwrap()
+                .is_allowed());
+        }
+        assert_eq!(
+            coordinator.calls(),
+            2,
+            "retry must be cached between sessions"
+        );
+
+        // The retry interval must not carry the policy past the cap.
+        advance_cache_age(&authorizer, Some("tenant"), Duration::from_secs(2));
+        for _ in 0..3 {
+            let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+            assert!(matches!(
+                hook.on_setup(&session, std::slice::from_ref(&token))
+                    .await
+                    .unwrap()
+                    .deny_reason(),
+                Some(DenyReason::PolicyDenied { .. })
+            ));
+        }
+        assert_eq!(coordinator.calls(), 3, "one retry at the cap");
+    }
+
+    #[cfg(feature = "auth-cat")]
+    #[tokio::test]
+    async fn an_enforced_scope_past_the_reuse_cap_denies_until_refresh_succeeds() {
+        use crate::auth::DenyReason;
+
+        let ttl = Duration::from_secs(60);
+        let (config, token) = enforced_config_and_setup_token(ttl);
+        let coordinator = Arc::new(ScriptedCoordinator::new(config));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+        let original = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        let session = crate::SessionContext::public(Some("tenant".to_string()));
+        assert!(original
+            .on_setup(&session, std::slice::from_ref(&token))
+            .await
+            .unwrap()
+            .is_allowed());
+
+        advance_cache_age(&authorizer, Some("tenant"), ttl * 11);
+        coordinator.set_failing(true);
+        let reused = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        assert!(reused
+            .on_setup(&session, std::slice::from_ref(&token))
+            .await
+            .unwrap()
+            .is_allowed());
+        assert_eq!(coordinator.calls(), 2);
+
+        // Failed refreshes must not reset the age measured from a successful fetch.
+        advance_cache_age(&authorizer, Some("tenant"), ttl);
+        for _ in 0..3 {
+            let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+            let decision = hook
+                .on_setup(&session, std::slice::from_ref(&token))
+                .await
+                .unwrap();
+            assert!(matches!(
+                decision.deny_reason(),
+                Some(DenyReason::PolicyDenied { .. })
+            ));
+        }
+        assert_eq!(coordinator.calls(), 3, "cache the denial between retries");
+
+        advance_cache_age(&authorizer, Some("tenant"), BROKEN_CONFIG_TTL);
+        let denied = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        assert!(!denied
+            .on_setup(&session, std::slice::from_ref(&token))
+            .await
+            .unwrap()
+            .is_allowed());
+        assert_eq!(coordinator.calls(), 4, "retry while past the cap");
+
+        // Admitted sessions hold their original hook even after the reuse cap.
+        assert!(original
+            .on_setup(&session, std::slice::from_ref(&token))
+            .await
+            .unwrap()
+            .is_allowed());
+
+        coordinator.set_failing(false);
+        let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        assert!(!hook
+            .on_setup(&session, std::slice::from_ref(&token))
+            .await
+            .unwrap()
+            .is_allowed());
+        assert_eq!(coordinator.calls(), 4, "wait for the retry interval");
+
+        advance_cache_age(&authorizer, Some("tenant"), BROKEN_CONFIG_TTL);
+        for _ in 0..3 {
+            let recovered = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+            assert!(recovered
+                .on_setup(&session, std::slice::from_ref(&token))
+                .await
+                .unwrap()
+                .is_allowed());
+        }
+        assert_eq!(
+            coordinator.calls(),
+            5,
+            "cache the successfully fetched policy"
+        );
+
+        advance_cache_age(&authorizer, Some("tenant"), ttl);
+        coordinator.set_failing(true);
+        let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        assert!(hook
+            .on_setup(&session, std::slice::from_ref(&token))
+            .await
+            .unwrap()
+            .is_allowed());
+        assert_eq!(
+            coordinator.calls(),
+            6,
+            "successful refresh resets policy age"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_does_not_overwrite_a_concurrent_success() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig {
+            auth: Some(ScopeAuthConfig::new(vec![])),
+            ..Default::default()
+        }));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+        assert!(authorizer.resolve(Some("tenant")).await.unwrap().is_some());
+        advance_cache_age(
+            &authorizer,
+            Some("tenant"),
+            crate::DEFAULT_SCOPE_AUTH_TTL * 12,
+        );
+        coordinator.set_failing(true);
+
+        let (failed_refresh, successful_refresh) =
+            tokio::join!(authorizer.resolve(Some("tenant")), async {
+                coordinator.set_config(ScopeConfig::default());
+                coordinator.set_failing(false);
+                authorizer.resolve(Some("tenant")).await
+            },);
+        assert!(successful_refresh.unwrap().is_none());
+        assert!(failed_refresh.unwrap().is_none());
+        assert!(authorizer.resolve(Some("tenant")).await.unwrap().is_none());
+        assert_eq!(coordinator.calls(), 3, "both refreshes must overlap");
+    }
+
+    #[tokio::test]
+    async fn an_expired_deny_all_scope_survives_a_coordinator_failure() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig {
+            auth: Some(ScopeAuthConfig::new(vec![])),
+            ..Default::default()
+        }));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+        let original = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        let session = crate::SessionContext::public(Some("tenant".to_string()));
+
+        advance_cache_age(&authorizer, Some("tenant"), BROKEN_CONFIG_TTL);
+        coordinator.set_failing(true);
+
+        for _ in 0..3 {
+            let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+            assert!(
+                Arc::ptr_eq(&hook, &original),
+                "reuse even an unusable policy's hook"
+            );
+            assert!(!hook.on_setup(&session, &[]).await.unwrap().is_allowed());
+        }
+        assert_eq!(
+            coordinator.calls(),
+            2,
+            "retry must be cached between sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recovered_coordinator_replaces_the_policy_after_the_retry_interval() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+        assert!(authorizer.resolve(Some("tenant")).await.unwrap().is_none());
+
+        advance_cache_age(&authorizer, Some("tenant"), crate::DEFAULT_SCOPE_AUTH_TTL);
+        coordinator.set_failing(true);
+        assert!(authorizer.resolve(Some("tenant")).await.unwrap().is_none());
+        assert_eq!(coordinator.calls(), 2);
+
+        coordinator.set_config(ScopeConfig {
+            auth: Some(ScopeAuthConfig::new(vec![])),
+            ..Default::default()
+        });
+        coordinator.set_failing(false);
+        assert!(authorizer.resolve(Some("tenant")).await.unwrap().is_none());
+        assert_eq!(
+            coordinator.calls(),
+            2,
+            "wait for the retry interval before refetching"
+        );
+
+        advance_cache_age(&authorizer, Some("tenant"), BROKEN_CONFIG_TTL);
+        let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
+        let session = crate::SessionContext::public(Some("tenant".to_string()));
+        assert!(!hook.on_setup(&session, &[]).await.unwrap().is_allowed());
+        assert_eq!(coordinator.calls(), 3);
+        assert!(authorizer.resolve(Some("tenant")).await.unwrap().is_some());
+        assert_eq!(coordinator.calls(), 3, "cache the recovered policy");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_refresh_failures_are_counted_once_per_retry_interval() {
+        use std::sync::atomic::AtomicU64;
+
+        use metrics::{
+            Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+        };
+
+        struct CountScopeErrors(Arc<AtomicU64>);
+        impl Recorder for CountScopeErrors {
+            fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+            fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+                assert_eq!(key.name(), "moq_relay_auth_errors_total");
+                assert_eq!(
+                    key.labels().collect::<Vec<_>>(),
+                    vec![&metrics::Label::new("stage", "scope_config")]
+                );
+                Counter::from_arc(self.0.clone())
+            }
+
+            fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+                Gauge::noop()
+            }
+
+            fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+                Histogram::noop()
+            }
+        }
+
+        let errors = Arc::new(AtomicU64::new(0));
+        let recorder = CountScopeErrors(errors.clone());
+        // The local recorder is thread-bound, so this test uses one runtime thread.
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+        assert!(authorizer.resolve(Some("tenant")).await.unwrap().is_none());
+        advance_cache_age(&authorizer, Some("tenant"), crate::DEFAULT_SCOPE_AUTH_TTL);
+        coordinator.set_failing(true);
+
+        let (first, second) = tokio::join!(
+            authorizer.resolve(Some("tenant")),
+            authorizer.resolve(Some("tenant")),
+        );
+        assert!(first.unwrap().is_none());
+        assert!(second.unwrap().is_none());
+        assert_eq!(coordinator.calls(), 3, "both refreshes must overlap");
+        assert!(authorizer.resolve(Some("tenant")).await.unwrap().is_none());
+        assert_eq!(coordinator.calls(), 3);
+        assert_eq!(errors.load(Ordering::SeqCst), 1);
+
+        advance_cache_age(&authorizer, Some("tenant"), BROKEN_CONFIG_TTL);
+        assert!(authorizer.resolve(Some("tenant")).await.unwrap().is_none());
+        assert_eq!(coordinator.calls(), 4);
+        assert_eq!(errors.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_cold_scope_coordinator_failure_fails_closed() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+        assert!(authorizer.resolve(Some("open")).await.unwrap().is_none());
+        coordinator.set_failing(true);
+
+        // Another scope's cached policy cannot establish this scope's policy.
         let err = authorizer
             .resolve(Some("tenant"))
             .await
             .err()
             .expect("a backend failure must surface");
         assert!(matches!(err, AuthError::Backend(_)), "{err:?}");
+        assert_eq!(coordinator.calls(), 2);
     }
 
     #[tokio::test]
