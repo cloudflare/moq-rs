@@ -13,7 +13,9 @@
 //! TOKEN parameters are still validated for wire-format conformance (§9.2.2.1)
 //! but do not gate admission.
 //!
-//! Where a policy is present, enforcement happens at two points:
+//! Internal relay peers bypass token authorization, relying on the embedder
+//! to authenticate them before tagging them internal. For public sessions
+//! where a policy is present, enforcement happens at two points:
 //!
 //! * **Setup.** The AUTHORIZATION TOKEN parameters from CLIENT_SETUP are
 //!   decoded (see [`decode_setup_tokens`]) and handed to
@@ -53,7 +55,8 @@
 //!
 //! # Failing closed
 //!
-//! Once a scope has opted in, anything short of an explicit allow denies:
+//! For public sessions on scopes with a policy, anything short of an explicit
+//! allow denies:
 //!
 //! * a coordinator that cannot be reached,
 //! * a configuration with no keys, too many keys, or unparseable key material,
@@ -61,8 +64,8 @@
 //! * a hook that returns an error,
 //! * a missing, malformed, expired or out-of-scope token.
 //!
-//! The one deliberate exception is a scope that never opted in, which is not
-//! an authorization failure but the absence of a policy.
+//! Scopes without a policy and authenticated internal relay peers bypass
+//! token authorization. Token wire-format validation applies to every session.
 //!
 //! [`Coordinator::resolve_scope`]: crate::Coordinator::resolve_scope
 //! [`Coordinator::get_scope_config`]: crate::Coordinator::get_scope_config

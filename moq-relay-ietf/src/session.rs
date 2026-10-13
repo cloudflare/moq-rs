@@ -32,6 +32,9 @@ pub enum SessionInterface {
     #[default]
     Public,
     /// An internal, relay-to-relay connection.
+    ///
+    /// These sessions bypass token authorization. Embedders must classify a
+    /// connection as internal only after authenticating its relay peer.
     Internal,
 }
 
@@ -169,6 +172,10 @@ impl ConnectionMeta {
 /// peer, via the well-known [`TAG_INTERFACE`] tag. Embedders implement it to
 /// match on the remote socket address, TLS SNI, or connection path.
 ///
+/// An internal tag bypasses token authorization at setup and on every request.
+/// Tag only authenticated relay peers as internal; matching connection metadata
+/// does not itself authenticate a peer.
+///
 /// The library ships **no** concrete implementation: it owns only the trait and
 /// the [`TAG_INTERFACE`] contract, while the embedder owns the site-specific
 /// policy of what counts as "internal". A relay with no tagger
@@ -221,8 +228,8 @@ impl ConnectionMeta {
 ///
 /// use moq_relay_ietf::{ConnectionMeta, ConnectionTagger, ConnectionTags, SessionInterface};
 ///
-/// /// Treats peers on the 10.0.0.0/8 mesh subnet, or presenting the mesh SNI,
-/// /// as internal relay-to-relay; everything else stays public.
+/// /// Classifies an authenticated relay mesh whose subnet admits only relay
+/// /// peers. The deployment must enforce that trust boundary.
 /// struct MeshTagger;
 ///
 /// impl ConnectionTagger for MeshTagger {
@@ -231,9 +238,8 @@ impl ConnectionMeta {
 ///             meta.remote_addr.map(|addr| addr.ip()),
 ///             Some(IpAddr::V4(ip)) if ip.octets()[0] == 10
 ///         );
-///         let from_mesh_sni = meta.server_name.as_deref() == Some("mesh.internal");
 ///
-///         if from_mesh_subnet || from_mesh_sni {
+///         if from_mesh_subnet {
 ///             ConnectionTags::new().with_interface(SessionInterface::Internal)
 ///         } else {
 ///             // Empty tags resolve to SessionInterface::Public.
