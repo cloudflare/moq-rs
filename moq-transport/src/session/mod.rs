@@ -1353,11 +1353,11 @@ impl Session {
                                     // exactly one reply, so REQUEST_OK ends them just as
                                     // REQUEST_ERROR does.
                                     //
-                                    // FETCH_OK is unconditionally terminal: the publisher
-                                    // FINs its bidi send-half immediately after sending it.
-                                    // Object data travels on a separate unidirectional stream,
-                                    // so keeping the bidi stream open serves no purpose and
-                                    // would exhaust MAX_CONCURRENT_BIDI_STREAMS slots.
+                                    // FETCH_OK ends the request here only because nothing
+                                    // serves FETCH yet. Draft-18 section 5.2 lets the
+                                    // requester cancel until the response ends, so once
+                                    // FETCH is served the request stream must stay open
+                                    // past FETCH_OK; FETCH serving changes this.
                                     let is_terminal = matches!(
                                         response.message,
                                         Message::RequestError(_)

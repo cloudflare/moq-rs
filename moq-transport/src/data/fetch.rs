@@ -322,21 +322,12 @@ mod tests {
         // obj_b, the decoder reads payload bytes as the group_id of obj_b.
         // Either the decode produces a wrong value or returns an error — either
         // way the stream is desynced.
-        let decoded_b_wrong = FetchObject::decode(&mut buf).unwrap_or(FetchObject {
-            group_id: u64::MAX, // sentinel: marks decode failure
-            subgroup_id: 0,
-            object_id: 0,
-            publisher_priority: 0,
-            extension_headers: KeyValuePairs::default(),
-            payload_length: 0,
-            status: Some(ObjectStatus::NormalObject),
-        });
-        // The group_id must NOT equal obj_b.group_id (2) because payload bytes
-        // were read as the varint instead of the actual group_id.
-        assert_ne!(
-            decoded_b_wrong.group_id, 2,
-            "consuming payload bytes before decode is required for correct stream sync"
-        );
+        if let Ok(decoded_b) = FetchObject::decode(&mut buf) {
+            assert_ne!(
+                decoded_b, obj_b,
+                "consuming payload bytes before decode is required for correct stream sync"
+            );
+        }
     }
 
     #[test]
