@@ -10,6 +10,7 @@ use std::time::Duration;
 use moq_transport::{
     coding::{Location, TrackNamespace, TrackNamespacePrefix},
     serve::{FullTrackName, ServeError, Track, TrackReader, TrackWriter},
+    session::Subscriber,
 };
 use tokio::sync::{broadcast, mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
@@ -64,6 +65,9 @@ const TRACK_CHANGE_CHANNEL_CAPACITY: usize = 1024;
 #[derive(Clone)]
 struct NamespaceSource {
     requests: mpsc::Sender<TrackRequest>,
+    /// Session that advertised the namespace, used to forward FETCH upstream.
+    /// `None` for sources that cannot serve FETCH.
+    fetch: Option<Subscriber>,
 }
 
 /// A request for a track that is not cached yet, sent to the session that
@@ -718,6 +722,27 @@ impl Locals {
         scope: Option<&str>,
         namespace: TrackNamespace,
     ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackRequest>)> {
+        self.register_namespace_inner(scope, namespace, None).await
+    }
+
+    /// Like [`Self::register_namespace`], also recording the advertising
+    /// session so a FETCH under the namespace can be forwarded to it.
+    pub(crate) async fn register_namespace_with_fetch(
+        &mut self,
+        scope: Option<&str>,
+        namespace: TrackNamespace,
+        fetch: Subscriber,
+    ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackRequest>)> {
+        self.register_namespace_inner(scope, namespace, Some(fetch))
+            .await
+    }
+
+    async fn register_namespace_inner(
+        &mut self,
+        scope: Option<&str>,
+        namespace: TrackNamespace,
+        fetch: Option<Subscriber>,
+    ) -> anyhow::Result<(LocalNamespaceRegistration, mpsc::Receiver<TrackRequest>)> {
         let scope_key = scope.unwrap_or(UNSCOPED).to_string();
         let (tx, rx) = mpsc::channel(NAMESPACE_REQUEST_CHANNEL_CAPACITY);
 
@@ -730,7 +755,10 @@ impl Locals {
             match bucket.entry(namespace.clone()) {
                 hash_map::Entry::Vacant(entry) => {
                     entry.insert(NamespaceEntry {
-                        local: Some(NamespaceSource { requests: tx }),
+                        local: Some(NamespaceSource {
+                            requests: tx,
+                            fetch,
+                        }),
                         remote: Weak::new(),
                     });
                     true
@@ -739,7 +767,10 @@ impl Locals {
                     if entry.get().local.is_some() {
                         return Err(ServeError::Duplicate.into());
                     }
-                    entry.get_mut().local = Some(NamespaceSource { requests: tx });
+                    entry.get_mut().local = Some(NamespaceSource {
+                        requests: tx,
+                        fetch,
+                    });
                     false
                 }
             }
@@ -1037,6 +1068,16 @@ impl Locals {
         }
 
         best_match
+    }
+
+    /// The session to forward a FETCH for `namespace` to, chosen by the same
+    /// longest-prefix match as SUBSCRIBE routing.
+    pub(crate) fn fetch_source(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+    ) -> Option<Subscriber> {
+        self.route_namespace(scope, namespace)?.fetch
     }
 
     pub(crate) fn has_namespace_route(
@@ -1908,7 +1949,10 @@ mod tests {
             .insert(
                 namespace.clone(),
                 NamespaceEntry {
-                    local: Some(NamespaceSource { requests }),
+                    local: Some(NamespaceSource {
+                        requests,
+                        fetch: None,
+                    }),
                     remote: Weak::new(),
                 },
             );

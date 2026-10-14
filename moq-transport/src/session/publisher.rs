@@ -4,7 +4,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -19,13 +22,22 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, BidiResponse, BidiResponseMap, DeliveryError, NameRegistry,
-    ObjectForwarderRecv, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
-    PublishedRecv, Reader, RequestId, Session, SessionError, Subscribed, SubscribedNamespace,
-    SubscribedNamespaceInfo, SubscribedNamespaceRecv, SubscribedTracks, SubscribedTracksInfo,
-    SubscribedTracksRecv, TrackStatusRequested, Writer,
+    split_published_state, BidiResponse, BidiResponseMap, DeliveryError, FetchRequested,
+    FetchRequestedRecv, NameRegistry, ObjectForwarderRecv, PublishNamespace, PublishNamespaceRecv,
+    Published, PublishedInfo, PublishedRecv, Reader, RequestId, Session, SessionError, Subscribed,
+    SubscribedNamespace, SubscribedNamespaceInfo, SubscribedNamespaceRecv, SubscribedTracks,
+    SubscribedTracksInfo, SubscribedTracksRecv, TrackStatusRequested, Writer,
 };
 use crate::message::RequestErrorCode;
+
+/// Most inbound FETCHes one session may have in flight (queued for the
+/// application or being answered). Further FETCHes get EXCESSIVE_LOAD, so a
+/// peer cannot grow the queue without bound.
+#[cfg(not(test))]
+const MAX_INBOUND_FETCHES_PER_SESSION: usize = 128;
+/// Small in tests so the cap is reachable within QUIC's stream limits.
+#[cfg(test)]
+pub(super) const MAX_INBOUND_FETCHES_PER_SESSION: usize = 4;
 
 /// Publisher-side state for one outbound PUBLISH.
 ///
@@ -138,6 +150,18 @@ pub struct Publisher {
     /// them cooperatively under structured concurrency (no task is spawned).
     bidi_task_tx: super::BidiTaskSender,
 
+    /// Inbound FETCHes awaiting the application.
+    unknown_fetch_requested: Queue<FetchRequested>,
+
+    /// Set by [`Publisher::accept_fetch`]. Until then FETCH is answered with
+    /// NOT_SUPPORTED, so an application that never polls
+    /// [`Publisher::fetch_requested`] still answers every FETCH.
+    fetch_enabled: Arc<AtomicBool>,
+
+    /// Session halves of inbound FETCHes, keyed by Request ID, so request
+    /// stream teardown can cancel an unanswered FETCH.
+    fetches: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
+
     /// Inbound request streams owned by `Session::run`. Normal serving waits
     /// for the owning writer to encode its terminal message and send FIN.
     pub(super) bidi_response_map: BidiResponseMap,
@@ -231,6 +255,9 @@ impl Publisher {
             request_id,
             mlog,
             bidi_task_tx,
+            unknown_fetch_requested: Default::default(),
+            fetch_enabled: Default::default(),
+            fetches: Default::default(),
             bidi_response_map: Default::default(),
         }
     }
@@ -884,6 +911,24 @@ impl Publisher {
         self.unknown_track_status_requested.pop().await
     }
 
+    /// Surface inbound FETCHes through [`Self::fetch_requested`] from now on.
+    ///
+    /// Applies to every clone of this publisher. Call it before the peer can
+    /// send FETCH (for example right after setup); a FETCH that arrives first
+    /// is answered with NOT_SUPPORTED.
+    pub fn accept_fetch(&self) {
+        self.fetch_enabled.store(true, Ordering::Release);
+    }
+
+    /// Returns the next inbound FETCH request (draft-18 §10.12).
+    ///
+    /// Requires [`Self::accept_fetch`]; this also enables it, but a FETCH
+    /// received before the first call was already refused.
+    pub async fn fetch_requested(&mut self) -> Option<FetchRequested> {
+        self.accept_fetch();
+        self.unknown_fetch_requested.pop().await
+    }
+
     /// Returns the next inbound SUBSCRIBE_NAMESPACE request.
     pub async fn subscribed_namespace(&mut self) -> Option<SubscribedNamespace> {
         self.unknown_subscribed_namespace.pop().await
@@ -1033,16 +1078,14 @@ impl Publisher {
             // or our PUBLISH; the request ID says which.
             message::Subscriber::RequestError(msg) => self.recv_request_error(msg)?,
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg)?,
-            // FETCH not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
-            message::Subscriber::Fetch(msg) => {
-                self.send_not_supported(msg.id, "fetch");
-            }
-            // FETCH_CANCEL references an existing request; log and ignore.
+            message::Subscriber::Fetch(msg) => self.recv_fetch(msg)?,
+            // Draft-18 has no FETCH_CANCEL (§A.2); requesters cancel by
+            // resetting the request stream, whose cleanup cancels the FETCH.
             message::Subscriber::FetchCancel(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     request_id = msg.id,
-                    "received FETCH_CANCEL for unsupported FETCH — ignoring"
+                    "ignoring FETCH_CANCEL, which draft-18 does not define"
                 );
             }
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg)?,
@@ -1080,6 +1123,107 @@ impl Publisher {
         }
 
         Ok(())
+    }
+
+    /// Handle an inbound FETCH (draft-18 §10.12) and surface it to the
+    /// application.
+    ///
+    /// Requests that can be answered without the application are rejected
+    /// here: every FETCH until [`Self::accept_fetch`] (NOT_SUPPORTED), too
+    /// many in flight (EXCESSIVE_LOAD), an empty standalone range
+    /// (§10.12.3), and Joining FETCH, which is not served yet.
+    fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
+        // §10.2.7 / §10.2.8: out-of-range values are PROTOCOL_VIOLATIONs.
+        super::validate_fetch_params(&msg.params)?;
+        if !self.fetch_enabled.load(Ordering::Acquire) {
+            self.send_not_supported(msg.id, "fetch");
+            return Ok(());
+        }
+        let in_flight = self
+            .fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .len();
+        if in_flight >= MAX_INBOUND_FETCHES_PER_SESSION {
+            self.send_request_error(
+                "fetch",
+                message::RequestError::new(
+                    msg.id,
+                    RequestErrorCode::ExcessiveLoad,
+                    0,
+                    "too many FETCH requests in flight",
+                ),
+            );
+            return Ok(());
+        }
+        match msg.fetch_type {
+            message::FetchType::Standalone => {
+                let standalone = msg
+                    .standalone_fetch
+                    .as_ref()
+                    .ok_or(SessionError::Internal)?;
+                if !super::fetch_range_is_valid(standalone.start_location, standalone.end_location)
+                {
+                    self.send_request_error(
+                        "fetch",
+                        message::RequestError::new(
+                            msg.id,
+                            RequestErrorCode::InvalidRange,
+                            0,
+                            "fetch start is after end",
+                        ),
+                    );
+                    return Ok(());
+                }
+            }
+            message::FetchType::RelativeJoining | message::FetchType::AbsoluteJoining => {
+                self.send_not_supported(msg.id, "joining_fetch");
+                return Ok(());
+            }
+        }
+
+        let id = msg.id;
+        let (request, recv) = FetchRequested::new(
+            self.webtransport.clone(),
+            self.outgoing.clone(),
+            self.fetches.clone(),
+            msg,
+        );
+        self.fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .insert(id, recv);
+        if let Err(request) = self.unknown_fetch_requested.push(request) {
+            request
+                .reject(RequestErrorCode::InternalError, "fetch queue closed")
+                .map_err(SessionError::Serve)?;
+        }
+        Ok(())
+    }
+
+    /// The requester reset or stopped an inbound FETCH's request stream, which
+    /// cancels it (draft-18 §5.2), before or after FETCH_OK. The entry stays
+    /// until the [`FetchRequested`] drops, so the cap counts the FETCH until
+    /// its serving actually stops.
+    pub(super) fn cancel_fetch(&self, id: u64) {
+        let Ok(mut fetches) = self.fetches.lock() else {
+            return;
+        };
+        if let Some(recv) = fetches.get_mut(&id) {
+            if recv.cancel() {
+                tracing::debug!(request_id = id, "FETCH cancelled by requester");
+            }
+        }
+    }
+
+    /// A future resolving when the application stops serving FETCH `id`, or
+    /// `None` if it was answered on receipt (NOT_SUPPORTED, EXCESSIVE_LOAD,
+    /// INVALID_RANGE) and nothing is serving it.
+    pub(super) fn fetch_served(
+        &self,
+        id: u64,
+    ) -> Option<impl std::future::Future<Output = bool> + Send + 'static> {
+        self.fetches.lock().ok()?.get(&id).map(|recv| recv.served())
     }
 
     /// Send REQUEST_ERROR NOT_SUPPORTED for an incoming request we do not implement.

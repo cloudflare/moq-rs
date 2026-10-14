@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod error;
+mod fetch;
+mod fetch_requested;
+mod fetch_validation;
 mod name_registry;
 mod publish_namespace;
 mod publish_received;
@@ -22,6 +25,10 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
+pub use fetch::Fetch;
+pub(crate) use fetch_requested::FetchRequestedRecv;
+pub use fetch_requested::{FetchOkInfo, FetchRequested, FetchWriter};
+pub(crate) use fetch_validation::*;
 pub(crate) use name_registry::NameRegistry;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
@@ -130,14 +137,8 @@ pub(crate) type BidiResponseMap = Arc<Mutex<HashMap<u64, RequestStreamSink>>>;
 enum BidiRequestKind {
     Subscribe,
     Publish,
-    /// Inbound FETCH: the publisher serves object data on a separate
-    /// unidirectional stream keyed by request ID.
-    ///
-    /// When the bidi control stream tears down, the outbound-FETCH routing
-    /// table on the subscriber side is not touched: inbound IDs have opposite
-    /// parity from any outbound-FETCH registration (§10.1), so any lookup
-    /// would find nothing.  Cancelling the publisher-side serving task is
-    /// added with FETCH serving.
+    /// Inbound FETCH. Teardown of its request stream before a response was
+    /// sent cancels the request (draft-18 §5.2).
     Fetch,
     Other,
 }
@@ -174,11 +175,9 @@ impl Drop for BidiRequestCleanup {
                 }
             }
             BidiRequestKind::Fetch => {
-                // Inbound FETCH (this session is the publisher): the data-stream
-                // routing table lives on the session that *sent* the FETCH
-                // (outbound side), whose IDs always have opposite parity from
-                // inbound IDs per §10.1 — no outbound registration to cancel.
-                // Cancelling the serving task is added with FETCH serving.
+                if let Some(publisher) = &self.publisher {
+                    publisher.cancel_fetch(self.id);
+                }
             }
             BidiRequestKind::Other => {}
         }
@@ -1261,10 +1260,10 @@ impl Session {
         // PUBLISH_NAMESPACE) may legitimately stay open until an explicit
         // terminal message and are therefore not bounded.
         //
-        // FETCH is one-shot on the bidi control stream: the publisher sends
-        // FETCH_OK (or REQUEST_ERROR) and immediately FINs.  The actual object
-        // data travels on a separate unidirectional stream opened by the
-        // publisher, keyed by the same request ID.
+        // FETCH sends one response, but its request stream outlives FETCH_OK:
+        // the requester cancels by resetting or stopping it (draft-18 §5.2),
+        // so it is FINned only once the response on the data stream is
+        // finished or reset.
         let bounded_response = matches!(&msg, Message::TrackStatus(_) | Message::RequestUpdate(_));
         let request_kind = match &msg {
             Message::Subscribe(_) => BidiRequestKind::Subscribe,
@@ -1326,6 +1325,16 @@ impl Session {
             Ok(())
         })();
 
+        // An inbound FETCH that reached the application is served after
+        // FETCH_OK; this resolves once that serving ends.
+        let mut fetch_served = match (request_kind, req_id, dispatch_result.is_ok()) {
+            (BidiRequestKind::Fetch, Some(id), true) => publisher
+                .as_ref()
+                .and_then(|p| p.fetch_served(id))
+                .map(Box::pin),
+            _ => None,
+        };
+
         // Wait for responses only if dispatch succeeded; otherwise the
         // handlers didn't register anything to respond to.
         let mut writer_closed = false;
@@ -1342,6 +1351,7 @@ impl Session {
                     let responses = async {
                         let mut deferred_publish_done = false;
                         let mut publish_response_sent = false;
+                        let mut fetch_ok_sent = false;
                         loop {
                             tokio::select! {
                                 biased;
@@ -1353,20 +1363,19 @@ impl Session {
                                     // exactly one reply, so REQUEST_OK ends them just as
                                     // REQUEST_ERROR does.
                                     //
-                                    // FETCH_OK ends the request here only because nothing
-                                    // serves FETCH yet. Draft-18 section 5.2 lets the
-                                    // requester cancel until the response ends, so once
-                                    // FETCH is served the request stream must stay open
-                                    // past FETCH_OK; FETCH serving changes this.
+                                    // FETCH_OK ends the request only when nothing serves
+                                    // the response; otherwise the stream stays open until
+                                    // `fetch_served` resolves, so a cancel is still seen.
+                                    let is_fetch_ok = matches!(response.message, Message::FetchOk(_));
                                     let is_terminal = matches!(
                                         response.message,
                                         Message::RequestError(_)
                                             | Message::PublishDone(_)
                                             | Message::PublishNamespaceDone(_)
                                             | Message::Unsubscribe(_)
-                                            | Message::FetchOk(_)
-                                    ) || (bounded_response
-                                        && matches!(response.message, Message::RequestOk(_)));
+                                    ) || (is_fetch_ok && fetch_served.is_none())
+                                        || (bounded_response
+                                            && matches!(response.message, Message::RequestOk(_)));
                                     if let Err(err) = Self::encode_bidi_response(
                                         &mut writer,
                                         &response.message,
@@ -1396,6 +1405,9 @@ impl Session {
                                     {
                                         publish_response_sent = true;
                                     }
+                                    if is_fetch_ok {
+                                        fetch_ok_sent = true;
+                                    }
                                     response.complete(Ok(()));
                                     if deferred_publish_done {
                                         return Ok(false);
@@ -1413,11 +1425,37 @@ impl Session {
                                             }
                                             deferred_publish_done = true;
                                         }
+                                        // §5.2: the publisher resets the request stream
+                                        // of a cancelled FETCH.
+                                        Ok(FollowupEnd::Cancelled)
+                                            if matches!(request_kind, BidiRequestKind::Fetch) =>
+                                        {
+                                            writer.reset(CANCELLED_STREAM_CODE);
+                                            return Ok(true);
+                                        }
                                         Ok(FollowupEnd::PublishDone | FollowupEnd::OtherTerminal | FollowupEnd::Cancelled) => {
                                             return Ok(false);
                                         }
                                         Err(err) => return Err(err),
                                     }
+                                }
+                                completed = async {
+                                    match fetch_served.as_mut() {
+                                        Some(served) => served.await,
+                                        None => std::future::pending().await,
+                                    }
+                                }, if fetch_ok_sent => {
+                                    // The response ended. FIN only if it completed;
+                                    // otherwise reset, since a reset data stream may
+                                    // never have delivered its FETCH_HEADER.
+                                    if completed {
+                                        if let Err(err) = writer.finish() {
+                                            tracing::debug!(error = %err, "failed to FIN FETCH request stream");
+                                        }
+                                    } else {
+                                        writer.reset(crate::data::DataStreamResetCode::InternalError as u32);
+                                    }
+                                    return Ok(true);
                                 }
                                 stopped = writer.closed() => {
                                     match stopped {
@@ -3184,10 +3222,10 @@ mod tests {
     // FETCH_CANCEL: a requester cancels by resetting the request stream
     // (section 5.2), which is covered with the FETCH serving path.
 
-    /// `FetchOk` in `is_terminal` FINs the bidi stream after `FetchOk`.
+    /// FETCH_OK for a FETCH that nothing is serving FINs the request stream.
     ///
-    /// The fix is adding `Message::FetchOk(_)` to `is_terminal` in
-    /// the bidi response loop.  This test exercises the real lifecycle path:
+    /// A served FETCH keeps its stream until the response ends (see the
+    /// `fetch` module tests). This test exercises the unserved path:
     ///
     /// 1. Open a FETCH bidi stream through `handle_bidi_request`.
     /// 2. The publisher stub calls `send_not_supported`, which sends
@@ -3198,8 +3236,7 @@ mod tests {
     /// 4. `is_terminal` fires → bidi send-half FINs → subscriber's bidi
     ///    reader sees FIN (`done() == true`).
     ///
-    /// Without it, `FetchOk` is absent from `is_terminal`, the loop
-    /// does not FIN, and the handler occupies one of the 128 shared
+    /// Otherwise the handler would occupy one of the 128 shared
     /// `MAX_CONCURRENT_BIDI_STREAMS` slots until idle timeout.
     #[tokio::test]
     async fn fetch_ok_in_is_terminal_fins_bidi_stream() {
@@ -3290,7 +3327,7 @@ mod tests {
             "bidi_response_map must have entry for request_id={request_id} within 2 s"
         );
 
-        // The bidi response loop receives FetchOk; is_terminal=true
+        // The bidi response loop receives FetchOk.  is_terminal=true
         // → handler FINs its bidi send-half.  The requester's reader sees FIN.
         let msg = tokio::time::timeout(
             std::time::Duration::from_secs(2),
