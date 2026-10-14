@@ -77,6 +77,11 @@ pub(super) struct StreamCount(Arc<AtomicU64>);
 
 impl StreamCount {
     fn opened(&self) {
+        // `fetch_update` triggers a deprecation lint with `-D warnings` on
+        // current toolchain.  The new name is `try_update` (pure alias, no
+        // behaviour change).  This targeted allow keeps the diff small;
+        // the rename will be swept codebase-wide in a dedicated commit.
+        #[allow(deprecated)]
         let _ = self
             .0
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {

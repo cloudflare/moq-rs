@@ -261,11 +261,13 @@ impl SubgroupsWriter {
     }
 
     // Helper to increment the group by one.
+    // The unreachable else-branch is intentional — it documents the planned refactor path.
+    #[allow(clippy::needless_late_init)]
     pub fn append(&mut self, priority: u8) -> Result<SubgroupWriter, ServeError> {
+        // TODO: refactor here... For now, every subgroup is mapped to a new group...
         let group_id;
         let subgroup_id;
 
-        // TODO: refactor here... For now, every subgroup is mapped to a new group...
         let start_new_group = true;
 
         if start_new_group {
