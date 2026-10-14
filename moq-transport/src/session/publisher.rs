@@ -1156,6 +1156,7 @@ impl Publisher {
             );
             return Ok(());
         }
+        let mut joining = None;
         match msg.fetch_type {
             message::FetchType::Standalone => {
                 let standalone = msg
@@ -1177,8 +1178,34 @@ impl Publisher {
                 }
             }
             message::FetchType::RelativeJoining | message::FetchType::AbsoluteJoining => {
-                self.send_not_supported(msg.id, "joining_fetch");
-                return Ok(());
+                let joining_request_id = msg
+                    .joining_fetch
+                    .as_ref()
+                    .ok_or(SessionError::Internal)?
+                    .joining_request_id;
+                // §10.12.2: the referenced Request ID must be a SUBSCRIBE in
+                // this session that is Established or Pending.
+                let handle = self
+                    .subscribeds
+                    .lock()
+                    .map_err(|_| SessionError::Internal)?
+                    .get(&joining_request_id)
+                    .and_then(|recv| recv.joining_handle());
+                match handle {
+                    Some(handle) => joining = Some(handle),
+                    None => {
+                        self.send_request_error(
+                            "fetch",
+                            message::RequestError::new(
+                                msg.id,
+                                RequestErrorCode::InvalidJoiningRequestId,
+                                0,
+                                "no such subscription",
+                            ),
+                        );
+                        return Ok(());
+                    }
+                }
             }
         }
 
@@ -1188,6 +1215,7 @@ impl Publisher {
             self.outgoing.clone(),
             self.fetches.clone(),
             msg,
+            joining,
         );
         self.fetches
             .lock()

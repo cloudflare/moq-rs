@@ -985,6 +985,38 @@ impl Subscriber {
         .await
     }
 
+    /// Send a Joining FETCH for the subscription with request ID
+    /// `subscribe_id` (draft-18 §10.12.2).
+    ///
+    /// The publisher computes the range so the response ends where the
+    /// subscription begins: `joining_start` groups before its Joining
+    /// Location for [`message::FetchType::RelativeJoining`], or from group
+    /// `joining_start` for [`message::FetchType::AbsoluteJoining`]. The
+    /// subscription should be sent first and have Forward State 1.
+    pub async fn joining_fetch(
+        &mut self,
+        fetch_type: message::FetchType,
+        subscribe_id: u64,
+        joining_start: u64,
+        params: KeyValuePairs,
+    ) -> Result<Fetch, ServeError> {
+        if fetch_type == message::FetchType::Standalone {
+            return Err(ServeError::Mode);
+        }
+        self.fetch_request(
+            fetch_type,
+            None,
+            Some(message::JoiningFetch {
+                joining_request_id: subscribe_id,
+                joining_start,
+            }),
+            // The range is chosen by the publisher; FETCH_OK bounds it.
+            None,
+            params,
+        )
+        .await
+    }
+
     pub(super) async fn fetch_request(
         &mut self,
         fetch_type: message::FetchType,

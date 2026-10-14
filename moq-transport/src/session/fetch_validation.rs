@@ -42,7 +42,6 @@ pub(crate) fn fetch_range_is_valid(start: Location, end: Location) -> bool {
 ///
 /// An Object ID of 2^64-1 has no `+1`; it is the last possible Object in the
 /// group, so the whole-group encoding `{group, 0}` covers it exactly.
-#[cfg_attr(not(test), allow(dead_code))] // used by Joining FETCH resolution
 pub(crate) fn joining_fetch_end_location(largest: Location) -> Location {
     match largest.object_id.checked_add(1) {
         Some(next) => Location::new(largest.group_id, next),

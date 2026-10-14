@@ -630,6 +630,255 @@ mod tests {
         );
     }
 
+    // ── Joining FETCH ────────────────────────────────────────────────────
+
+    fn track(name: &str) -> (crate::serve::TrackWriter, crate::serve::TrackReader) {
+        crate::serve::Track::new(TrackNamespace::from_utf8_path("test/fetch"), name).produce()
+    }
+
+    /// Joining FETCH sent while its SUBSCRIBE is still pending is buffered
+    /// until SUBSCRIBE_OK, then resolved against the Joining Location.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn joining_fetch_waits_for_the_subscription_and_ends_at_its_start() {
+        let (mut sub, mut publ) = pair().await;
+        let (writer, _reader) = track("video");
+        let subscribe = sub.subscribe_start(writer).await.unwrap();
+        let subscribe_id = subscribe.info.id;
+        let mut fetch = sub
+            .joining_fetch(
+                crate::message::FetchType::RelativeJoining,
+                subscribe_id,
+                2,
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+
+        let subscribed = tokio::time::timeout(T, publ.subscribed())
+            .await
+            .unwrap()
+            .unwrap();
+        let requested = tokio::time::timeout(T, publ.fetch_requested())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Pending until the subscription is accepted.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), requested.resolve())
+                .await
+                .is_err(),
+            "a Joining FETCH must wait for its subscription"
+        );
+
+        let (_track_writer, track_reader) = track("video");
+        let serve = tokio::spawn(async move {
+            subscribed
+                .serve_with_largest_location(track_reader, Some(Location::new(5, 3)))
+                .await
+        });
+        let range = tokio::time::timeout(T, requested.resolve())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // Resolution is memoized; responding uses the same range.
+        assert_eq!(requested.resolve().await.unwrap().unwrap(), range);
+        assert_eq!(
+            range.track_namespace,
+            TrackNamespace::from_utf8_path("test/fetch")
+        );
+        assert_eq!(range.start_location, Location::new(3, 0));
+        assert_eq!(range.end_location, Location::new(5, 4));
+        subscribe.ok().await.unwrap();
+
+        let mut writer = requested
+            .respond(ok_info(Location::new(5, 4)))
+            .await
+            .unwrap();
+        writer.write_record(&obj(3, 0, 0)).await.unwrap();
+        writer.write_record(&obj(5, 3, 1)).await.unwrap();
+        writer.write_payload(b"x").await.unwrap();
+        assert!(
+            writer.write_record(&obj(5, 4, 0)).await.is_err(),
+            "the Joining Location is the last Object in the response"
+        );
+        writer.finish().await.unwrap();
+
+        let ok = tokio::time::timeout(T, fetch.ok()).await.unwrap().unwrap();
+        assert_eq!(ok.end_location, Location::new(5, 4));
+        let records = read_all(&mut fetch).await;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1], (obj(5, 3, 1), b"x".to_vec()));
+        drop(serve);
+    }
+
+    async fn joining_error(
+        sub: &mut Subscriber,
+        fetch_type: crate::message::FetchType,
+        subscribe_id: u64,
+        joining_start: u64,
+    ) -> Option<u64> {
+        let fetch = sub
+            .joining_fetch(
+                fetch_type,
+                subscribe_id,
+                joining_start,
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        match tokio::time::timeout(T, fetch.ok()).await.unwrap() {
+            Err(ServeError::Closed(code)) => Some(code),
+            _ => None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn joining_fetch_for_an_unknown_subscription_is_rejected() {
+        let (mut sub, _publ) = pair().await;
+        assert_eq!(
+            joining_error(&mut sub, crate::message::FetchType::AbsoluteJoining, 98, 0).await,
+            Some(RequestErrorCode::InvalidJoiningRequestId as u64)
+        );
+    }
+
+    /// §10.12.2: Forward State 0 and an empty track are both INVALID_RANGE,
+    /// as is an absolute start after the Joining Location.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn joining_fetch_range_errors() {
+        let (mut sub, mut publ) = pair().await;
+        // The application resolves each FETCH; resolution sends the error.
+        let mut resolver = publ.clone();
+        tokio::spawn(async move {
+            while let Some(requested) = resolver.fetch_requested().await {
+                tokio::spawn(async move {
+                    if let Ok(Some(_)) = requested.resolve().await {
+                        let _ = requested.reject(RequestErrorCode::InternalError, "unexpected");
+                    }
+                });
+            }
+        });
+
+        let serve_track = |publ: &mut Publisher, largest: Option<Location>| {
+            let mut publ = publ.clone();
+            async move {
+                let subscribed = publ.subscribed().await.unwrap();
+                let name = subscribed.info.track_name.to_string_lossy().into_owned();
+                let (_w, reader) = track(&name);
+                tokio::spawn(async move {
+                    let _keep = _w;
+                    subscribed
+                        .serve_with_largest_location(reader, largest)
+                        .await
+                });
+            }
+        };
+
+        // Forward State 0.
+        let (writer, _r0) = track("paused");
+        let mut params = KeyValuePairs::default();
+        params.set_forward(false);
+        let (paused, ()) = tokio::join!(
+            sub.subscribe_open_with_params(writer, params),
+            serve_track(&mut publ, Some(Location::new(4, 0))),
+        );
+        let paused = paused.unwrap();
+        assert_eq!(
+            joining_error(
+                &mut sub,
+                crate::message::FetchType::RelativeJoining,
+                paused.info.id,
+                0
+            )
+            .await,
+            Some(RequestErrorCode::InvalidRange as u64)
+        );
+
+        // No Objects published yet.
+        let (writer, _r1) = track("empty");
+        let (empty, ()) = tokio::join!(sub.subscribe_open(writer), serve_track(&mut publ, None));
+        let empty = empty.unwrap();
+        assert_eq!(
+            joining_error(
+                &mut sub,
+                crate::message::FetchType::RelativeJoining,
+                empty.info.id,
+                0
+            )
+            .await,
+            Some(RequestErrorCode::InvalidRange as u64)
+        );
+
+        // Absolute start after the Joining Location; relative start before 0.
+        let (writer, _r2) = track("live");
+        let (live, ()) = tokio::join!(
+            sub.subscribe_open(writer),
+            serve_track(&mut publ, Some(Location::new(4, 0)))
+        );
+        let live = live.unwrap();
+        assert_eq!(
+            joining_error(
+                &mut sub,
+                crate::message::FetchType::AbsoluteJoining,
+                live.info.id,
+                5
+            )
+            .await,
+            Some(RequestErrorCode::InvalidRange as u64)
+        );
+        assert_eq!(
+            joining_error(
+                &mut sub,
+                crate::message::FetchType::RelativeJoining,
+                live.info.id,
+                5
+            )
+            .await,
+            Some(RequestErrorCode::InvalidRange as u64)
+        );
+    }
+
+    /// A pending Joining FETCH whose subscription is rejected is answered
+    /// with INVALID_JOINING_REQUEST_ID rather than left waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn joining_fetch_fails_when_the_pending_subscription_is_rejected() {
+        let (mut sub, mut publ) = pair().await;
+        let (writer, _reader) = track("video");
+        let subscribe = sub.subscribe_start(writer).await.unwrap();
+        let fetch = sub
+            .joining_fetch(
+                crate::message::FetchType::RelativeJoining,
+                subscribe.info.id,
+                0,
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        let subscribed = tokio::time::timeout(T, publ.subscribed())
+            .await
+            .unwrap()
+            .unwrap();
+        let requested = tokio::time::timeout(T, publ.fetch_requested())
+            .await
+            .unwrap()
+            .unwrap();
+        let resolve = tokio::spawn(async move {
+            let result = requested.resolve().await;
+            (result, requested)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        subscribed.close(ServeError::not_found_ctx("gone")).unwrap();
+        let (result, _requested) = tokio::time::timeout(T, resolve).await.unwrap().unwrap();
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(
+            tokio::time::timeout(T, fetch.ok()).await.unwrap(),
+            Err(ServeError::Closed(
+                RequestErrorCode::InvalidJoiningRequestId as u64
+            ))
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_fetch_surfaces_request_error() {
         let (mut sub, mut publ) = pair().await;
