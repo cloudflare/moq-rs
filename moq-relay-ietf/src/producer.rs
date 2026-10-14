@@ -39,7 +39,7 @@ use crate::{
 /// removed; 30s was its default there too.
 const MAX_RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Upper bound on serving one FETCH, from receipt to the end of the copied
+/// Upper bound on serving one FETCH, from receipt to the end of the relayed
 /// response. A relayed FETCH holds an upstream request and a downstream
 /// stream for its whole life, so it is bounded like a rendezvous hold.
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -431,7 +431,7 @@ impl Producer {
     /// The relay keeps no history beyond its live subscription caches, so a
     /// FETCH is passed through: to the session that advertised the namespace on
     /// this relay, otherwise to the relay the coordinator names. The upstream
-    /// response, or its REQUEST_ERROR, is copied back.
+    /// response, or its REQUEST_ERROR, is relayed back.
     async fn serve_fetch(self, fetch: FetchRequested) -> Result<(), anyhow::Error> {
         let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
         let standalone = tokio::select! {
@@ -3185,7 +3185,7 @@ mod tests {
     }
 
     /// End to end: a FETCH to the relay is forwarded to the session that
-    /// advertised the namespace, and its response is copied back.
+    /// advertised the namespace, and its response is relayed back.
     #[tokio::test(flavor = "multi_thread")]
     async fn fetch_is_forwarded_to_the_namespace_source() {
         let locals = Locals::new();

@@ -1058,8 +1058,18 @@ impl Subscriber {
                                     other.name()
                                 )));
                             }
+                            // After FETCH_OK, FIN means the response completed;
+                            // a reset means it failed (its data stream may be
+                            // unidentifiable).
+                            Err(err) if answered && err.is_stream_error() => {
+                                tracing::debug!(request_id = id, error = %err, "FETCH response aborted after FETCH_OK");
+                                recv.recv_abort();
+                                return Ok(());
+                            }
                             Err(err) if err.is_stream_ended() => {
-                                tracing::debug!(request_id = id, error = %err, "FETCH request stream ended without a response");
+                                if !answered {
+                                    tracing::debug!(request_id = id, error = %err, "FETCH request stream ended without a response");
+                                }
                                 return Ok(());
                             }
                             Err(err) => return Err(err),

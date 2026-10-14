@@ -1222,7 +1222,7 @@ impl Publisher {
     pub(super) fn fetch_served(
         &self,
         id: u64,
-    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+    ) -> Option<impl std::future::Future<Output = bool> + Send + 'static> {
         self.fetches.lock().ok()?.get(&id).map(|recv| recv.served())
     }
 

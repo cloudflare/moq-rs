@@ -38,13 +38,51 @@ use crate::{
 
 use super::{Fetch, FetchValidator, SessionError, Writer};
 
-/// Chunk size for copying an upstream FETCH body in [`FetchRequested::proxy`].
+/// Chunk size for relaying upstream FETCH payloads in [`FetchRequested::proxy`].
 const COPY_CHUNK_SIZE: usize = 64 * 1024;
 
 enum ProxyOutcome {
-    Done(Result<message::FetchOk, SessionError>),
+    Done(Result<(), SessionError>),
     Cancelled(ServeError),
     TimedOut,
+}
+
+enum ProxyStep {
+    Response(Result<message::FetchOk, Option<message::RequestError>>),
+    Record(Option<FetchRecord>),
+    Payload(Option<bytes::Bytes>),
+}
+
+/// The downstream side of [`FetchRequested::proxy`].
+struct ProxyState {
+    stream: Option<FetchStream>,
+    encoder: FetchRecordEncoder,
+    validator: FetchValidator,
+    payload_remaining: u64,
+    ok_sent: bool,
+}
+
+impl ProxyState {
+    fn new(range: (Location, Location), order: Option<GroupOrder>) -> Self {
+        Self {
+            stream: None,
+            encoder: FetchRecordEncoder::new(order),
+            validator: FetchValidator::new(Some(range), order),
+            payload_remaining: 0,
+            ok_sent: false,
+        }
+    }
+}
+
+/// Whether a relay failure came from a malformed upstream response, as
+/// opposed to a transport or local failure.
+fn is_malformed_response(err: &SessionError) -> bool {
+    matches!(
+        err,
+        SessionError::ProtocolViolation(_)
+            | SessionError::WrongSize
+            | SessionError::Serve(ServeError::Size)
+    )
 }
 
 #[derive(Debug)]
@@ -52,6 +90,8 @@ struct FetchRequestedState {
     closed: Result<(), ServeError>,
     /// FETCH_OK or REQUEST_ERROR has been queued; exactly one is allowed (§5.2).
     responded: bool,
+    /// The response data stream ended with FIN.
+    completed: bool,
 }
 
 impl Default for FetchRequestedState {
@@ -59,6 +99,7 @@ impl Default for FetchRequestedState {
         Self {
             closed: Ok(()),
             responded: false,
+            completed: false,
         }
     }
 }
@@ -119,19 +160,27 @@ impl FetchRequestedRecv {
 
     /// Resolves once the application half is gone: the response was finished
     /// or reset, the request was rejected, or the [`FetchRequested`] dropped.
+    /// Yields whether the data stream ended with FIN.
     ///
-    /// The request-stream handler waits for this before it FINs, so the
-    /// request stream (and its cancellation path) lives as long as the
-    /// response is being served.
-    pub fn served(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+    /// The request-stream handler waits for this before it ends the request
+    /// stream, so the stream (and its cancellation path) lives as long as the
+    /// response is being served. A response that did not complete gets the
+    /// request stream reset rather than FINned: resetting the data stream may
+    /// discard its FETCH_HEADER, leaving the requester unable to tell which
+    /// request it belonged to.
+    pub fn served(&self) -> impl std::future::Future<Output = bool> + Send + 'static {
         let state = self.state.clone();
         async move {
             loop {
-                let notify = state.lock().modified();
-                match notify {
-                    Some(notify) => notify.await,
-                    None => return,
-                }
+                let notify = {
+                    let state = state.lock();
+                    let completed = state.completed;
+                    match state.modified() {
+                        Some(notify) => notify,
+                        None => return completed,
+                    }
+                };
+                notify.await;
             }
         }
     }
@@ -203,6 +252,11 @@ impl FetchRequested {
         self.state.lock().closed.is_err()
     }
 
+    /// Record that the data stream ended with FIN.
+    fn mark_completed(&self) {
+        self.state.lock().into_mut_closed().completed = true;
+    }
+
     /// Reject the FETCH with REQUEST_ERROR.
     pub fn reject(self, code: RequestErrorCode, reason: &str) -> Result<(), ServeError> {
         self.claim_response()?;
@@ -242,19 +296,26 @@ impl FetchRequested {
         })
     }
 
-    /// Answer by copying an upstream FETCH response.
+    /// Answer by relaying an upstream FETCH response.
     ///
-    /// The upstream body is relayed byte for byte behind a fresh FETCH_HEADER,
-    /// which is valid because the upstream request carries the same GROUP_ORDER
-    /// (the delta encoding depends on it, §11.4.4.1). FETCH_OK is sent once the
-    /// upstream's FETCH_OK is known and the body has been copied; an upstream
-    /// REQUEST_ERROR is forwarded, and any already-written body is reset
-    /// (§10.12.3 lets a relay deliver objects before learning the result).
+    /// FETCH_OK is forwarded as soon as the upstream sends it, while the body
+    /// is relayed concurrently (§10.12.3 allows either order), so neither
+    /// side waits on the other and bodies larger than a stream window flow.
+    /// Upstream records are decoded and validated on this hop, where this
+    /// endpoint is the subscriber (§11.4.4.1), then re-encoded downstream;
+    /// payloads are streamed in chunks.
+    ///
+    /// An upstream REQUEST_ERROR that arrives before FETCH_OK is forwarded,
+    /// and any body already written is reset. A failure after FETCH_OK
+    /// cannot send a second response, so it resets the data stream instead:
+    /// MALFORMED_TRACK for a malformed upstream body, DELIVERY_TIMEOUT on
+    /// timeout, INTERNAL_ERROR otherwise. A malformed upstream body is never
+    /// session-fatal downstream.
     pub async fn proxy(self, mut upstream: Fetch, timeout: Duration) -> Result<(), SessionError> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut stream = None;
+        let mut relay = ProxyState::new(self.standalone_range()?, self.group_order());
         let outcome = {
-            let copy = self.proxy_body(&mut upstream, &mut stream);
+            let copy = self.proxy_body(&mut upstream, &mut relay);
             tokio::pin!(copy);
             tokio::select! {
                 biased;
@@ -265,58 +326,138 @@ impl FetchRequested {
         };
 
         match outcome {
-            ProxyOutcome::Done(Ok(ok)) => {
-                let mut stream = stream.ok_or(SessionError::Internal)?;
-                // FETCH_OK first, then FIN: a subscriber that sees FIN before
-                // FETCH_OK cannot yet tell where the response ends.
-                self.commit_ok(message::FetchOk {
-                    id: self.id,
-                    params: KeyValuePairs::default(),
-                    ..ok
-                })?;
+            ProxyOutcome::Done(Ok(())) => {
+                let mut stream = relay.stream.ok_or(SessionError::Internal)?;
                 stream.finish()?;
+                self.mark_completed();
                 Ok(())
             }
             ProxyOutcome::Cancelled(err) => {
-                if let Some(stream) = stream.as_mut() {
+                if let Some(stream) = relay.stream.as_mut() {
                     stream.reset = DataStreamResetCode::Cancelled;
                 }
                 Err(err.into())
             }
             ProxyOutcome::TimedOut => {
-                if let Some(stream) = stream.as_mut() {
-                    stream.reset = DataStreamResetCode::DeliveryTimeout;
+                if relay.ok_sent {
+                    self.reset_after_ok(&mut relay, DataStreamResetCode::DeliveryTimeout)
+                        .await;
+                } else {
+                    if let Some(stream) = relay.stream.as_mut() {
+                        stream.reset = DataStreamResetCode::DeliveryTimeout;
+                    }
+                    self.reject(RequestErrorCode::Timeout, "fetch proxy timed out")?;
                 }
-                self.reject(RequestErrorCode::Timeout, "fetch proxy timed out")?;
                 Err(ServeError::Timeout.into())
             }
             ProxyOutcome::Done(Err(err)) => {
-                // Any opened stream keeps its INTERNAL_ERROR reset code: the
-                // body copy failed partway, and the requester must not take
-                // the truncated body as complete.
-                if let Some(error) = upstream.rejection() {
-                    self.reject_with(error)?;
+                let code = if is_malformed_response(&err) {
+                    DataStreamResetCode::MalformedTrack
                 } else {
-                    self.reject(RequestErrorCode::InternalError, "fetch proxy failed")?;
+                    DataStreamResetCode::InternalError
+                };
+                if relay.ok_sent {
+                    self.reset_after_ok(&mut relay, code).await;
+                } else {
+                    if let Some(stream) = relay.stream.as_mut() {
+                        stream.reset = code;
+                    }
+                    if let Some(error) = upstream.rejection() {
+                        self.reject_with(error)?;
+                    } else {
+                        self.reject(RequestErrorCode::InternalError, "fetch proxy failed")?;
+                    }
                 }
                 Err(err)
             }
         }
     }
 
+    /// After FETCH_OK the requester expects a data stream; make sure there
+    /// is one so it learns the response failed rather than waiting for it.
+    async fn reset_after_ok(&self, relay: &mut ProxyState, code: DataStreamResetCode) {
+        if relay.stream.is_none() {
+            relay.stream = self.open_stream().await.ok();
+        }
+        if let Some(stream) = relay.stream.as_mut() {
+            stream.reset = code;
+        }
+    }
+
     async fn proxy_body(
         &self,
         upstream: &mut Fetch,
-        stream: &mut Option<FetchStream>,
-    ) -> Result<message::FetchOk, SessionError> {
-        // Wait for the upstream decision before opening anything downstream,
-        // so an upstream rejection is forwarded without an orphan data stream.
-        let ok = upstream.ok().await?;
-        let out = stream.insert(self.open_stream().await?);
-        while let Some(chunk) = upstream.read_stream_chunk(COPY_CHUNK_SIZE).await? {
-            out.writer.write(&chunk).await?;
+        relay: &mut ProxyState,
+    ) -> Result<(), SessionError> {
+        let response = upstream.response();
+        tokio::pin!(response);
+        let mut responded = false;
+        let mut body_done = false;
+        while !(responded && body_done) {
+            // Only upstream reads race FETCH_OK; downstream writes below run
+            // to completion so a frame is never cut short.
+            let step = {
+                let read = async {
+                    if relay.payload_remaining > 0 {
+                        upstream
+                            .read_payload_chunk(COPY_CHUNK_SIZE)
+                            .await
+                            .map(ProxyStep::Payload)
+                    } else {
+                        upstream.next().await.map(ProxyStep::Record)
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    response = &mut response, if !responded => ProxyStep::Response(response),
+                    step = read, if !body_done => step?,
+                }
+            };
+            match step {
+                ProxyStep::Response(Ok(ok)) => {
+                    responded = true;
+                    relay
+                        .validator
+                        .validate_ok(ok.end_location, &ok.track_extensions)?;
+                    self.commit_ok(message::FetchOk {
+                        id: self.id,
+                        params: KeyValuePairs::default(),
+                        ..ok
+                    })?;
+                    relay.ok_sent = true;
+                    if relay.stream.is_none() {
+                        relay.stream = Some(self.open_stream().await?);
+                    }
+                }
+                ProxyStep::Response(Err(_)) => {
+                    // A REQUEST_ERROR (forwarded by the caller) or a request
+                    // stream that ended without a response.
+                    return Err(ServeError::Cancel.into());
+                }
+                ProxyStep::Record(Some(record)) => {
+                    relay.validator.validate_record(&record)?;
+                    if relay.stream.is_none() {
+                        relay.stream = Some(self.open_stream().await?);
+                    }
+                    let mut encoded = bytes::BytesMut::new();
+                    relay.encoder.encode(&record, &mut encoded)?;
+                    let out = relay.stream.as_mut().ok_or(SessionError::Internal)?;
+                    out.writer.write(&encoded).await?;
+                    if let FetchRecord::Object(object) = &record {
+                        relay.payload_remaining = object.payload_length;
+                    }
+                }
+                ProxyStep::Record(None) => body_done = true,
+                ProxyStep::Payload(Some(chunk)) => {
+                    relay.payload_remaining -= chunk.len() as u64;
+                    let out = relay.stream.as_mut().ok_or(SessionError::Internal)?;
+                    out.writer.write(&chunk).await?;
+                }
+                // `read_payload_chunk` only returns `None` with nothing left.
+                ProxyStep::Payload(None) => relay.payload_remaining = 0,
+            }
         }
-        Ok(ok)
+        Ok(())
     }
 
     fn standalone_range(&self) -> Result<(Location, Location), SessionError> {
@@ -489,7 +630,15 @@ impl FetchWriter {
         if self.payload_remaining != 0 {
             return Err(ServeError::Size.into());
         }
-        self.stream.finish()
+        self.stream.finish()?;
+        self.request.mark_completed();
+        Ok(())
+    }
+
+    /// Write bytes past the validator and encoder, to simulate a broken peer.
+    #[cfg(test)]
+    pub(crate) async fn write_raw(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
+        self.write(bytes).await
     }
 
     /// Reset the data stream with an explicit code, e.g. UNKNOWN_OBJECT_STATUS.

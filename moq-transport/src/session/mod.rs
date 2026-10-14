@@ -1439,16 +1439,21 @@ impl Session {
                                         Err(err) => return Err(err),
                                     }
                                 }
-                                _ = async {
+                                completed = async {
                                     match fetch_served.as_mut() {
                                         Some(served) => served.await,
                                         None => std::future::pending().await,
                                     }
                                 }, if fetch_ok_sent => {
-                                    // The response is finished or reset: FIN the
-                                    // request stream (draft-18 §5.2).
-                                    if let Err(err) = writer.finish() {
-                                        tracing::debug!(error = %err, "failed to FIN FETCH request stream");
+                                    // The response ended. FIN only if it completed;
+                                    // otherwise reset, since a reset data stream may
+                                    // never have delivered its FETCH_HEADER.
+                                    if completed {
+                                        if let Err(err) = writer.finish() {
+                                            tracing::debug!(error = %err, "failed to FIN FETCH request stream");
+                                        }
+                                    } else {
+                                        writer.reset(crate::data::DataStreamResetCode::InternalError as u32);
                                     }
                                     return Ok(true);
                                 }

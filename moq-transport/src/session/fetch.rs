@@ -34,16 +34,8 @@ const MALFORMED: u32 = crate::data::DataStreamResetCode::MalformedTrack as u32;
 pub(super) struct FetchState {
     ok: Option<FetchOk>,
     error: Option<message::RequestError>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum BodyMode {
-    #[default]
-    Undecided,
-    /// Typed records via [`Fetch::next`].
-    Records,
-    /// Raw bytes after the FETCH_HEADER, for relays that copy the body.
-    Raw,
+    /// The request stream was reset after FETCH_OK: the response failed.
+    aborted: bool,
 }
 
 /// An outbound FETCH.
@@ -63,7 +55,6 @@ pub struct Fetch {
     reader: Option<Reader>,
     decoder: FetchRecordDecoder,
     payload_remaining: u64,
-    mode: BodyMode,
     stream_done: bool,
 }
 
@@ -96,7 +87,6 @@ impl Fetch {
                 reader: None,
                 decoder: FetchRecordDecoder::new(order),
                 payload_remaining: 0,
-                mode: BodyMode::Undecided,
                 stream_done: false,
             },
             FetchRecv {
@@ -149,7 +139,6 @@ impl Fetch {
         if self.payload_remaining != 0 {
             return Err(ServeError::Size.into());
         }
-        self.enter_mode(BodyMode::Records)?;
         if self.stream_done {
             return Ok(None);
         }
@@ -196,7 +185,7 @@ impl Fetch {
         if self.payload_remaining == 0 {
             return Ok(None);
         }
-        if max == 0 || self.mode != BodyMode::Records {
+        if max == 0 {
             return Err(ServeError::Mode.into());
         }
         let limit = usize::try_from(self.payload_remaining)
@@ -213,35 +202,31 @@ impl Fetch {
         }
     }
 
-    /// Read raw response bytes after the FETCH_HEADER, without decoding.
-    ///
-    /// For relays that forward the body unchanged; it cannot be mixed with
-    /// [`Self::next`]. `Ok(None)` means FIN.
-    pub(super) async fn read_stream_chunk(
-        &mut self,
-        max: usize,
-    ) -> Result<Option<bytes::Bytes>, SessionError> {
-        self.enter_mode(BodyMode::Raw)?;
-        if self.stream_done {
-            return Ok(None);
-        }
-        self.ensure_reader().await?;
-        let reader = self.reader.as_mut().ok_or(SessionError::Internal)?;
-        let chunk = reader.read_chunk(max).await?;
-        if chunk.is_none() {
-            self.stream_done = true;
-        }
-        Ok(chunk)
-    }
-
-    fn enter_mode(&mut self, mode: BodyMode) -> Result<(), ServeError> {
-        match self.mode {
-            BodyMode::Undecided => {
-                self.mode = mode;
-                Ok(())
+    /// Wait for FETCH_OK without borrowing the handle, so the body can be
+    /// read concurrently. `Err(None)` means the request stream ended with
+    /// no response.
+    pub(super) fn response(
+        &self,
+    ) -> impl std::future::Future<Output = Result<FetchOk, Option<message::RequestError>>> + Send + 'static
+    {
+        let state = self.state.clone();
+        async move {
+            loop {
+                let notify = {
+                    let state = state.lock();
+                    if let Some(ok) = &state.ok {
+                        return Ok(ok.clone());
+                    }
+                    if let Some(error) = &state.error {
+                        return Err(Some(error.clone()));
+                    }
+                    state.modified()
+                };
+                match notify {
+                    Some(notify) => notify.await,
+                    None => return Err(None),
+                }
             }
-            current if current == mode => Ok(()),
-            _ => Err(ServeError::Mode),
         }
     }
 
@@ -265,7 +250,7 @@ impl Fetch {
 
     fn is_complete(&self) -> bool {
         let state = self.state.lock();
-        state.error.is_some() || (state.ok.is_some() && self.stream_done)
+        state.error.is_some() || state.aborted || (state.ok.is_some() && self.stream_done)
     }
 
     fn stop(&mut self, code: u32) {
@@ -298,6 +283,9 @@ async fn wait_rejected(state: &State<FetchState>) -> ServeError {
             if let Some(error) = &state.error {
                 return ServeError::Closed(error.error_code);
             }
+            if state.aborted {
+                return ServeError::Cancel;
+            }
             if state.ok.is_some() {
                 None
             } else {
@@ -327,6 +315,14 @@ impl FetchRecv {
         };
         state.ok = Some(ok);
         Ok(())
+    }
+
+    /// The publisher reset the request stream after FETCH_OK: the response
+    /// will not complete, and its data stream may never be identifiable.
+    pub fn recv_abort(&mut self) {
+        if let Some(mut state) = self.state.lock_mut() {
+            state.aborted = true;
+        }
     }
 
     /// Record REQUEST_ERROR.
@@ -762,7 +758,7 @@ mod tests {
         let mut done = fetches.pop().unwrap();
         assert!(read_all(&mut done).await.is_empty());
         let _again = sub.fetch(range(), KeyValuePairs::default()).await.unwrap();
-        tokio::time::timeout(T, publ.fetch_requested())
+        let _accepted = tokio::time::timeout(T, publ.fetch_requested())
             .await
             .expect("a finished response frees its slot")
             .unwrap();
@@ -869,6 +865,156 @@ mod tests {
             Err(ServeError::Closed(RequestErrorCode::InvalidRange as u64))
         );
         assert_eq!(fetch.rejection().unwrap().reason.0, "nothing yet");
+    }
+
+    /// A body larger than a QUIC stream window flows through the proxy to a
+    /// requester that waits for FETCH_OK before reading.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_streams_a_large_body_to_a_requester_awaiting_fetch_ok() {
+        const LEN: usize = 4 * 1024 * 1024;
+        let (mut relay_up, mut origin) = pair().await;
+        let (mut end, mut relay_down) = pair().await;
+        let range = request(Location::new(0, 0), Location::new(1, 0));
+        let mut fetch = end
+            .fetch(range.clone(), KeyValuePairs::default())
+            .await
+            .unwrap();
+        let downstream = tokio::time::timeout(T, relay_down.fetch_requested())
+            .await
+            .unwrap()
+            .unwrap();
+        let upstream = relay_up
+            .fetch(range, KeyValuePairs::default())
+            .await
+            .unwrap();
+        let origin_task = tokio::spawn(async move {
+            let requested = origin.fetch_requested().await.unwrap();
+            let mut writer = requested
+                .respond(ok_info(Location::new(0, 1)))
+                .await
+                .unwrap();
+            writer.write_record(&obj(0, 0, LEN as u64)).await.unwrap();
+            for chunk in vec![7u8; LEN].chunks(64 * 1024) {
+                writer.write_payload(chunk).await.unwrap();
+            }
+            writer.finish().await.unwrap();
+            origin
+        });
+        let relay = tokio::spawn(downstream.proxy(upstream, Duration::from_secs(30)));
+
+        tokio::time::timeout(T, fetch.ok())
+            .await
+            .expect("FETCH_OK must not wait for the body")
+            .unwrap();
+        let record = tokio::time::timeout(T, fetch.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record, Some(obj(0, 0, LEN as u64)));
+        let mut received = 0;
+        while let Some(chunk) = tokio::time::timeout(T, fetch.read_payload_chunk(1 << 20))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            assert!(chunk.iter().all(|b| *b == 7));
+            received += chunk.len();
+        }
+        assert_eq!(received, LEN);
+        assert_eq!(
+            tokio::time::timeout(T, fetch.next())
+                .await
+                .unwrap()
+                .unwrap(),
+            None
+        );
+        tokio::time::timeout(T, relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let _origin = origin_task.await.unwrap();
+    }
+
+    /// A malformed upstream body resets the downstream data stream; the
+    /// requester's session with the relay survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_resets_downstream_on_a_malformed_upstream_body() {
+        let (mut relay_up, mut origin) = pair().await;
+        let (mut end, mut relay_down) = pair().await;
+        let range = request(Location::new(0, 0), Location::new(2, 0));
+        let mut fetch = end
+            .fetch(range.clone(), KeyValuePairs::default())
+            .await
+            .unwrap();
+        let downstream = tokio::time::timeout(T, relay_down.fetch_requested())
+            .await
+            .unwrap()
+            .unwrap();
+        let upstream = relay_up
+            .fetch(range.clone(), KeyValuePairs::default())
+            .await
+            .unwrap();
+        let origin_task = tokio::spawn(async move {
+            let requested = origin.fetch_requested().await.unwrap();
+            let mut writer = requested
+                .respond(ok_info(Location::new(1, 0)))
+                .await
+                .unwrap();
+            // §11.4.4.1: Serialization Flags 0x00 on the first Object refers
+            // to a prior Object that does not exist.
+            writer.write_raw(&[0x00, 0x00, 0x00, 0x00]).await.unwrap();
+            // Hold the stream open; the relay must react to the bad record.
+            tokio::time::sleep(T).await;
+            drop(writer);
+            origin
+        });
+        let relay = tokio::spawn(downstream.proxy(upstream, Duration::from_secs(30)));
+
+        let relayed = tokio::time::timeout(T, relay).await.unwrap().unwrap();
+        assert!(relayed.is_err());
+        // The relay may hit the bad record before or after the upstream
+        // FETCH_OK: REQUEST_ERROR, or FETCH_OK and a failed body. A request
+        // stream reset can also overtake an undelivered FETCH_OK (Cancel).
+        match tokio::time::timeout(T, fetch.ok()).await.unwrap() {
+            Ok(_) => assert!(
+                tokio::time::timeout(T, fetch.next())
+                    .await
+                    .unwrap()
+                    .is_err(),
+                "the requester sees a failed body, not a malformed record"
+            ),
+            Err(err) => assert!(
+                err == ServeError::Cancel
+                    || err == ServeError::Closed(RequestErrorCode::InternalError as u64),
+                "unexpected {err:?}"
+            ),
+        }
+
+        // §11.4.4.1: the relay, as subscriber on the upstream hop, closes
+        // the session that sent the malformed object.
+        tokio::time::timeout(T, async {
+            while relay_up
+                .fetch(
+                    request(Location::new(0, 0), Location::new(1, 0)),
+                    KeyValuePairs::default(),
+                )
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the upstream session is closed");
+
+        // The requester's session with the relay is still usable.
+        let _again = end.fetch(range, KeyValuePairs::default()).await.unwrap();
+        let _accepted = tokio::time::timeout(T, relay_down.fetch_requested())
+            .await
+            .expect("session with the relay survives")
+            .unwrap();
+        origin_task.abort();
     }
 
     #[test]
