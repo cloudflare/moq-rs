@@ -520,9 +520,8 @@ impl ScopeConfigSource {
 
     /// Load the file, reusing the previous result if nothing changed.
     ///
-    /// Logs only when the outcome changes. The library does not cache a
-    /// failed lookup, so a broken file is re-read once per
-    /// [`REVALIDATE_INTERVAL`] for as long as sessions keep arriving, and
+    /// Logs only when the outcome changes. A broken file is re-read once per
+    /// [`REVALIDATE_INTERVAL`] for as long as the library keeps retrying, and
     /// logging each read would bury the first, useful, message.
     fn load(&self) -> Result<Arc<ScopePolicies>, ScopeConfigError> {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());

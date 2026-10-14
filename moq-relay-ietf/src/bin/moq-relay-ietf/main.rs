@@ -134,13 +134,14 @@ async fn main() -> anyhow::Result<()> {
     if scope_config.is_some()
         && (cli.api.is_some() || cli.api_url.is_some() || cli.announce.is_some())
     {
-        // Peer relays connect as ordinary clients and present no token, so
-        // in a scope that enforces tokens they are refused like any client
-        // without one. Not fatal: scopes with `"auth": null` work normally.
+        // This binary has no connection tagger, so peer relays are public
+        // sessions. They present no token, so in a scope that enforces tokens
+        // they are refused like any client without one. Not fatal: scopes
+        // with `"auth": null` work normally.
         tracing::warn!(
             "--scope-config is combined with multi-relay options (--api, --api-url or \
-             --announce). Relay-to-relay sessions present no token, so they are refused in \
-             every scope that enforces tokens; cross-relay delivery works only in scopes \
+             --announce). This binary does not tag peer relays as internal, and they present \
+             no token, so they are refused in every scope that enforces tokens; cross-relay delivery works only in scopes \
              with no token policy"
         );
     }
