@@ -255,6 +255,8 @@ impl Producer {
         context: SessionContext,
         auth: Option<SessionAuth>,
     ) -> Self {
+        // The relay serves FETCH, so opt in before the session runs.
+        publisher.accept_fetch();
         Self {
             publisher,
             locals,
@@ -3160,6 +3162,9 @@ mod tests {
         .await
         .expect("MoQT setup timed out");
         let (origin, origin_publisher, _) = origin.expect("accept origin session");
+        if let Some(publisher) = &origin_publisher {
+            publisher.accept_fetch();
+        }
         let (relay, _, relay_subscriber) = relay.expect("connect relay session");
         tokio::spawn(async move { origin.run().await });
         tokio::spawn(async move { relay.run().await });

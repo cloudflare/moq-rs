@@ -269,8 +269,10 @@ mod tests {
             moq_transport::session::Session::accept(transport, None, info.transport)
                 .await
                 .unwrap();
+        let publisher = publisher.unwrap();
+        publisher.accept_fetch();
         TestPeer {
-            publisher: publisher.unwrap(),
+            publisher,
             _subscriber: subscriber.unwrap(),
             session: tokio::spawn(session.run()),
         }

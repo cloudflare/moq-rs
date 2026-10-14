@@ -381,9 +381,38 @@ mod tests {
         );
         let (client, _client_pub, client_sub) = client.unwrap();
         let (server, server_pub, _server_sub) = server.unwrap();
+        let server_pub = server_pub.unwrap();
+        server_pub.accept_fetch();
         tokio::spawn(client.run());
         tokio::spawn(server.run());
-        (client_sub, server_pub.unwrap())
+        (client_sub, server_pub)
+    }
+
+    /// A publisher that never opted in to FETCH answers NOT_SUPPORTED, as it
+    /// did before FETCH serving existed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_is_not_supported_until_the_publisher_accepts_it() {
+        let (client_t, server_t) = super::super::test_support::loopback_session_pair().await;
+        let (client, server) = tokio::join!(
+            Session::connect(client_t, None, Transport::WebTransport),
+            Session::accept(server_t, None, Transport::WebTransport),
+        );
+        let (client, _client_pub, client_sub) = client.unwrap();
+        let (server, _server_pub, _server_sub) = server.unwrap();
+        tokio::spawn(client.run());
+        tokio::spawn(server.run());
+        let mut sub = client_sub;
+        let fetch = sub
+            .fetch(
+                request(Location::new(0, 0), Location::new(1, 0)),
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(T, fetch.ok()).await.unwrap(),
+            Err(ServeError::Closed(RequestErrorCode::NotSupported as u64))
+        );
     }
 
     fn request(start: Location, end: Location) -> StandaloneFetch {

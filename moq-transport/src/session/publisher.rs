@@ -4,7 +4,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -26,6 +29,11 @@ use super::{
     SubscribedTracksInfo, SubscribedTracksRecv, TrackStatusRequested, Writer,
 };
 use crate::message::RequestErrorCode;
+
+/// Most inbound FETCHes one session may have in flight (queued for the
+/// application or being answered). Further FETCHes get EXCESSIVE_LOAD, so a
+/// peer cannot grow the queue without bound.
+const MAX_INBOUND_FETCHES_PER_SESSION: usize = 128;
 
 /// Publisher-side state for one outbound PUBLISH.
 ///
@@ -141,6 +149,11 @@ pub struct Publisher {
     /// Inbound FETCHes awaiting the application.
     unknown_fetch_requested: Queue<FetchRequested>,
 
+    /// Set by [`Publisher::accept_fetch`]. Until then FETCH is answered with
+    /// NOT_SUPPORTED, so an application that never polls
+    /// [`Publisher::fetch_requested`] still answers every FETCH.
+    fetch_enabled: Arc<AtomicBool>,
+
     /// Session halves of inbound FETCHes, keyed by Request ID, so request
     /// stream teardown can cancel an unanswered FETCH.
     fetches: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
@@ -239,6 +252,7 @@ impl Publisher {
             mlog,
             bidi_task_tx,
             unknown_fetch_requested: Default::default(),
+            fetch_enabled: Default::default(),
             fetches: Default::default(),
             bidi_response_map: Default::default(),
         }
@@ -893,8 +907,21 @@ impl Publisher {
         self.unknown_track_status_requested.pop().await
     }
 
+    /// Surface inbound FETCHes through [`Self::fetch_requested`] from now on.
+    ///
+    /// Applies to every clone of this publisher. Call it before the peer can
+    /// send FETCH (for example right after setup); a FETCH that arrives first
+    /// is answered with NOT_SUPPORTED.
+    pub fn accept_fetch(&self) {
+        self.fetch_enabled.store(true, Ordering::Release);
+    }
+
     /// Returns the next inbound FETCH request (draft-18 §10.12).
+    ///
+    /// Requires [`Self::accept_fetch`]; this also enables it, but a FETCH
+    /// received before the first call was already refused.
     pub async fn fetch_requested(&mut self) -> Option<FetchRequested> {
+        self.accept_fetch();
         self.unknown_fetch_requested.pop().await
     }
 
@@ -1048,14 +1075,13 @@ impl Publisher {
             message::Subscriber::RequestError(msg) => self.recv_request_error(msg)?,
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg)?,
             message::Subscriber::Fetch(msg) => self.recv_fetch(msg)?,
-            // Draft-18 has no FETCH_CANCEL (§A.2); a draft-16 peer's FETCH_CANCEL
-            // on the request stream ends that stream, and the request-stream
-            // cleanup cancels the FETCH. Nothing else to do here.
+            // Draft-18 has no FETCH_CANCEL (§A.2); requesters cancel by
+            // resetting the request stream, whose cleanup cancels the FETCH.
             message::Subscriber::FetchCancel(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     request_id = msg.id,
-                    "received draft-16 FETCH_CANCEL"
+                    "ignoring FETCH_CANCEL, which draft-18 does not define"
                 );
             }
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg)?,
@@ -1099,11 +1125,33 @@ impl Publisher {
     /// application.
     ///
     /// Requests that can be answered without the application are rejected
-    /// here: an empty standalone range (§10.12.3), and Joining FETCH, which is
-    /// not served yet.
+    /// here: every FETCH until [`Self::accept_fetch`] (NOT_SUPPORTED), too
+    /// many in flight (EXCESSIVE_LOAD), an empty standalone range
+    /// (§10.12.3), and Joining FETCH, which is not served yet.
     fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
         // §10.2.7 / §10.2.8: out-of-range values are PROTOCOL_VIOLATIONs.
         super::validate_fetch_params(&msg.params)?;
+        if !self.fetch_enabled.load(Ordering::Acquire) {
+            self.send_not_supported(msg.id, "fetch");
+            return Ok(());
+        }
+        let in_flight = self
+            .fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .len();
+        if in_flight >= MAX_INBOUND_FETCHES_PER_SESSION {
+            self.send_request_error(
+                "fetch",
+                message::RequestError::new(
+                    msg.id,
+                    RequestErrorCode::ExcessiveLoad,
+                    0,
+                    "too many FETCH requests in flight",
+                ),
+            );
+            return Ok(());
+        }
         match msg.fetch_type {
             message::FetchType::Standalone => {
                 let standalone = msg
