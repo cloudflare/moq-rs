@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
+use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::{
     coding::{KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix},
@@ -432,6 +433,11 @@ impl Producer {
     /// FETCH is passed through: to the session that advertised the namespace on
     /// this relay, otherwise to the relay the coordinator names. The upstream
     /// response, or its REQUEST_ERROR, is relayed back.
+    ///
+    /// A Joining FETCH is first resolved against the Joining Location this
+    /// relay sent in its own SUBSCRIBE_OK, then forwarded as the equivalent
+    /// standalone FETCH, so the response stays contiguous with what this
+    /// session's subscription delivers.
     async fn serve_fetch(self, fetch: FetchRequested) -> Result<(), anyhow::Error> {
         let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
         let standalone = tokio::select! {
@@ -441,14 +447,14 @@ impl Producer {
                 fetch.reject(RequestErrorCode::Timeout, "FETCH resolution timed out")?;
                 return Ok(());
             }
-            result = fetch.resolve() => match result? {
+            result = fetch.resolve() => match result.context("failed to resolve FETCH")? {
                 Some(standalone) => standalone,
-                // Already answered (Joining FETCH is not served yet).
+                // Already answered with REQUEST_ERROR.
                 None => return Ok(()),
             },
         };
 
-        // Authorize before any lookup: deciding afterwards would make response
+        // Authorize before any routing lookup: deciding afterwards would make response
         // timing an existence oracle for tracks the peer may not access.
         if let Err(reason) = may_fetch_track(
             self.auth.as_ref(),
@@ -3311,9 +3317,110 @@ mod tests {
         assert_eq!(*coordinator.track_lookups.lock().unwrap(), vec!["video"]);
     }
 
-    /// Joining FETCH is not served yet and is refused without routing.
+    /// End to end: a Joining FETCH is resolved against the Joining Location
+    /// in the relay's own SUBSCRIBE_OK and forwarded to the origin as the
+    /// equivalent standalone range.
     #[tokio::test(flavor = "multi_thread")]
-    async fn joining_fetch_is_not_supported() {
+    async fn joining_fetch_is_resolved_locally_and_forwarded() {
+        let locals = Locals::new();
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let (mut origin, _registration, _requests) =
+            spawn_fetch_origin(&locals, "fetch/origin").await;
+
+        // A locally published track whose largest Object is {6, 2}.
+        let namespace = TrackNamespace::from_utf8_path("fetch/origin");
+        let (track_writer, track_reader) = Track::new(namespace.clone(), "video").produce();
+        let mut subgroups = track_writer.subgroups().unwrap();
+        let mut subgroup = subgroups
+            .create(moq_transport::serve::Subgroup {
+                group_id: 6,
+                subgroup_id: 0,
+                priority: 1,
+            })
+            .unwrap();
+        for _ in 0..3 {
+            subgroup.write(bytes::Bytes::from_static(b"o")).unwrap();
+        }
+        let _track_registration = locals
+            .clone()
+            .register_track(None, track_reader)
+            .await
+            .unwrap();
+
+        let mut subscriber = spawn_relay_session(locals, remotes, coordinator).await;
+        let (sub_writer, _sub_reader) = Track::new(namespace, "video").produce();
+        let subscribe = subscriber.subscribe_open(sub_writer).await.unwrap();
+
+        let mut fetch = subscriber
+            .joining_fetch(
+                moq_transport::message::FetchType::RelativeJoining,
+                subscribe.info.id,
+                2,
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        let requested = tokio::time::timeout(Duration::from_secs(5), origin.fetch_requested())
+            .await
+            .expect("Joining FETCH was not forwarded")
+            .unwrap();
+        assert_eq!(
+            requested.request.fetch_type,
+            moq_transport::message::FetchType::Standalone,
+            "the origin has no subscription to join, so the relay sends the resolved range"
+        );
+        let forwarded = requested.resolve().await.unwrap().unwrap();
+        assert_eq!(forwarded.track_name, TrackName::from("video"));
+        assert_eq!(
+            forwarded.start_location,
+            moq_transport::coding::Location::new(4, 0)
+        );
+        assert_eq!(
+            forwarded.end_location,
+            moq_transport::coding::Location::new(6, 3)
+        );
+
+        let mut writer = requested
+            .respond(moq_transport::session::FetchOkInfo {
+                end_of_track: false,
+                end_location: moq_transport::coding::Location::new(6, 3),
+                params: KeyValuePairs::default(),
+                track_extensions: Default::default(),
+            })
+            .await
+            .unwrap();
+        writer.write_record(&fetch_object(4, 0, 0)).await.unwrap();
+        writer.write_record(&fetch_object(6, 2, 0)).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let ok = tokio::time::timeout(Duration::from_secs(5), fetch.ok())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok.end_location, moq_transport::coding::Location::new(6, 3));
+        let mut locations = Vec::new();
+        while let Some(record) = tokio::time::timeout(Duration::from_secs(5), fetch.next())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            locations.push(record.location());
+        }
+        assert_eq!(
+            locations,
+            vec![
+                moq_transport::coding::Location::new(4, 0),
+                moq_transport::coding::Location::new(6, 2)
+            ]
+        );
+        drop(subscribe);
+    }
+
+    /// A Joining FETCH naming no subscription on this session is refused
+    /// without routing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn joining_fetch_for_an_unknown_subscription_is_refused() {
         let coordinator = Arc::new(CountingCoordinator::default());
         let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
         let (transport, _subscriber, _) = spawn_relay_session_with_limits(
@@ -3330,8 +3437,10 @@ mod tests {
             id: 0,
             fetch_type: moq_transport::message::FetchType::RelativeJoining,
             standalone_fetch: None,
+            // Odd: an ID only the relay could allocate, so it can never be a
+            // SUBSCRIBE from this peer and is refused without waiting.
             joining_fetch: Some(moq_transport::message::JoiningFetch {
-                joining_request_id: 2,
+                joining_request_id: 1,
                 joining_start: 1,
             }),
             params: KeyValuePairs::default(),

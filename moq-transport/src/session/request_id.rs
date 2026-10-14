@@ -77,6 +77,16 @@ impl RequestId {
         Ok(id)
     }
 
+    /// Whether `id` is a request ID the peer may still use: its parity, and
+    /// not received yet. A Joining FETCH can name such an ID when its
+    /// SUBSCRIBE is on a request stream that has not been read yet.
+    pub fn is_unused_peer_id(&self, id: u64) -> bool {
+        match self.inner.recv.lock() {
+            Ok(recv) => (id & 1) == recv.expected_parity && !recv.seen.contains(&id),
+            Err(_) => false,
+        }
+    }
+
     /// Validate an incoming request ID from the peer.
     ///
     /// Draft-18 §10.1: checks correct parity and rejects duplicates.

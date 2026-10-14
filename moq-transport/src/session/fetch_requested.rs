@@ -24,7 +24,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -36,7 +36,10 @@ use crate::{
     watch::{Queue, State},
 };
 
-use super::{Fetch, FetchValidator, SessionError, Writer};
+use super::{
+    joining_fetch_end_location, Fetch, FetchValidator, JoiningError, JoiningSnapshot,
+    JoiningTarget, SessionError, Writer,
+};
 
 /// Chunk size for relaying upstream FETCH payloads in [`FetchRequested::proxy`].
 const COPY_CHUNK_SIZE: usize = 64 * 1024;
@@ -130,6 +133,10 @@ pub struct FetchRequested {
     active: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
     state: State<FetchRequestedState>,
     id: u64,
+    /// The subscription a Joining FETCH references, found when it arrived.
+    joining: Option<JoiningTarget>,
+    /// The range [`Self::resolve`] settled on.
+    resolved: OnceLock<message::StandaloneFetch>,
     /// The FETCH as received.
     pub request: message::Fetch,
 }
@@ -192,6 +199,7 @@ impl FetchRequested {
         outgoing: Queue<Message>,
         active: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
         request: message::Fetch,
+        joining: Option<JoiningTarget>,
     ) -> (Self, FetchRequestedRecv) {
         let (send, recv) = State::default().split();
         (
@@ -201,6 +209,8 @@ impl FetchRequested {
                 active,
                 state: send,
                 id: request.id,
+                joining,
+                resolved: OnceLock::new(),
                 request,
             },
             FetchRequestedRecv { state: recv },
@@ -220,21 +230,73 @@ impl FetchRequested {
 
     /// Resolve the request to the standalone range it covers.
     ///
-    /// Standalone FETCH resolves immediately. Joining FETCH is not served yet:
-    /// it is answered with REQUEST_ERROR(NOT_SUPPORTED) and `None` is returned.
+    /// Standalone FETCH resolves immediately. A Joining FETCH waits until its
+    /// subscription is accepted (§10.12.2: the publisher buffers it), so the
+    /// caller bounds this with its own timeout. If the request cannot be
+    /// served, REQUEST_ERROR is sent and `None` is returned:
+    ///
+    /// * INVALID_JOINING_REQUEST_ID when the subscription is unknown (a
+    ///   SUBSCRIBE not yet read is waited for briefly) or ended first;
+    /// * INVALID_RANGE when it has Forward State 0, had no Objects when it was
+    ///   accepted, or the computed start is past the Joining Location.
     pub async fn resolve(&self) -> Result<Option<message::StandaloneFetch>, SessionError> {
-        match self.request.fetch_type {
+        if let Some(resolved) = self.resolved.get() {
+            return Ok(Some(resolved.clone()));
+        }
+        let resolved = match self.request.fetch_type {
             message::FetchType::Standalone => self
                 .request
                 .standalone_fetch
                 .clone()
-                .map(Some)
-                .ok_or(SessionError::Internal),
+                .ok_or(SessionError::Internal)?,
             message::FetchType::RelativeJoining | message::FetchType::AbsoluteJoining => {
-                self.send_resolution_error(RequestErrorCode::NotSupported, "joining fetch");
-                Ok(None)
+                let target = self.joining.as_ref().ok_or(SessionError::Internal)?;
+                let Some(joining) = target.handle().await else {
+                    self.send_resolution_error(
+                        RequestErrorCode::InvalidJoiningRequestId,
+                        "no such subscription",
+                    );
+                    return Ok(None);
+                };
+                let fields = self
+                    .request
+                    .joining_fetch
+                    .as_ref()
+                    .ok_or(SessionError::Internal)?;
+                let snapshot = match joining.snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(JoiningError::NotJoinable) => {
+                        self.send_resolution_error(
+                            RequestErrorCode::InvalidJoiningRequestId,
+                            "joined subscription is not active",
+                        );
+                        return Ok(None);
+                    }
+                    Err(JoiningError::NotForwarding) => {
+                        self.send_resolution_error(
+                            RequestErrorCode::InvalidRange,
+                            "joined subscription has Forward State 0",
+                        );
+                        return Ok(None);
+                    }
+                };
+                match resolve_joining_range(
+                    &snapshot,
+                    self.request.fetch_type,
+                    fields.joining_start,
+                ) {
+                    Some(range) => range,
+                    None => {
+                        self.send_resolution_error(
+                            RequestErrorCode::InvalidRange,
+                            "invalid joining FETCH range",
+                        );
+                        return Ok(None);
+                    }
+                }
             }
-        }
+        };
+        Ok(Some(self.resolved.get_or_init(|| resolved).clone()))
     }
 
     /// Wait until the request is cancelled or the session closes.
@@ -460,12 +522,15 @@ impl FetchRequested {
         Ok(())
     }
 
+    /// The range being answered: the standalone request, or the range a
+    /// Joining FETCH resolved to. Responding before resolving a Joining FETCH
+    /// is a caller error.
     fn standalone_range(&self) -> Result<(Location, Location), SessionError> {
-        let standalone = self
-            .request
-            .standalone_fetch
-            .as_ref()
-            .ok_or(SessionError::Serve(ServeError::Mode))?;
+        let standalone = match self.request.fetch_type {
+            message::FetchType::Standalone => self.request.standalone_fetch.as_ref(),
+            _ => self.resolved.get(),
+        }
+        .ok_or(SessionError::Serve(ServeError::Mode))?;
         Ok((standalone.start_location, standalone.end_location))
     }
 
@@ -519,6 +584,32 @@ impl FetchRequested {
             let _ = self.send(message::RequestError::new(self.id, code, 0, reason).into());
         }
     }
+}
+
+/// The standalone range a Joining FETCH covers (§10.12.2.1), or `None` if it
+/// is an INVALID_RANGE: no Objects when the subscription was accepted, a
+/// relative start reaching before group 0, or a start past the Joining
+/// Location.
+fn resolve_joining_range(
+    snapshot: &JoiningSnapshot,
+    fetch_type: message::FetchType,
+    joining_start: u64,
+) -> Option<message::StandaloneFetch> {
+    let joining = snapshot.joining_location?;
+    let start_group = match fetch_type {
+        message::FetchType::RelativeJoining => joining.group_id.checked_sub(joining_start)?,
+        message::FetchType::AbsoluteJoining => joining_start,
+        message::FetchType::Standalone => return None,
+    };
+    if start_group > joining.group_id {
+        return None;
+    }
+    Some(message::StandaloneFetch {
+        track_namespace: snapshot.track_namespace.clone(),
+        track_name: snapshot.track_name.clone(),
+        start_location: Location::new(start_group, 0),
+        end_location: joining_fetch_end_location(joining),
+    })
 }
 
 impl Drop for FetchRequested {
@@ -692,7 +783,7 @@ mod tests {
         let keepalive = outgoing.clone();
         let active = Arc::new(Mutex::new(HashMap::new()));
         let (request, recv) =
-            FetchRequested::new(session, outgoing, active.clone(), standalone(id));
+            FetchRequested::new(session, outgoing, active.clone(), standalone(id), None);
         (request, recv, Sent(outgoing_rx, keepalive), active)
     }
 
@@ -778,26 +869,70 @@ mod tests {
         assert!(active.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn joining_resolution_is_not_supported_yet() {
-        let session = super::super::test_support::loopback_session().await;
-        let (outgoing, rx) = Queue::default().split();
-        let rx = Sent(rx, outgoing.clone());
-        let mut msg = standalone(13);
-        msg.fetch_type = message::FetchType::RelativeJoining;
-        msg.standalone_fetch = None;
-        msg.joining_fetch = Some(message::JoiningFetch {
-            joining_request_id: 1,
-            joining_start: 0,
-        });
-        let (request, _recv) = FetchRequested::new(session, outgoing, Default::default(), msg);
-        assert_eq!(request.resolve().await.unwrap(), None);
-        drop(request);
-        let messages = rx.close();
-        assert_eq!(messages.len(), 1, "one response only, even after drop");
-        assert!(matches!(
-            &messages[0],
-            Message::RequestError(e) if e.error_code == RequestErrorCode::NotSupported as u64
-        ));
+    fn snapshot(joining: Option<Location>) -> JoiningSnapshot {
+        JoiningSnapshot {
+            track_namespace: TrackNamespace::from_utf8_path("test"),
+            track_name: "video".into(),
+            joining_location: joining,
+        }
+    }
+
+    fn range(start: Location, end: Location) -> Option<(Location, Location)> {
+        Some((start, end))
+    }
+
+    fn resolved(
+        joining: Option<Location>,
+        fetch_type: message::FetchType,
+        joining_start: u64,
+    ) -> Option<(Location, Location)> {
+        resolve_joining_range(&snapshot(joining), fetch_type, joining_start)
+            .map(|r| (r.start_location, r.end_location))
+    }
+
+    /// §10.12.2.1: end is `{JL.group, JL.object + 1}`; start is group-aligned.
+    #[test]
+    fn joining_range_is_contiguous_with_the_subscription() {
+        use message::FetchType::{AbsoluteJoining, RelativeJoining};
+        let jl = Some(Location::new(7, 11));
+        assert_eq!(
+            resolved(jl, RelativeJoining, 3),
+            range(Location::new(4, 0), Location::new(7, 12))
+        );
+        assert_eq!(
+            resolved(jl, RelativeJoining, 0),
+            range(Location::new(7, 0), Location::new(7, 12))
+        );
+        assert_eq!(
+            resolved(jl, AbsoluteJoining, 2),
+            range(Location::new(2, 0), Location::new(7, 12))
+        );
+        assert_eq!(
+            resolved(jl, AbsoluteJoining, 7),
+            range(Location::new(7, 0), Location::new(7, 12))
+        );
+    }
+
+    #[test]
+    fn joining_range_rejects_what_cannot_be_served() {
+        use message::FetchType::{AbsoluteJoining, RelativeJoining, Standalone};
+        let jl = Some(Location::new(2, 3));
+        // No Objects published when the subscription was accepted.
+        assert_eq!(resolved(None, RelativeJoining, 0), None);
+        // Relative start before group 0.
+        assert_eq!(resolved(jl, RelativeJoining, 3), None);
+        // Absolute start past the Joining Location.
+        assert_eq!(resolved(jl, AbsoluteJoining, 3), None);
+        assert_eq!(resolved(jl, Standalone, 0), None);
+    }
+
+    /// Object ID 2^64-1 has no `+1`; the whole-group encoding covers it.
+    #[test]
+    fn joining_range_at_max_object_uses_whole_group_end() {
+        let jl = Some(Location::new(2, u64::MAX));
+        assert_eq!(
+            resolved(jl, message::FetchType::RelativeJoining, 0),
+            range(Location::new(2, 0), Location::new(2, 0))
+        );
     }
 }

@@ -23,12 +23,13 @@ This repository provides:
 - SUBSCRIBE
 - SUBSCRIBE_NAMESPACE
 - PUBLISH / REQUEST_OK / PUBLISH_DONE (publisher-initiated tracks)
-- Standalone FETCH (the relay forwards it to the track's origin)
+- FETCH, standalone and joining (the relay forwards it to the track's origin)
 - WebTransport and raw QUIC transport layers
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
-- Joining FETCH (answered with NOT_SUPPORTED)
+- REQUEST_UPDATE (so a Joining FETCH can only join a subscription whose Forward State was set by SUBSCRIBE)
+- Joining FETCH for a subscription created by PUBLISH (answered with NOT_SUPPORTED)
 
 ## Interoperability
 

@@ -14,7 +14,7 @@ use crate::data::DataStreamResetCode;
 use crate::message::RequestErrorCode;
 use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
-use crate::watch::State;
+use crate::watch::{State, StateWeak};
 use crate::{data, message, serve};
 
 use super::{DeliveryError, DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
@@ -26,6 +26,10 @@ const MAX_CONCURRENT_SUBGROUPS: usize = 128;
 #[derive(Debug)]
 struct ObjectForwarderState {
     largest_location: Option<Location>,
+    /// The Largest Location sent in SUBSCRIBE_OK, saved as the Joining
+    /// Location (draft-18 §5.1.2). `None` until the subscription is accepted;
+    /// `Some(None)` when it was accepted with no Objects published yet.
+    joining_location: Option<Option<Location>>,
     retry_interval: u64,
     /// Set to true when UNSUBSCRIBE is received.  When true, Drop skips sending
     /// PUBLISH_DONE or REQUEST_ERROR because the subscriber already terminated.
@@ -49,6 +53,7 @@ impl Default for ObjectForwarderState {
     fn default() -> Self {
         Self {
             largest_location: None,
+            joining_location: None,
             retry_interval: 0,
             unsubscribed: false,
             closed: Ok(()),
@@ -141,7 +146,10 @@ impl ObjectForwarder {
             mlog,
             stream_count: StreamCount::default(),
         };
-        let recv = ObjectForwarderRecv { state: recv };
+        let recv = ObjectForwarderRecv {
+            state: recv,
+            joining: None,
+        };
         (send, recv)
     }
 
@@ -170,7 +178,9 @@ impl ObjectForwarder {
             return Err(ServeError::Timeout);
         }
 
-        state.into_mut().ok_or(ServeError::Cancel)?.largest_location = largest_location;
+        let mut state = state.into_mut().ok_or(ServeError::Cancel)?;
+        state.largest_location = largest_location;
+        state.joining_location = Some(largest_location);
         Ok(())
     }
 
@@ -404,7 +414,13 @@ impl Subscribed {
     ) -> Result<(Self, ObjectForwarderRecv), SessionError> {
         let info = SubscribeInfo::new_from_subscribe(&msg)?;
         // The subscription's request ID doubles as its Track Alias.
-        let (forwarder, recv) = ObjectForwarder::new(publisher, info.id, mlog);
+        let (forwarder, mut recv) = ObjectForwarder::new(publisher, info.id, mlog);
+        recv.joining = Some(JoiningHandle {
+            state: recv.state.downgrade(),
+            track_namespace: info.track_namespace.clone(),
+            track_name: info.track_name.clone(),
+            forward: info.forward,
+        });
         let send = Self {
             info,
             forwarder,
@@ -1214,9 +1230,157 @@ impl ObjectForwarder {
 
 pub(super) struct ObjectForwarderRecv {
     state: State<ObjectForwarderState>,
+    /// Set for inbound SUBSCRIBEs, which a Joining FETCH can reference.
+    joining: Option<JoiningHandle>,
+}
+
+/// What a Joining FETCH learns from the subscription it joins.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(super) struct JoiningSnapshot {
+    pub track_namespace: crate::coding::TrackNamespace,
+    pub track_name: crate::coding::TrackName,
+    /// `None` when no Objects had been published when the subscription was
+    /// accepted.
+    pub joining_location: Option<Location>,
+}
+
+/// A Joining FETCH's view of an inbound SUBSCRIBE.
+///
+/// Weak, so a FETCH waiting on a pending subscription does not keep the
+/// subscription's receive half alive: dropping that half is how the
+/// forwarder learns of UNSUBSCRIBE.
+#[derive(Clone)]
+pub(super) struct JoiningHandle {
+    state: StateWeak<ObjectForwarderState>,
+    track_namespace: crate::coding::TrackNamespace,
+    track_name: crate::coding::TrackName,
+    forward: bool,
+}
+
+/// A Joining FETCH's reference to a subscription.
+pub(super) enum JoiningTarget {
+    /// The SUBSCRIBE had arrived when the FETCH did.
+    Known(JoiningHandle),
+    /// The SUBSCRIBE may still be on its way: request streams are unordered,
+    /// so the FETCH can be read first.
+    Awaiting(PendingJoin),
+}
+
+impl JoiningTarget {
+    /// The subscription, waiting for its SUBSCRIBE if needed. `None` means
+    /// the Request ID names no subscription (INVALID_JOINING_REQUEST_ID).
+    pub async fn handle(&self) -> Option<JoiningHandle> {
+        match self {
+            Self::Known(handle) => Some(handle.clone()),
+            Self::Awaiting(pending) => pending.wait().await,
+        }
+    }
+}
+
+/// How long a Joining FETCH waits for a SUBSCRIBE that has not arrived yet.
+/// Covers stream reordering, not a peer that never sends it.
+const PENDING_JOIN_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long to wait for a SUBSCRIBE whose Request ID has been received but
+/// not yet registered. Registration follows receipt without any I/O.
+const PENDING_JOIN_REGISTER_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Waits for an inbound SUBSCRIBE with a given Request ID.
+pub(super) struct PendingJoin {
+    pub subscribeds: std::sync::Weak<Mutex<std::collections::HashMap<u64, ObjectForwarderRecv>>>,
+    pub request_ids: super::RequestId,
+    /// Notified whenever an inbound SUBSCRIBE is registered.
+    pub arrived: Arc<tokio::sync::Notify>,
+    pub id: u64,
+}
+
+impl PendingJoin {
+    async fn wait(&self) -> Option<JoiningHandle> {
+        let deadline = tokio::time::Instant::now() + PENDING_JOIN_HOLD;
+        let mut seen_absent = false;
+        loop {
+            // Register for the wakeup before checking, so a SUBSCRIBE that
+            // lands in between is not missed.
+            let notified = self.arrived.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let subscribeds = self.subscribeds.upgrade()?;
+            if let Some(handle) = subscribeds
+                .lock()
+                .ok()?
+                .get(&self.id)
+                .and_then(|recv| recv.joining_handle())
+            {
+                return Some(handle);
+            }
+            drop(subscribeds);
+            let wait_until = if self.request_ids.is_unused_peer_id(self.id) {
+                deadline
+            } else if !seen_absent {
+                // The ID is recorded as received before its SUBSCRIBE is
+                // registered, so a SUBSCRIBE may be between the two steps.
+                // Allow one short wait for it before deciding the ID belongs
+                // to something else.
+                seen_absent = true;
+                deadline.min(tokio::time::Instant::now() + PENDING_JOIN_REGISTER_GRACE)
+            } else {
+                return None;
+            };
+            if tokio::time::timeout_at(wait_until, notified).await.is_err()
+                && wait_until == deadline
+            {
+                return None;
+            }
+        }
+    }
+}
+
+/// Why a subscription cannot be joined.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum JoiningError {
+    /// Not an Established or Pending subscription (INVALID_JOINING_REQUEST_ID).
+    NotJoinable,
+    /// Forward State 0 (§10.12.2: INVALID_RANGE).
+    NotForwarding,
+}
+
+impl JoiningHandle {
+    /// Wait for the subscription to be accepted, then return its Joining
+    /// Location. A pending subscription is waited on (§10.12.2: the publisher
+    /// buffers the Joining FETCH); the caller bounds the wait.
+    pub async fn snapshot(&self) -> Result<JoiningSnapshot, JoiningError> {
+        if !self.forward {
+            // REQUEST_UPDATE is not supported, so the Forward State set by
+            // SUBSCRIBE is final.
+            return Err(JoiningError::NotForwarding);
+        }
+        loop {
+            let notify = {
+                let state = self.state.upgrade().ok_or(JoiningError::NotJoinable)?;
+                let state = state.lock();
+                if state.closed.is_err() {
+                    return Err(JoiningError::NotJoinable);
+                }
+                if let Some(joining_location) = state.joining_location {
+                    return Ok(JoiningSnapshot {
+                        track_namespace: self.track_namespace.clone(),
+                        track_name: self.track_name.clone(),
+                        joining_location,
+                    });
+                }
+                state.modified().ok_or(JoiningError::NotJoinable)?
+            };
+            notify.await;
+        }
+    }
 }
 
 impl ObjectForwarderRecv {
+    /// The handle a Joining FETCH resolves against, if this is a SUBSCRIBE.
+    pub fn joining_handle(&self) -> Option<JoiningHandle> {
+        self.joining.clone()
+    }
+
     pub fn recv_unsubscribe(&mut self) -> Result<(), ServeError> {
         let state = self.state.lock();
         state.closed.clone()?;
@@ -2874,7 +3038,10 @@ mod tests {
     fn recv_unsubscribe_marks_unsubscribed_and_closes() {
         let state = State::<ObjectForwarderState>::default();
         let (_send, recv_state) = state.split();
-        let mut recv = ObjectForwarderRecv { state: recv_state };
+        let mut recv = ObjectForwarderRecv {
+            state: recv_state,
+            joining: None,
+        };
 
         assert!(!recv.state.lock().unsubscribed);
 

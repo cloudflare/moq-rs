@@ -131,6 +131,19 @@ pub(super) struct FetchStreamReg {
 }
 
 impl FetchStreamReg {
+    /// A registration with no routing entry, for unit tests.
+    #[cfg(test)]
+    pub(super) fn detached() -> Self {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        Self {
+            _cleanup: FetchStreamCleanup {
+                fetch_streams: Default::default(),
+                request_id: 0,
+            },
+            rx,
+        }
+    }
+
     /// Await the FETCH data stream.
     ///
     /// Returns `Ok(reader)` when [`route_fetch_stream`](Subscriber::route_fetch_stream)
@@ -980,6 +993,39 @@ impl Subscriber {
             Some(standalone),
             None,
             range,
+            params,
+        )
+        .await
+    }
+
+    /// Send a Joining FETCH for the subscription with request ID
+    /// `subscribe_id` (draft-18 §10.12.2).
+    ///
+    /// The publisher computes the range so the response ends where the
+    /// subscription begins: `joining_start` groups before its Joining
+    /// Location for [`message::FetchType::RelativeJoining`], or from group
+    /// `joining_start` for [`message::FetchType::AbsoluteJoining`]. The
+    /// subscription should be sent first and have Forward State 1.
+    pub async fn joining_fetch(
+        &mut self,
+        fetch_type: message::FetchType,
+        subscribe_id: u64,
+        joining_start: u64,
+        params: KeyValuePairs,
+    ) -> Result<Fetch, ServeError> {
+        if fetch_type == message::FetchType::Standalone {
+            return Err(ServeError::Mode);
+        }
+        self.fetch_request(
+            fetch_type,
+            None,
+            Some(message::JoiningFetch {
+                joining_request_id: subscribe_id,
+                joining_start,
+            }),
+            // The end is chosen by the publisher, so FETCH_OK bounds it; an
+            // absolute join's known start is checked by the response validator.
+            None,
             params,
         )
         .await
