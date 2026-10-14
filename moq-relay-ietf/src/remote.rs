@@ -10,8 +10,9 @@ use std::time::Duration;
 use moq_native_ietf::quic;
 use moq_transport::coding::{KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix};
 
+use moq_transport::message::StandaloneFetch;
 use moq_transport::serve::{ServeError, Track, TrackReader, TracksReader};
-use moq_transport::session::{Publisher, SessionConfig, Subscribe, SubscribeNamespace};
+use moq_transport::session::{Fetch, Publisher, SessionConfig, Subscribe, SubscribeNamespace};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -210,6 +211,235 @@ pub struct RemoteManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test::test_endpoint;
+
+    /// Routes every namespace to one test endpoint.
+    struct RoutedCoordinator {
+        url: Url,
+        addr: SocketAddr,
+        client: quic::Client,
+    }
+
+    #[async_trait::async_trait]
+    impl Coordinator for RoutedCoordinator {
+        async fn register_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+            _context: &crate::CoordinatorContext,
+        ) -> crate::CoordinatorResult<crate::NamespaceRegistration> {
+            Ok(crate::NamespaceRegistration::new(()))
+        }
+
+        async fn unregister_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &TrackNamespace,
+        ) -> crate::CoordinatorResult<()> {
+            Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            _scope: Option<&str>,
+            namespace: &TrackNamespace,
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
+            Ok((
+                crate::NamespaceOrigin::new(namespace.clone(), self.url.clone(), Some(self.addr)),
+                Some(self.client.clone()),
+            ))
+        }
+    }
+
+    struct TestPeer {
+        publisher: Publisher,
+        _subscriber: moq_transport::session::Subscriber,
+        session: tokio::task::JoinHandle<Result<(), moq_transport::session::SessionError>>,
+    }
+
+    impl Drop for TestPeer {
+        fn drop(&mut self) {
+            self.session.abort();
+        }
+    }
+
+    async fn accept_peer(server: &mut quic::Server) -> TestPeer {
+        let (transport, info) = server.accept().await.expect("test endpoint closed");
+        let (session, publisher, subscriber) =
+            moq_transport::session::Session::accept(transport, None, info.transport)
+                .await
+                .unwrap();
+        TestPeer {
+            publisher: publisher.unwrap(),
+            _subscriber: subscriber.unwrap(),
+            session: tokio::spawn(session.run()),
+        }
+    }
+
+    fn fetch_request(namespace: &TrackNamespace) -> StandaloneFetch {
+        StandaloneFetch {
+            track_namespace: namespace.clone(),
+            track_name: "video".into(),
+            start_location: moq_transport::coding::Location::new(0, 0),
+            end_location: moq_transport::coding::Location::new(1, 0),
+        }
+    }
+
+    async fn cached_remote(manager: &RemoteManager, key: &RemoteCacheKey) -> Remote {
+        let slot = manager
+            .remotes
+            .lock()
+            .await
+            .get(key)
+            .expect("remote cache entry missing")
+            .clone();
+        let remote = slot
+            .lock()
+            .await
+            .as_ref()
+            .expect("remote cache slot empty")
+            .clone();
+        remote
+    }
+
+    const FETCH_TEST_GUARD: Duration = Duration::from_secs(10);
+
+    /// A peer REQUEST_ERROR concerns one request stream, so the pooled
+    /// connection is kept and reused for the next FETCH.
+    #[tokio::test]
+    async fn repeated_fetch_reuses_connection_after_request_error() {
+        tokio::time::timeout(FETCH_TEST_GUARD, async {
+            let endpoint = test_endpoint();
+            let key = (endpoint.url.clone(), Some(endpoint.addr));
+            let manager = RemoteManager::new(
+                Arc::new(RoutedCoordinator {
+                    url: endpoint.url.clone(),
+                    addr: endpoint.addr,
+                    client: endpoint.client.clone(),
+                }),
+                Vec::new(),
+            );
+            let namespace = TrackNamespace::from_utf8_path("test/fetch");
+            let mut server = endpoint.server;
+
+            let (first_fetch, peer) = tokio::join!(
+                manager.fetch(None, fetch_request(&namespace), KeyValuePairs::default()),
+                accept_peer(&mut server),
+            );
+            let first_fetch = first_fetch.unwrap().unwrap();
+            let mut peer = peer;
+            let first_remote = cached_remote(&manager, &key).await;
+            let first_request = peer.publisher.fetch_requested().await.unwrap();
+            let first_id = first_request.id();
+            first_request
+                .reject(
+                    moq_transport::message::RequestErrorCode::DoesNotExist,
+                    "not here",
+                )
+                .unwrap();
+            assert_eq!(
+                first_fetch
+                    .ok()
+                    .await
+                    .expect_err("FETCH should be rejected"),
+                ServeError::Closed(moq_transport::message::RequestErrorCode::DoesNotExist as u64)
+            );
+            let after_error = cached_remote(&manager, &key).await;
+            assert!(after_error.is_connected());
+            assert!(first_remote.is_same_connection(&after_error));
+
+            let second_fetch = manager
+                .fetch(None, fetch_request(&namespace), KeyValuePairs::default())
+                .await
+                .unwrap()
+                .unwrap();
+            let second_request = peer.publisher.fetch_requested().await.unwrap();
+            assert_ne!(second_request.id(), first_id);
+            second_request
+                .reject(
+                    moq_transport::message::RequestErrorCode::DoesNotExist,
+                    "still not here",
+                )
+                .unwrap();
+            assert!(first_remote.is_same_connection(&cached_remote(&manager, &key).await));
+            assert_eq!(manager.remotes.lock().await.len(), 1);
+
+            drop(second_fetch);
+            manager.shutdown().await;
+        })
+        .await
+        .expect("FETCH reuse test deadlocked");
+    }
+
+    /// A connection already known to be dead is replaced on the next FETCH.
+    #[tokio::test]
+    async fn dead_connection_is_replaced_on_next_fetch() {
+        tokio::time::timeout(FETCH_TEST_GUARD, async {
+            let endpoint = test_endpoint();
+            let key = (endpoint.url.clone(), Some(endpoint.addr));
+            let manager = RemoteManager::new(
+                Arc::new(RoutedCoordinator {
+                    url: endpoint.url.clone(),
+                    addr: endpoint.addr,
+                    client: endpoint.client.clone(),
+                }),
+                Vec::new(),
+            );
+            let namespace = TrackNamespace::from_utf8_path("test/fetch");
+            let mut server = endpoint.server;
+
+            let (first_fetch, first_peer) = tokio::join!(
+                manager.fetch(None, fetch_request(&namespace), KeyValuePairs::default()),
+                accept_peer(&mut server),
+            );
+            let first_fetch = first_fetch.unwrap().unwrap();
+            let mut first_peer = first_peer;
+            let first_remote = cached_remote(&manager, &key).await;
+            first_peer
+                .publisher
+                .fetch_requested()
+                .await
+                .unwrap()
+                .reject(
+                    moq_transport::message::RequestErrorCode::DoesNotExist,
+                    "not here",
+                )
+                .unwrap();
+            first_fetch
+                .ok()
+                .await
+                .expect_err("FETCH should be rejected");
+            drop(first_fetch);
+
+            first_remote.connected.store(false, Ordering::Release);
+
+            let (second_fetch, second_peer) = tokio::join!(
+                manager.fetch(None, fetch_request(&namespace), KeyValuePairs::default()),
+                accept_peer(&mut server),
+            );
+            let second_fetch = second_fetch.unwrap().unwrap();
+            let mut second_peer = second_peer;
+            let second_remote = cached_remote(&manager, &key).await;
+            assert!(second_remote.is_connected());
+            assert!(!first_remote.is_same_connection(&second_remote));
+            assert_eq!(manager.remotes.lock().await.len(), 1);
+            second_peer
+                .publisher
+                .fetch_requested()
+                .await
+                .unwrap()
+                .reject(
+                    moq_transport::message::RequestErrorCode::DoesNotExist,
+                    "not here",
+                )
+                .unwrap();
+
+            drop(second_fetch);
+            manager.shutdown().await;
+        })
+        .await
+        .expect("dead connection test deadlocked");
+    }
 
     struct NoopCoordinator;
 
@@ -665,6 +895,48 @@ impl RemoteManager {
         }
     }
 
+    /// Forward a standalone FETCH to the relay serving its track.
+    ///
+    /// Returns `Ok(None)` when the coordinator knows no origin for the track.
+    /// A FETCH owns its own request stream, so a peer rejection does not evict
+    /// the pooled connection; only a failure to open the request does.
+    pub async fn fetch(
+        &self,
+        scope: Option<&str>,
+        request: StandaloneFetch,
+        params: KeyValuePairs,
+    ) -> anyhow::Result<Option<Fetch>> {
+        let (origin, client) = match self
+            .coordinator
+            .lookup_track(
+                scope,
+                &request.track_namespace,
+                &request.track_name.to_string(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(CoordinatorError::NamespaceNotFound) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let cache_key = (origin.url(), origin.addr());
+        let remote = self
+            .get_or_connect(cache_key.clone(), client.as_ref())
+            .await?;
+        match remote.fetch(request, params).await {
+            Ok(fetch) => Ok(Some(fetch)),
+            Err(err) => {
+                // Only a dead connection is evicted; a refused request (for
+                // example an invalid range) says nothing about the session.
+                if !remote.is_connected() {
+                    tracing::warn!(remote_url = %remote.url, error = %err, "remote FETCH failed on a closed connection, removing from cache");
+                    self.remove_if_same_remote(&cache_key, &remote).await;
+                }
+                Err(err.into())
+            }
+        }
+    }
+
     /// Forward a `SUBSCRIBE_NAMESPACE` to a specific relay peer.
     ///
     /// Connects to (or reuses a connection to) `relay` and opens a namespace
@@ -1084,6 +1356,21 @@ impl Remote {
             cancel,
             cache_idle_timeout,
         })
+    }
+
+    async fn fetch(
+        &self,
+        request: StandaloneFetch,
+        params: KeyValuePairs,
+    ) -> Result<Fetch, ServeError> {
+        if !self.is_connected() {
+            return Err(ServeError::internal_ctx(format!(
+                "remote connection to {} is closed",
+                self.url
+            )));
+        }
+        let mut subscriber = self.subscriber.clone();
+        subscriber.fetch(request, params).await
     }
 
     /// Check if the connection is still alive.

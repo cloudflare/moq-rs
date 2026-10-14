@@ -11,8 +11,8 @@ use moq_transport::{
     message::RequestErrorCode,
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
     session::{
-        Publisher, ServeWithDeadlineError, SessionError, Subscribed, SubscribedNamespace,
-        SubscribedTracks, TrackStatusRequested,
+        FetchRequested, Publisher, ServeWithDeadlineError, SessionError, Subscribed,
+        SubscribedNamespace, SubscribedTracks, TrackStatusRequested,
     },
 };
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
@@ -38,6 +38,11 @@ use crate::{
 /// the same knob the pre-spec "lingering subscribe" config carried before it was
 /// removed; 30s was its default there too.
 const MAX_RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Upper bound on serving one FETCH, from receipt to the end of the copied
+/// response. A relayed FETCH holds an upstream request and a downstream
+/// stream for its whole life, so it is bounded like a rendezvous hold.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Keep one session from consuming the relay's entire rendezvous budget. Half
 /// the relay-wide capacity remains available to other sessions.
@@ -327,6 +332,7 @@ impl Producer {
             let mut publisher_track_status = self.publisher.clone();
             let mut publisher_subscribed_namespace = self.publisher.clone();
             let mut publisher_subscribed_tracks = self.publisher.clone();
+            let mut publisher_fetch = self.publisher.clone();
 
             tokio::select! {
                 // Handle a new subscribe request
@@ -401,11 +407,113 @@ impl Producer {
                         }
                     }.boxed())
                 },
+                Some(fetch) = publisher_fetch.fetch_requested() => {
+                    metrics::counter!("moq_relay_fetches_total").increment(1);
+                    let this = self.clone();
+                    tasks.push(async move {
+                        let id = fetch.id();
+                        if let Err(err) = this.serve_fetch(fetch).await {
+                            tracing::debug!(request_id = id, error = %err, "failed serving FETCH");
+                        }
+                    }.boxed())
+                },
                 Some(task) = child_task_rx.recv() => tasks.push(task),
                 _= tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(()),
             };
         }
+    }
+
+    /// Serve a FETCH by forwarding it to the track's origin.
+    ///
+    /// The relay keeps no history beyond its live subscription caches, so a
+    /// FETCH is passed through: to the session that advertised the namespace on
+    /// this relay, otherwise to the relay the coordinator names. The upstream
+    /// response, or its REQUEST_ERROR, is copied back.
+    async fn serve_fetch(self, fetch: FetchRequested) -> Result<(), anyhow::Error> {
+        let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
+        let standalone = tokio::select! {
+            biased;
+            _ = fetch.closed() => return Ok(()),
+            _ = tokio::time::sleep_until(deadline) => {
+                fetch.reject(RequestErrorCode::Timeout, "FETCH resolution timed out")?;
+                return Ok(());
+            }
+            result = fetch.resolve() => match result? {
+                Some(standalone) => standalone,
+                // Already answered (Joining FETCH is not served yet).
+                None => return Ok(()),
+            },
+        };
+
+        // Authorize before any lookup: deciding afterwards would make response
+        // timing an existence oracle for tracks the peer may not access.
+        if let Err(reason) = may_fetch_track(
+            self.auth.as_ref(),
+            &self.context,
+            &standalone.track_namespace,
+            &standalone.track_name,
+            fetch.id(),
+        )
+        .await
+        {
+            metrics::counter!("moq_relay_fetch_errors_total", "phase" => "auth").increment(1);
+            let code = match reason {
+                DenyReason::TokenMalformed => RequestErrorCode::MalformedAuthToken,
+                DenyReason::TokenExpired => RequestErrorCode::ExpiredAuthToken,
+                _ => RequestErrorCode::Unauthorized,
+            };
+            fetch.reject(code, "unauthorized")?;
+            return Err(anyhow::anyhow!("unauthorized FETCH"));
+        }
+
+        // Only GROUP_ORDER is forwarded: the response's delta encoding depends
+        // on it (draft-18 section 11.4.4.1); other parameters are hop-by-hop.
+        let mut params = KeyValuePairs::default();
+        if let Some(order) = fetch.group_order() {
+            params.set_group_order(order);
+        }
+
+        let open = async {
+            if let Some(mut source) = self
+                .locals
+                .fetch_source(self.context.scope(), &standalone.track_namespace)
+            {
+                Ok(Some(source.fetch(standalone, params).await?))
+            } else {
+                self.remotes
+                    .fetch(self.context.scope(), standalone, params)
+                    .await
+            }
+        };
+        let upstream = tokio::select! {
+            biased;
+            _ = fetch.closed() => return Ok(()),
+            _ = tokio::time::sleep_until(deadline) => {
+                fetch.reject(RequestErrorCode::Timeout, "FETCH routing timed out")?;
+                return Ok(());
+            }
+            result = open => match result {
+                Ok(Some(upstream)) => upstream,
+                Ok(None) => {
+                    metrics::counter!("moq_relay_fetch_errors_total", "phase" => "not_found").increment(1);
+                    fetch.reject(RequestErrorCode::DoesNotExist, "track not found")?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    metrics::counter!("moq_relay_fetch_errors_total", "phase" => "upstream").increment(1);
+                    fetch.reject(RequestErrorCode::InternalError, "failed to open upstream FETCH")?;
+                    return Err(err.context("failed to open upstream FETCH"));
+                }
+            },
+        };
+        fetch
+            .proxy(
+                upstream,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Serve a subscribe request.
@@ -1673,6 +1781,31 @@ fn same_track_generation(left: &TrackReader, right: &TrackReader) -> bool {
     Arc::ptr_eq(&left.info, &right.info)
 }
 
+/// Whether the peer may FETCH `track` in `namespace`.
+///
+/// Requires `Fetch` (`MoqtAction::Fetch` in the CAT `moqt` claim registry).
+/// Any other outcome (wrong scope, no scope, hook fault, expired token) is a
+/// definitive denial. FETCH retrieves track content, so it is gated at least
+/// as tightly as SUBSCRIBE.
+///
+/// A free function so the decision is testable without a live session. The
+/// tests pin which operation is checked as well as the outcome.
+async fn may_fetch_track(
+    auth: Option<&SessionAuth>,
+    context: &SessionContext,
+    namespace: &TrackNamespace,
+    track: &TrackName,
+    request_id: u64,
+) -> Result<(), DenyReason> {
+    authorize(
+        auth,
+        context,
+        AuthzOperation::Fetch { namespace, track },
+        Some(request_id),
+    )
+    .await
+}
+
 /// Whether a track may be delivered through a SUBSCRIBE_TRACKS generated
 /// PUBLISH.
 ///
@@ -1760,10 +1893,10 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::{
-        full_name_for_track, may_announce_namespace, may_serve_track_in_fanout, namespace_covers,
-        rendezvous_hold, Producer, SubscribeTracksSlot, SubscribeTracksSlotAction,
-        MAX_CONCURRENT_RENDEZVOUS_HOLDS_PER_SESSION, MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
-        MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+        full_name_for_track, may_announce_namespace, may_fetch_track, may_serve_track_in_fanout,
+        namespace_covers, rendezvous_hold, Producer, SubscribeTracksSlot,
+        SubscribeTracksSlotAction, MAX_CONCURRENT_RENDEZVOUS_HOLDS_PER_SESSION,
+        MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION, MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
     };
     use crate::auth::{
         AuthDecision, AuthError, AuthHook, AuthRequest, AuthToken, AuthzOperation, DenyReason,
@@ -2834,6 +2967,11 @@ mod tests {
                 AuthzOperation::SubscribeNamespace { prefix } => {
                     format!("subscribe_namespace {}", prefix.to_utf8_path())
                 }
+                AuthzOperation::Fetch { namespace, track } => format!(
+                    "fetch {} {}",
+                    namespace.to_utf8_path(),
+                    track.to_string_lossy()
+                ),
                 other => format!("other {}", other.label()),
             };
             let decision = (self.decide)(&detail);
@@ -2969,6 +3107,296 @@ mod tests {
         )
         .await;
         (transport, subscriber)
+    }
+
+    // ── FETCH ────────────────────────────────────────────────────────────
+
+    fn fetch_request(namespace: &str, track: &str) -> moq_transport::message::StandaloneFetch {
+        moq_transport::message::StandaloneFetch {
+            track_namespace: TrackNamespace::from_utf8_path(namespace),
+            track_name: track.into(),
+            start_location: moq_transport::coding::Location::new(0, 0),
+            end_location: moq_transport::coding::Location::new(2, 0),
+        }
+    }
+
+    fn fetch_object(group_id: u64, object_id: u64, len: u64) -> moq_transport::data::FetchRecord {
+        moq_transport::data::FetchRecord::Object(moq_transport::data::FetchRecordObject {
+            group_id,
+            subgroup_id: Some(0),
+            object_id,
+            publisher_priority: 1,
+            extension_headers: Default::default(),
+            payload_length: len,
+        })
+    }
+
+    /// An origin session whose namespace is registered on `locals` as a FETCH
+    /// source, as `Consumer` does on PUBLISH_NAMESPACE. Returns the origin's
+    /// publisher and the registration keeping the route alive.
+    async fn spawn_fetch_origin(
+        locals: &Locals,
+        namespace: &str,
+    ) -> (
+        moq_transport::session::Publisher,
+        crate::local::LocalNamespaceRegistration,
+        tokio::sync::mpsc::Receiver<TrackRequest>,
+    ) {
+        let (origin_transport, relay_transport) = loopback_webtransport_pair().await;
+        let (origin, relay) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                TransportSession::accept(origin_transport, None, Transport::WebTransport),
+                TransportSession::connect(relay_transport, None, Transport::WebTransport),
+            )
+        })
+        .await
+        .expect("MoQT setup timed out");
+        let (origin, origin_publisher, _) = origin.expect("accept origin session");
+        let (relay, _, relay_subscriber) = relay.expect("connect relay session");
+        tokio::spawn(async move { origin.run().await });
+        tokio::spawn(async move { relay.run().await });
+        let (registration, requests) = locals
+            .clone()
+            .register_namespace_with_fetch(
+                None,
+                TrackNamespace::from_utf8_path(namespace),
+                relay_subscriber,
+            )
+            .await
+            .expect("register FETCH source");
+        (
+            origin_publisher.expect("origin publisher"),
+            registration,
+            requests,
+        )
+    }
+
+    /// End to end: a FETCH to the relay is forwarded to the session that
+    /// advertised the namespace, and its response is copied back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_is_forwarded_to_the_namespace_source() {
+        let locals = Locals::new();
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let (mut origin, _registration, _requests) =
+            spawn_fetch_origin(&locals, "fetch/origin").await;
+        let mut subscriber = spawn_relay_session(locals, remotes, coordinator.clone()).await;
+
+        let mut fetch = subscriber
+            .fetch(
+                fetch_request("fetch/origin", "video"),
+                KeyValuePairs::default(),
+            )
+            .await
+            .expect("send FETCH");
+
+        let requested = tokio::time::timeout(Duration::from_secs(5), origin.fetch_requested())
+            .await
+            .expect("FETCH was not forwarded")
+            .expect("origin publisher closed");
+        let forwarded = requested.resolve().await.unwrap().unwrap();
+        assert_eq!(forwarded, fetch_request("fetch/origin", "video"));
+        let mut writer = requested
+            .respond(moq_transport::session::FetchOkInfo {
+                end_of_track: false,
+                end_location: moq_transport::coding::Location::new(1, 2),
+                params: KeyValuePairs::default(),
+                track_extensions: Default::default(),
+            })
+            .await
+            .unwrap();
+        writer.write_record(&fetch_object(0, 0, 3)).await.unwrap();
+        writer.write_payload(b"abc").await.unwrap();
+        writer.write_record(&fetch_object(1, 1, 0)).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let ok = tokio::time::timeout(Duration::from_secs(5), fetch.ok())
+            .await
+            .expect("FETCH_OK timed out")
+            .expect("FETCH rejected");
+        assert_eq!(ok.end_location, moq_transport::coding::Location::new(1, 2));
+
+        let mut records = Vec::new();
+        while let Some(record) = tokio::time::timeout(Duration::from_secs(5), fetch.next())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            let mut payload = Vec::new();
+            while let Some(chunk) = fetch.read_payload_chunk(16).await.unwrap() {
+                payload.extend_from_slice(&chunk);
+            }
+            records.push((record, payload));
+        }
+        assert_eq!(
+            records,
+            vec![
+                (fetch_object(0, 0, 3), b"abc".to_vec()),
+                (fetch_object(1, 1, 0), Vec::new()),
+            ]
+        );
+        assert!(
+            coordinator.track_lookups.lock().unwrap().is_empty(),
+            "a local source must be used without consulting the coordinator"
+        );
+    }
+
+    /// An upstream REQUEST_ERROR reaches the fetcher unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_rejection_from_the_source_is_forwarded() {
+        let locals = Locals::new();
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let (mut origin, _registration, _requests) =
+            spawn_fetch_origin(&locals, "fetch/origin").await;
+        let mut subscriber = spawn_relay_session(locals, remotes, coordinator).await;
+
+        let fetch = subscriber
+            .fetch(
+                fetch_request("fetch/origin", "video"),
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        let requested = tokio::time::timeout(Duration::from_secs(5), origin.fetch_requested())
+            .await
+            .unwrap()
+            .unwrap();
+        requested
+            .reject(RequestErrorCode::InvalidRange, "no objects in range")
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), fetch.ok())
+                .await
+                .unwrap(),
+            Err(ServeError::Closed(RequestErrorCode::InvalidRange as u64))
+        );
+        assert_eq!(fetch.rejection().unwrap().reason.0, "no objects in range");
+    }
+
+    /// A FETCH with no local source and no coordinator route is DOES_NOT_EXIST.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_for_an_unknown_track_does_not_exist() {
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let mut subscriber = spawn_relay_session(Locals::new(), remotes, coordinator.clone()).await;
+
+        let fetch = subscriber
+            .fetch(
+                fetch_request("fetch/nowhere", "video"),
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), fetch.ok())
+                .await
+                .unwrap(),
+            Err(ServeError::Closed(RequestErrorCode::DoesNotExist as u64))
+        );
+        assert_eq!(*coordinator.track_lookups.lock().unwrap(), vec!["video"]);
+    }
+
+    /// Joining FETCH is not served yet and is refused without routing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn joining_fetch_is_not_supported() {
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let (transport, _subscriber, _) = spawn_relay_session_with_limits(
+            Locals::new(),
+            remotes,
+            coordinator.clone(),
+            MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
+            MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+        )
+        .await;
+        let (mut send, mut recv) = transport.open_bi().await.expect("open request stream");
+        let mut buffer = Vec::new();
+        Message::Fetch(moq_transport::message::Fetch {
+            id: 0,
+            fetch_type: moq_transport::message::FetchType::RelativeJoining,
+            standalone_fetch: None,
+            joining_fetch: Some(moq_transport::message::JoiningFetch {
+                joining_request_id: 2,
+                joining_start: 1,
+            }),
+            params: KeyValuePairs::default(),
+        })
+        .encode(&mut buffer)
+        .expect("encode FETCH");
+        let mut buffer = Cursor::new(buffer);
+        while buffer.position() < buffer.get_ref().len() as u64 {
+            send.write_buf(&mut buffer).await.expect("send FETCH");
+        }
+        let mut response = Vec::new();
+        let (message_type, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_bidi_response_frame(&mut recv, &mut response),
+        )
+        .await
+        .expect("no response to joining FETCH");
+        assert_eq!(message_type, wire_id::RequestError);
+        assert!(coordinator.track_lookups.lock().unwrap().is_empty());
+    }
+
+    /// The FETCH gate asks about `Fetch` for the exact track, not `Subscribe`.
+    #[tokio::test]
+    async fn fetch_gate_asks_about_fetch() {
+        let hook = RecordingHook::new(|_| allow());
+        let auth = session_auth(hook.clone());
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+        let track = TrackName::from("video");
+
+        assert!(
+            may_fetch_track(Some(&auth), &auth_context(), &namespace, &track, 3)
+                .await
+                .is_ok()
+        );
+        assert_eq!(hook.seen(), vec!["fetch /sports/football video"]);
+        assert!(
+            may_fetch_track(None, &auth_context(), &namespace, &track, 3)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// End to end: a denied FETCH is UNAUTHORIZED, decided before any local
+    /// or coordinator lookup, so the response does not reveal whether the
+    /// track exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn denied_fetch_is_unauthorized_before_any_lookup() {
+        let hook = RecordingHook::new(|_| deny());
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let locals = Locals::new();
+        let (mut origin, _registration, _requests) =
+            spawn_fetch_origin(&locals, "fetch/origin").await;
+        let (_transport, mut subscriber) =
+            spawn_authorized_session(locals, coordinator.clone(), hook.clone()).await;
+
+        for namespace in ["fetch/origin", "fetch/nowhere"] {
+            let fetch = subscriber
+                .fetch(fetch_request(namespace, "secret"), KeyValuePairs::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), fetch.ok())
+                    .await
+                    .unwrap(),
+                Err(ServeError::Closed(RequestErrorCode::Unauthorized as u64))
+            );
+        }
+        assert_eq!(
+            hook.seen(),
+            vec!["fetch /fetch/origin secret", "fetch /fetch/nowhere secret"]
+        );
+        assert!(coordinator.track_lookups.lock().unwrap().is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), origin.fetch_requested())
+                .await
+                .is_err(),
+            "a denied FETCH must not reach the source"
+        );
     }
 
     /// End to end: a denied SUBSCRIBE is answered with UNAUTHORIZED (draft-18

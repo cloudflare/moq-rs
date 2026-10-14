@@ -291,15 +291,21 @@ impl Drop for Fetch {
 /// still be on its way.
 async fn wait_rejected(state: &State<FetchState>) -> ServeError {
     loop {
+        // The guard must not live across an await: it would make every
+        // future that polls this one `!Send`.
         let notify = {
             let state = state.lock();
             if let Some(error) = &state.error {
                 return ServeError::Closed(error.error_code);
             }
             if state.ok.is_some() {
-                return std::future::pending().await;
+                None
+            } else {
+                Some(state.modified())
             }
-            state.modified()
+        };
+        let Some(notify) = notify else {
+            return std::future::pending().await;
         };
         match notify {
             Some(notify) => notify.await,
@@ -349,6 +355,22 @@ mod tests {
     use std::time::Duration;
 
     const T: Duration = Duration::from_secs(5);
+
+    /// Relays spawn these futures onto multi-threaded runtimes.
+    #[allow(dead_code)]
+    fn fetch_futures_are_send(mut f: Fetch, r: crate::session::FetchRequested, mut s: Subscriber) {
+        fn send<T: Send>(_: T) {}
+        send(f.ok());
+        send(f.next());
+        send(f.read_payload_chunk(1));
+        send(s.fetch(
+            request(Location::new(0, 0), Location::new(1, 0)),
+            KeyValuePairs::default(),
+        ));
+        send(r.resolve());
+        send(r.closed());
+        send(r.proxy(f, T));
+    }
 
     /// Two connected sessions, both running. Client fetches, server publishes.
     async fn pair() -> (Subscriber, Publisher) {
