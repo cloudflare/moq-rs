@@ -25,9 +25,10 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    BidiResponse, BidiResponseMap, DoneOutcome, NameRegistry, PublishDoneInfo, PublishReceived,
-    PublishReceivedRecv, PublishedNamespace, PublishedNamespaceRecv, Reader, RequestId, Session,
-    SessionError, Subscribe, SubscribeNamespace, SubscribeNamespaceInfo, SubscribeRecv, Writer,
+    fetch_range_is_valid, validate_fetch_params, BidiResponse, BidiResponseMap, DoneOutcome, Fetch,
+    NameRegistry, PublishDoneInfo, PublishReceived, PublishReceivedRecv, PublishedNamespace,
+    PublishedNamespaceRecv, Reader, RequestId, Session, SessionError, Subscribe,
+    SubscribeNamespace, SubscribeNamespaceInfo, SubscribeRecv, Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -77,12 +78,8 @@ struct SubscribeNamespaceCleanup {
     active: bool,
 }
 
-/// Inner cleanup guard for a FETCH data-stream routing entry.
-///
-/// Placing the `Drop` impl on this inner type — rather than on [`FetchStreamReg`]
-/// itself — lets `FetchStreamReg` be destructured by value in an async fn
-/// (`let Self { _cleanup, rx } = self`), moving `rx` directly without any
-/// `Option`/`take()`/`expect()` indirection in production code.
+/// Inner cleanup guard for a FETCH data-stream routing entry; removes the
+/// entry when the owning [`FetchStreamReg`] drops.
 struct FetchStreamCleanup {
     fetch_streams: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Reader>>>>,
     request_id: u64,
@@ -102,7 +99,8 @@ impl Drop for FetchStreamCleanup {
 
 /// RAII registration for a FETCH data-stream routing entry.
 ///
-/// Created by [`Subscriber::register_fetch_stream`].  Owning this value is
+/// Created by [`Subscriber::register_fetch_stream`] and owned by the outbound
+/// [`Fetch`](super::Fetch) handle.  Owning this value is
 /// the *only* way to receive the FETCH data stream: the
 /// [`tokio::sync::oneshot::Receiver<Reader>`] is stored inside and accessible
 /// only through [`await_stream`](Self::await_stream).
@@ -136,20 +134,17 @@ impl FetchStreamReg {
     /// Await the FETCH data stream.
     ///
     /// Returns `Ok(reader)` when [`route_fetch_stream`](Subscriber::route_fetch_stream)
-    /// delivered the data-stream `Reader`, or `Err` when the Sender was already
-    /// dropped before (or during) the wait — for example by an explicit call to
+    /// delivered the data-stream `Reader`, or `Err` when the Sender was dropped
+    /// before (or during) the wait — for example by an explicit call to
     /// [`cancel_fetch_stream`](Subscriber::cancel_fetch_stream).
     ///
-    /// The map entry is cleaned up on every exit: `_cleanup` drops when this
-    /// function returns, removing any still-live entry (no-op if already gone).
-    #[allow(dead_code)] // used once outbound FETCH is issued
+    /// Takes `&mut self` so the wait is cancel-safe: if the awaiting future is
+    /// dropped, the registration stays in place and can be awaited again. The
+    /// map entry is removed when the `FetchStreamReg` itself drops.
     pub(super) async fn await_stream(
-        self,
+        &mut self,
     ) -> Result<Reader, tokio::sync::oneshot::error::RecvError> {
-        let Self { _cleanup, rx } = self;
-        rx.await
-        // _cleanup drops here → removes map entry (no-op if route_fetch_stream
-        // or cancel_fetch_stream already consumed it).
+        (&mut self.rx).await
     }
 }
 
@@ -962,6 +957,120 @@ impl Subscriber {
         Ok(send)
     }
 
+    /// Send a Standalone FETCH (draft-18 §10.12.1).
+    ///
+    /// Opens a request stream, sends FETCH and FINs the send half. The returned
+    /// handle resolves FETCH_OK / REQUEST_ERROR and reads the object stream.
+    /// `Session::run` must be driven concurrently.
+    ///
+    /// The range uses the draft-18 End Location encoding (last Object plus
+    /// one, or `{group, 0}` for the whole group); an empty range is rejected
+    /// locally rather than sent.
+    pub async fn fetch(
+        &mut self,
+        standalone: message::StandaloneFetch,
+        params: KeyValuePairs,
+    ) -> Result<Fetch, ServeError> {
+        if !fetch_range_is_valid(standalone.start_location, standalone.end_location) {
+            return Err(ServeError::Size);
+        }
+        let range = Some((standalone.start_location, standalone.end_location));
+        self.fetch_request(
+            message::FetchType::Standalone,
+            Some(standalone),
+            None,
+            range,
+            params,
+        )
+        .await
+    }
+
+    pub(super) async fn fetch_request(
+        &mut self,
+        fetch_type: message::FetchType,
+        standalone_fetch: Option<message::StandaloneFetch>,
+        joining_fetch: Option<message::JoiningFetch>,
+        range: Option<(crate::coding::Location, crate::coding::Location)>,
+        params: KeyValuePairs,
+    ) -> Result<Fetch, ServeError> {
+        validate_fetch_params(&params).map_err(|_| ServeError::Size)?;
+        let id = self
+            .get_next_request_id()
+            .map_err(|e| ServeError::internal_ctx(format!("request ID limit: {e}")))?;
+        let request = message::Fetch {
+            id,
+            fetch_type,
+            standalone_fetch,
+            joining_fetch,
+            params,
+        };
+
+        // Register before sending so a data stream that overtakes FETCH_OK has
+        // somewhere to go.
+        let registration = self.register_fetch_stream(id);
+        let (mut writer, mut reader) = self
+            .open_request_stream(&Message::Fetch(request.clone()))
+            .await
+            .map_err(|e| ServeError::internal_ctx(format!("failed to open FETCH stream: {e}")))?;
+        // No further messages go on the request stream from this side.
+        let _ = writer.finish();
+
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<u32>();
+        let (fetch, mut recv) = Fetch::new(
+            request,
+            range,
+            self.webtransport.clone(),
+            registration,
+            cancel_tx,
+        );
+
+        let response = async move {
+            let mut cancel_open = true;
+            loop {
+                tokio::select! {
+                    biased;
+                    code = &mut cancel_rx, if cancel_open => match code {
+                        Ok(code) => {
+                            reader.stop(code);
+                            return Ok(());
+                        }
+                        Err(_) => cancel_open = false,
+                    },
+                    msg = Session::decode_bidi_response(&mut reader, id) => {
+                        match msg {
+                            Ok(Message::FetchOk(ok)) => {
+                                recv.recv_ok(ok)?;
+                                // §5.2: exactly one response; FIN follows.
+                                return Ok(());
+                            }
+                            Ok(Message::RequestError(error)) => {
+                                recv.recv_error(error);
+                                return Ok(());
+                            }
+                            Ok(other) => {
+                                return Err(SessionError::ProtocolViolation(format!(
+                                    "unexpected {} on FETCH request stream",
+                                    other.name()
+                                )));
+                            }
+                            Err(err) if err.is_stream_ended() => {
+                                tracing::debug!(request_id = id, error = %err, "FETCH request stream ended without a response");
+                                return Ok(());
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                }
+            }
+        };
+        if self.bidi_task_tx.send(Box::pin(response)).is_err() {
+            return Err(ServeError::internal_ctx(
+                "session request task queue closed",
+            ));
+        }
+        Ok(fetch)
+    }
+
     /// Subscribe to namespace announcements under a prefix (draft-18 §10.18).
     ///
     /// The request gets its own bidirectional stream. REQUEST_OK / REQUEST_ERROR
@@ -1070,13 +1179,12 @@ impl Subscriber {
             // Draft-16 shared responses (REQUEST_OK / REQUEST_ERROR).
             message::Publisher::RequestOk(msg) => self.recv_request_ok(msg)?,
             message::Publisher::RequestError(msg) => self.recv_request_error(msg)?,
-            // FETCH_OK is part of draft-16, but FETCH is not implemented here yet.
-            message::Publisher::FetchOk(msg) => {
-                tracing::debug!(
-                    target: "moq_transport::control",
-                    request_id = msg.id,
-                    "received FETCH_OK for unsupported FETCH — ignoring"
-                );
+            // Draft-18 §10.13: FETCH_OK is only valid on its FETCH request
+            // stream, where the FETCH handle's reader consumes it directly.
+            message::Publisher::FetchOk(_) => {
+                return Err(SessionError::ProtocolViolation(
+                    "FETCH_OK outside its FETCH request stream".to_string(),
+                ));
             }
         }
 
@@ -1808,18 +1916,6 @@ impl Subscriber {
     /// receive the [`Reader`] when the data stream arrives.  Dropping the
     /// registration before calling `await_stream` cancels the entry.
     ///
-    /// # Usage pattern
-    ///
-    /// ```text
-    /// let reg = subscriber.register_fetch_stream(id);
-    /// // open bidi stream, send FETCH message
-    /// match reg.await_stream().await {
-    ///     Ok(reader) => { /* consume object stream */ }
-    ///     Err(_)     => { /* Sender dropped: explicit cancel or lock poison */ }
-    /// }
-    /// // reg's Drop removes the map entry on every path (no-op if already routed)
-    /// ```
-    #[allow(dead_code)] // used once outbound FETCH is issued
     pub(super) fn register_fetch_stream(&self, request_id: u64) -> FetchStreamReg {
         let (tx, rx) = tokio::sync::oneshot::channel();
         match self.fetch_streams.lock() {
@@ -1854,9 +1950,9 @@ impl Subscriber {
     ///
     /// Normally cleanup happens automatically via [`FetchStreamCleanup::drop`]
     /// when the owning [`FetchStreamReg`] goes out of scope.  This function is
-    /// useful when external code (e.g. an outbound FETCH being dropped) needs to
+    /// useful when external code (e.g. the F3 outbound-FETCH Drop impl) needs to
     /// signal cancellation before the registration drops naturally.
-    #[allow(dead_code)] // used once outbound FETCH is issued, and by tests
+    #[cfg(test)]
     pub(super) fn cancel_fetch_stream(&self, request_id: u64) {
         match self.fetch_streams.lock() {
             Ok(mut map) => {
@@ -4750,7 +4846,7 @@ mod tests {
         let (session_a, session_b) = loopback_raw_session_pair().await;
         let subscriber = test_subscriber(session_a);
 
-        let reg = subscriber.register_fetch_stream(2);
+        let mut reg = subscriber.register_fetch_stream(2);
         let (send, recv) = session_b.open_bi().await.unwrap();
         drop(send);
 
@@ -4763,7 +4859,7 @@ mod tests {
             .await
             .expect("timeout");
         assert!(result.is_ok(), "await_stream must yield Ok(Reader)");
-        // _cleanup dropped inside await_stream; route_fetch_stream already removed entry.
+        // route_fetch_stream already removed the entry.
         assert!(subscriber.fetch_streams.lock().unwrap().is_empty());
     }
 
@@ -4803,7 +4899,7 @@ mod tests {
         let (session_a, _) = loopback_raw_session_pair().await;
         let subscriber = test_subscriber(session_a);
 
-        let reg = subscriber.register_fetch_stream(4);
+        let mut reg = subscriber.register_fetch_stream(4);
         assert_eq!(subscriber.fetch_streams.lock().unwrap().len(), 1);
 
         // Abandoning the FETCH calls cancel_fetch_stream to signal the Receiver.
@@ -4856,7 +4952,7 @@ mod tests {
         let (client, server) = loopback_raw_session_pair().await;
         let subscriber = test_subscriber(client.clone());
 
-        let reg = subscriber.register_fetch_stream(4);
+        let mut reg = subscriber.register_fetch_stream(4);
 
         // Server writes FetchHeader (type=0x05, request_id=4) on a uni stream.
         {

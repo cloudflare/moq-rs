@@ -19,11 +19,11 @@ use crate::{
 use crate::watch::Queue;
 
 use super::{
-    split_published_state, BidiResponse, BidiResponseMap, DeliveryError, NameRegistry,
-    ObjectForwarderRecv, PublishNamespace, PublishNamespaceRecv, Published, PublishedInfo,
-    PublishedRecv, Reader, RequestId, Session, SessionError, Subscribed, SubscribedNamespace,
-    SubscribedNamespaceInfo, SubscribedNamespaceRecv, SubscribedTracks, SubscribedTracksInfo,
-    SubscribedTracksRecv, TrackStatusRequested, Writer,
+    split_published_state, BidiResponse, BidiResponseMap, DeliveryError, FetchRequested,
+    FetchRequestedRecv, NameRegistry, ObjectForwarderRecv, PublishNamespace, PublishNamespaceRecv,
+    Published, PublishedInfo, PublishedRecv, Reader, RequestId, Session, SessionError, Subscribed,
+    SubscribedNamespace, SubscribedNamespaceInfo, SubscribedNamespaceRecv, SubscribedTracks,
+    SubscribedTracksInfo, SubscribedTracksRecv, TrackStatusRequested, Writer,
 };
 use crate::message::RequestErrorCode;
 
@@ -138,6 +138,13 @@ pub struct Publisher {
     /// them cooperatively under structured concurrency (no task is spawned).
     bidi_task_tx: super::BidiTaskSender,
 
+    /// Inbound FETCHes awaiting the application.
+    unknown_fetch_requested: Queue<FetchRequested>,
+
+    /// Session halves of inbound FETCHes, keyed by Request ID, so request
+    /// stream teardown can cancel an unanswered FETCH.
+    fetches: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
+
     /// Inbound request streams owned by `Session::run`. Normal serving waits
     /// for the owning writer to encode its terminal message and send FIN.
     pub(super) bidi_response_map: BidiResponseMap,
@@ -231,6 +238,8 @@ impl Publisher {
             request_id,
             mlog,
             bidi_task_tx,
+            unknown_fetch_requested: Default::default(),
+            fetches: Default::default(),
             bidi_response_map: Default::default(),
         }
     }
@@ -884,6 +893,11 @@ impl Publisher {
         self.unknown_track_status_requested.pop().await
     }
 
+    /// Returns the next inbound FETCH request (draft-18 §10.12).
+    pub async fn fetch_requested(&mut self) -> Option<FetchRequested> {
+        self.unknown_fetch_requested.pop().await
+    }
+
     /// Returns the next inbound SUBSCRIBE_NAMESPACE request.
     pub async fn subscribed_namespace(&mut self) -> Option<SubscribedNamespace> {
         self.unknown_subscribed_namespace.pop().await
@@ -1033,16 +1047,15 @@ impl Publisher {
             // or our PUBLISH; the request ID says which.
             message::Subscriber::RequestError(msg) => self.recv_request_error(msg)?,
             message::Subscriber::Unsubscribe(msg) => self.recv_unsubscribe(msg)?,
-            // FETCH not yet implemented — send REQUEST_ERROR NOT_SUPPORTED (§4).
-            message::Subscriber::Fetch(msg) => {
-                self.send_not_supported(msg.id, "fetch");
-            }
-            // FETCH_CANCEL references an existing request; log and ignore.
+            message::Subscriber::Fetch(msg) => self.recv_fetch(msg)?,
+            // Draft-18 has no FETCH_CANCEL (§A.2); a draft-16 peer's FETCH_CANCEL
+            // on the request stream ends that stream, and the request-stream
+            // cleanup cancels the FETCH. Nothing else to do here.
             message::Subscriber::FetchCancel(msg) => {
                 tracing::debug!(
                     target: "moq_transport::control",
                     request_id = msg.id,
-                    "received FETCH_CANCEL for unsupported FETCH — ignoring"
+                    "received draft-16 FETCH_CANCEL"
                 );
             }
             message::Subscriber::TrackStatus(msg) => self.recv_track_status(msg)?,
@@ -1080,6 +1093,71 @@ impl Publisher {
         }
 
         Ok(())
+    }
+
+    /// Handle an inbound FETCH (draft-18 §10.12) and surface it to the
+    /// application.
+    ///
+    /// Requests that can be answered without the application are rejected
+    /// here: an empty standalone range (§10.12.3), and Joining FETCH, which is
+    /// not served yet.
+    fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
+        // §10.2.7 / §10.2.8: out-of-range values are PROTOCOL_VIOLATIONs.
+        super::validate_fetch_params(&msg.params)?;
+        match msg.fetch_type {
+            message::FetchType::Standalone => {
+                let standalone = msg
+                    .standalone_fetch
+                    .as_ref()
+                    .ok_or(SessionError::Internal)?;
+                if !super::fetch_range_is_valid(standalone.start_location, standalone.end_location)
+                {
+                    self.send_request_error(
+                        "fetch",
+                        message::RequestError::new(
+                            msg.id,
+                            RequestErrorCode::InvalidRange,
+                            0,
+                            "fetch start is after end",
+                        ),
+                    );
+                    return Ok(());
+                }
+            }
+            message::FetchType::RelativeJoining | message::FetchType::AbsoluteJoining => {
+                self.send_not_supported(msg.id, "joining_fetch");
+                return Ok(());
+            }
+        }
+
+        let id = msg.id;
+        let (request, recv) = FetchRequested::new(
+            self.webtransport.clone(),
+            self.outgoing.clone(),
+            self.fetches.clone(),
+            msg,
+        );
+        self.fetches
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .insert(id, recv);
+        if let Err(request) = self.unknown_fetch_requested.push(request) {
+            request
+                .reject(RequestErrorCode::InternalError, "fetch queue closed")
+                .map_err(SessionError::Serve)?;
+        }
+        Ok(())
+    }
+
+    /// The request stream of an inbound FETCH ended. If no response was sent
+    /// the requester abandoned it (draft-18 §5.2), so tell the application.
+    pub(super) fn cancel_fetch(&self, id: u64) {
+        let recv = self.fetches.lock().ok().and_then(|mut f| f.remove(&id));
+        if let Some(mut recv) = recv {
+            if recv.cancel_unanswered() {
+                tracing::debug!(request_id = id, "FETCH cancelled by requester");
+            }
+        }
     }
 
     /// Send REQUEST_ERROR NOT_SUPPORTED for an incoming request we do not implement.

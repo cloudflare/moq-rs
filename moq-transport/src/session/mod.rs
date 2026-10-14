@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod error;
+mod fetch;
+mod fetch_requested;
+mod fetch_validation;
 mod name_registry;
 mod publish_namespace;
 mod publish_received;
@@ -22,6 +25,10 @@ mod track_status_requested;
 mod writer;
 
 pub use error::*;
+pub use fetch::Fetch;
+pub(crate) use fetch_requested::FetchRequestedRecv;
+pub use fetch_requested::{FetchOkInfo, FetchRequested, FetchWriter};
+pub(crate) use fetch_validation::*;
 pub(crate) use name_registry::NameRegistry;
 pub use publish_namespace::*;
 pub use publish_received::PublishReceived;
@@ -130,14 +137,8 @@ pub(crate) type BidiResponseMap = Arc<Mutex<HashMap<u64, RequestStreamSink>>>;
 enum BidiRequestKind {
     Subscribe,
     Publish,
-    /// Inbound FETCH: the publisher serves object data on a separate
-    /// unidirectional stream keyed by request ID.
-    ///
-    /// When the bidi control stream tears down, the outbound-FETCH routing
-    /// table on the subscriber side is not touched: inbound IDs have opposite
-    /// parity from any outbound-FETCH registration (§10.1), so any lookup
-    /// would find nothing.  Cancelling the publisher-side serving task is
-    /// added with FETCH serving.
+    /// Inbound FETCH. Teardown of its request stream before a response was
+    /// sent cancels the request (draft-18 §5.2).
     Fetch,
     Other,
 }
@@ -174,11 +175,9 @@ impl Drop for BidiRequestCleanup {
                 }
             }
             BidiRequestKind::Fetch => {
-                // Inbound FETCH (this session is the publisher): the data-stream
-                // routing table lives on the session that *sent* the FETCH
-                // (outbound side), whose IDs always have opposite parity from
-                // inbound IDs per §10.1 — no outbound registration to cancel.
-                // Cancelling the serving task is added with FETCH serving.
+                if let Some(publisher) = &self.publisher {
+                    publisher.cancel_fetch(self.id);
+                }
             }
             BidiRequestKind::Other => {}
         }
@@ -3290,7 +3289,7 @@ mod tests {
             "bidi_response_map must have entry for request_id={request_id} within 2 s"
         );
 
-        // The bidi response loop receives FetchOk; is_terminal=true
+        // The bidi response loop receives FetchOk.  is_terminal=true
         // → handler FINs its bidi send-half.  The requester's reader sees FIN.
         let msg = tokio::time::timeout(
             std::time::Duration::from_secs(2),
