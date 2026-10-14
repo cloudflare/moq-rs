@@ -749,6 +749,10 @@ impl Coordinator for FileCoordinator {
         scope_config::get_scope_config(self.scope_config.as_ref(), scope).await
     }
 
+    fn reuse_scope_config_on_error(&self) -> bool {
+        scope_config::reuse_scope_config_on_error(self.scope_config.as_ref())
+    }
+
     async fn shutdown(&self) -> CoordinatorResult<()> {
         // Nothing to clean up - file will be unlocked automatically
         Ok(())
@@ -780,6 +784,23 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .expect("test namespace should be valid")
+    }
+
+    /// A broken `--scope-config` must not fall back to cached state; without
+    /// the flag the library default stays.
+    #[test]
+    fn scope_config_turns_off_cached_policy_reuse() {
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(temp_file_path("reuse-default"), relay_url.clone());
+        assert!(coordinator.reuse_scope_config_on_error());
+
+        let config = temp_file_path("reuse-scope-config");
+        std::fs::write(&config, "{}").unwrap();
+        let source = Arc::new(ScopeConfigSource::open(&config).unwrap());
+        let coordinator = FileCoordinator::new(temp_file_path("reuse-off"), relay_url)
+            .with_scope_config(Some(source));
+        assert!(!coordinator.reuse_scope_config_on_error());
+        std::fs::remove_file(config).unwrap();
     }
 
     #[tokio::test]

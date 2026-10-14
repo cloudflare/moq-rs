@@ -325,6 +325,10 @@ impl Coordinator for ApiCoordinator {
         scope_config::get_scope_config(self.scope_config.as_ref(), scope).await
     }
 
+    fn reuse_scope_config_on_error(&self) -> bool {
+        scope_config::reuse_scope_config_on_error(self.scope_config.as_ref())
+    }
+
     async fn shutdown(&self) -> CoordinatorResult<()> {
         tracing::info!("shutting down API coordinator");
         // The moq-api client uses reqwest which handles connection cleanup internally
@@ -361,5 +365,25 @@ mod tests {
 
         assert_eq!(config.registration_ttl_secs, 120);
         assert_eq!(config.refresh_interval_secs, 60);
+    }
+
+    /// A broken `--scope-config` must not fall back to cached state; without
+    /// the flag the library default stays.
+    #[test]
+    fn scope_config_turns_off_cached_policy_reuse() {
+        let api_url = Url::parse("http://localhost:8080").unwrap();
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let config = ApiCoordinatorConfig::new(api_url, relay_url);
+        assert!(ApiCoordinator::new(config.clone()).reuse_scope_config_on_error());
+
+        let path = std::env::temp_dir().join(format!(
+            "moq-api-coordinator-reuse-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, "{}").unwrap();
+        let source = Arc::new(ScopeConfigSource::open(&path).unwrap());
+        let coordinator = ApiCoordinator::new(config).with_scope_config(Some(source));
+        assert!(!coordinator.reuse_scope_config_on_error());
+        std::fs::remove_file(path).unwrap();
     }
 }

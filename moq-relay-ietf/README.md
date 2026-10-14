@@ -54,14 +54,13 @@ The `moq-relay-ietf` binary can load per-scope CAT policy from a JSON file, so t
 
 **Enforced scopes and multiple relays.** The relay library exempts sessions that the embedder tags as internal relay peers from token authorization. This binary has no way to tag peers yet, so every inbound session is treated as a public client. That includes peers in an `--api` or `--api-url` cluster and `--announce` forward links. Peer relays present no token, so in a scope that enforces tokens they are refused like any client without one, and media published on one relay doesn't reach subscribers on another. Scopes with `"auth": null` are unaffected. The relay logs a warning at startup when `--scope-config` is combined with these options.
 
-**Validation and failures.** The whole file is validated together: unknown fields, a bad key, or a malformed scope key in any entry rejects the entire file. If the file is unusable at startup, the relay refuses to start. If it later goes missing, becomes unreadable, or fails validation, the relay's policy lookup returns an error, which is logged with the file and location (never key material). The relay never treats that error as "no policy". Instead, the relay library's cached-policy rules apply:
+**Validation and failures.** The whole file is validated together: unknown fields, a bad key, or a malformed scope key in any entry rejects the entire file. If the file is unusable at startup, the relay refuses to start. If it later goes missing, becomes unreadable, or fails validation, the relay's policy lookup returns an error, which is logged with the file and location (never key material). The relay never treats that error as "no policy", and it doesn't fall back to a scope's cached state either (the binary turns off the relay library's `reuse_scope_config_on_error`):
 
-- A scope the relay has never resolved refuses new sessions with UNAUTHORIZED.
-- A scope with an enforced cached policy keeps using it for at most 12 of its TTLs after the last successful load (one hour at the default `ttl_secs`), then refuses new sessions until the file is fixed.
-- A scope whose cached state is "no policy" keeps admitting sessions without a token, with no time limit.
-- The relay retries a failed lookup every 30 seconds, so a fixed file takes effect within about 30 s.
+- A scope whose cached entry is still fresh keeps its cached state until the entry expires: its `ttl_secs` for an enforced policy, 300 s for no policy.
+- After that, the scope refuses new sessions with UNAUTHORIZED until the file is fixed. This includes scopes that previously had no policy.
+- A failed lookup isn't cached, so once the file is fixed, the next session's lookup picks it up (the file is re-checked at most once a second).
 
-So an edit that fails validation does not take effect, and every scope keeps its previous state, which may be no policy. Watch the error log after editing the file.
+So an edit that fails validation does not take effect, and it shuts every scope to new sessions once their cache entries expire. Watch the error log after editing the file.
 
 **Reloading.** The file and any `pem_file`s are re-checked when the relay looks up a scope's policy (at most once a second), so edits apply without a restart. The relay caches each scope's resolved policy, though, so an edit reaches a scope's new sessions only after that scope's cache entry expires:
 

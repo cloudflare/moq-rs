@@ -520,9 +520,10 @@ impl ScopeConfigSource {
 
     /// Load the file, reusing the previous result if nothing changed.
     ///
-    /// Logs only when the outcome changes. A broken file is re-read once per
-    /// [`REVALIDATE_INTERVAL`] for as long as the library keeps retrying, and
-    /// logging each read would bury the first, useful, message.
+    /// Logs only when the outcome changes. The binary turns off the library's
+    /// reuse of cached policy, so a failed lookup is not cached and a broken
+    /// file is re-read once per [`REVALIDATE_INTERVAL`] for as long as sessions
+    /// keep arriving. Logging each read would bury the first, useful, message.
     fn load(&self) -> Result<Arc<ScopePolicies>, ScopeConfigError> {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
 
@@ -681,6 +682,21 @@ pub async fn get_scope_config(
         // Exactly the trait's default: no flag, no change in behaviour.
         None => Ok(ScopeConfig::default()),
     }
+}
+
+/// Shared [`Coordinator::reuse_scope_config_on_error`] answer for the binary's
+/// coordinators.
+///
+/// With `--scope-config` the policy comes from a local file, so a failed lookup
+/// almost always means the operator broke the file. Reusing the cached state
+/// would hide that, and for a scope cached as "no policy" it would keep
+/// admitting sessions without a token. Reuse is therefore off when a scope
+/// config is set. Without one, nothing can fail, and the library default is
+/// kept.
+///
+/// [`Coordinator::reuse_scope_config_on_error`]: moq_relay_ietf::Coordinator::reuse_scope_config_on_error
+pub fn reuse_scope_config_on_error(source: Option<&Arc<ScopeConfigSource>>) -> bool {
+    source.is_none()
 }
 
 #[cfg(test)]
