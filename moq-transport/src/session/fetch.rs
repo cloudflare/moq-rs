@@ -519,6 +519,51 @@ mod tests {
         assert_eq!(groups, vec![4, 2, 0]);
     }
 
+    /// An End Location of `{group, 0}` covers the whole of `group` (§10.12.1),
+    /// so any Object in it is in range and the next group is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn whole_group_end_location_covers_the_group() {
+        let (mut sub, mut publ) = pair().await;
+        let mut fetch = sub
+            .fetch(
+                request(Location::new(1, 0), Location::new(2, 0)),
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        let requested = tokio::time::timeout(T, publ.fetch_requested())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut writer = requested
+            .respond(ok_info(Location::new(2, 0)))
+            .await
+            .unwrap();
+        writer.write_record(&obj(1, 0, 0)).await.unwrap();
+        writer.write_record(&obj(2, 0, 0)).await.unwrap();
+        writer.write_record(&obj(2, 900, 0)).await.unwrap();
+        assert!(
+            writer.write_record(&obj(3, 0, 0)).await.is_err(),
+            "the group after a whole-group end is out of range"
+        );
+        writer.finish().await.unwrap();
+
+        tokio::time::timeout(T, fetch.ok()).await.unwrap().unwrap();
+        let locations: Vec<Location> = read_all(&mut fetch)
+            .await
+            .into_iter()
+            .map(|(r, _)| r.location())
+            .collect();
+        assert_eq!(
+            locations,
+            vec![
+                Location::new(1, 0),
+                Location::new(2, 0),
+                Location::new(2, 900)
+            ]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_fetch_surfaces_request_error() {
         let (mut sub, mut publ) = pair().await;

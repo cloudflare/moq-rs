@@ -463,8 +463,16 @@ impl Producer {
                 DenyReason::TokenExpired => RequestErrorCode::ExpiredAuthToken,
                 _ => RequestErrorCode::Unauthorized,
             };
+            tracing::debug!(
+                request_id = fetch.id(),
+                namespace = %standalone.track_namespace.to_utf8_path(),
+                track = %standalone.track_name,
+                reason = ?reason,
+                "FETCH denied"
+            );
+            // A denial is an answered request, like DOES_NOT_EXIST below.
             fetch.reject(code, "unauthorized")?;
-            return Err(anyhow::anyhow!("unauthorized FETCH"));
+            return Ok(());
         }
 
         // Only GROUP_ORDER is forwarded: the response's delta encoding depends

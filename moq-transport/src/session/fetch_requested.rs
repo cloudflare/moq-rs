@@ -270,6 +270,9 @@ impl FetchRequested {
                 Err(ServeError::Timeout.into())
             }
             ProxyOutcome::Done(Err(err)) => {
+                // Any opened stream keeps its INTERNAL_ERROR reset code: the
+                // body copy failed partway, and the requester must not take
+                // the truncated body as complete.
                 if let Some(error) = upstream.rejection() {
                     self.reject_with(error)?;
                 } else {
