@@ -14,6 +14,7 @@ members = [
 	"moq-catalog",
 	"moq-test-client",
 	"moq-cat-mint",
+	"moq-test-relay",
 ]
 resolver = "2"
 
