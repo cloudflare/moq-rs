@@ -388,6 +388,47 @@ mod tests {
         (client_sub, server_pub)
     }
 
+    /// FETCHes beyond the per-session cap get EXCESSIVE_LOAD, and answering
+    /// one frees its slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_fetches_beyond_the_cap_are_excessive_load() {
+        let (mut sub, mut publ) = pair().await;
+        let cap = crate::session::publisher::MAX_INBOUND_FETCHES_PER_SESSION;
+        let range = || request(Location::new(0, 0), Location::new(1, 0));
+        let mut held = Vec::new();
+        let mut pending = Vec::new();
+        for _ in 0..cap {
+            pending.push(sub.fetch(range(), KeyValuePairs::default()).await.unwrap());
+            held.push(
+                tokio::time::timeout(T, publ.fetch_requested())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let over = sub.fetch(range(), KeyValuePairs::default()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(T, over.ok()).await.unwrap(),
+            Err(ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64))
+        );
+
+        // Answering one frees a slot.
+        held.pop()
+            .unwrap()
+            .reject(RequestErrorCode::DoesNotExist, "gone")
+            .unwrap();
+        let rejected = pending.pop().unwrap();
+        tokio::time::timeout(T, rejected.ok())
+            .await
+            .unwrap()
+            .unwrap_err();
+        let _again = sub.fetch(range(), KeyValuePairs::default()).await.unwrap();
+        let _accepted = tokio::time::timeout(T, publ.fetch_requested())
+            .await
+            .expect("a freed slot accepts the next FETCH")
+            .unwrap();
+    }
+
     /// A publisher that never opted in to FETCH answers NOT_SUPPORTED, as it
     /// did before FETCH serving existed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1948,10 +1948,10 @@ impl Subscriber {
     /// consumed by [`route_fetch_stream`](Self::route_fetch_stream) or by
     /// [`FetchStreamCleanup::drop`]) this is a no-op.
     ///
-    /// Normally cleanup happens automatically via [`FetchStreamCleanup::drop`]
-    /// when the owning [`FetchStreamReg`] goes out of scope.  This function is
-    /// useful when external code (e.g. the F3 outbound-FETCH Drop impl) needs to
-    /// signal cancellation before the registration drops naturally.
+    /// Production code relies on [`FetchStreamCleanup::drop`] when the owning
+    /// [`FetchStreamReg`] goes out of scope; a cancelled [`super::Fetch`]
+    /// signals through its own channel. This exists to test the explicit
+    /// removal path of the routing table.
     #[cfg(test)]
     pub(super) fn cancel_fetch_stream(&self, request_id: u64) {
         match self.fetch_streams.lock() {

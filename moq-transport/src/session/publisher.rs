@@ -33,7 +33,11 @@ use crate::message::RequestErrorCode;
 /// Most inbound FETCHes one session may have in flight (queued for the
 /// application or being answered). Further FETCHes get EXCESSIVE_LOAD, so a
 /// peer cannot grow the queue without bound.
+#[cfg(not(test))]
 const MAX_INBOUND_FETCHES_PER_SESSION: usize = 128;
+/// Small in tests so the cap is reachable within QUIC's stream limits.
+#[cfg(test)]
+pub(super) const MAX_INBOUND_FETCHES_PER_SESSION: usize = 4;
 
 /// Publisher-side state for one outbound PUBLISH.
 ///
