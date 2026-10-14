@@ -1201,15 +1201,29 @@ impl Publisher {
         Ok(())
     }
 
-    /// The request stream of an inbound FETCH ended. If no response was sent
-    /// the requester abandoned it (draft-18 §5.2), so tell the application.
+    /// The requester reset or stopped an inbound FETCH's request stream, which
+    /// cancels it (draft-18 §5.2), before or after FETCH_OK. The entry stays
+    /// until the [`FetchRequested`] drops, so the cap counts the FETCH until
+    /// its serving actually stops.
     pub(super) fn cancel_fetch(&self, id: u64) {
-        let recv = self.fetches.lock().ok().and_then(|mut f| f.remove(&id));
-        if let Some(mut recv) = recv {
-            if recv.cancel_unanswered() {
+        let Ok(mut fetches) = self.fetches.lock() else {
+            return;
+        };
+        if let Some(recv) = fetches.get_mut(&id) {
+            if recv.cancel() {
                 tracing::debug!(request_id = id, "FETCH cancelled by requester");
             }
         }
+    }
+
+    /// A future resolving when the application stops serving FETCH `id`, or
+    /// `None` if it was answered on receipt (NOT_SUPPORTED, EXCESSIVE_LOAD,
+    /// INVALID_RANGE) and nothing is serving it.
+    pub(super) fn fetch_served(
+        &self,
+        id: u64,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+        self.fetches.lock().ok()?.get(&id).map(|recv| recv.served())
     }
 
     /// Send REQUEST_ERROR NOT_SUPPORTED for an incoming request we do not implement.

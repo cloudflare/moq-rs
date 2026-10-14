@@ -16,7 +16,9 @@
 //! * There is no FETCH_CANCEL (§A.2, "remove cancel messages"). A requester
 //!   cancels with STOP_SENDING / RESET_STREAM on the request stream (§5.2),
 //!   which the session turns into [`FetchRequestedRecv::cancel`], or by
-//!   STOP_SENDING the data stream, which surfaces as a write error.
+//!   STOP_SENDING the data stream, which surfaces as a write error. The
+//!   request stream therefore stays open until the response is finished or
+//!   reset, not just until FETCH_OK.
 //! * FETCH objects are delta encoded against the group order (§11.4.4.1), so
 //!   the writer's encoder is created with the request's GROUP_ORDER.
 
@@ -98,21 +100,40 @@ pub(crate) struct FetchRequestedRecv {
 }
 
 impl FetchRequestedRecv {
-    /// The requester abandoned the request stream before a response was sent.
+    /// The requester cancelled: it reset or stopped the request stream (§5.2).
     ///
-    /// Returns whether the request was still unanswered. Once FETCH_OK is
-    /// queued the request stream FINs normally, so its teardown is not a
-    /// cancellation; a requester that loses interest after FETCH_OK stops the
-    /// data stream instead.
-    pub fn cancel_unanswered(&mut self) -> bool {
+    /// Returns whether the request was still live. Before a response this
+    /// suppresses the REQUEST_ERROR a dropped [`FetchRequested`] would send;
+    /// after FETCH_OK it makes the response writer stop and reset the data
+    /// stream with CANCELLED.
+    pub fn cancel(&mut self) -> bool {
         let Some(mut state) = self.state.lock_mut() else {
             return false;
         };
-        if state.responded || state.closed.is_err() {
+        if state.closed.is_err() {
             return false;
         }
         state.closed = Err(ServeError::Cancel);
         true
+    }
+
+    /// Resolves once the application half is gone: the response was finished
+    /// or reset, the request was rejected, or the [`FetchRequested`] dropped.
+    ///
+    /// The request-stream handler waits for this before it FINs, so the
+    /// request stream (and its cancellation path) lives as long as the
+    /// response is being served.
+    pub fn served(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let state = self.state.clone();
+        async move {
+            loop {
+                let notify = state.lock().modified();
+                match notify {
+                    Some(notify) => notify.await,
+                    None => return,
+                }
+            }
+        }
     }
 }
 
@@ -478,11 +499,14 @@ impl FetchWriter {
 
     async fn write(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
         let write = self.stream.writer.write(bytes);
-        tokio::select! {
+        let result = tokio::select! {
             biased;
-            err = self.request.closed() => Err(err.into()),
-            result = write => result,
-        }
+            err = self.request.closed() => Err(err),
+            result = write => return result,
+        };
+        // §5.2: a cancelled FETCH has its data stream reset.
+        self.stream.reset = DataStreamResetCode::Cancelled;
+        result.map_err(Into::into)
     }
 }
 
@@ -561,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_before_response_closes_and_suppresses_drop_error() {
         let (request, mut recv, rx, _) = requested(7).await;
-        assert!(recv.cancel_unanswered());
+        assert!(recv.cancel());
         assert_eq!(request.closed().await, ServeError::Cancel);
         drop(request);
         assert!(
@@ -570,12 +594,31 @@ mod tests {
         );
     }
 
+    /// §5.2: STOP_SENDING on the request stream cancels even after FETCH_OK.
     #[tokio::test]
-    async fn cancel_after_response_is_not_a_cancellation() {
+    async fn cancel_after_response_still_cancels() {
         let (request, mut recv, _rx, _) = requested(9).await;
         request.claim_response().unwrap();
-        assert!(!recv.cancel_unanswered());
-        assert!(!request.is_closed());
+        assert!(recv.cancel());
+        assert!(request.is_closed());
+        assert!(!recv.cancel(), "a second cancel is a no-op");
+    }
+
+    #[tokio::test]
+    async fn served_resolves_when_the_request_drops() {
+        let (request, recv, _rx, _) = requested(15).await;
+        let served = recv.served();
+        tokio::pin!(served);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut served)
+                .await
+                .is_err(),
+            "still being served"
+        );
+        drop(request);
+        tokio::time::timeout(Duration::from_secs(2), served)
+            .await
+            .expect("served after the request dropped");
     }
 
     #[tokio::test]

@@ -1026,6 +1026,7 @@ impl Subscriber {
 
         let response = async move {
             let mut cancel_open = true;
+            let mut answered = false;
             loop {
                 tokio::select! {
                     biased;
@@ -1038,12 +1039,16 @@ impl Subscriber {
                     },
                     msg = Session::decode_bidi_response(&mut reader, id) => {
                         match msg {
-                            Ok(Message::FetchOk(ok)) => {
+                            // §5.2: exactly one response. After FETCH_OK the
+                            // stream stays open until the publisher finishes
+                            // the response, and dropping the reader here would
+                            // STOP_SENDING it, which cancels the FETCH. So keep
+                            // reading until FIN, or until the caller cancels.
+                            Ok(Message::FetchOk(ok)) if !answered => {
                                 recv.recv_ok(ok)?;
-                                // §5.2: exactly one response; FIN follows.
-                                return Ok(());
+                                answered = true;
                             }
-                            Ok(Message::RequestError(error)) => {
+                            Ok(Message::RequestError(error)) if !answered => {
                                 recv.recv_error(error);
                                 return Ok(());
                             }

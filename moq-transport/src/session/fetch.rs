@@ -693,6 +693,81 @@ mod tests {
         );
     }
 
+    /// §5.2: the requester can cancel after FETCH_OK, and the publisher sees it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_fetch_after_fetch_ok_cancels_the_response() {
+        let (mut sub, mut publ) = pair().await;
+        let fetch = sub
+            .fetch(
+                request(Location::new(0, 0), Location::new(1, 0)),
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        let requested = tokio::time::timeout(T, publ.fetch_requested())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut writer = requested
+            .respond(ok_info(Location::new(1, 0)))
+            .await
+            .unwrap();
+        tokio::time::timeout(T, fetch.ok()).await.unwrap().unwrap();
+        drop(fetch);
+
+        // Keep writing an endless payload until the cancel lands; it may
+        // already have landed before the first record.
+        let cancelled = tokio::time::timeout(T, async {
+            if writer.write_record(&obj(0, 0, u64::MAX)).await.is_err() {
+                return;
+            }
+            while writer.write_payload(&[0; 1024]).await.is_ok() {}
+        })
+        .await;
+        assert!(cancelled.is_ok(), "the writer must observe the cancel");
+    }
+
+    /// A FETCH counts against the cap until its response ends, not just until
+    /// FETCH_OK.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_holds_its_cap_slot_until_the_response_ends() {
+        let (mut sub, mut publ) = pair().await;
+        let cap = crate::session::publisher::MAX_INBOUND_FETCHES_PER_SESSION;
+        let range = || request(Location::new(0, 0), Location::new(1, 0));
+        let mut fetches = Vec::new();
+        let mut writers = Vec::new();
+        for _ in 0..cap {
+            let fetch = sub.fetch(range(), KeyValuePairs::default()).await.unwrap();
+            let requested = tokio::time::timeout(T, publ.fetch_requested())
+                .await
+                .unwrap()
+                .unwrap();
+            writers.push(
+                requested
+                    .respond(ok_info(Location::new(0, 1)))
+                    .await
+                    .unwrap(),
+            );
+            tokio::time::timeout(T, fetch.ok()).await.unwrap().unwrap();
+            fetches.push(fetch);
+        }
+        let over = sub.fetch(range(), KeyValuePairs::default()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(T, over.ok()).await.unwrap(),
+            Err(ServeError::Closed(RequestErrorCode::ExcessiveLoad as u64)),
+            "FETCH_OK alone does not free a slot"
+        );
+
+        writers.pop().unwrap().finish().await.unwrap();
+        let mut done = fetches.pop().unwrap();
+        assert!(read_all(&mut done).await.is_empty());
+        let _again = sub.fetch(range(), KeyValuePairs::default()).await.unwrap();
+        tokio::time::timeout(T, publ.fetch_requested())
+            .await
+            .expect("a finished response frees its slot")
+            .unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn empty_response_is_header_then_fin() {
         let (mut sub, mut publ) = pair().await;
