@@ -37,9 +37,17 @@
 //!
 //! # Revocation, and what it does not cover
 //!
-//! Rotating a scope's keys stops new sessions being established with the old
-//! key within one [`ScopeAuthConfig::ttl`], but does **not** terminate
-//! sessions already running: a session holds the hook it was admitted with.
+//! While the coordinator is reachable, rotating a scope's keys stops new
+//! sessions being established with the old key within one
+//! [`ScopeAuthConfig::ttl`]. By default, during an outage, new sessions use the
+//! last fetched policy for at most 12 effective TTLs from the last successful
+//! fetch (one hour at the default TTL). A failed refresh past that cap refuses
+//! new sessions until a refresh succeeds. Scopes without a policy have no reuse
+//! limit. A coordinator can turn reuse off with
+//! [`Coordinator::reuse_scope_config_on_error`]; a failed refresh then refuses
+//! new sessions on any scope as soon as its cached entry expires.
+//! Rotation does **not** terminate sessions already running: a session holds
+//! the hook it was admitted with.
 //! Token expiry is therefore what bounds a compromised credential, which is
 //! why the CAT hook requires `exp` and caps how far ahead it may be.
 //!
@@ -55,17 +63,23 @@
 //!
 //! Once a scope has opted in, anything short of an explicit allow denies:
 //!
-//! * a coordinator that cannot be reached,
+//! * a coordinator that cannot be reached before this scope's policy has been
+//!   fetched, after the enforced policy's 12-TTL reuse cap, or whenever a fetch
+//!   fails with reuse turned off,
 //! * a configuration with no keys, too many keys, or unparseable key material,
 //! * a relay built without the scheme's feature,
 //! * a hook that returns an error,
 //! * a missing, malformed, expired or out-of-scope token.
 //!
-//! The one deliberate exception is a scope that never opted in, which is not
-//! an authorization failure but the absence of a policy.
+//! By default, a failed refresh reuses a fetched policy within the cap, with
+//! token checks enforced. A cached configuration with no policy has no reuse
+//! limit because it does not require token authorization. A coordinator can
+//! turn this exception off with [`Coordinator::reuse_scope_config_on_error`],
+//! so every failed fetch denies admission even on scopes without a policy.
 //!
 //! [`Coordinator::resolve_scope`]: crate::Coordinator::resolve_scope
 //! [`Coordinator::get_scope_config`]: crate::Coordinator::get_scope_config
+//! [`Coordinator::reuse_scope_config_on_error`]: crate::Coordinator::reuse_scope_config_on_error
 //! [`ScopeAuthConfig`]: crate::ScopeAuthConfig
 
 mod hook;

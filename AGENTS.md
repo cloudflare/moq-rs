@@ -78,7 +78,13 @@ otherwise undo. Prefer citing a draft section over restating the line below.
 **Fail closed.** Anything on an authorization or admission path treats an error
 as a denial, never as a pass. `Result` in that code is not an escape hatch:
 `unwrap_or_default`, `.ok()` and a permissive `_ =>` arm are how these bugs get
-written.
+written. The scope-policy cache is the one exception: by default, to admit new
+sessions during a coordinator outage, it reuses the last fetched policy after
+a failed refresh. A coordinator can turn this exception off with
+`Coordinator::reuse_scope_config_on_error`. Reuse is limited to 12 effective
+TTLs from the last successful fetch on scopes that enforce tokens. Scopes
+without a policy have no reuse limit. A scope whose configuration has never
+been fetched denies new sessions if the fetch fails.
 
 **Tests should fail when the behaviour breaks.** For a security control, check
 that: remove the control, confirm a test goes red, put it back. A test that
