@@ -8,8 +8,7 @@ use crate::data::{ObjectStatus, StreamHeaderType};
 ///
 /// A publisher opens a **unidirectional** stream per FETCH response.  The
 /// stream begins with this header, which ties it back to the originating FETCH
-/// request via [`request_id`].  All subsequent bytes are zero or more
-/// [`FetchObject`] frames (header + payload), each read independently.
+/// request via [`request_id`].  The FETCH objects follow it (§11.4.4).
 ///
 /// # Wire format
 ///
@@ -53,7 +52,11 @@ impl Encode for FetchHeader {
     }
 }
 
-/// One object frame on a FETCH data stream (§11.5).
+/// Legacy fixed-layout FETCH object, retained for source compatibility.
+///
+/// This is **not** the draft-18 FETCH object encoding, which uses
+/// Serialization Flags and delta-encoded IDs (§11.4.4). The draft-18 codec
+/// arrives with FETCH serving.
 ///
 /// # Payload contract — callers must consume payload bytes
 ///
@@ -67,21 +70,6 @@ impl Encode for FetchHeader {
 ///
 /// For status-only objects (`payload_length == 0`) the next field is the
 /// single-byte [`ObjectStatus`] code; that IS consumed by `decode`.
-///
-/// # Wire format (per object)
-///
-/// ```text
-/// FETCH Object {
-///   Group ID (i),
-///   Subgroup ID (i),
-///   Object ID (i),
-///   Publisher Priority (8),
-///   Extension Headers (..),
-///   Payload Length (i),
-///   [Object Status (8)]  -- only when Payload Length == 0
-///   [payload bytes]      -- Payload Length raw bytes, read/written by caller
-/// }
-/// ```
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct FetchObject {
     /// Group sequence number.

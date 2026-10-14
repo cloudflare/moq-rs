@@ -136,8 +136,8 @@ enum BidiRequestKind {
     /// When the bidi control stream tears down, the outbound-FETCH routing
     /// table on the subscriber side is not touched: inbound IDs have opposite
     /// parity from any outbound-FETCH registration (§10.1), so any lookup
-    /// would find nothing.  The publisher-side serving-task cancel is added
-    /// in PR F2.
+    /// would find nothing.  Cancelling the publisher-side serving task is
+    /// added with FETCH serving.
     Fetch,
     Other,
 }
@@ -178,7 +178,7 @@ impl Drop for BidiRequestCleanup {
                 // routing table lives on the session that *sent* the FETCH
                 // (outbound side), whose IDs always have opposite parity from
                 // inbound IDs per §10.1 — no outbound registration to cancel.
-                // Publisher-side serving-task cancel is added in PR F2.
+                // Cancelling the serving task is added with FETCH serving.
             }
             BidiRequestKind::Other => {}
         }
@@ -3177,16 +3177,16 @@ mod tests {
         drop(client_session);
     }
 
-    // ── FETCH bidi-stream lifecycle (B2, B3, decode_bidi_response) ───────────
+    // ── FETCH bidi-stream lifecycle ──────────────────────────────────────────
     //
-    // B2 has a full handle_bidi_request integration test (inject FetchOk via
+    // This has a full handle_bidi_request integration test (inject FetchOk via
     // bidi_response_map, verify bidi stream FINs). Draft-18 has no
     // FETCH_CANCEL: a requester cancels by resetting the request stream
     // (section 5.2), which is covered with the FETCH serving path.
 
-    /// B2: `FetchOk` in `is_terminal` — FINs the bidi stream after `FetchOk`.
+    /// `FetchOk` in `is_terminal` FINs the bidi stream after `FetchOk`.
     ///
-    /// The actual B2 fix is adding `Message::FetchOk(_)` to `is_terminal` in
+    /// The fix is adding `Message::FetchOk(_)` to `is_terminal` in
     /// the bidi response loop.  This test exercises the real lifecycle path:
     ///
     /// 1. Open a FETCH bidi stream through `handle_bidi_request`.
@@ -3198,7 +3198,7 @@ mod tests {
     /// 4. `is_terminal` fires → bidi send-half FINs → subscriber's bidi
     ///    reader sees FIN (`done() == true`).
     ///
-    /// Without the B2 fix, `FetchOk` is absent from `is_terminal`, the loop
+    /// Without it, `FetchOk` is absent from `is_terminal`, the loop
     /// does not FIN, and the handler occupies one of the 128 shared
     /// `MAX_CONCURRENT_BIDI_STREAMS` slots until idle timeout.
     #[tokio::test]
@@ -3290,7 +3290,7 @@ mod tests {
             "bidi_response_map must have entry for request_id={request_id} within 2 s"
         );
 
-        // The bidi response loop receives FetchOk.  B2 fix: is_terminal=true
+        // The bidi response loop receives FetchOk; is_terminal=true
         // → handler FINs its bidi send-half.  The requester's reader sees FIN.
         let msg = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -3310,7 +3310,7 @@ mod tests {
             .unwrap();
         assert!(
             done,
-            "bidi stream send-half must FIN after FetchOk (B2: is_terminal=true)"
+            "bidi stream send-half must FIN after FetchOk (is_terminal=true)"
         );
 
         // Handler must exit cleanly — it does not leak the bidi slot.

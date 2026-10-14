@@ -142,7 +142,7 @@ impl FetchStreamReg {
     ///
     /// The map entry is cleaned up on every exit: `_cleanup` drops when this
     /// function returns, removing any still-live entry (no-op if already gone).
-    #[allow(dead_code)] // called by the outbound FETCH state machine (PR F3)
+    #[allow(dead_code)] // used once outbound FETCH is issued
     pub(super) async fn await_stream(
         self,
     ) -> Result<Reader, tokio::sync::oneshot::error::RecvError> {
@@ -457,7 +457,7 @@ pub struct Subscriber {
 
     /// Pending FETCH data-stream deliveries, keyed by FETCH request ID.
     ///
-    /// When an outbound FETCH is issued (PR F3), the subscriber inserts a
+    /// When an outbound FETCH is issued, the subscriber inserts a
     /// [`oneshot::Sender<Reader>`] here before the bidi control stream is
     /// opened.  When the publisher later opens the corresponding unidirectional
     /// data stream — identified by the [`crate::data::FetchHeader::request_id`]
@@ -466,7 +466,7 @@ pub struct Subscriber {
     ///
     /// When the FETCH completes normally, [`Self::route_fetch_stream`] removes
     /// the entry.  When the FETCH is abandoned (REQUEST_ERROR, cancellation,
-    /// session shutdown), the F3 state machine drops the [`FetchStreamReg`];
+    /// session shutdown), the outbound FETCH drops the [`FetchStreamReg`];
     /// [`FetchStreamCleanup::drop`] then removes the entry automatically.
     /// [`Self::cancel_fetch_stream`] may also remove an entry explicitly.
     /// An entry cannot outlive its [`FetchStreamReg`] owner.
@@ -1808,7 +1808,7 @@ impl Subscriber {
     /// receive the [`Reader`] when the data stream arrives.  Dropping the
     /// registration before calling `await_stream` cancels the entry.
     ///
-    /// # F3 usage pattern
+    /// # Usage pattern
     ///
     /// ```text
     /// let reg = subscriber.register_fetch_stream(id);
@@ -1819,7 +1819,7 @@ impl Subscriber {
     /// }
     /// // reg's Drop removes the map entry on every path (no-op if already routed)
     /// ```
-    #[allow(dead_code)] // called by the outbound FETCH state machine (PR F3)
+    #[allow(dead_code)] // used once outbound FETCH is issued
     pub(super) fn register_fetch_stream(&self, request_id: u64) -> FetchStreamReg {
         let (tx, rx) = tokio::sync::oneshot::channel();
         match self.fetch_streams.lock() {
@@ -1854,9 +1854,9 @@ impl Subscriber {
     ///
     /// Normally cleanup happens automatically via [`FetchStreamCleanup::drop`]
     /// when the owning [`FetchStreamReg`] goes out of scope.  This function is
-    /// useful when external code (e.g. the F3 outbound-FETCH Drop impl) needs to
+    /// useful when external code (e.g. an outbound FETCH being dropped) needs to
     /// signal cancellation before the registration drops naturally.
-    #[allow(dead_code)] // used by F3 outbound-FETCH Drop impl and tests
+    #[allow(dead_code)] // used once outbound FETCH is issued, and by tests
     pub(super) fn cancel_fetch_stream(&self, request_id: u64) {
         match self.fetch_streams.lock() {
             Ok(mut map) => {
@@ -4738,7 +4738,7 @@ mod tests {
     //
     // Terminal paths tested here:
     //   (a) Normal: data stream arrives  → await_stream Ok, route removes entry
-    //   (b) REQUEST_ERROR / caller drop / session-close → F3 drops FetchStreamReg
+    //   (b) REQUEST_ERROR / caller drop / session-close → FetchStreamReg dropped
     //       → FetchStreamCleanup::drop removes entry (no leak)
     //   (c) Explicit cancel → cancel_fetch_stream removes
     //       entry → Sender dropped → await_stream Err
@@ -4768,7 +4768,7 @@ mod tests {
     }
 
     /// (b) REQUEST_ERROR or session-close terminal: dropping the FetchStreamReg
-    /// without calling await_stream cleans the entry.  In F3 this fires when the
+    /// without calling await_stream cleans the entry.  This fires when the
     /// bidi response is REQUEST_ERROR or the task holding the registration is
     /// cancelled by session shutdown.
     #[tokio::test]
@@ -4779,7 +4779,7 @@ mod tests {
         let reg = subscriber.register_fetch_stream(4);
         assert_eq!(subscriber.fetch_streams.lock().unwrap().len(), 1);
 
-        // F3 received REQUEST_ERROR (or task cancelled by session shutdown) →
+        // REQUEST_ERROR received (or task cancelled by session shutdown) →
         // drops FetchStreamReg → FetchStreamCleanup::drop removes the entry.
         drop(reg);
 
@@ -4848,7 +4848,7 @@ mod tests {
     /// registered waiter via `is_fetch()` dispatch and `recv_fetch_stream`,
     /// and `await_stream` resolves with the Reader.
     ///
-    /// Exercises the full B1 dispatch path:
+    /// Exercises the full dispatch path:
     ///   peer opens uni-stream → FetchHeader → subscriber.recv_stream
     ///   → is_fetch() → recv_fetch_stream → route_fetch_stream → await_stream
     #[tokio::test]
