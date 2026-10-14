@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.30](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.29...moq-relay-ietf-v0.7.30) - 2026-10-14
+
+### Added
+
+- *(moq-relay-ietf)* load CAT scope policy from a --scope-config file
+
+### Fixed
+
+- *(moq-relay-ietf)* do not reuse cached scope policy when --scope-config is set
+- *(moq-relay-ietf)* warn on multi-relay scope configs and wide policies
+- *(auth)* admit internal relay peers on scopes with a token policy
+- *(auth)* reuse the cached scope policy when the coordinator is down
+
+### Other
+
+- *(moq-relay-ietf)* fix the scope config reload table and token actions
+- *(moq-relay-ietf)* qualify the --scope-config help for cached policies
+- *(moq-relay-ietf)* describe scope config failures with the cached-policy rules
+- *(moq-relay-ietf)* tie scope config failure wording to the library cache
+- *(auth)* state that an address alone does not authenticate a relay peer
+
 ## [0.7.29](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.28...moq-relay-ietf-v0.7.29) - 2026-10-12
 
 ### Fixed
