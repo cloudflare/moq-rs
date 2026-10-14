@@ -104,9 +104,10 @@ pub struct Cli {
     ///
     /// When set, scopes the file configures require a valid CAT in the
     /// CLIENT_SETUP AUTHORIZATION TOKEN parameter. The file is re-read for new
-    /// sessions, so edits apply without a restart. If it later becomes
-    /// missing or invalid, sessions are refused rather than admitted
-    /// without a token. Requires a relay built with `--features auth-cat`.
+    /// sessions, so edits apply without a restart once a scope's cached
+    /// policy expires. If the file later becomes missing or invalid, each
+    /// scope keeps its cached state until it expires, then refuses new
+    /// sessions rather than admitting them without a token. Requires a relay built with `--features auth-cat`.
     /// See the moq-relay-ietf README for the format.
     #[arg(long, env = "MOQ_RELAY_SCOPE_CONFIG")]
     pub scope_config: Option<PathBuf>,
