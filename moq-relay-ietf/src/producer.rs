@@ -3437,8 +3437,10 @@ mod tests {
             id: 0,
             fetch_type: moq_transport::message::FetchType::RelativeJoining,
             standalone_fetch: None,
+            // Odd: an ID only the relay could allocate, so it can never be a
+            // SUBSCRIBE from this peer and is refused without waiting.
             joining_fetch: Some(moq_transport::message::JoiningFetch {
-                joining_request_id: 2,
+                joining_request_id: 1,
                 joining_start: 1,
             }),
             params: KeyValuePairs::default(),

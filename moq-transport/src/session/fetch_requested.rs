@@ -37,8 +37,8 @@ use crate::{
 };
 
 use super::{
-    joining_fetch_end_location, Fetch, FetchValidator, JoiningError, JoiningHandle,
-    JoiningSnapshot, SessionError, Writer,
+    joining_fetch_end_location, Fetch, FetchValidator, JoiningError, JoiningSnapshot,
+    JoiningTarget, SessionError, Writer,
 };
 
 /// Chunk size for relaying upstream FETCH payloads in [`FetchRequested::proxy`].
@@ -134,7 +134,7 @@ pub struct FetchRequested {
     state: State<FetchRequestedState>,
     id: u64,
     /// The subscription a Joining FETCH references, found when it arrived.
-    joining: Option<JoiningHandle>,
+    joining: Option<JoiningTarget>,
     /// The range [`Self::resolve`] settled on.
     resolved: OnceLock<message::StandaloneFetch>,
     /// The FETCH as received.
@@ -199,7 +199,7 @@ impl FetchRequested {
         outgoing: Queue<Message>,
         active: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
         request: message::Fetch,
-        joining: Option<JoiningHandle>,
+        joining: Option<JoiningTarget>,
     ) -> (Self, FetchRequestedRecv) {
         let (send, recv) = State::default().split();
         (
@@ -235,7 +235,8 @@ impl FetchRequested {
     /// caller bounds this with its own timeout. If the request cannot be
     /// served, REQUEST_ERROR is sent and `None` is returned:
     ///
-    /// * INVALID_JOINING_REQUEST_ID when the subscription ended first;
+    /// * INVALID_JOINING_REQUEST_ID when the subscription is unknown (a
+    ///   SUBSCRIBE not yet read is waited for briefly) or ended first;
     /// * INVALID_RANGE when it has Forward State 0, had no Objects when it was
     ///   accepted, or the computed start is past the Joining Location.
     pub async fn resolve(&self) -> Result<Option<message::StandaloneFetch>, SessionError> {
@@ -249,7 +250,14 @@ impl FetchRequested {
                 .clone()
                 .ok_or(SessionError::Internal)?,
             message::FetchType::RelativeJoining | message::FetchType::AbsoluteJoining => {
-                let joining = self.joining.as_ref().ok_or(SessionError::Internal)?;
+                let target = self.joining.as_ref().ok_or(SessionError::Internal)?;
+                let Some(joining) = target.handle().await else {
+                    self.send_resolution_error(
+                        RequestErrorCode::InvalidJoiningRequestId,
+                        "no such subscription",
+                    );
+                    return Ok(None);
+                };
                 let fields = self
                     .request
                     .joining_fetch

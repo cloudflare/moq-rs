@@ -1257,6 +1257,69 @@ pub(super) struct JoiningHandle {
     forward: bool,
 }
 
+/// A Joining FETCH's reference to a subscription.
+pub(super) enum JoiningTarget {
+    /// The SUBSCRIBE had arrived when the FETCH did.
+    Known(JoiningHandle),
+    /// The SUBSCRIBE may still be on its way: request streams are unordered,
+    /// so the FETCH can be read first.
+    Awaiting(PendingJoin),
+}
+
+impl JoiningTarget {
+    /// The subscription, waiting for its SUBSCRIBE if needed. `None` means
+    /// the Request ID names no subscription (INVALID_JOINING_REQUEST_ID).
+    pub async fn handle(&self) -> Option<JoiningHandle> {
+        match self {
+            Self::Known(handle) => Some(handle.clone()),
+            Self::Awaiting(pending) => pending.wait().await,
+        }
+    }
+}
+
+/// How long a Joining FETCH waits for a SUBSCRIBE that has not arrived yet.
+/// Covers stream reordering, not a peer that never sends it.
+const PENDING_JOIN_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Waits for an inbound SUBSCRIBE with a given Request ID.
+pub(super) struct PendingJoin {
+    pub subscribeds: std::sync::Weak<Mutex<std::collections::HashMap<u64, ObjectForwarderRecv>>>,
+    pub request_ids: super::RequestId,
+    /// Notified whenever an inbound SUBSCRIBE is registered.
+    pub arrived: Arc<tokio::sync::Notify>,
+    pub id: u64,
+}
+
+impl PendingJoin {
+    async fn wait(&self) -> Option<JoiningHandle> {
+        let deadline = tokio::time::Instant::now() + PENDING_JOIN_HOLD;
+        loop {
+            // Register for the wakeup before checking, so a SUBSCRIBE that
+            // lands in between is not missed.
+            let notified = self.arrived.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let subscribeds = self.subscribeds.upgrade()?;
+            if let Some(handle) = subscribeds
+                .lock()
+                .ok()?
+                .get(&self.id)
+                .and_then(|recv| recv.joining_handle())
+            {
+                return Some(handle);
+            }
+            drop(subscribeds);
+            // Used by something else, or never coming in time.
+            if !self.request_ids.is_unused_peer_id(self.id) {
+                return None;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return None;
+            }
+        }
+    }
+}
+
 /// Why a subscription cannot be joined.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum JoiningError {

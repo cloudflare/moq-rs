@@ -737,10 +737,71 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn joining_fetch_for_an_unknown_subscription_is_rejected() {
         let (mut sub, _publ) = pair().await;
+        // Not an ID the client can use (wrong parity).
         assert_eq!(
-            joining_error(&mut sub, crate::message::FetchType::AbsoluteJoining, 98, 0).await,
+            joining_error(&mut sub, crate::message::FetchType::AbsoluteJoining, 99, 0).await,
             Some(RequestErrorCode::InvalidJoiningRequestId as u64)
         );
+        // Already used, by the FETCH above, so it can never be a SUBSCRIBE.
+        assert_eq!(
+            joining_error(&mut sub, crate::message::FetchType::AbsoluteJoining, 0, 0).await,
+            Some(RequestErrorCode::InvalidJoiningRequestId as u64)
+        );
+    }
+
+    /// Request streams are unordered, so a Joining FETCH can be read before
+    /// the SUBSCRIBE it names. It waits for the SUBSCRIBE instead of being
+    /// rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn joining_fetch_read_before_its_subscribe_waits_for_it() {
+        let (mut sub, mut publ) = pair().await;
+        // A fresh client allocates request IDs 0, 2, ...: the FETCH takes 0
+        // and names 2, which the SUBSCRIBE sent afterwards will use.
+        let mut fetch = sub
+            .joining_fetch(
+                crate::message::FetchType::AbsoluteJoining,
+                2,
+                1,
+                KeyValuePairs::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetch.id(), 0);
+        let requested = tokio::time::timeout(T, publ.fetch_requested())
+            .await
+            .unwrap()
+            .unwrap();
+        let resolve = tokio::spawn(async move {
+            let range = requested.resolve().await;
+            (range, requested)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (writer, _reader) = track("video");
+        let subscribe = sub.subscribe_start(writer).await.unwrap();
+        assert_eq!(subscribe.info.id, 2);
+        let subscribed = tokio::time::timeout(T, publ.subscribed())
+            .await
+            .unwrap()
+            .unwrap();
+        let (_track_writer, track_reader) = track("video");
+        let _serve = tokio::spawn(async move {
+            subscribed
+                .serve_with_largest_location(track_reader, Some(Location::new(3, 0)))
+                .await
+        });
+
+        let (range, requested) = tokio::time::timeout(T, resolve).await.unwrap().unwrap();
+        let range = range.unwrap().expect("resolved once the SUBSCRIBE arrived");
+        assert_eq!(range.start_location, Location::new(1, 0));
+        assert_eq!(range.end_location, Location::new(3, 1));
+        let writer = requested
+            .respond(ok_info(Location::new(3, 1)))
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+        tokio::time::timeout(T, fetch.ok()).await.unwrap().unwrap();
+        assert!(read_all(&mut fetch).await.is_empty());
     }
 
     /// §10.12.2: Forward State 0 and an empty track are both INVALID_RANGE,

@@ -153,6 +153,10 @@ pub struct Publisher {
     /// Inbound FETCHes awaiting the application.
     unknown_fetch_requested: Queue<FetchRequested>,
 
+    /// Woken whenever an inbound SUBSCRIBE is registered, for Joining
+    /// FETCHes that arrived before their SUBSCRIBE.
+    subscribe_arrived: Arc<tokio::sync::Notify>,
+
     /// Set by [`Publisher::accept_fetch`]. Until then FETCH is answered with
     /// NOT_SUPPORTED, so an application that never polls
     /// [`Publisher::fetch_requested`] still answers every FETCH.
@@ -257,6 +261,7 @@ impl Publisher {
             bidi_task_tx,
             unknown_fetch_requested: Default::default(),
             fetch_enabled: Default::default(),
+            subscribe_arrived: Default::default(),
             fetches: Default::default(),
             bidi_response_map: Default::default(),
         }
@@ -1131,7 +1136,11 @@ impl Publisher {
     /// Requests that can be answered without the application are rejected
     /// here: every FETCH until [`Self::accept_fetch`] (NOT_SUPPORTED), too
     /// many in flight (EXCESSIVE_LOAD), an empty standalone range
-    /// (§10.12.3), and Joining FETCH, which is not served yet.
+    /// (§10.12.3), and a Joining FETCH naming a Request ID that is not, and
+    /// can no longer become, a SUBSCRIBE in this session
+    /// (INVALID_JOINING_REQUEST_ID). A Joining FETCH for a subscription that
+    /// is pending, or whose SUBSCRIBE has not been read yet, is resolved later
+    /// by [`FetchRequested::resolve`].
     fn recv_fetch(&mut self, msg: message::Fetch) -> Result<(), SessionError> {
         // §10.2.7 / §10.2.8: out-of-range values are PROTOCOL_VIOLATIONs.
         super::validate_fetch_params(&msg.params)?;
@@ -1192,7 +1201,17 @@ impl Publisher {
                     .get(&joining_request_id)
                     .and_then(|recv| recv.joining_handle());
                 match handle {
-                    Some(handle) => joining = Some(handle),
+                    Some(handle) => joining = Some(super::JoiningTarget::Known(handle)),
+                    // Request streams are unordered, so the SUBSCRIBE may not
+                    // have been read yet; resolution waits for it briefly.
+                    None if self.request_id.is_unused_peer_id(joining_request_id) => {
+                        joining = Some(super::JoiningTarget::Awaiting(super::PendingJoin {
+                            subscribeds: Arc::downgrade(&self.subscribeds),
+                            request_ids: self.request_id.clone(),
+                            arrived: self.subscribe_arrived.clone(),
+                            id: joining_request_id,
+                        }));
+                    }
                     None => {
                         self.send_request_error(
                             "fetch",
@@ -1457,6 +1476,7 @@ impl Publisher {
             let (send, recv) = Subscribed::new(self.clone(), msg, self.mlog.clone())?;
             subscribed_names.insert(full_name, send.info.id);
             subscribeds.insert(send.info.id, recv);
+            self.subscribe_arrived.notify_waiters();
 
             send
         };
