@@ -33,8 +33,8 @@ pub struct Producer {
     upstream_namespaces: UpstreamNamespaces,
     /// Relay-level context for this MoQT session.
     context: SessionContext,
-    /// Authorization state for this session. `None` when the scope has no
-    /// authorization policy, in which case every request is permitted.
+    /// Token authorization state. Internal relay peers and sessions in scopes
+    /// without a policy carry `None`, permitting every request.
     auth: Option<SessionAuth>,
 }
 
@@ -61,8 +61,8 @@ impl Producer {
     /// required argument rather than something attached afterwards: a producer
     /// with no authorization serves every request, so forgetting to supply it
     /// must be a compile error rather than a silent grant. `None` states that
-    /// the session needs no authorization — its scope has no policy, or the
-    /// relay dialled the peer itself.
+    /// the session needs no token authorization because it is an internal
+    /// relay peer or its scope has no policy.
     ///
     /// **Breaking change** (SemVer `0.7.x` → `0.8.x`): the old `Producer::new`
     /// public convenience constructor has been removed because it could only

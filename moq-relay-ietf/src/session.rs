@@ -32,6 +32,9 @@ pub enum SessionInterface {
     #[default]
     Public,
     /// An internal, relay-to-relay connection.
+    ///
+    /// These sessions bypass token authorization. Embedders must classify a
+    /// connection as internal only after authenticating its relay peer.
     Internal,
 }
 
@@ -177,6 +180,18 @@ impl ConnectionMeta {
 /// [`Coordinator::resolve_scope`], which resolves *identity and permissions*;
 /// the coordinator cannot know the transport interface a connection arrived on.
 ///
+/// # Security
+///
+/// An internal tag skips token authorization at setup and on every request,
+/// so tag a connection internal only when its peer is an authenticated relay.
+/// This crate authenticates nothing in [`ConnectionMeta`]. A client that can
+/// reach the listener chooses its own SNI and path. An address, such as a
+/// private source subnet or an internal listener IP, shows where a connection
+/// came from but not who sent it. It identifies a relay only when the network
+/// authenticates the sender, for example a WireGuard or IPsec tunnel that ties
+/// each source address to one relay's key. Without that guarantee, leave every
+/// connection public.
+///
 /// # Where classification happens (important)
 ///
 /// The `public`/`internal` label is **local to the relay that accepts the
@@ -204,6 +219,9 @@ impl ConnectionMeta {
 ///   hostname can be matched here.
 /// * [`ConnectionMeta::path`] — the connection path from the dialed URL.
 ///
+/// None of these authenticates the dialer on its own; see
+/// [Security](#security).
+///
 /// For a mesh where both relays should see each other as internal, both relays
 /// need a tagger, and each must dial the other on an address/SNI/path the
 /// peer's tagger recognizes.
@@ -221,19 +239,19 @@ impl ConnectionMeta {
 ///
 /// use moq_relay_ietf::{ConnectionMeta, ConnectionTagger, ConnectionTags, SessionInterface};
 ///
-/// /// Treats peers on the 10.0.0.0/8 mesh subnet, or presenting the mesh SNI,
-/// /// as internal relay-to-relay; everything else stays public.
+/// /// Tags peers on the relay tunnel network as internal. Illustration only:
+/// /// this is safe only if every address in 10.0.0.0/8 belongs to a relay that
+/// /// the tunnel has authenticated, as described under Security.
 /// struct MeshTagger;
 ///
 /// impl ConnectionTagger for MeshTagger {
 ///     fn tag(&self, meta: &ConnectionMeta) -> ConnectionTags {
-///         let from_mesh_subnet = matches!(
+///         let from_relay_tunnel = matches!(
 ///             meta.remote_addr.map(|addr| addr.ip()),
 ///             Some(IpAddr::V4(ip)) if ip.octets()[0] == 10
 ///         );
-///         let from_mesh_sni = meta.server_name.as_deref() == Some("mesh.internal");
 ///
-///         if from_mesh_subnet || from_mesh_sni {
+///         if from_relay_tunnel {
 ///             ConnectionTags::new().with_interface(SessionInterface::Internal)
 ///         } else {
 ///             // Empty tags resolve to SessionInterface::Public.

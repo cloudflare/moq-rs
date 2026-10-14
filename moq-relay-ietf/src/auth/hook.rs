@@ -17,14 +17,16 @@ use crate::SessionContext;
 ///
 /// # Contract
 ///
-/// * [`on_setup`] runs once per session, before either half of the session is
-///   constructed. Denying it terminates the session.
+/// * [`on_setup`] runs once per public session with a policy, before either
+///   half of the session is constructed. Denying it terminates the session.
 /// * [`on_request`] runs before every authorization-relevant request, and is
 ///   given the [`Principal`] that `on_setup` established. Implementations
 ///   should treat it as a hot path and avoid cryptography there — verify at
 ///   setup and carry the validated state in the principal.
 /// * Returning `Err` is never an allow. The relay treats it as a denial and
 ///   counts it separately as a fault.
+/// * Internal relay peers bypass both methods, relying on the embedder's peer
+///   authentication.
 ///
 /// [`ScopeConfig::auth`]: crate::ScopeConfig::auth
 /// [`on_setup`]: Self::on_setup
