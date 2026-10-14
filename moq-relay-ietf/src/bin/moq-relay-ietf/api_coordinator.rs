@@ -11,6 +11,7 @@
 //! - Automatic TTL refresh to maintain registrations
 //! - High availability when using the moq-api server
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -22,8 +23,10 @@ use url::Url;
 
 use moq_relay_ietf::{
     Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceOrigin,
-    NamespaceRegistration,
+    NamespaceRegistration, ScopeConfig,
 };
+
+use crate::scope_config::{self, ScopeConfigSource};
 
 /// Default TTL for namespace registrations (in seconds)
 /// moq-api server uses 600 seconds (10 minutes) TTL
@@ -121,6 +124,8 @@ pub struct ApiCoordinator {
     client: Client,
     /// Configuration
     config: ApiCoordinatorConfig,
+    /// Per-scope token policy from `--scope-config`, if given.
+    scope_config: Option<Arc<ScopeConfigSource>>,
 }
 
 impl ApiCoordinator {
@@ -170,7 +175,17 @@ impl ApiCoordinator {
     pub fn new(config: ApiCoordinatorConfig) -> Self {
         let client = Client::new(config.api_url.clone());
 
-        Self { client, config }
+        Self {
+            client,
+            config,
+            scope_config: None,
+        }
+    }
+
+    /// Serve per-scope token policy from a `--scope-config` file.
+    pub fn with_scope_config(mut self, scope_config: Option<Arc<ScopeConfigSource>>) -> Self {
+        self.scope_config = scope_config;
+        self
     }
 
     /// Start a background task to refresh namespace registration
@@ -306,6 +321,14 @@ impl Coordinator for ApiCoordinator {
         }
     }
 
+    async fn get_scope_config(&self, scope: Option<&str>) -> CoordinatorResult<ScopeConfig> {
+        scope_config::get_scope_config(self.scope_config.as_ref(), scope).await
+    }
+
+    fn reuse_scope_config_on_error(&self) -> bool {
+        scope_config::reuse_scope_config_on_error(self.scope_config.as_ref())
+    }
+
     async fn shutdown(&self) -> CoordinatorResult<()> {
         tracing::info!("shutting down API coordinator");
         // The moq-api client uses reqwest which handles connection cleanup internally
@@ -342,5 +365,25 @@ mod tests {
 
         assert_eq!(config.registration_ttl_secs, 120);
         assert_eq!(config.refresh_interval_secs, 60);
+    }
+
+    /// A broken `--scope-config` must not fall back to cached state; without
+    /// the flag the library default stays.
+    #[test]
+    fn scope_config_turns_off_cached_policy_reuse() {
+        let api_url = Url::parse("http://localhost:8080").unwrap();
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let config = ApiCoordinatorConfig::new(api_url, relay_url);
+        assert!(ApiCoordinator::new(config.clone()).reuse_scope_config_on_error());
+
+        let path = std::env::temp_dir().join(format!(
+            "moq-api-coordinator-reuse-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, "{}").unwrap();
+        let source = Arc::new(ScopeConfigSource::open(&path).unwrap());
+        let coordinator = ApiCoordinator::new(config).with_scope_config(Some(source));
+        assert!(!coordinator.reuse_scope_config_on_error());
+        std::fs::remove_file(path).unwrap();
     }
 }

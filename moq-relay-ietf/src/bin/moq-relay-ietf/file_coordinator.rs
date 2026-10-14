@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -22,8 +23,11 @@ use url::Url;
 
 use moq_relay_ietf::{
     Coordinator, CoordinatorContext, CoordinatorError, CoordinatorResult, NamespaceOrigin,
-    NamespaceRegistration, NamespaceSubscription, RelayInfo, SessionInterface, TrackRegistration,
+    NamespaceRegistration, NamespaceSubscription, RelayInfo, ScopeConfig, SessionInterface,
+    TrackRegistration,
 };
+
+use crate::scope_config::{self, ScopeConfigSource};
 
 /// Data stored in the shared file
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -288,6 +292,8 @@ pub struct FileCoordinator {
     file_path: PathBuf,
     /// URL of this relay (used when registering namespaces)
     relay_url: Url,
+    /// Per-scope token policy from `--scope-config`, if given.
+    scope_config: Option<Arc<ScopeConfigSource>>,
 }
 
 impl FileCoordinator {
@@ -300,7 +306,14 @@ impl FileCoordinator {
         Self {
             file_path: file_path.as_ref().to_path_buf(),
             relay_url,
+            scope_config: None,
         }
+    }
+
+    /// Serve per-scope token policy from a `--scope-config` file.
+    pub fn with_scope_config(mut self, scope_config: Option<Arc<ScopeConfigSource>>) -> Self {
+        self.scope_config = scope_config;
+        self
     }
 }
 
@@ -732,6 +745,14 @@ impl Coordinator for FileCoordinator {
         result.ok_or(CoordinatorError::NamespaceNotFound)
     }
 
+    async fn get_scope_config(&self, scope: Option<&str>) -> CoordinatorResult<ScopeConfig> {
+        scope_config::get_scope_config(self.scope_config.as_ref(), scope).await
+    }
+
+    fn reuse_scope_config_on_error(&self) -> bool {
+        scope_config::reuse_scope_config_on_error(self.scope_config.as_ref())
+    }
+
     async fn shutdown(&self) -> CoordinatorResult<()> {
         // Nothing to clean up - file will be unlocked automatically
         Ok(())
@@ -763,6 +784,23 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .expect("test namespace should be valid")
+    }
+
+    /// A broken `--scope-config` must not fall back to cached state; without
+    /// the flag the library default stays.
+    #[test]
+    fn scope_config_turns_off_cached_policy_reuse() {
+        let relay_url = Url::parse("https://relay.example.com").unwrap();
+        let coordinator = FileCoordinator::new(temp_file_path("reuse-default"), relay_url.clone());
+        assert!(coordinator.reuse_scope_config_on_error());
+
+        let config = temp_file_path("reuse-scope-config");
+        std::fs::write(&config, "{}").unwrap();
+        let source = Arc::new(ScopeConfigSource::open(&config).unwrap());
+        let coordinator = FileCoordinator::new(temp_file_path("reuse-off"), relay_url)
+            .with_scope_config(Some(source));
+        assert!(!coordinator.reuse_scope_config_on_error());
+        std::fs::remove_file(config).unwrap();
     }
 
     #[tokio::test]

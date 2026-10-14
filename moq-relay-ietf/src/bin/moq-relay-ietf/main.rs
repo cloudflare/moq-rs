@@ -3,6 +3,7 @@
 
 mod api_coordinator;
 mod file_coordinator;
+mod scope_config;
 
 use std::sync::Arc;
 use std::{net, path::PathBuf};
@@ -98,6 +99,18 @@ pub struct Cli {
     /// When set, serves metrics at http://<addr>/metrics
     #[arg(long)]
     pub metrics_addr: Option<net::SocketAddr>,
+
+    /// JSON file of per-scope Common Access Token (CAT) policies.
+    ///
+    /// When set, scopes the file configures require a valid CAT in the
+    /// CLIENT_SETUP AUTHORIZATION TOKEN parameter. The file is re-read for new
+    /// sessions, so edits apply without a restart once a scope's cached
+    /// policy expires. If the file later becomes missing or invalid, each
+    /// scope keeps its cached state until it expires, then refuses new
+    /// sessions rather than admitting them without a token. Requires a relay built with `--features auth-cat`.
+    /// See the moq-relay-ietf README for the format.
+    #[arg(long, env = "MOQ_RELAY_SCOPE_CONFIG")]
+    pub scope_config: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -115,6 +128,24 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Checked before anything else so a relay that cannot enforce the
+    // requested policy never starts listening.
+    let scope_config = scope_config::from_cli(cli.scope_config.as_deref())?;
+    if scope_config.is_some()
+        && (cli.api.is_some() || cli.api_url.is_some() || cli.announce.is_some())
+    {
+        // This binary has no connection tagger, so peer relays are public
+        // sessions. They present no token, so in a scope that enforces tokens
+        // they are refused like any client without one. Not fatal: scopes
+        // with `"auth": null` work normally.
+        tracing::warn!(
+            "--scope-config is combined with multi-relay options (--api, --api-url or \
+             --announce). This binary does not tag peer relays as internal, and they present \
+             no token, so they are refused in every scope that enforces tokens; cross-relay delivery works only in scopes \
+             with no token policy"
+        );
+    }
 
     // Initialize Prometheus metrics exporter if --metrics-addr is provided
     #[cfg(feature = "metrics-prometheus")]
@@ -186,12 +217,14 @@ async fn main() -> anyhow::Result<()> {
     // Priority: api-url > file coordinator
     let coordinator: Arc<dyn Coordinator> = if let Some(api_url) = &cli.api_url {
         let config = ApiCoordinatorConfig::new(api_url.clone(), relay_url).with_ttl(cli.api_ttl);
-        let api_coordinator = ApiCoordinator::new(config);
+        let api_coordinator = ApiCoordinator::new(config).with_scope_config(scope_config);
         tracing::info!("using API coordinator: {}", api_url);
         Arc::new(api_coordinator)
     } else {
         tracing::info!("using file coordinator: {}", cli.coordinator_file.display());
-        Arc::new(FileCoordinator::new(&cli.coordinator_file, relay_url))
+        Arc::new(
+            FileCoordinator::new(&cli.coordinator_file, relay_url).with_scope_config(scope_config),
+        )
     };
 
     // Create a QUIC server for media.

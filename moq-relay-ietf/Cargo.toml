@@ -70,7 +70,7 @@ fs2 = "0.4"
 anyhow = { version = "1", features = ["backtrace"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 
 # Logging

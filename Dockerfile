@@ -13,9 +13,13 @@ COPY . ./
 # There's also issues with the cache mount since it builds into /usr/local/cargo/bin
 # We can't mount that without clobbering cargo itself.
 # We instead we build the binaries and copy them to the cargo bin directory.
+#
+# moq-relay-ietf is built with Common Access Token support (`auth-cat`) so the
+# image can enforce a `--scope-config` policy. No other crate depends on
+# moq-relay-ietf, so this changes no other binary.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release && cp /build/target/release/moq-* /usr/local/cargo/bin
+    cargo build --release --features moq-relay-ietf/auth-cat && cp /build/target/release/moq-* /usr/local/cargo/bin
 
 # Create a pub image that also contains ffmpeg and a helper script
 FROM debian:bookworm-slim as moq-pub
