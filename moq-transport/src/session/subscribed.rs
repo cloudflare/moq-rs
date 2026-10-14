@@ -1281,6 +1281,10 @@ impl JoiningTarget {
 /// Covers stream reordering, not a peer that never sends it.
 const PENDING_JOIN_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long to wait for a SUBSCRIBE whose Request ID has been received but
+/// not yet registered. Registration follows receipt without any I/O.
+const PENDING_JOIN_REGISTER_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Waits for an inbound SUBSCRIBE with a given Request ID.
 pub(super) struct PendingJoin {
     pub subscribeds: std::sync::Weak<Mutex<std::collections::HashMap<u64, ObjectForwarderRecv>>>,
@@ -1293,6 +1297,7 @@ pub(super) struct PendingJoin {
 impl PendingJoin {
     async fn wait(&self) -> Option<JoiningHandle> {
         let deadline = tokio::time::Instant::now() + PENDING_JOIN_HOLD;
+        let mut seen_absent = false;
         loop {
             // Register for the wakeup before checking, so a SUBSCRIBE that
             // lands in between is not missed.
@@ -1309,11 +1314,21 @@ impl PendingJoin {
                 return Some(handle);
             }
             drop(subscribeds);
-            // Used by something else, or never coming in time.
-            if !self.request_ids.is_unused_peer_id(self.id) {
+            let wait_until = if self.request_ids.is_unused_peer_id(self.id) {
+                deadline
+            } else if !seen_absent {
+                // The ID is recorded as received before its SUBSCRIBE is
+                // registered, so a SUBSCRIBE may be between the two steps.
+                // Allow one short wait for it before deciding the ID belongs
+                // to something else.
+                seen_absent = true;
+                deadline.min(tokio::time::Instant::now() + PENDING_JOIN_REGISTER_GRACE)
+            } else {
                 return None;
-            }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            };
+            if tokio::time::timeout_at(wait_until, notified).await.is_err()
+                && wait_until == deadline
+            {
                 return None;
             }
         }
