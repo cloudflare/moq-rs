@@ -29,6 +29,7 @@ This repository provides:
 
 **Not Supported:**
 - REQUEST_UPDATE (so a Joining FETCH can only join a subscription whose Forward State was set by SUBSCRIBE)
+- Joining FETCH for a subscription created by PUBLISH (answered with NOT_SUPPORTED)
 
 ## Interoperability
 

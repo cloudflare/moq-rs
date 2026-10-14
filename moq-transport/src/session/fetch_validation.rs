@@ -64,6 +64,9 @@ pub(crate) fn validate_fetch_params(
 /// Checks a FETCH response against the request and against itself.
 pub(crate) struct FetchValidator {
     range: Option<(Location, Location)>,
+    /// A known start when the end is not: an Absolute Joining FETCH starts
+    /// at `{joining_start, 0}` but its end is chosen by the publisher.
+    min_start: Option<Location>,
     order: GroupOrder,
     previous: Option<Location>,
     largest: Option<Location>,
@@ -77,6 +80,7 @@ impl FetchValidator {
     pub fn new(range: Option<(Location, Location)>, order: Option<GroupOrder>) -> Self {
         Self {
             range,
+            min_start: None,
             order: effective_fetch_order(order),
             previous: None,
             largest: None,
@@ -84,6 +88,17 @@ impl FetchValidator {
             priorities: HashMap::new(),
             response_end: None,
         }
+    }
+
+    /// Bound the response below by `start` when only the start is known.
+    pub fn with_min_start(mut self, start: Option<Location>) -> Self {
+        self.min_start = start;
+        self
+    }
+
+    /// The requested start, from the full range or a start-only bound.
+    fn start(&self) -> Option<Location> {
+        self.range.map(|(start, _)| start).or(self.min_start)
     }
 
     /// Validate the next record on the response stream.
@@ -127,14 +142,14 @@ impl FetchValidator {
         end: Location,
         extensions: &TrackExtensions,
     ) -> Result<(), SessionError> {
-        if let Some((start, requested_end)) = self.range {
-            // §10.13: "If End Location is smaller than the Start Location in the
-            // corresponding FETCH the receiver MUST close the session".
-            if inclusive_end(end) < start {
-                return Err(Self::invalid_ok(
-                    "FETCH_OK end precedes the requested start",
-                ));
-            }
+        // §10.13: "If End Location is smaller than the Start Location in the
+        // corresponding FETCH the receiver MUST close the session".
+        if self.start().is_some_and(|start| inclusive_end(end) < start) {
+            return Err(Self::invalid_ok(
+                "FETCH_OK end precedes the requested start",
+            ));
+        }
+        if let Some((_, requested_end)) = self.range {
             if inclusive_end(end) > inclusive_end(requested_end) {
                 return Err(Self::invalid_ok("FETCH_OK end exceeds the requested range"));
             }
@@ -154,6 +169,9 @@ impl FetchValidator {
             if location < start || location > inclusive_end(end) {
                 return Err(Self::malformed("record is outside the requested range"));
             }
+        }
+        if self.min_start.is_some_and(|start| location < start) {
+            return Err(Self::malformed("record precedes the requested start"));
         }
         if let Some(end) = self.response_end {
             if location > inclusive_end(end) {
@@ -253,6 +271,19 @@ mod tests {
             Location::new(2, 0),
             Location::new(1, 5)
         ));
+    }
+
+    /// An Absolute Joining FETCH knows its start but not its end.
+    #[test]
+    fn start_only_bound_checks_fetch_ok_and_records() {
+        let validator =
+            || FetchValidator::new(None, None).with_min_start(Some(Location::new(4, 0)));
+        let ext = TrackExtensions::default();
+        assert!(validator().validate_ok(Location::new(3, 0), &ext).is_err());
+        assert!(validator().validate_ok(Location::new(4, 1), &ext).is_ok());
+        assert!(validator().validate_ok(Location::new(9, 0), &ext).is_ok());
+        assert!(validator().validate_record(&object(3, 0, 9, 1)).is_err());
+        assert!(validator().validate_record(&object(4, 0, 0, 1)).is_ok());
     }
 
     #[test]

@@ -131,6 +131,19 @@ pub(super) struct FetchStreamReg {
 }
 
 impl FetchStreamReg {
+    /// A registration with no routing entry, for unit tests.
+    #[cfg(test)]
+    pub(super) fn detached() -> Self {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        Self {
+            _cleanup: FetchStreamCleanup {
+                fetch_streams: Default::default(),
+                request_id: 0,
+            },
+            rx,
+        }
+    }
+
     /// Await the FETCH data stream.
     ///
     /// Returns `Ok(reader)` when [`route_fetch_stream`](Subscriber::route_fetch_stream)
@@ -1010,7 +1023,8 @@ impl Subscriber {
                 joining_request_id: subscribe_id,
                 joining_start,
             }),
-            // The range is chosen by the publisher; FETCH_OK bounds it.
+            // The end is chosen by the publisher, so FETCH_OK bounds it; an
+            // absolute join's known start is checked by the response validator.
             None,
             params,
         )

@@ -74,7 +74,17 @@ impl Fetch {
     ) -> (Self, FetchRecv) {
         let order = request.params.group_order().ok().flatten();
         let (send, recv) = State::default().split();
-        let validator = Arc::new(Mutex::new(FetchValidator::new(range, order)));
+        // §10.12.2.1: an Absolute Joining FETCH starts at `{joining_start, 0}`;
+        // its end comes from the publisher, so only the start is checked.
+        let min_start = match (&request.fetch_type, &request.joining_fetch) {
+            (message::FetchType::AbsoluteJoining, Some(joining)) => {
+                Some(Location::new(joining.joining_start, 0))
+            }
+            _ => None,
+        };
+        let validator = Arc::new(Mutex::new(
+            FetchValidator::new(range, order).with_min_start(min_start),
+        ));
         (
             Self {
                 id: request.id,
@@ -749,6 +759,49 @@ mod tests {
         );
     }
 
+    /// Joining a PUBLISH is not supported yet: its Joining Location is not
+    /// recorded, so it gets NOT_SUPPORTED rather than INVALID_JOINING_REQUEST_ID.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn joining_fetch_for_a_publish_is_not_supported() {
+        let (client_t, server_t) = super::super::test_support::loopback_session_pair().await;
+        let (client, server) = tokio::join!(
+            Session::connect(client_t, None, Transport::WebTransport),
+            Session::accept(server_t, None, Transport::WebTransport),
+        );
+        let (client, _client_pub, client_sub) = client.unwrap();
+        let (server, server_pub, _server_sub) = server.unwrap();
+        let mut client_sub = client_sub;
+        let mut server_pub = server_pub.unwrap();
+        server_pub.accept_fetch();
+        tokio::spawn(client.run());
+        tokio::spawn(server.run());
+
+        let (_writer, reader) = track("video");
+        let publish = tokio::spawn(async move {
+            let published = server_pub.publish(reader, KeyValuePairs::default()).await;
+            (server_pub, published)
+        });
+        let mut received = tokio::time::timeout(T, client_sub.publish_received())
+            .await
+            .unwrap()
+            .unwrap();
+        // The publisher uses the Request ID as the Track Alias.
+        let publish_id = received.track_alias();
+        received.accept(true).unwrap();
+        let (_server_pub, _published) = tokio::time::timeout(T, publish).await.unwrap().unwrap();
+
+        assert_eq!(
+            joining_error(
+                &mut client_sub,
+                crate::message::FetchType::RelativeJoining,
+                publish_id,
+                0
+            )
+            .await,
+            Some(RequestErrorCode::NotSupported as u64)
+        );
+    }
+
     /// Request streams are unordered, so a Joining FETCH can be read before
     /// the SUBSCRIBE it names. It waits for the SUBSCRIBE instead of being
     /// rejected.
@@ -1342,6 +1395,42 @@ mod tests {
             "failed",
         ));
         assert!(!recv.is_live());
+    }
+
+    /// §10.12.2.1/§10.13: an Absolute Joining FETCH's requester rejects a
+    /// FETCH_OK that ends before `{joining_start, 0}`; a relative join has no
+    /// known start.
+    #[tokio::test]
+    async fn absolute_joining_fetch_checks_its_start() {
+        async fn recv_for(fetch_type: message::FetchType) -> (Fetch, FetchRecv) {
+            let session = super::super::test_support::loopback_session().await;
+            let (cancel, _) = tokio::sync::oneshot::channel();
+            let request = message::Fetch {
+                id: 0,
+                fetch_type,
+                standalone_fetch: None,
+                joining_fetch: Some(message::JoiningFetch {
+                    joining_request_id: 2,
+                    joining_start: 4,
+                }),
+                params: KeyValuePairs::default(),
+            };
+            Fetch::new(request, None, session, FetchStreamReg::detached(), cancel)
+        }
+        let early = || FetchOk {
+            id: 0,
+            end_of_track: false,
+            end_location: Location::new(3, 5),
+            params: KeyValuePairs::default(),
+            track_extensions: Default::default(),
+        };
+        let (_f, mut recv) = recv_for(message::FetchType::AbsoluteJoining).await;
+        assert!(matches!(
+            recv.recv_ok(early()),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+        let (_f, mut recv) = recv_for(message::FetchType::RelativeJoining).await;
+        recv.recv_ok(early()).unwrap();
     }
 
     #[test]

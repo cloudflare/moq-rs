@@ -1200,8 +1200,20 @@ impl Publisher {
                     .map_err(|_| SessionError::Internal)?
                     .get(&joining_request_id)
                     .and_then(|recv| recv.joining_handle());
+                // A PUBLISH this endpoint sent is a subscription too (§5.1),
+                // but its Joining Location is not recorded yet.
+                let names_publish = handle.is_none()
+                    && self
+                        .publisheds
+                        .lock()
+                        .map_err(|_| SessionError::Internal)?
+                        .contains_key(&joining_request_id);
                 match handle {
                     Some(handle) => joining = Some(super::JoiningTarget::Known(handle)),
+                    None if names_publish => {
+                        self.send_not_supported(msg.id, "joining_fetch_publish");
+                        return Ok(());
+                    }
                     // Request streams are unordered, so the SUBSCRIBE may not
                     // have been read yet; resolution waits for it briefly.
                     None if self.request_id.is_unused_peer_id(joining_request_id) => {
