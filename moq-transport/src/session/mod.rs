@@ -1522,11 +1522,6 @@ impl Session {
                 Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {
                     Some(FollowupEnd::OtherTerminal)
                 }
-                // FETCH_CANCEL ends the requester's interest in the response.
-                // Treating it as a terminal follow-up ends the request stream
-                // and frees the bidi slot.  The publisher serving task that
-                // would read the data stream is added in PR F2.
-                Message::FetchCancel(_) => Some(FollowupEnd::OtherTerminal),
                 _ => None,
             };
 
@@ -1715,12 +1710,6 @@ impl Session {
                 }))
             }
             wire_id::Unsubscribe => Ok(Message::Unsubscribe(message::Unsubscribe {
-                id: request_id,
-            })),
-            // FETCH_CANCEL is a follow-up sent by the subscriber on the FETCH
-            // bidi stream to cancel an in-progress FETCH.  Like UNSUBSCRIBE,
-            // it carries only the request ID (injected here).
-            wire_id::FetchCancel => Ok(Message::FetchCancel(message::FetchCancel {
                 id: request_id,
             })),
             // NAMESPACE / NAMESPACE_DONE have no Request ID field, so nothing
@@ -3191,10 +3180,9 @@ mod tests {
     // ── FETCH bidi-stream lifecycle (B2, B3, decode_bidi_response) ───────────
     //
     // B2 has a full handle_bidi_request integration test (inject FetchOk via
-    // bidi_response_map, verify bidi stream FINs).  B3 and decode_bidi_response
-    // are tested at the codec level — `handle_bidi_request` level FETCH_CANCEL
-    // test (B3 integration, verifying the serving task stops) is deferred to PR
-    // F2 when the publisher gains a real FETCH dispatch path.
+    // bidi_response_map, verify bidi stream FINs). Draft-18 has no
+    // FETCH_CANCEL: a requester cancels by resetting the request stream
+    // (section 5.2), which is covered with the FETCH serving path.
 
     /// B2: `FetchOk` in `is_terminal` — FINs the bidi stream after `FetchOk`.
     ///
@@ -3249,7 +3237,8 @@ mod tests {
             }))
             .await
             .unwrap();
-        // Leave req_writer open — FETCH bidi streams may have FETCH_CANCEL follow-ups.
+        // Leave req_writer open, as a requester does until it cancels or
+        // the response completes.
         let mut response_reader = Reader::new(req_recv);
 
         // Responder accepts the bidi stream; run handle_bidi_request in a task.
@@ -3331,54 +3320,5 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.is_ok(), "handler must exit cleanly after FetchOk");
-    }
-
-    /// B3 + decode_bidi_response: FETCH_CANCEL decodes without a session-fatal error.
-    ///
-    /// `read_request_follow_ups` routes FETCH_CANCEL to `OtherTerminal` (the
-    /// `Message::FetchCancel(_) => Some(FollowupEnd::OtherTerminal)` arm added
-    /// by this fix).  That arm is only reachable if `decode_bidi_response` can
-    /// parse FETCH_CANCEL successfully — previously it hit the session-fatal
-    /// `unimplemented` arm.
-    ///
-    /// Full integration (FETCH_CANCEL stopping a live serving task) is deferred
-    /// to PR F2 when the publisher gains a real FETCH handler.
-    #[tokio::test]
-    async fn decode_bidi_response_handles_fetch_cancel() {
-        // `decode_bidi_response` is called by `read_request_follow_ups` from
-        // the perspective of the ACCEPTOR (publisher side), reading from the
-        // INITIATOR's (subscriber's) send half.
-        //
-        // So: initiator opens bidi, WRITES FetchCancel on their send half;
-        // acceptor reads from their recv half via `decode_bidi_response`.
-        let (requester, responder) = test_support::loopback_session_pair().await;
-        let (initiator_send, _initiator_recv) = requester.open_bi().await.unwrap();
-        let (_acceptor_send, acceptor_recv) = responder.accept_bi().await.unwrap();
-
-        // Initiator (subscriber) writes FETCH_CANCEL as a bidi follow-up:
-        //   - msg_type 0x17 as u64 QUIC varint (1 byte, 23 < 64)
-        //   - payload length as u16 big-endian: 0x00 0x00
-        //   - payload: empty (request ID injected from the reader's parameter)
-        let mut writer = Writer::new(initiator_send);
-        writer.write(&[0x17u8, 0x00, 0x00]).await.unwrap();
-        drop(writer); // FIN
-
-        // Acceptor (publisher) reads via decode_bidi_response from their recv half.
-        let mut reader = Reader::new(acceptor_recv);
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            Session::decode_bidi_response(&mut reader, 4),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        // The id is injected from the decode_bidi_response parameter (4),
-        // not read from the wire (where it is absent on bidi streams).
-        assert!(
-            matches!(msg, Message::FetchCancel(ref c) if c.id == 4),
-            "expected FetchCancel with id=4, got {:?}",
-            msg
-        );
     }
 }

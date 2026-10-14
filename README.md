@@ -27,7 +27,7 @@ This repository provides:
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
-- FETCH (in progress: the transport routes FETCH data streams and FETCH_OK/FETCH_CANCEL, but neither endpoint serves or issues FETCH yet)
+- FETCH (in progress: the transport routes FETCH data streams and reads FETCH_OK/REQUEST_ERROR on the request stream, but neither endpoint serves or issues FETCH yet)
 
 ## Interoperability
 

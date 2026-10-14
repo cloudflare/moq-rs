@@ -117,8 +117,9 @@ impl Drop for FetchStreamCleanup {
 /// * **Data stream arrives** (normal): [`route_fetch_stream`] removes the
 ///   entry before delivering the `Reader`; `FetchStreamCleanup::drop` then
 ///   finds nothing to remove — it is a no-op.
-/// * **REQUEST_ERROR or FETCH_CANCEL**: the F3 outbound-FETCH state machine
-///   receives the bidi response and drops `FetchStreamReg` → cleanup fires.
+/// * **REQUEST_ERROR or cancellation**: the outbound-FETCH state machine
+///   receives the bidi response, or the requester stops the request stream
+///   (draft-18 section 5.2), and drops `FetchStreamReg` → cleanup fires.
 /// * **Session close** (task cancelled): `FetchStreamReg` drops with the
 ///   task → cleanup fires.
 /// * **Explicit cancel** ([`cancel_fetch_stream`]): removes the entry and
@@ -464,7 +465,7 @@ pub struct Subscriber {
     /// to hand the `Reader` to the waiting receiver.
     ///
     /// When the FETCH completes normally, [`Self::route_fetch_stream`] removes
-    /// the entry.  When the FETCH is abandoned (REQUEST_ERROR, FETCH_CANCEL,
+    /// the entry.  When the FETCH is abandoned (REQUEST_ERROR, cancellation,
     /// session shutdown), the F3 state machine drops the [`FetchStreamReg`];
     /// [`FetchStreamCleanup::drop`] then removes the entry automatically.
     /// [`Self::cancel_fetch_stream`] may also remove an entry explicitly.
@@ -4739,7 +4740,7 @@ mod tests {
     //   (a) Normal: data stream arrives  → await_stream Ok, route removes entry
     //   (b) REQUEST_ERROR / caller drop / session-close → F3 drops FetchStreamReg
     //       → FetchStreamCleanup::drop removes entry (no leak)
-    //   (c) Explicit cancel (F3 FETCH_CANCEL path) → cancel_fetch_stream removes
+    //   (c) Explicit cancel → cancel_fetch_stream removes
     //       entry → Sender dropped → await_stream Err
     //   (d) No waiter (stream for unknown/already-cancelled ID) → route false
 
@@ -4795,8 +4796,8 @@ mod tests {
         );
     }
 
-    /// (c) Explicit-cancel terminal: the F3 FETCH_CANCEL path calls
-    /// cancel_fetch_stream, which drops the Sender → await_stream returns Err.
+    /// (c) Explicit-cancel terminal: cancel_fetch_stream drops the Sender →
+    /// await_stream returns Err.
     #[tokio::test]
     async fn fetch_stream_cleaned_on_explicit_cancel() {
         let (session_a, _) = loopback_raw_session_pair().await;
@@ -4805,8 +4806,7 @@ mod tests {
         let reg = subscriber.register_fetch_stream(4);
         assert_eq!(subscriber.fetch_streams.lock().unwrap().len(), 1);
 
-        // F3 FETCH_CANCEL handling calls cancel_fetch_stream to signal the
-        // Receiver (e.g. when a FETCH_CANCEL message is received from the peer).
+        // Abandoning the FETCH calls cancel_fetch_stream to signal the Receiver.
         subscriber.cancel_fetch_stream(4);
 
         assert!(
