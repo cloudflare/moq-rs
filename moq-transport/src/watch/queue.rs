@@ -76,8 +76,9 @@ impl<T> Queue<T> {
     }
 
     /// Push an item and wait until it is popped.
-    /// Returns Ok(()) if the item was successfully popped.
-    /// Returns Err(()) if the queue was closed before the item could be confirmed popped.
+    /// Returns `Ok(())` if the item was successfully popped.
+    /// Returns `Err(())` if the queue was closed before the item could be confirmed popped.
+    #[allow(clippy::result_unit_err)]
     pub async fn push_and_wait_until_popped(&mut self, item: T) -> Result<(), ()> {
         // Create a oneshot channel
         let (tx, rx) = oneshot::channel();
