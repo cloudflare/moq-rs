@@ -454,7 +454,7 @@ impl Producer {
             },
         };
 
-        // Authorize before any lookup: deciding afterwards would make response
+        // Authorize before any routing lookup: deciding afterwards would make response
         // timing an existence oracle for tracks the peer may not access.
         if let Err(reason) = may_fetch_track(
             self.auth.as_ref(),
