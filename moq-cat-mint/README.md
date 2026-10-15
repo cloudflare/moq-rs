@@ -10,7 +10,7 @@ and it shouldn't be used with production keys.
 cargo build --release -p moq-cat-mint
 M=target/release/moq-cat-mint
 
-$M keygen                       # writes issuer.key (0600) and issuer.pub.pem
+$M keygen                       # writes issuer.key (0600 on Unix) and issuer.pub.pem
 # Configure the relay to trust issuer.pub.pem (never the .key) and your issuer.
 
 TOKEN=$($M mint --iss https://issuer.example --aud my-relay --ns clock --publish)

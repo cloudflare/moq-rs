@@ -26,7 +26,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Generate an ES256 (P-256) keypair. Writes the private key (PKCS#8,
-    /// mode 0600) and the public key (SPKI). Give the relay only the public one.
+    /// mode 0600 on Unix) and the public key (SPKI). Give the relay only the
+    /// public one.
     Keygen {
         #[arg(long, default_value = "issuer.key")]
         private: PathBuf,
