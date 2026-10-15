@@ -18,7 +18,7 @@ use moq_transport::{
     coding::{KeyValuePairs, TrackNamespace},
     message::PublishDoneCode,
     serve::{ServeError, Track, TrackReaderMode, TrackWriter, Tracks},
-    session::Session,
+    session::{Session, SessionError},
 };
 
 use crate::Args;
@@ -51,6 +51,7 @@ const RENDEZVOUS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Returns (session, connection_id, transport) so we can report CIDs for mlog correlation
 async fn connect(
     args: &Args,
+    sessions: &mut TestSessions,
 ) -> Result<(
     web_transport::Session,
     String,
@@ -60,7 +61,79 @@ async fn connect(
     let quic = quic::Endpoint::new(quic::Config::new(args.bind, None, tls)?)?;
 
     let (session, connection_id, transport) = quic.client.connect(&args.relay, None).await?;
+    sessions.connections.push((session.clone(), quic.client));
     Ok((session, connection_id, transport))
+}
+
+/// Keep transport sessions and their drivers alive until graceful close is flushed.
+#[derive(Default)]
+struct TestSessions {
+    connections: Vec<(web_transport::Session, quic::Client)>,
+    drivers: Vec<tokio::task::AbortHandle>,
+}
+
+// Reserve part of TEST_TIMEOUT for transport shutdown, including failed tests.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Dropping a scenario's waiter must not drop the driver's control stream.
+struct RunningSession(tokio::task::JoinHandle<Result<(), SessionError>>);
+
+impl RunningSession {
+    async fn run(self) -> Result<(), SessionError> {
+        self.0.await.map_err(|_| SessionError::Internal)?
+    }
+}
+
+impl TestSessions {
+    fn start(&mut self, session: Session) -> RunningSession {
+        let driver = tokio::spawn(session.run());
+        self.drivers.push(driver.abort_handle());
+        RunningSession(driver)
+    }
+
+    async fn finish(
+        self,
+        result: Result<Result<TestConnectionIds>, tokio::time::error::Elapsed>,
+    ) -> Result<TestConnectionIds> {
+        // Draft-18 Section 3.3 forbids a control-stream FIN during the session.
+        // Close the transport while its MoQT driver still owns the control stream.
+        for (session, _) in &self.connections {
+            session.close(0, "test complete");
+        }
+        let closed = timeout(CLOSE_TIMEOUT, async {
+            let mut result = Ok(());
+            for (session, client) in &self.connections {
+                let error = SessionError::from(session.closed().await);
+                if !error.is_graceful_close() {
+                    result = Err(error).context("session closed with an error");
+                }
+                // Raw QUIC closed() completes locally before CONNECTION_CLOSE
+                // is sent. Keep the endpoint and runtime alive until it drains.
+                client.wait_idle().await;
+            }
+            result
+        })
+        .await
+        .context("graceful session close timed out");
+        for driver in self.drivers {
+            driver.abort();
+        }
+        let result = result.context("test timed out")?;
+        Self::finish_result(result, closed.and_then(|result| result))
+    }
+
+    fn finish_result(
+        result: Result<TestConnectionIds>,
+        closed: Result<()>,
+    ) -> Result<TestConnectionIds> {
+        match (result, closed) {
+            (Err(error), Err(close_error)) => Err(error.context(format!(
+                "graceful session close also failed: {close_error:#}"
+            ))),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Ok(cids), Ok(())) => Ok(cids),
+        }
+    }
 }
 
 /// Collected connection IDs from a test run
@@ -106,81 +179,80 @@ pub(crate) fn is_normal_subscription_end(err: &ServeError) -> bool {
 ///
 /// Connect to relay, complete CLIENT_SETUP/SERVER_SETUP exchange, close gracefully.
 pub async fn test_setup_only(args: &Args) -> Result<TestConnectionIds> {
-    timeout(TEST_TIMEOUT, async {
-        let (session, cid, transport) =
-            connect(args).await.context("failed to connect to relay")?;
+    let mut sessions = TestSessions::default();
+    let result = timeout(TEST_TIMEOUT - CLOSE_TIMEOUT, async {
+        let (session, cid, transport) = connect(args, &mut sessions)
+            .await
+            .context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
         cids.add(cid);
 
         let (session, _publisher, _subscriber) = Session::connect(session, None, transport)
             .await
             .context("SETUP exchange failed")?;
+        let _session = sessions.start(session);
 
         tracing::info!("SETUP exchange completed successfully");
-        drop(session);
         Ok(cids)
     })
-    .await
-    .context("test timed out")?
+    .await;
+    sessions.finish(result).await
 }
 
 /// T0.2: Publish Namespace Only
 ///
 /// Connect to relay, send PUBLISH_NAMESPACE, receive REQUEST_OK, close.
 pub async fn test_publish_namespace_only(args: &Args) -> Result<TestConnectionIds> {
-    timeout(TEST_TIMEOUT, async {
-        let (session, cid, transport) =
-            connect(args).await.context("failed to connect to relay")?;
+    let mut sessions = TestSessions::default();
+    let result = timeout(TEST_TIMEOUT - CLOSE_TIMEOUT, async {
+        let (session, cid, transport) = connect(args, &mut sessions)
+            .await
+            .context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
         cids.add(cid);
 
         let (session, mut publisher, _subscriber) = Session::connect(session, None, transport)
             .await
             .context("SETUP exchange failed")?;
+        let session = sessions.start(session);
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
-        let (_, _, reader) = Tracks::new(namespace.clone()).produce();
-
         tracing::info!("Sending PUBLISH_NAMESPACE for: {}", TEST_NAMESPACE);
 
-        // publish_namespace() blocks waiting for subscriptions after receiving REQUEST_OK.
-        // If we receive REQUEST_ERROR instead, it returns Err immediately.
-        // Timing out here means we received REQUEST_OK and are now waiting for subscribers,
-        // which is the expected success case.
-        let result = tokio::select! {
-            res = publisher.publish_namespace(reader) => res,
+        let publish = publisher
+            .publish_namespace_start(namespace)
+            .await
+            .context("failed to send PUBLISH_NAMESPACE")?;
+        tokio::select! {
+            res = publish.ok() => res.context("PUBLISH_NAMESPACE rejected")?,
             res = session.run() => {
                 res.context("session error")?;
-                anyhow::bail!("session ended before PUBLISH_NAMESPACE completed");
+                anyhow::bail!("session ended before REQUEST_OK");
             }
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                tracing::info!(
-                    "PUBLISH_NAMESPACE succeeded (REQUEST_OK received, waiting for subscribers)"
-                );
-                return Ok(cids);
-            }
-        };
-
-        result.context("PUBLISH_NAMESPACE failed")?;
+        }
+        tracing::info!("Received REQUEST_OK for PUBLISH_NAMESPACE");
         Ok(cids)
     })
-    .await
-    .context("test timed out")?
+    .await;
+    sessions.finish(result).await
 }
 
 /// T0.3: Subscribe Error
 ///
 /// Subscribe to a non-existent track and verify we get a subscription error.
 pub async fn test_subscribe_error(args: &Args) -> Result<TestConnectionIds> {
-    timeout(TEST_TIMEOUT, async {
-        let (session, cid, transport) =
-            connect(args).await.context("failed to connect to relay")?;
+    let mut sessions = TestSessions::default();
+    let result = timeout(TEST_TIMEOUT - CLOSE_TIMEOUT, async {
+        let (session, cid, transport) = connect(args, &mut sessions)
+            .await
+            .context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
         cids.add(cid);
 
         let (session, _publisher, mut subscriber) = Session::connect(session, None, transport)
             .await
             .context("SETUP exchange failed")?;
+        let session = sessions.start(session);
 
         let namespace = TrackNamespace::from_utf8_path("nonexistent/namespace");
         let (mut writer, _, _reader) = Tracks::new(namespace.clone()).produce();
@@ -229,8 +301,8 @@ pub async fn test_subscribe_error(args: &Args) -> Result<TestConnectionIds> {
             }
         }
     })
-    .await
-    .context("test timed out")?
+    .await;
+    sessions.finish(result).await
 }
 
 /// T0.9: Rendezvous Timeout
@@ -238,15 +310,18 @@ pub async fn test_subscribe_error(args: &Args) -> Result<TestConnectionIds> {
 /// Subscribe to a track with no publisher and verify the relay reports TIMEOUT
 /// after processing a nonzero RENDEZVOUS_TIMEOUT.
 pub async fn test_rendezvous_timeout(args: &Args) -> Result<TestConnectionIds> {
-    timeout(TEST_TIMEOUT, async {
-        let (session, cid, transport) =
-            connect(args).await.context("failed to connect to relay")?;
+    let mut sessions = TestSessions::default();
+    let result = timeout(TEST_TIMEOUT - CLOSE_TIMEOUT, async {
+        let (session, cid, transport) = connect(args, &mut sessions)
+            .await
+            .context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
         cids.add(cid);
 
         let (session, _publisher, mut subscriber) = Session::connect(session, None, transport)
             .await
             .context("SETUP exchange failed")?;
+        let session = sessions.start(session);
 
         let namespace = TrackNamespace::from_utf8_path("nonexistent/rendezvous");
         let (mut writer, _, _reader) = Tracks::new(namespace).produce();
@@ -292,8 +367,8 @@ pub async fn test_rendezvous_timeout(args: &Args) -> Result<TestConnectionIds> {
             Ok(_) => anyhow::bail!("subscribe succeeded but no publisher serves the track"),
         }
     })
-    .await
-    .context("test timed out")?
+    .await;
+    sessions.finish(result).await
 }
 
 /// T0.4: Publish Namespace + Subscribe
@@ -301,23 +376,27 @@ pub async fn test_rendezvous_timeout(args: &Args) -> Result<TestConnectionIds> {
 /// Publisher sends PUBLISH_NAMESPACE; subscriber subscribes to a track in that namespace.
 /// Verifies the relay correctly routes the subscription to the publisher.
 pub async fn test_publish_namespace_subscribe(args: &Args) -> Result<TestConnectionIds> {
-    timeout(TEST_TIMEOUT, async {
+    let mut sessions = TestSessions::default();
+    let result = timeout(TEST_TIMEOUT - CLOSE_TIMEOUT, async {
         let mut cids = TestConnectionIds::default();
 
-        let (pub_session, pub_cid, pub_transport) =
-            connect(args).await.context("publisher failed to connect")?;
+        let (pub_session, pub_cid, pub_transport) = connect(args, &mut sessions)
+            .await
+            .context("publisher failed to connect")?;
         cids.add(pub_cid);
         let (pub_session, mut publisher, _) = Session::connect(pub_session, None, pub_transport)
             .await
             .context("publisher SETUP failed")?;
+        let pub_session = sessions.start(pub_session);
 
-        let (sub_session, sub_cid, sub_transport) = connect(args)
+        let (sub_session, sub_cid, sub_transport) = connect(args, &mut sessions)
             .await
             .context("subscriber failed to connect")?;
         cids.add(sub_cid);
         let (sub_session, _, mut subscriber) = Session::connect(sub_session, None, sub_transport)
             .await
             .context("subscriber SETUP failed")?;
+        let sub_session = sessions.start(sub_session);
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
 
@@ -332,83 +411,101 @@ pub async fn test_publish_namespace_subscribe(args: &Args) -> Result<TestConnect
             .ok_or_else(|| anyhow::anyhow!("failed to create subscriber track"))?;
 
         tracing::info!(
-            "Subscriber subscribing to track: {}/{}",
+            "Preparing subscriber track: {}/{}",
             TEST_NAMESPACE,
             TEST_TRACK
         );
 
+        let publish = publisher
+            .publish_namespace_start(namespace)
+            .await
+            .context("failed to send PUBLISH_NAMESPACE")?;
+        let pub_run = pub_session.run();
+        let sub_run = sub_session.run();
+        tokio::pin!(pub_run, sub_run);
         tokio::select! {
-            res = publisher.publish_namespace(pub_reader) => {
-                res.context("publisher PUBLISH_NAMESPACE failed")?;
-                tracing::info!("Publisher PUBLISH_NAMESPACE completed");
+            res = publish.ok() => res.context("publisher PUBLISH_NAMESPACE rejected")?,
+            res = &mut pub_run => {
+                res.context("publisher session error")?;
+                anyhow::bail!("publisher session ended before REQUEST_OK");
             }
-            res = subscriber.subscribe(sub_track) => {
-                match res {
-                    Ok(()) => tracing::info!(
-                        "Subscriber got subscription response - relay routed correctly"
-                    ),
-                    Err(e) => tracing::info!(
-                        "Subscriber got error: {} - subscription was processed", e
-                    ),
-                }
+            res = &mut sub_run => {
+                res.context("subscriber session error")?;
+                anyhow::bail!("subscriber session ended before SUBSCRIBE");
             }
-            res = pub_session.run() => res.context("publisher session error")?,
-            res = sub_session.run() => res.context("subscriber session error")?,
-            _ = tokio::time::sleep(Duration::from_secs(3)) => {
-                tracing::info!(
-                    "Test timeout reached - subscription routing may still be in progress"
-                );
+        }
+        tracing::info!("Publisher received REQUEST_OK; starting SUBSCRIBE");
+
+        // Draft-18 Section 10.8: subscribe_open returns only after SUBSCRIBE_OK.
+        tokio::select! {
+            res = subscriber.subscribe_open(sub_track) => {
+                let _subscription = res.context("subscriber did not receive SUBSCRIBE_OK")?;
+                tracing::info!("Subscriber received SUBSCRIBE_OK");
             }
-        };
+            res = publish.serve(pub_reader) => {
+                res.context("publisher namespace serving failed")?;
+                anyhow::bail!("publisher namespace ended before SUBSCRIBE_OK");
+            }
+            res = &mut pub_run => {
+                res.context("publisher session error")?;
+                anyhow::bail!("publisher session ended before SUBSCRIBE_OK");
+            }
+            res = &mut sub_run => {
+                res.context("subscriber session error")?;
+                anyhow::bail!("subscriber session ended before SUBSCRIBE_OK");
+            }
+        }
 
         Ok(cids)
     })
-    .await
-    .context("test timed out")?
+    .await;
+    sessions.finish(result).await
 }
 
 /// T0.6: Publish Namespace Done
 ///
-/// Send PUBLISH_NAMESPACE, receive REQUEST_OK, then send PUBLISH_NAMESPACE_DONE.
+/// Send PUBLISH_NAMESPACE, receive REQUEST_OK, then cancel the request stream.
 /// Verifies the relay handles namespace unpublishing correctly.
 pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionIds> {
-    timeout(TEST_TIMEOUT, async {
-        let (session, cid, transport) =
-            connect(args).await.context("failed to connect to relay")?;
+    let mut sessions = TestSessions::default();
+    let result = timeout(TEST_TIMEOUT - CLOSE_TIMEOUT, async {
+        let (session, cid, transport) = connect(args, &mut sessions)
+            .await
+            .context("failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
         cids.add(cid);
 
         let (session, mut publisher, _subscriber) = Session::connect(session, None, transport)
             .await
             .context("SETUP exchange failed")?;
+        let session = sessions.start(session);
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
-        let (_, _, reader) = Tracks::new(namespace.clone()).produce();
-
         tracing::info!("Sending PUBLISH_NAMESPACE: {}", TEST_NAMESPACE);
 
-        let result = tokio::select! {
-            res = publisher.publish_namespace(reader) => res,
+        let publish = publisher
+            .publish_namespace_start(namespace)
+            .await
+            .context("failed to send PUBLISH_NAMESPACE")?;
+        tokio::select! {
+            res = publish.ok() => res.context("PUBLISH_NAMESPACE rejected")?,
             res = session.run() => {
                 res.context("session error")?;
-                anyhow::bail!("session ended before PUBLISH_NAMESPACE completed");
+                anyhow::bail!("session ended before REQUEST_OK");
             }
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                // No error received: REQUEST_OK arrived and we are waiting for subscribers.
-                // Drop publish_namespace here to send PUBLISH_NAMESPACE_DONE.
-                tracing::info!("PUBLISH_NAMESPACE active; sending PUBLISH_NAMESPACE_DONE");
-                Ok(())
-            }
-        };
-
-        result.context("PUBLISH_NAMESPACE failed")?;
-
+        }
+        // Draft-18 Sections 6.2 and 3.3.2 withdraw by request cancellation.
+        drop(publish);
+        // The transport API exposes no cancellation acknowledgement, and closing
+        // a raw QUIC connection at once can discard the queued reset. Give the
+        // reset time to leave before the close; in local runs 1 ms sufficed, so
+        // 100 ms leaves margin for a loaded host.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        tracing::info!("PUBLISH_NAMESPACE_DONE sent successfully");
+        tracing::info!("PUBLISH_NAMESPACE request cancelled");
         Ok(cids)
     })
-    .await
-    .context("test timed out")?
+    .await;
+    sessions.finish(result).await
 }
 
 /// T0.7: Publish Track Only
@@ -423,8 +520,9 @@ pub async fn test_publish_namespace_done(args: &Args) -> Result<TestConnectionId
 /// stopped being swallowed; before that it returned `Ok` even when nothing was
 /// transmitted. End-to-end receipt is asserted by `publish-track-subscribe`.
 pub async fn test_publish_track_only(args: &Args) -> Result<TestConnectionIds> {
-    timeout(TEST_TIMEOUT, async {
-        let (session, cid, transport) = connect(args)
+    let mut sessions = TestSessions::default();
+    let result = timeout(TEST_TIMEOUT - CLOSE_TIMEOUT, async {
+        let (session, cid, transport) = connect(args, &mut sessions)
             .await
             .context("publisher failed to connect to relay")?;
         let mut cids = TestConnectionIds::default();
@@ -433,6 +531,7 @@ pub async fn test_publish_track_only(args: &Args) -> Result<TestConnectionIds> {
         let (session, mut publisher, _subscriber) = Session::connect(session, None, transport)
             .await
             .context("publisher SETUP failed")?;
+        let session = sessions.start(session);
 
         let namespace = TrackNamespace::from_utf8_path(PUBLISH_NAMESPACE);
         let (track_writer, track_reader) = Track::new(namespace.clone(), PUBLISH_TRACK).produce();
@@ -470,8 +569,8 @@ pub async fn test_publish_track_only(args: &Args) -> Result<TestConnectionIds> {
         result?;
         Ok(cids)
     })
-    .await
-    .context("test timed out")?
+    .await;
+    sessions.finish(result).await
 }
 
 /// T0.8: Publish Track + Subscribe
@@ -479,10 +578,11 @@ pub async fn test_publish_track_only(args: &Args) -> Result<TestConnectionIds> {
 /// Publisher sends direct PUBLISH for one track; after PUBLISH_OK, a subscriber
 /// subscribes to the exact track and receives the relayed object stream.
 pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionIds> {
-    timeout(TEST_TIMEOUT, async {
+    let mut sessions = TestSessions::default();
+    let result = timeout(TEST_TIMEOUT - CLOSE_TIMEOUT, async {
         let mut cids = TestConnectionIds::default();
 
-        let (pub_session, pub_cid, pub_transport) = connect(args)
+        let (pub_session, pub_cid, pub_transport) = connect(args, &mut sessions)
             .await
             .context("publisher failed to connect")?;
         cids.add(pub_cid);
@@ -490,8 +590,9 @@ pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionI
             Session::connect(pub_session, None, pub_transport)
                 .await
                 .context("publisher SETUP failed")?;
+        let pub_session = sessions.start(pub_session);
 
-        let (sub_session, sub_cid, sub_transport) = connect(args)
+        let (sub_session, sub_cid, sub_transport) = connect(args, &mut sessions)
             .await
             .context("subscriber failed to connect")?;
         cids.add(sub_cid);
@@ -499,6 +600,7 @@ pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionI
             Session::connect(sub_session, None, sub_transport)
                 .await
                 .context("subscriber SETUP failed")?;
+        let sub_session = sessions.start(sub_session);
 
         let namespace = TrackNamespace::from_utf8_path(PUBLISH_NAMESPACE);
         let (track_writer, track_reader) = Track::new(namespace.clone(), PUBLISH_TRACK).produce();
@@ -589,8 +691,8 @@ pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionI
         result?;
         Ok(cids)
     })
-    .await
-    .context("test timed out")?
+    .await;
+    sessions.finish(result).await
 }
 
 /// T0.5: Subscribe Before Publish Namespace
@@ -598,17 +700,19 @@ pub async fn test_publish_track_subscribe(args: &Args) -> Result<TestConnectionI
 /// Subscriber subscribes first (will be pending), then publisher sends PUBLISH_NAMESPACE.
 /// Verifies the relay correctly handles out-of-order setup.
 pub async fn test_subscribe_before_publish_namespace(args: &Args) -> Result<TestConnectionIds> {
-    timeout(TEST_TIMEOUT, async {
+    let mut sessions = TestSessions::default();
+    let result = timeout(TEST_TIMEOUT - CLOSE_TIMEOUT, async {
         let mut cids = TestConnectionIds::default();
 
         // Subscriber connects first.
-        let (sub_session, sub_cid, sub_transport) = connect(args)
+        let (sub_session, sub_cid, sub_transport) = connect(args, &mut sessions)
             .await
             .context("subscriber failed to connect")?;
         cids.add(sub_cid);
         let (sub_session, _, mut subscriber) = Session::connect(sub_session, None, sub_transport)
             .await
             .context("subscriber SETUP failed")?;
+        let sub_session = sessions.start(sub_session);
 
         let namespace = TrackNamespace::from_utf8_path(TEST_NAMESPACE);
 
@@ -638,12 +742,14 @@ pub async fn test_subscribe_before_publish_namespace(args: &Args) -> Result<Test
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Now publisher connects and sends PUBLISH_NAMESPACE.
-        let (pub_session, pub_cid, pub_transport) =
-            connect(args).await.context("publisher failed to connect")?;
+        let (pub_session, pub_cid, pub_transport) = connect(args, &mut sessions)
+            .await
+            .context("publisher failed to connect")?;
         cids.add(pub_cid);
         let (pub_session, mut publisher, _) = Session::connect(pub_session, None, pub_transport)
             .await
             .context("publisher SETUP failed")?;
+        let pub_session = sessions.start(pub_session);
 
         let (mut pub_writer, _, pub_reader) = Tracks::new(namespace.clone()).produce();
         let _track_writer = pub_writer.create(TEST_TRACK);
@@ -678,6 +784,39 @@ pub async fn test_subscribe_before_publish_namespace(args: &Args) -> Result<Test
 
         Ok(cids)
     })
-    .await
-    .context("test timed out")?
+    .await;
+    sessions.finish(result).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_keeps_scenario_error_when_graceful_close_also_fails() {
+        let scenario = Err(ServeError::NotFound).context("SUBSCRIBE failed");
+        let closed =
+            Err(anyhow::anyhow!("connection reset")).context("session closed with an error");
+        let error = TestSessions::finish_result(scenario, closed).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ServeError>(),
+            Some(&ServeError::NotFound)
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("SUBSCRIBE failed"), "{message}");
+        assert!(
+            message.contains("session closed with an error: connection reset"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn finish_reports_close_failure_when_scenario_succeeded() {
+        let error = TestSessions::finish_result(
+            Ok(TestConnectionIds::default()),
+            Err(anyhow::anyhow!("connection reset")),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "connection reset");
+    }
 }
