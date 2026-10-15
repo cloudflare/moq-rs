@@ -684,6 +684,12 @@ pub struct Client {
 }
 
 impl Client {
+    /// Wait for all connections to finish shutting down so CONNECTION_CLOSE
+    /// packets can leave the process before it exits.
+    pub async fn wait_idle(&self) {
+        self.quic.wait_idle().await;
+    }
+
     /// Returns the local address of the QUIC socket.
     pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {
         self.quic
