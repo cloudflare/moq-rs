@@ -102,7 +102,7 @@ pub enum TestCase {
     /// T0.5: Subscriber subscribes before publisher sends PUBLISH_NAMESPACE
     #[value(alias = "subscribe-before-announce")]
     SubscribeBeforePublishNamespace,
-    /// T0.6: Send PUBLISH_NAMESPACE, receive REQUEST_OK, send PUBLISH_NAMESPACE_DONE
+    /// T0.6: Send PUBLISH_NAMESPACE, receive REQUEST_OK, cancel its request stream
     PublishNamespaceDone,
     /// T0.7: Publisher sends PUBLISH for one track, receives PUBLISH_OK, then completes
     PublishTrackOnly,
