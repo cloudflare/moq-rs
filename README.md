@@ -56,6 +56,7 @@ This repository contains several crates:
   - **moq-catalog**: Catalog format handling.
   - **moq-sub**: A subscriber client for consuming MoQT streams.
 - **moq-clock-ietf**: A simple time publisher/subscriber demonstrating non-media use cases.
+- **moq-cat-mint**: A CLI that mints Common Access Tokens (CAT) for testing relays that require them.
 
 ## Development
 
