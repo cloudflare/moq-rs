@@ -92,12 +92,15 @@ pub enum TestCase {
     /// T0.1: Connect, complete SETUP exchange, close gracefully
     SetupOnly,
     /// T0.2: Connect, send PUBLISH_NAMESPACE, receive REQUEST_OK, close
+    #[value(alias = "announce-only")]
     PublishNamespaceOnly,
     /// T0.3: Subscribe to non-existent track, expect error
     SubscribeError,
     /// T0.4: Publisher sends PUBLISH_NAMESPACE, subscriber subscribes, verify handshake
+    #[value(alias = "announce-subscribe")]
     PublishNamespaceSubscribe,
     /// T0.5: Subscriber subscribes before publisher sends PUBLISH_NAMESPACE
+    #[value(alias = "subscribe-before-announce")]
     SubscribeBeforePublishNamespace,
     /// T0.6: Send PUBLISH_NAMESPACE, receive REQUEST_OK, send PUBLISH_NAMESPACE_DONE
     PublishNamespaceDone,
