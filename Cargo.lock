@@ -1655,6 +1655,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moq-cat-mint"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "cat-token",
+ "clap",
+ "p256",
+]
+
+[[package]]
 name = "moq-catalog"
 version = "0.2.3"
 dependencies = [

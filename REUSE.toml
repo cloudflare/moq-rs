@@ -41,6 +41,7 @@ path = [
   "moq-relay-ietf/README.md",
   "moq-test-client/CHANGELOG.md",
   "moq-test-client/README.md",
+  "moq-cat-mint/README.md",
   "deploy/MLOG_SETUP.md",
   "deploy/QLOG_SETUP.md",
   "flake.lock",
