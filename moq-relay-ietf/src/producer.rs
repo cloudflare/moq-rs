@@ -2486,13 +2486,48 @@ mod tests {
         )
     }
 
+    async fn assert_track_status_ok_forwards_track_extensions(
+        transport: &web_transport::Session,
+        request_id: u64,
+    ) {
+        let (kind, payload, _send, mut recv) = open_request(
+            transport,
+            Message::TrackStatus(moq_transport::message::TrackStatus {
+                id: request_id,
+                track_namespace: TrackNamespace::from_utf8_path("admission"),
+                track_name: "properties".into(),
+                params: KeyValuePairs::default(),
+            }),
+        )
+        .await;
+        assert_eq!(kind, wire_id::RequestOk);
+        let mut input = payload.as_slice();
+        let _params = KeyValuePairs::decode_message_params(&mut input).unwrap();
+        // Compare the remaining wire bytes, including opaque Immutable Properties.
+        assert_eq!(input, TRACK_PROPERTY_BYTES, "TRACK_STATUS_OK");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), recv.read(1))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none(),
+            "TRACK_STATUS_OK must FIN"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn inbound_publish_forwards_track_extensions_to_subscribe_ok_and_generated_publish() {
+    async fn inbound_publish_forwards_track_extensions_to_subscribe_status_and_generated_publish() {
         let locals = Locals::new();
         let coordinator = Arc::new(CountingCoordinator::default());
         let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
-        let mut downstream =
-            spawn_relay_session(locals.clone(), remotes.clone(), coordinator.clone()).await;
+        let (downstream_transport, mut downstream, _) = spawn_relay_session_with_limits(
+            locals.clone(),
+            remotes.clone(),
+            coordinator.clone(),
+            MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
+            MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+        )
+        .await;
         let (fanout_transport, mut fanout, _) = spawn_relay_session_with_limits(
             locals.clone(),
             remotes.clone(),
@@ -2530,6 +2565,7 @@ mod tests {
             .encode(&mut forwarded)
             .unwrap();
         assert_eq!(forwarded, TRACK_PROPERTY_BYTES, "PUBLISH -> SUBSCRIBE_OK");
+        assert_track_status_ok_forwards_track_extensions(&downstream_transport, 2).await;
 
         let request = Message::SubscribeTracks(SubscribeTracks {
             id: 0,
@@ -2625,14 +2661,20 @@ mod tests {
         }
     }
 
-    async fn assert_subscribe_ok_forwards_track_extensions(rendezvous: bool) {
+    async fn assert_subscribe_and_track_status_ok_forward_track_extensions(rendezvous: bool) {
         let locals = Locals::new();
         let coordinator = Arc::new(CountingCoordinator::default());
         let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
         let mut first_subscriber =
             spawn_relay_session(locals.clone(), remotes.clone(), coordinator.clone()).await;
-        let mut cached_subscriber =
-            spawn_relay_session(locals.clone(), remotes.clone(), coordinator.clone()).await;
+        let (status_transport, mut cached_subscriber, _) = spawn_relay_session_with_limits(
+            locals.clone(),
+            remotes.clone(),
+            coordinator.clone(),
+            MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
+            MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+        )
+        .await;
         let (_, mut publisher, tasks) =
             spawn_relay_publisher(locals, remotes, coordinator.clone()).await;
         let namespace = TrackNamespace::from_utf8_path("admission");
@@ -2725,6 +2767,8 @@ mod tests {
             assert_eq!(forwarded, property_bytes, "{path}, rendezvous={rendezvous}");
         }
 
+        assert_track_status_ok_forwards_track_extensions(&status_transport, 2).await;
+
         drop(cached);
         drop(first);
         serve.abort();
@@ -2734,13 +2778,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn subscribe_ok_forwards_track_extensions_to_first_and_cached_subscribers() {
-        assert_subscribe_ok_forwards_track_extensions(false).await;
+    async fn subscribe_and_track_status_ok_forward_track_extensions_to_first_and_cached_subscribers(
+    ) {
+        assert_subscribe_and_track_status_ok_forward_track_extensions(false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn subscribe_ok_forwards_track_extensions_after_rendezvous() {
-        assert_subscribe_ok_forwards_track_extensions(true).await;
+    async fn subscribe_and_track_status_ok_forward_track_extensions_after_rendezvous() {
+        assert_subscribe_and_track_status_ok_forward_track_extensions(true).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -472,6 +472,7 @@ impl Publisher {
                             request_stopped = true;
                         }
                         PublishNamespaceEvent::Response(Ok(Message::RequestOk(msg))) => {
+                            super::validate_propertyless_request_ok(&msg)?;
                             if responded {
                                 return Err(SessionError::ProtocolViolation(
                                     "multiple responses to PUBLISH_NAMESPACE".to_string(),
@@ -1119,10 +1120,7 @@ impl Publisher {
                     request_id = msg.id,
                     "PUBLISH accepted with the draft-16 PUBLISH_OK type"
                 );
-                let msg = message::RequestOk {
-                    id: msg.id,
-                    params: msg.params,
-                };
+                let msg = message::RequestOk::new(msg.id, msg.params);
                 self.recv_publish_ok(&msg)?;
             }
         }
@@ -1314,6 +1312,7 @@ impl Publisher {
     /// from the type instead would resolve a PUBLISH as a namespace
     /// registration and leave the publish waiting forever.
     fn recv_request_ok(&mut self, msg: message::RequestOk) -> Result<(), SessionError> {
+        super::validate_propertyless_request_ok(&msg)?;
         if self.recv_publish_namespace_ok(&msg)? {
             return Ok(());
         }
@@ -1942,10 +1941,10 @@ mod tests {
                 let mut writer = Writer::new(send_stream);
                 Session::encode_bidi_response(
                     &mut writer,
-                    &Message::RequestOk(message::RequestOk {
-                        id: publish.id,
-                        params: KeyValuePairs::default(),
-                    }),
+                    &Message::RequestOk(message::RequestOk::new(
+                        publish.id,
+                        KeyValuePairs::default(),
+                    )),
                 )
                 .await
                 .unwrap();
@@ -2054,10 +2053,10 @@ mod tests {
             let mut writer = Writer::new(send_stream);
             Session::encode_bidi_response(
                 &mut writer,
-                &Message::RequestOk(message::RequestOk {
-                    id: publish.id,
-                    params: KeyValuePairs::default(),
-                }),
+                &Message::RequestOk(message::RequestOk::new(
+                    publish.id,
+                    KeyValuePairs::default(),
+                )),
             )
             .await
             .unwrap();
@@ -2116,10 +2115,10 @@ mod tests {
             let mut writer = Writer::new(send_stream);
             Session::encode_bidi_response(
                 &mut writer,
-                &Message::RequestOk(message::RequestOk {
-                    id: publish.id,
-                    params: KeyValuePairs::default(),
-                }),
+                &Message::RequestOk(message::RequestOk::new(
+                    publish.id,
+                    KeyValuePairs::default(),
+                )),
             )
             .await
             .unwrap();
@@ -2242,10 +2241,7 @@ mod tests {
         ));
         Session::encode_bidi_response(
             &mut peer_writer,
-            &Message::RequestOk(message::RequestOk {
-                id: 0,
-                params: Default::default(),
-            }),
+            &Message::RequestOk(message::RequestOk::new(0, Default::default())),
         )
         .await
         .unwrap();
@@ -2382,10 +2378,7 @@ mod tests {
         ));
         Session::encode_bidi_response(
             &mut peer_writer,
-            &Message::RequestOk(message::RequestOk {
-                id: 0,
-                params: Default::default(),
-            }),
+            &Message::RequestOk(message::RequestOk::new(0, Default::default())),
         )
         .await
         .unwrap();
