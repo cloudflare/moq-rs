@@ -2441,6 +2441,144 @@ mod tests {
         );
     }
 
+    async fn assert_subscribe_ok_forwards_track_extensions(rendezvous: bool) {
+        let locals = Locals::new();
+        let coordinator = Arc::new(CountingCoordinator::default());
+        let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+        let mut first_subscriber =
+            spawn_relay_session(locals.clone(), remotes.clone(), coordinator.clone()).await;
+        let mut cached_subscriber =
+            spawn_relay_session(locals.clone(), remotes.clone(), coordinator.clone()).await;
+        let (server_transport, client_transport) = loopback_webtransport_pair().await;
+        let (server, client) = tokio::join!(
+            TransportSession::accept(server_transport, None, Transport::WebTransport),
+            TransportSession::connect(client_transport, None, Transport::WebTransport),
+        );
+        let (server, _, server_subscriber) = server.expect("accept publisher session");
+        let (client, mut publisher, _) = client.expect("connect publisher session");
+        let consumer = crate::Consumer::new(
+            server_subscriber.expect("relay subscriber"),
+            locals,
+            coordinator.clone(),
+            remotes,
+            None,
+            SessionContext::public(None),
+            None,
+        );
+        let server_task = tokio::spawn(server.run());
+        let client_task = tokio::spawn(client.run());
+        let consumer_task = tokio::spawn(consumer.run());
+        let namespace = TrackNamespace::from_utf8_path("admission");
+        let publication = if rendezvous {
+            None
+        } else {
+            let publication = publisher
+                .publish_namespace_start(namespace.clone())
+                .await
+                .expect("send PUBLISH_NAMESPACE");
+            tokio::time::timeout(Duration::from_secs(2), publication.ok())
+                .await
+                .expect("PUBLISH_NAMESPACE timed out")
+                .expect("PUBLISH_NAMESPACE accepted");
+            Some(publication)
+        };
+
+        let first = tokio::spawn(async move {
+            subscribe_result(
+                &mut first_subscriber,
+                "properties",
+                rendezvous.then_some(10_000),
+            )
+            .await
+        });
+        if rendezvous {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !coordinator.looked_up("properties") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("subscriber did not enter rendezvous routing");
+            assert!(!first.is_finished(), "subscriber must wait for a publisher");
+        }
+        let publication = match publication {
+            Some(publication) => publication,
+            None => {
+                let publication = publisher
+                    .publish_namespace_start(namespace.clone())
+                    .await
+                    .expect("send PUBLISH_NAMESPACE during rendezvous");
+                tokio::time::timeout(Duration::from_secs(2), publication.ok())
+                    .await
+                    .expect("PUBLISH_NAMESPACE timed out")
+                    .expect("PUBLISH_NAMESPACE accepted");
+                publication
+            }
+        };
+        let upstream = tokio::time::timeout(Duration::from_secs(2), publication.subscribed())
+            .await
+            .expect("upstream SUBSCRIBE timed out")
+            .expect("receive upstream SUBSCRIBE")
+            .expect("namespace still open");
+        assert!(
+            !first.is_finished(),
+            "relay must wait for upstream acceptance"
+        );
+
+        // Unknown repeated byte values and non-minimal varints inside Immutable
+        // Properties must survive both hops (draft-18 Sections 2.5 and 12.7).
+        let property_bytes = [
+            0x0b, 0x04, 0x80, 0x02, 0x80, 0x07, 0x03, 0x80, 0xc8, 0x2b, 0x03, 0x00, 0xff, 0x80,
+            0x00, 0x01, 0x7f,
+        ];
+        let properties =
+            moq_transport::message::TrackExtensions::decode(&mut property_bytes.as_slice())
+                .expect("decode property fixture");
+        let (mut writer, reader) = Track::new(namespace, "properties").produce();
+        writer.set_track_extensions(properties);
+        let serve = tokio::spawn(upstream.serve(reader));
+        let first = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first downstream SUBSCRIBE_OK timed out")
+            .expect("join first subscriber")
+            .expect("first subscription accepted");
+
+        // Only the first upstream request is served. A second upstream request
+        // would leave this subscriber waiting rather than accepting from cache.
+        let cached = tokio::time::timeout(
+            Duration::from_secs(2),
+            subscribe_result(&mut cached_subscriber, "properties", None),
+        )
+        .await
+        .expect("cached downstream SUBSCRIBE_OK timed out")
+        .expect("cached subscription accepted");
+        for (path, subscription) in [("first", &first), ("cached", &cached)] {
+            let ok = subscription.subscribe_ok().expect("received SUBSCRIBE_OK");
+            let mut forwarded = Vec::new();
+            ok.track_extensions
+                .encode(&mut forwarded)
+                .expect("encode properties");
+            assert_eq!(forwarded, property_bytes, "{path}, rendezvous={rendezvous}");
+        }
+
+        drop(cached);
+        drop(first);
+        serve.abort();
+        consumer_task.abort();
+        server_task.abort();
+        client_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_ok_forwards_track_extensions_to_first_and_cached_subscribers() {
+        assert_subscribe_ok_forwards_track_extensions(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_ok_forwards_track_extensions_after_rendezvous() {
+        assert_subscribe_ok_forwards_track_extensions(true).await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn relay_admission_serves_available_tracks_before_rejecting_new_holds() {
         let locals = Locals::with_rendezvous_capacity(1);

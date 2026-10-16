@@ -452,6 +452,10 @@ impl SubscribeRecv {
         }
 
         if let Some(mut state) = state.into_mut() {
+            // Downstream waiters may answer as soon as ok is set (draft-18 Section 9.4).
+            if let Some(TrackWriterMode::Track(track)) = self.writer.as_mut() {
+                track.set_track_extensions(msg.track_extensions.clone());
+            }
             state.ok = true;
             state.track_alias = Some(msg.track_alias);
             state.subscribe_ok = Some(SubscribeOkInfo {
@@ -892,6 +896,28 @@ mod tests {
             Some(60_000)
         );
         assert_eq!(ok.track_extensions.dynamic_groups().unwrap(), Some(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_ok_stores_track_extensions_before_establishment() {
+        let (send, mut recv, reader) = test_recv_with_reader().await;
+        let mut msg = subscribe_ok(42);
+        msg.track_extensions = TrackExtensions(vec![
+            crate::coding::KeyValuePair::new_bytes(0x0b, vec![0x80, 0x02, 0x80, 0x07]),
+            crate::coding::KeyValuePair::new_int(0x0e, 200),
+            crate::coding::KeyValuePair::new_bytes(0x39, vec![0x00, 0xff]),
+            crate::coding::KeyValuePair::new_bytes(0x39, vec![0x80]),
+        ]);
+
+        let established = async {
+            send.ok().await.unwrap();
+            assert_eq!(reader.track_extensions(), msg.track_extensions);
+        };
+        let receive = async { recv.ok(&msg, 200).unwrap() };
+        tokio::join!(established, receive);
+
+        assert_eq!(recv.ok(&subscribe_ok(43), 128), Err(ServeError::Duplicate));
+        assert_eq!(reader.track_extensions(), msg.track_extensions);
     }
 
     /// PUBLISH_DONE's Stream Count, status code, and reason phrase must reach
