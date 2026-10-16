@@ -81,13 +81,7 @@ impl SubscribedNamespace {
     pub fn ok(&mut self) -> Result<(), ServeError> {
         self.responded()?;
         self.outgoing
-            .try_send(
-                message::RequestOk {
-                    id: self.info.request_id,
-                    params: Default::default(),
-                }
-                .into(),
-            )
+            .try_send(message::RequestOk::new(self.info.request_id, Default::default()).into())
             .map_err(|_| ServeError::Cancel)
     }
 

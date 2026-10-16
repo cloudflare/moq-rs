@@ -315,7 +315,8 @@ impl SubscribeNamespaceRecv {
 
     fn recv_message(&mut self, msg: Message) -> Result<ResponseFlow, SessionError> {
         match msg {
-            Message::RequestOk(_) if !self.responded => {
+            Message::RequestOk(msg) if !self.responded => {
+                super::validate_propertyless_request_ok(&msg)?;
                 self.responded = true;
                 self.recv_ok();
                 Ok(ResponseFlow::Continue)
@@ -493,10 +494,7 @@ mod tests {
     }
 
     fn request_ok() -> Message {
-        Message::RequestOk(RequestOk {
-            id: 0,
-            params: Default::default(),
-        })
+        Message::RequestOk(RequestOk::new(0, Default::default()))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

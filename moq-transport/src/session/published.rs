@@ -365,7 +365,7 @@ mod tests {
         let mut params = KeyValuePairs::default();
         params.set_forward(false);
 
-        recv.recv_ok(&message::RequestOk { id: 0, params }).unwrap();
+        recv.recv_ok(&message::RequestOk::new(0, params)).unwrap();
 
         assert!(!recv.state.lock().forward);
         assert!(recv.state.lock().ok);

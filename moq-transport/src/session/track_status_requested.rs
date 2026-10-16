@@ -38,11 +38,8 @@ impl TrackStatusRequested {
         Ok(())
     }
 
-    /// Accept the TRACK_STATUS request with REQUEST_OK (draft-16 §9.7).
-    ///
-    /// The response includes LARGEST_OBJECT when objects have been published.
-    /// No Track Alias is included — draft-16 §9.19 does not use one for
-    /// TRACK_STATUS responses.
+    /// Accept TRACK_STATUS with the track's properties and LARGEST_OBJECT when
+    /// objects have been published. No Track Alias is included (draft-18 Section 10.14).
     pub fn respond_ok(mut self, track: &serve::TrackReader) -> Result<(), SessionError> {
         let mut params = KeyValuePairs::default();
 
@@ -57,9 +54,53 @@ impl TrackStatusRequested {
             RequestOk {
                 id: self.request_msg.id,
                 params,
+                track_extensions: track.track_extensions(),
             },
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::{Decode, Encode, TrackNamespace};
+    use crate::session::{test_support, RequestId};
+    use crate::watch::Queue;
+
+    #[tokio::test]
+    async fn respond_ok_sends_track_extensions_snapshot() {
+        let transport = test_support::loopback_session().await;
+        let (outgoing, mut responses) = Queue::default().split();
+        let (tasks, _task_recv) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::new(outgoing, transport, None, RequestId::new(1, 0), tasks);
+        let namespace = TrackNamespace::from_utf8_path("test");
+        let request = TrackStatusRequested::new(
+            publisher.clone(),
+            message::TrackStatus {
+                id: 42,
+                track_namespace: namespace.clone(),
+                track_name: "track".into(),
+                params: KeyValuePairs::default(),
+            },
+        );
+        let (mut writer, reader) = serve::Track::new(namespace, "track").produce();
+        let mut input = test_support::TRACK_PROPERTY_BYTES;
+        writer.set_track_extensions(message::TrackExtensions::decode(&mut input).unwrap());
+        request.respond_ok(&reader).unwrap();
+        writer.set_track_extensions(message::TrackExtensions::new());
+
+        let Some(message::Message::RequestOk(ok)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), responses.pop())
+                .await
+                .unwrap()
+        else {
+            panic!("expected TRACK_STATUS_OK");
+        };
+        assert_eq!(ok.id, 42);
+        let mut forwarded = Vec::new();
+        ok.track_extensions.encode(&mut forwarded).unwrap();
+        assert_eq!(forwarded, test_support::TRACK_PROPERTY_BYTES);
     }
 }

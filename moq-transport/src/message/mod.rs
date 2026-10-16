@@ -396,10 +396,10 @@ mod tests {
 
     #[test]
     fn sequenced_request_id_ignores_messages_that_reference_existing_requests() {
-        assert_not_sequenced(Message::RequestOk(RequestOk {
-            id: 0,
-            params: KeyValuePairs::default(),
-        }));
+        assert_not_sequenced(Message::RequestOk(RequestOk::new(
+            0,
+            KeyValuePairs::default(),
+        )));
 
         assert_not_sequenced(Message::RequestError(RequestError {
             id: 0,
@@ -454,7 +454,7 @@ mod tests {
     fn message_boundary_enforces_parameter_scope() {
         let mut params = KeyValuePairs::default();
         params.set_rendezvous_timeout(1_000);
-        let request_ok = RequestOk { id: 1, params };
+        let request_ok = RequestOk::new(1, params);
 
         let mut encoded = bytes::BytesMut::new();
         let err = Message::RequestOk(request_ok.clone())
