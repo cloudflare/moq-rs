@@ -76,6 +76,26 @@ fn validate_propertyless_request_ok(msg: &message::RequestOk) -> Result<(), Sess
     Ok(())
 }
 
+// Section 2.5.1 registers no supported mandatory types. Section 12.7 makes
+// unparseable Immutable Properties a malformed track, not a malformed message.
+fn track_properties_error(
+    extensions: &message::TrackExtensions,
+) -> Option<message::RequestErrorCode> {
+    match extensions.has_unknown_mandatory_extension() {
+        Ok(false) => None,
+        Ok(true) => Some(message::RequestErrorCode::UnsupportedExtension),
+        Err(_) => Some(message::RequestErrorCode::MalformedTrack),
+    }
+}
+
+fn track_properties_reset_code(code: message::RequestErrorCode) -> u32 {
+    if code == message::RequestErrorCode::MalformedTrack {
+        crate::data::DataStreamResetCode::MalformedTrack as u32
+    } else {
+        CANCELLED_STREAM_CODE
+    }
+}
+
 pub(crate) struct BidiResponse {
     message: Message,
     completion: Option<tokio::sync::oneshot::Sender<Result<(), DeliveryError>>>,
@@ -1978,12 +1998,38 @@ impl Session {
 /// Shared helpers for session-layer unit tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use crate::message;
     // Repeated unknown values and non-minimal varints inside Immutable Properties
     // must survive forwarding (draft-18 Sections 2.5 and 12.7).
     pub(crate) const TRACK_PROPERTY_BYTES: &[u8] = &[
         0x0b, 0x04, 0x80, 0x02, 0x80, 0x07, 0x03, 0x80, 0xc8, 0x2b, 0x03, 0x00, 0xff, 0x80, 0x00,
         0x01, 0x7f,
     ];
+
+    pub(crate) fn immutable_properties(
+        properties: message::TrackExtensions,
+    ) -> message::TrackExtensions {
+        use crate::coding::Encode;
+        let mut bytes = Vec::new();
+        properties.encode(&mut bytes).unwrap();
+        let mut result = message::TrackExtensions::new();
+        result.set_bytes_extension(message::extension_type::IMMUTABLE_EXTENSIONS, bytes);
+        result
+    }
+
+    pub(crate) fn rejected_track_properties() -> Vec<(message::TrackExtensions, u64, u32)> {
+        let mut mandatory = message::TrackExtensions::new();
+        mandatory.set_int_extension(0x4000, 7);
+        let mut inner = message::TrackExtensions::new();
+        inner.set_bytes_extension(0x7fff, vec![7]);
+        let mut malformed = message::TrackExtensions::new();
+        malformed.set_bytes_extension(message::extension_type::IMMUTABLE_EXTENSIONS, vec![2]);
+        vec![
+            (mandatory, 0x33, 1),
+            (immutable_properties(inner), 0x33, 1),
+            (malformed, 0x12, 0x12),
+        ]
+    }
 
     pub(crate) async fn loopback_session_pair() -> (web_transport::Session, web_transport::Session)
     {
@@ -2868,6 +2914,274 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subscribe_namespace_ok_with_track_extensions_closes_session() {
         assert_request_ok_properties_close_session(message::wire_id::SubscribeNamespace).await;
+    }
+
+    async fn assert_track_property_values_close_session(kind: u64) {
+        use crate::coding::{KeyValuePair, Location, TrackNamespace};
+        use message::{extension_type, wire_id, TrackExtensions};
+
+        for (key, values) in [
+            (
+                extension_type::DEFAULT_PUBLISHER_GROUP_ORDER,
+                &[0, 3, 1, 2][..],
+            ),
+            (extension_type::DYNAMIC_GROUPS, &[2, 0, 1][..]),
+            (
+                extension_type::DEFAULT_PUBLISHER_PRIORITY,
+                &[256, 0, 255][..],
+            ),
+        ] {
+            for &value in values {
+                for placement in 0..5 {
+                    let valid = match key {
+                        extension_type::DEFAULT_PUBLISHER_GROUP_ORDER => value == 1 || value == 2,
+                        extension_type::DYNAMIC_GROUPS => value <= 1,
+                        _ => value <= 255,
+                    };
+                    if valid && placement >= 2 {
+                        continue;
+                    }
+                    let mut properties = TrackExtensions(vec![KeyValuePair::new_int(key, value)]);
+                    match placement {
+                        0 => {
+                            // A valid first occurrence cannot hide a bad repeated value.
+                            properties.0.insert(0, KeyValuePair::new_int(key, 1));
+                        }
+                        1 => {
+                            properties = test_support::immutable_properties(properties);
+                            // A valid mutable value cannot hide a bad immutable value.
+                            properties.0.push(KeyValuePair::new_int(key, 1));
+                        }
+                        2 => {
+                            // Malformed immutable bytes cannot hide an invalid top-level value.
+                            properties
+                                .set_bytes_extension(extension_type::IMMUTABLE_EXTENSIONS, vec![2]);
+                        }
+                        3 => {
+                            properties = test_support::immutable_properties(properties);
+                            // Even a mandatory type cannot hide an invalid known value.
+                            properties.set_int_extension(0x4000, 7);
+                        }
+                        4 => {
+                            properties = test_support::immutable_properties(properties);
+                            // Inspect each parseable immutable value, even after a malformed one.
+                            properties.0.insert(
+                                0,
+                                KeyValuePair::new_bytes(
+                                    extension_type::IMMUTABLE_EXTENSIONS,
+                                    vec![2],
+                                ),
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                    let (client_t, peer_t) = test_support::loopback_session_pair().await;
+                    let peer = peer_t.clone();
+                    let (client, server) = tokio::join!(
+                        Session::connect(client_t, None, Transport::WebTransport),
+                        Session::accept(peer_t, None, Transport::WebTransport),
+                    );
+                    let (session, _, mut sub) = client.unwrap();
+                    let (mut server, _, _) = server.unwrap();
+                    let mut run = tokio::spawn(session.run());
+                    let namespace = TrackNamespace::from_utf8_path("test");
+                    let mut subscribe = None;
+                    let mut fetch = None;
+                    let mut stream = None;
+                    match kind {
+                        wire_id::SubscribeOk | wire_id::FetchOk => {
+                            if kind == wire_id::SubscribeOk {
+                                let (writer, _) =
+                                    crate::serve::Track::new(namespace, "values").produce();
+                                subscribe = Some(sub.subscribe_start(writer).await.unwrap());
+                            } else {
+                                fetch = Some(
+                                    sub.fetch(
+                                        message::StandaloneFetch {
+                                            track_namespace: namespace,
+                                            track_name: "values".into(),
+                                            start_location: Location::new(0, 0),
+                                            end_location: Location::new(1, 0),
+                                        },
+                                        KeyValuePairs::default(),
+                                    )
+                                    .await
+                                    .unwrap(),
+                                );
+                            }
+                            let (send, recv) = peer.accept_bi().await.unwrap();
+                            let mut writer = Writer::new(send);
+                            let mut reader = Reader::new(recv);
+                            let _: Message = reader.decode().await.unwrap();
+                            let ok = if kind == wire_id::SubscribeOk {
+                                Message::SubscribeOk(message::SubscribeOk {
+                                    id: 0,
+                                    track_alias: 42,
+                                    params: KeyValuePairs::default(),
+                                    track_extensions: properties,
+                                })
+                            } else {
+                                Message::FetchOk(message::FetchOk {
+                                    id: 0,
+                                    end_of_track: false,
+                                    end_location: Location::new(1, 0),
+                                    params: KeyValuePairs::default(),
+                                    track_extensions: properties,
+                                })
+                            };
+                            Session::encode_bidi_response(&mut writer, &ok)
+                                .await
+                                .unwrap();
+                            stream = Some((writer, reader));
+                        }
+                        wire_id::Publish => {
+                            let (send, recv) = peer.open_bi().await.unwrap();
+                            let mut writer = Writer::new(send);
+                            writer
+                                .encode(&Message::Publish(message::Publish {
+                                    id: 1,
+                                    track_namespace: namespace,
+                                    track_name: "values".into(),
+                                    track_alias: 42,
+                                    params: KeyValuePairs::default(),
+                                    track_extensions: properties,
+                                }))
+                                .await
+                                .unwrap();
+                            stream = Some((writer, Reader::new(recv)));
+                        }
+                        wire_id::RequestOk => {
+                            // There is no outbound TRACK_STATUS response reader yet.
+                            // Exercise the generic REQUEST_OK handler through its control receive path.
+                            server
+                                .sender
+                                .encode(&Message::RequestOk(message::RequestOk {
+                                    id: 0,
+                                    params: KeyValuePairs::default(),
+                                    track_extensions: properties,
+                                }))
+                                .await
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    if valid {
+                        match kind {
+                            wire_id::SubscribeOk => tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                subscribe.as_ref().unwrap().ok(),
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                            wire_id::FetchOk => {
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    fetch.as_ref().unwrap().ok(),
+                                )
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            }
+                            wire_id::Publish => {
+                                let _received = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    sub.publish_received(),
+                                )
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            }
+                            _ => {
+                                assert!(tokio::time::timeout(
+                                    std::time::Duration::from_millis(20),
+                                    &mut run
+                                )
+                                .await
+                                .is_err());
+                            }
+                        }
+                        assert!(
+                            !run.is_finished(),
+                            "accepted boundary {key:#x}={value}, placement={placement}"
+                        );
+                    } else {
+                        let result =
+                            tokio::time::timeout(std::time::Duration::from_secs(2), &mut run)
+                                .await
+                                .expect("invalid property must close session")
+                                .unwrap();
+                        assert_eq!(result.unwrap_err().code(), 0x3);
+                        assert!(matches!(
+                            tokio::time::timeout(std::time::Duration::from_secs(2), peer.closed())
+                                .await
+                                .unwrap(),
+                            web_transport::Error::Session(
+                                web_transport::quinn::SessionError::WebTransportError(
+                                    web_transport::quinn::WebTransportError::Closed(0x3, _)
+                                )
+                            )
+                        ));
+                    }
+                    run.abort();
+                    drop((subscribe, fetch, stream, server));
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_ok_validates_all_track_property_values() {
+        assert_track_property_values_close_session(message::wire_id::SubscribeOk).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_ok_validates_all_track_property_values() {
+        assert_track_property_values_close_session(message::wire_id::FetchOk).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_validates_all_track_property_values() {
+        assert_track_property_values_close_session(message::wire_id::Publish).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn track_status_ok_validates_all_track_property_values() {
+        assert_track_property_values_close_session(message::wire_id::RequestOk).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn track_status_ok_with_mandatory_or_malformed_properties_keeps_the_session() {
+        use crate::coding::KeyValuePair;
+        use message::extension_type;
+
+        for property in [
+            KeyValuePair::new_int(0x4000, 7),
+            KeyValuePair::new_bytes(extension_type::IMMUTABLE_EXTENSIONS, vec![0x02]),
+        ] {
+            let (client_t, peer_t) = test_support::loopback_session_pair().await;
+            let (client, server) = tokio::join!(
+                Session::connect(client_t, None, Transport::WebTransport),
+                Session::accept(peer_t, None, Transport::WebTransport),
+            );
+            let (session, _, _subscriber) = client.unwrap();
+            let (mut server, _, _) = server.unwrap();
+            let mut run = tokio::spawn(session.run());
+            // There is no outbound TRACK_STATUS response reader yet, so this
+            // uses the generic REQUEST_OK handler's control receive path.
+            server
+                .sender
+                .encode(&Message::RequestOk(message::RequestOk {
+                    id: 0,
+                    params: KeyValuePairs::default(),
+                    track_extensions: message::TrackExtensions(vec![property]),
+                }))
+                .await
+                .unwrap();
+            let ended = tokio::time::timeout(std::time::Duration::from_millis(200), &mut run).await;
+            assert!(ended.is_err(), "session ended: {ended:?}");
+            run.abort();
+        }
     }
 
     #[test]
