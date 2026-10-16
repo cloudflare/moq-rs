@@ -96,10 +96,35 @@ impl TrackExtensions {
         self.0.is_empty()
     }
 
-    pub(crate) fn contains_only(&self, supported_types: &[u64]) -> bool {
-        self.0
-            .iter()
-            .all(|extension| supported_types.contains(&extension.key))
+    /// Whether the set holds a Mandatory Track Property (0x4000-0x7FFF), at the
+    /// top level or inside Immutable Properties (draft-18 Sections 2.5.1 and
+    /// 12.7). Draft 18 registers none, so every such type is unknown here.
+    ///
+    /// Immutable Properties are parsed into a temporary view, so their stored
+    /// bytes are unchanged. An error means they cannot be parsed, which makes the
+    /// track malformed.
+    pub(crate) fn has_unknown_mandatory_extension(&self) -> Result<bool, DecodeError> {
+        let contains_mandatory = |pairs: &[KeyValuePair]| {
+            pairs
+                .iter()
+                .any(|pair| (0x4000..=0x7fff).contains(&pair.key))
+        };
+        if contains_mandatory(&self.0) {
+            return Ok(true);
+        }
+        for pair in &self.0 {
+            if pair.key != extension_type::IMMUTABLE_EXTENSIONS {
+                continue;
+            }
+            let Value::BytesValue(bytes) = &pair.value else {
+                return Err(DecodeError::InvalidParameter);
+            };
+            let inner = Self::decode(&mut bytes.as_slice())?;
+            if contains_mandatory(&inner.0) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn delivery_timeout(&self) -> Result<Option<u64>, DecodeError> {
@@ -547,17 +572,5 @@ mod tests {
             extensions.set_default_publisher_group_order(GroupOrder::Publisher),
             Err(EncodeError::InvalidValue)
         ));
-    }
-
-    #[test]
-    fn track_extensions_contains_only_supported_types() {
-        let mut extensions = TrackExtensions::default();
-        let supported = [extension_type::DEFAULT_PUBLISHER_PRIORITY];
-
-        assert!(extensions.contains_only(&supported));
-        extensions.set_default_publisher_priority(30);
-        assert!(extensions.contains_only(&supported));
-        extensions.set_delivery_timeout(10);
-        assert!(!extensions.contains_only(&supported));
     }
 }

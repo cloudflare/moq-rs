@@ -2768,13 +2768,9 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_ok_forwards_track_extensions_with_and_without_largest_object() {
-        // The immutable value uses non-minimal inner varints (Section 12.7).
-        // Repeated unknown properties must retain their order and byte values.
-        let property_bytes = [
-            0x0b, 0x04, 0x80, 0x02, 0x80, 0x07, 0x03, 0x80, 0xc8, 0x2b, 0x03, 0x00, 0xff, 0x80,
-            0x00, 0x01, 0x7f,
-        ];
-        let properties = message::TrackExtensions::decode(&mut property_bytes.as_slice()).unwrap();
+        let property_bytes = super::super::test_support::TRACK_PROPERTY_BYTES;
+        let mut input = property_bytes;
+        let properties = message::TrackExtensions::decode(&mut input).unwrap();
 
         for with_deadline in [false, true] {
             for largest in [None, Some(Location::new(7, 3))] {

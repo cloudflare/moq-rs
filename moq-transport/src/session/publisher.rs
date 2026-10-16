@@ -620,7 +620,7 @@ impl Publisher {
             track_name: info.track_name.clone(),
             track_alias,
             params,
-            track_extensions: Default::default(),
+            track_extensions: track.track_extensions(),
         };
         let abort = AbortPublishedOnDrop {
             publisher: self.clone(),
@@ -1805,6 +1805,54 @@ mod tests {
                 crate::coding::EncodeError::InvalidValue
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn publish_sends_track_extensions_snapshot_and_preserves_empty_wire_output() {
+        use crate::coding::{Decode, Encode};
+        use crate::session::test_support::TRACK_PROPERTY_BYTES;
+
+        for property_bytes in [TRACK_PROPERTY_BYTES, &[][..]] {
+            let (publisher_session, peer_session) = loopback_session_pair().await;
+            let (outgoing, _outgoing_recv) = Queue::default().split();
+            let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut publisher = Publisher::new(
+                outgoing,
+                publisher_session,
+                None,
+                RequestId::new(0, 1),
+                bidi_task_tx,
+            );
+            let (mut writer, track) =
+                serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+            let mut input = property_bytes;
+            writer.set_track_extensions(message::TrackExtensions::decode(&mut input).unwrap());
+            let _published = publisher
+                .publish(track, KeyValuePairs::default())
+                .await
+                .unwrap();
+            writer.set_track_extensions(message::TrackExtensions::new());
+
+            let (_send, recv) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), peer_session.accept_bi())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut reader = Reader::new(recv);
+            let Message::Publish(publish) = reader.decode().await.unwrap() else {
+                panic!("expected PUBLISH");
+            };
+            let mut forwarded = Vec::new();
+            publish.track_extensions.encode(&mut forwarded).unwrap();
+            assert_eq!(forwarded, property_bytes);
+
+            if property_bytes.is_empty() {
+                let mut frame = Vec::new();
+                Message::Publish(publish).encode(&mut frame).unwrap();
+                // Original empty-property PUBLISH for request/alias 0, namespace ("test"), name "track".
+                assert_eq!(frame, b"\x1d\x00\x0f\x00\x01\x04test\x05track\x00\x00");
+            }
+        }
     }
 
     #[tokio::test]

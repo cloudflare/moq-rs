@@ -1748,30 +1748,34 @@ impl Subscriber {
     /// This establishes a publisher-initiated subscription: the peer offers a
     /// track and this endpoint becomes its subscriber.
     fn recv_publish(&mut self, msg: &message::Publish) -> Result<(), SessionError> {
+        let rejection = match msg.track_extensions.has_unknown_mandatory_extension() {
+            Ok(false) => None,
+            Ok(true) => Some((
+                message::RequestErrorCode::UnsupportedExtension,
+                "unsupported mandatory track property",
+            )),
+            Err(_) => Some((
+                message::RequestErrorCode::MalformedTrack,
+                "malformed immutable track properties",
+            )),
+        };
+        if let Some((code, reason)) = rejection {
+            self.send_request_error(
+                "publish",
+                message::RequestError {
+                    id: msg.id,
+                    error_code: code as u64,
+                    retry_interval: 0,
+                    reason: crate::coding::ReasonPhrase(reason.to_string()),
+                },
+            );
+            return Ok(());
+        }
         let default_publisher_priority = msg
             .track_extensions
             .default_publisher_priority()
             .map_err(SessionError::Decode)?
             .unwrap_or(data::DEFAULT_PUBLISHER_PRIORITY);
-        // DEFAULT_PUBLISHER_PRIORITY is consumed by subgroup decoding. Keep
-        // rejecting properties the serve model cannot preserve yet.
-        if !msg
-            .track_extensions
-            .contains_only(&[message::extension_type::DEFAULT_PUBLISHER_PRIORITY])
-        {
-            self.send_request_error(
-                "publish",
-                message::RequestError {
-                    id: msg.id,
-                    error_code: message::RequestErrorCode::NotSupported as u64,
-                    retry_interval: 0,
-                    reason: crate::coding::ReasonPhrase(
-                        "track extensions not supported".to_string(),
-                    ),
-                },
-            );
-            return Ok(());
-        }
 
         let full_name = FullTrackName {
             namespace: msg.track_namespace.clone(),
@@ -1835,8 +1839,10 @@ impl Subscriber {
 
         // Allocate the track. The transport owns the writer; the application
         // gets the reader from PublishReceived::ok.
-        let (writer, reader) =
+        let (mut writer, reader) =
             serve::Track::new(msg.track_namespace.clone(), msg.track_name.clone()).produce();
+        // Store properties before exposing the track to the application or Object routing.
+        writer.set_track_extensions(msg.track_extensions.clone());
 
         let (publish_received, recv) = PublishReceivedRecv::produce(
             self.clone(),
@@ -4313,6 +4319,133 @@ mod tests {
         let publish = subscriber.publish_received().await.expect("queued PUBLISH");
         assert_eq!(publish.track_alias(), 7);
         assert_eq!(publish.name(), &TrackName::from("video"));
+    }
+
+    #[tokio::test]
+    async fn recv_publish_stores_track_extensions_before_exposing_track() {
+        use crate::coding::Encode;
+        use crate::session::test_support::TRACK_PROPERTY_BYTES;
+
+        let mut subscriber = test_subscriber(loopback_session().await);
+        let mut input = TRACK_PROPERTY_BYTES;
+        subscriber
+            .recv_publish(&message::Publish {
+                id: 1,
+                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                track_name: "video".into(),
+                track_alias: 7,
+                params: Default::default(),
+                track_extensions: message::TrackExtensions::decode(&mut input).unwrap(),
+            })
+            .unwrap();
+
+        let mut publish =
+            tokio::time::timeout(Duration::from_secs(2), subscriber.publish_received())
+                .await
+                .expect("PUBLISH must reach the application")
+                .unwrap();
+        let reader = publish.take_reader().unwrap();
+        let mut forwarded = Vec::new();
+        reader.track_extensions().encode(&mut forwarded).unwrap();
+        assert_eq!(forwarded, TRACK_PROPERTY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn recv_publish_rejects_mandatory_track_extensions_without_reservations() {
+        for (key, error) in [
+            (0x4000, Some(0x33)),
+            (0x7fff, Some(0x33)),
+            (0x3fff, None),
+            (0x8000, None),
+        ] {
+            let mut extensions = message::TrackExtensions::new();
+            if key % 2 == 0 {
+                extensions.set_int_extension(key, 7);
+            } else {
+                extensions.set_bytes_extension(key, vec![7]);
+            }
+            assert_publish_property_admission(extensions, error).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_publish_rejects_mandatory_properties_inside_immutable_properties() {
+        use crate::coding::Encode;
+
+        for key in [0x4000, 0x7fff] {
+            let mut inner = message::TrackExtensions::new();
+            if key % 2 == 0 {
+                inner.set_int_extension(key, 7);
+            } else {
+                inner.set_bytes_extension(key, vec![7]);
+            }
+            let mut bytes = Vec::new();
+            inner.encode(&mut bytes).unwrap();
+            let mut extensions = message::TrackExtensions::new();
+            extensions.set_bytes_extension(message::extension_type::IMMUTABLE_EXTENSIONS, bytes);
+            assert_publish_property_admission(extensions, Some(0x33)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_publish_rejects_unparseable_immutable_properties_as_malformed_track() {
+        let mut malformed = message::TrackExtensions::new();
+        // An inner KVP with a type but no value is a malformed track (Section 12.7).
+        malformed.set_bytes_extension(message::extension_type::IMMUTABLE_EXTENSIONS, vec![2]);
+        assert_publish_property_admission(malformed, Some(0x12)).await;
+    }
+
+    async fn assert_publish_property_admission(
+        extensions: message::TrackExtensions,
+        expected_error: Option<u64>,
+    ) {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        let (outgoing, mut responses) = Queue::default().split();
+        subscriber.outgoing = outgoing;
+        let mut msg = message::Publish {
+            id: 1,
+            track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+            track_name: "video".into(),
+            track_alias: 7,
+            params: Default::default(),
+            track_extensions: extensions,
+        };
+        subscriber.recv_publish(&msg).unwrap();
+
+        if let Some(code) = expected_error {
+            let Some(Message::RequestError(error)) =
+                tokio::time::timeout(Duration::from_secs(2), responses.pop())
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected REQUEST_ERROR");
+            };
+            assert_eq!(error.id, msg.id);
+            assert_eq!(error.error_code, code);
+            assert!(subscriber.publishes_received.lock().unwrap().is_empty());
+            assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
+            assert!(!subscriber.has_subscriber_name(&FullTrackName {
+                namespace: msg.track_namespace.clone(),
+                name: msg.track_name.clone(),
+            }));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), subscriber.publish_received())
+                    .await
+                    .is_err(),
+                "rejected PUBLISH must not reach the application"
+            );
+
+            // A new request can use the rejected name and alias on the same session.
+            msg.id = 3;
+            msg.track_extensions = Default::default();
+            subscriber.recv_publish(&msg).unwrap();
+        }
+        let publish = tokio::time::timeout(Duration::from_secs(2), subscriber.publish_received())
+            .await
+            .expect("accepted PUBLISH must reach the application")
+            .unwrap();
+        assert_eq!(publish.track_alias(), msg.track_alias);
+        assert_eq!(publish.name(), &msg.track_name);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1965,6 +1965,13 @@ impl Session {
 /// Shared helpers for session-layer unit tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    // Repeated unknown values and non-minimal varints inside Immutable Properties
+    // must survive forwarding (draft-18 Sections 2.5 and 12.7).
+    pub(crate) const TRACK_PROPERTY_BYTES: &[u8] = &[
+        0x0b, 0x04, 0x80, 0x02, 0x80, 0x07, 0x03, 0x80, 0xc8, 0x2b, 0x03, 0x00, 0xff, 0x80, 0x00,
+        0x01, 0x7f,
+    ];
+
     pub(crate) async fn loopback_session_pair() -> (web_transport::Session, web_transport::Session)
     {
         use web_transport::quinn::{ClientBuilder, ServerBuilder};
