@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Cloudflare Inc.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "moq-test-relay"
+description = "MoQT interop test relay with relay-side observations"
+authors = ["moq-rs contributors"]
+repository = "https://github.com/cloudflare/moq-rs"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+moq-transport = { path = "../moq-transport", version = "0.16" }
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
+web-transport = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = "1"
+serde_json = "1"
+
+[dev-dependencies]
+rcgen = "0.13.2"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+url = "2"

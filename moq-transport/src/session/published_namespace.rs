@@ -34,9 +34,21 @@ enum StreamEvent {
     ResponseStopped(Result<Option<u8>, SessionError>),
 }
 
+/// Why an inbound PUBLISH_NAMESPACE request stream ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishedNamespaceCloseCause {
+    /// The peer cancelled an open stream direction with RESET_STREAM or STOP_SENDING.
+    /// Browsers may not expose the stream error code.
+    PeerCancelled { code: Option<u32> },
+    /// The stream task ended without observing peer cancellation, including
+    /// local cancellation, rejection, or session teardown.
+    Teardown,
+}
+
 #[derive(Default)]
 struct PublishedNamespaceState {
     done: bool,
+    cause: Option<PublishedNamespaceCloseCause>,
 }
 
 /// Represents an inbound PUBLISH_NAMESPACE received by a subscriber.
@@ -106,11 +118,7 @@ impl PublishedNamespace {
 
         self.outgoing
             .try_send(StreamAction::Response(
-                message::RequestOk {
-                    id: self.info.request_id,
-                    params: Default::default(),
-                }
-                .into(),
+                message::RequestOk::new(self.info.request_id, Default::default()).into(),
             ))
             .map_err(|_| ServeError::Cancel)?;
         self.ok = true;
@@ -126,6 +134,26 @@ impl PublishedNamespace {
             };
 
             modified.await;
+        }
+    }
+
+    /// Wait for the request stream to end and report its observed terminal cause.
+    ///
+    /// Unlike [`Self::closed`], this distinguishes peer cancellation from task
+    /// teardown. A session close alone is not evidence of namespace withdrawal.
+    pub async fn closed_cause(&self) -> PublishedNamespaceCloseCause {
+        loop {
+            let modified = {
+                let state = self.state.lock();
+                if let Some(cause) = state.cause.filter(|_| state.done) {
+                    return cause;
+                }
+                state.modified()
+            };
+            match modified {
+                Some(modified) => modified.await,
+                None => return PublishedNamespaceCloseCause::Teardown,
+            }
         }
     }
 
@@ -271,7 +299,10 @@ impl PublishedNamespaceRecv {
                     };
                     match encoded {
                         Ok(()) => {}
-                        Err(err) if err.is_stream_error() => return Ok(()),
+                        Err(err) if err.is_stream_error() => {
+                            self.record_peer_cancel(&err);
+                            return Ok(());
+                        }
                         Err(err) => return Err(err),
                     }
                     if terminal {
@@ -293,17 +324,41 @@ impl PublishedNamespaceRecv {
                         ));
                     }
                     Err(err) if err.is_stream_error() => {
+                        self.record_peer_cancel(&err);
                         writer.reset(CANCELLED_STREAM_CODE);
                         return Ok(());
                     }
                     Err(err) => return Err(err),
                 },
                 StreamEvent::ResponseStopped(stopped) => {
-                    let _ = stopped?;
+                    if let Some(code) = stopped? {
+                        self.set_peer_cancel(Some(u32::from(code)));
+                    }
                     reader.stop(CANCELLED_STREAM_CODE);
                     return Ok(());
                 }
             }
+        }
+    }
+
+    fn set_peer_cancel(&self, code: Option<u32>) {
+        if let Some(mut state) = self.state.lock_mut() {
+            state.cause = Some(PublishedNamespaceCloseCause::PeerCancelled { code });
+        }
+    }
+
+    fn record_peer_cancel(&self, err: &SessionError) {
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        if let SessionError::WebTransport(
+            web_transport::Error::Read(web_transport::quinn::ReadError::Reset(code))
+            | web_transport::Error::Write(web_transport::quinn::WriteError::Stopped(code)),
+        ) = err
+        {
+            self.set_peer_cancel(Some(*code));
+        }
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        if let SessionError::WebTransport(err @ web_transport::Error::Stream(_)) = err {
+            self.set_peer_cancel(err.code().map(u32::from));
         }
     }
 
@@ -339,6 +394,9 @@ impl Drop for PublishedNamespaceRecv {
         self.subscriber.remove_published_namespace(self.request_id);
         if let Some(mut state) = self.state.lock_mut() {
             state.done = true;
+            state
+                .cause
+                .get_or_insert(PublishedNamespaceCloseCause::Teardown);
         }
     }
 }
@@ -422,6 +480,10 @@ mod tests {
         drop(recv);
 
         published.closed().await.unwrap();
+        assert_eq!(
+            published.closed_cause().await,
+            PublishedNamespaceCloseCause::Teardown
+        );
         assert!(published.state.lock().done);
     }
 
@@ -512,8 +574,87 @@ mod tests {
         request_send.reset(CANCELLED_STREAM_CODE);
 
         published.closed().await.unwrap();
+        assert_eq!(
+            published.closed_cause().await,
+            PublishedNamespaceCloseCause::PeerCancelled {
+                code: Some(CANCELLED_STREAM_CODE)
+            }
+        );
         run.await.unwrap().unwrap();
         assert!(response_reader.done().await.unwrap_err().is_stream_error());
+    }
+
+    async fn close_cause_after_peer_end(
+        cancel: bool,
+        stop_response: bool,
+    ) -> PublishedNamespaceCloseCause {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = Subscriber::new(
+            Queue::default(),
+            server.clone(),
+            Transport::WebTransport,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+            Default::default(),
+        );
+        let (mut published, recv) =
+            PublishedNamespace::new(subscriber, 0, TrackNamespace::from_utf8_path("test"));
+        let (mut request_send, response_recv) = client.open_bi().await.unwrap();
+        request_send.write(b"request").await.unwrap();
+        let (response_send, mut request_recv) = server.accept_bi().await.unwrap();
+        request_recv.read(7).await.unwrap();
+        published.ok().unwrap();
+        let run =
+            tokio::spawn(recv.run(Writer::new(response_send), Reader::new(request_recv), None));
+        // Establish acceptance before cancellation; no timing sleep substitutes
+        // for the required REQUEST_OK response.
+        let mut response_reader = Reader::new(response_recv);
+        Session::decode_bidi_response(&mut response_reader, 0)
+            .await
+            .unwrap();
+        if cancel {
+            request_send.reset(CANCELLED_STREAM_CODE);
+        } else if stop_response {
+            response_reader.stop(CANCELLED_STREAM_CODE);
+        }
+        client.close(0, "test complete");
+        let cause =
+            tokio::time::timeout(std::time::Duration::from_secs(2), published.closed_cause())
+                .await
+                .unwrap();
+        published.closed().await.unwrap();
+        let _ = run.await.unwrap();
+        cause
+    }
+
+    #[tokio::test]
+    async fn session_close_without_cancel_is_teardown() {
+        assert_eq!(
+            close_cause_after_peer_end(false, false).await,
+            PublishedNamespaceCloseCause::Teardown
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_reset_then_immediate_session_close_preserves_cancel_cause() {
+        assert_eq!(
+            close_cause_after_peer_end(true, false).await,
+            PublishedNamespaceCloseCause::PeerCancelled {
+                code: Some(CANCELLED_STREAM_CODE)
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_stop_sending_then_immediate_session_close_preserves_cancel_cause() {
+        assert_eq!(
+            close_cause_after_peer_end(false, true).await,
+            PublishedNamespaceCloseCause::PeerCancelled {
+                code: Some(CANCELLED_STREAM_CODE)
+            }
+        );
     }
 
     #[tokio::test]

@@ -136,13 +136,8 @@ impl PublishReceived {
         let mut params = KeyValuePairs::default();
         params.set_forward(forward);
 
-        self.session.send_publish_response(
-            message::RequestOk {
-                id: self.request_id,
-                params,
-            }
-            .into(),
-        )?;
+        self.session
+            .send_publish_response(message::RequestOk::new(self.request_id, params).into())?;
         self.ok = true;
 
         Ok(())

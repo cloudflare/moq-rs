@@ -1802,6 +1802,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "moq-test-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "moq-native-ietf",
+ "moq-transport",
+ "rcgen",
+ "rustls 0.23.31",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "web-transport",
+]
+
+[[package]]
 name = "moq-transport"
 version = "0.16.0"
 dependencies = [

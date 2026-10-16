@@ -34,6 +34,7 @@ const MALFORMED: u32 = crate::data::DataStreamResetCode::MalformedTrack as u32;
 pub(super) struct FetchState {
     ok: Option<FetchOk>,
     error: Option<message::RequestError>,
+    properties_error: Option<message::RequestErrorCode>,
     /// The request stream was reset after FETCH_OK: the response failed.
     aborted: bool,
 }
@@ -115,12 +116,17 @@ impl Fetch {
     ///
     /// A REQUEST_ERROR resolves to `Err(ServeError::Closed(code))`; the exact
     /// message is then available from [`Self::rejection`].
+    /// Unsupported mandatory properties and malformed Immutable Properties also
+    /// return `Closed(0x33)` and `Closed(0x12)`, respectively, without acceptance.
     pub async fn ok(&self) -> Result<FetchOk, ServeError> {
         loop {
             let notify = {
                 let state = self.state.lock();
                 if let Some(ok) = &state.ok {
                     return Ok(ok.clone());
+                }
+                if let Some(code) = state.properties_error {
+                    return Err(ServeError::Closed(code as u64));
                 }
                 if let Some(error) = &state.error {
                     return Err(ServeError::Closed(error.error_code));
@@ -140,6 +146,10 @@ impl Fetch {
         self.state.lock().error.clone()
     }
 
+    pub(super) fn properties_error(&self) -> Option<message::RequestErrorCode> {
+        self.state.lock().properties_error
+    }
+
     /// Decode the next record from the response stream.
     ///
     /// The Object payload must be fully consumed with
@@ -154,7 +164,12 @@ impl Fetch {
         }
         self.ensure_reader().await?;
         let reader = self.reader.as_mut().ok_or(SessionError::Internal)?;
-        let record = match reader.decode_fetch(&mut self.decoder).await {
+        let decoded = tokio::select! {
+            biased;
+            err = wait_rejected(&self.state) => Err(err.into()),
+            record = reader.decode_fetch(&mut self.decoder) => record,
+        };
+        let record = match decoded {
             Ok(Some(record)) => record,
             Ok(None) => {
                 self.stream_done = true;
@@ -168,7 +183,12 @@ impl Fetch {
                     .close(err.code() as u32, "malformed FETCH object");
                 return Err(err);
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                if let Some(code) = self.properties_error() {
+                    self.stop(super::track_properties_reset_code(code));
+                }
+                return Err(err);
+            }
         };
         let validated = self
             .validator
@@ -202,7 +222,16 @@ impl Fetch {
             .unwrap_or(usize::MAX)
             .min(max);
         let reader = self.reader.as_mut().ok_or(SessionError::Internal)?;
-        match reader.read_chunk(limit).await? {
+        let chunk = tokio::select! {
+            biased;
+            err = wait_rejected(&self.state) => Err(err.into()),
+            chunk = reader.read_chunk(limit) => chunk,
+        };
+        if let Some(code) = self.properties_error() {
+            self.stop(super::track_properties_reset_code(code));
+            return Err(ServeError::Closed(code as u64).into());
+        }
+        match chunk? {
             Some(chunk) => {
                 self.payload_remaining -= chunk.len() as u64;
                 Ok(Some(chunk))
@@ -213,12 +242,10 @@ impl Fetch {
     }
 
     /// Wait for FETCH_OK without borrowing the handle, so the body can be
-    /// read concurrently. `Err(None)` means the request stream ended with
-    /// no response.
+    /// read concurrently. A request stream ending without a response is cancelled.
     pub(super) fn response(
         &self,
-    ) -> impl std::future::Future<Output = Result<FetchOk, Option<message::RequestError>>> + Send + 'static
-    {
+    ) -> impl std::future::Future<Output = Result<FetchOk, ServeError>> + Send + 'static {
         let state = self.state.clone();
         async move {
             loop {
@@ -227,14 +254,17 @@ impl Fetch {
                     if let Some(ok) = &state.ok {
                         return Ok(ok.clone());
                     }
+                    if let Some(code) = state.properties_error {
+                        return Err(ServeError::Closed(code as u64));
+                    }
                     if let Some(error) = &state.error {
-                        return Err(Some(error.clone()));
+                        return Err(ServeError::Closed(error.error_code));
                     }
                     state.modified()
                 };
                 match notify {
                     Some(notify) => notify.await,
-                    None => return Err(None),
+                    None => return Err(ServeError::Cancel),
                 }
             }
         }
@@ -248,10 +278,10 @@ impl Fetch {
         let failed = wait_rejected(&self.state);
         let reader = tokio::select! {
             biased;
+            err = failed => return Err(err.into()),
             reader = self.registration.await_stream() => {
                 reader.map_err(|_| SessionError::Serve(ServeError::Cancel))?
             }
-            err = failed => return Err(err.into()),
             _ = self.webtransport.closed() => return Err(ServeError::Cancel.into()),
         };
         self.reader = Some(reader);
@@ -275,7 +305,9 @@ impl Fetch {
 
 impl Drop for Fetch {
     fn drop(&mut self) {
-        if !self.is_complete() {
+        if let Some(code) = self.properties_error() {
+            self.stop(super::track_properties_reset_code(code));
+        } else if !self.is_complete() {
             self.stop(CANCELLED);
         }
     }
@@ -290,6 +322,9 @@ async fn wait_rejected(state: &State<FetchState>) -> ServeError {
         // future that polls this one `!Send`.
         let notify = {
             let state = state.lock();
+            if let Some(code) = state.properties_error {
+                return ServeError::Closed(code as u64);
+            }
             if let Some(error) = &state.error {
                 return ServeError::Closed(error.error_code);
             }
@@ -313,18 +348,29 @@ async fn wait_rejected(state: &State<FetchState>) -> ServeError {
 }
 
 impl FetchRecv {
-    /// Record FETCH_OK. An invalid FETCH_OK is session-fatal (§10.13).
+    /// Record FETCH_OK only after its properties and range pass validation.
     pub fn recv_ok(&mut self, ok: FetchOk) -> Result<(), SessionError> {
+        // Session-fatal range and value checks come before refusing the track.
         self.validator
             .lock()
             .map_err(|_| SessionError::Internal)?
             .validate_ok(ok.end_location, &ok.track_extensions)?;
+        if let Some(code) = super::track_properties_error(&ok.track_extensions) {
+            if let Some(mut state) = self.state.lock_mut() {
+                state.properties_error = Some(code);
+            }
+            return Err(ServeError::Closed(code as u64).into());
+        }
         let Some(mut state) = self.state.lock_mut() else {
             // The application dropped the FETCH already.
             return Ok(());
         };
         state.ok = Some(ok);
         Ok(())
+    }
+
+    pub fn properties_error(&self) -> Option<message::RequestErrorCode> {
+        self.state.lock().properties_error
     }
 
     /// The publisher reset the request stream after FETCH_OK: the response
@@ -1378,6 +1424,178 @@ mod tests {
             .expect("session with the relay survives")
             .unwrap();
         origin_task.abort();
+    }
+
+    async fn raw_origin() -> (
+        Subscriber,
+        web_transport::Session,
+        tokio::task::JoinHandle<Result<(), SessionError>>,
+        Session,
+    ) {
+        let (client_t, peer_t) = super::super::test_support::loopback_session_pair().await;
+        let peer = peer_t.clone();
+        let (client, server) = tokio::join!(
+            Session::connect(client_t, None, Transport::WebTransport),
+            Session::accept(peer_t, None, Transport::WebTransport)
+        );
+        let (client, _, sub) = client.unwrap();
+        let (server, _, _) = server.unwrap();
+        (sub, peer, tokio::spawn(client.run()), server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_ok_rejects_unsupported_and_malformed_track_properties() {
+        for (properties, code, reset) in super::super::test_support::rejected_track_properties() {
+            let (mut sub, peer, run, _server) = raw_origin().await;
+            let mut fetch = sub
+                .fetch(
+                    request(Location::new(0, 0), Location::new(1, 0)),
+                    KeyValuePairs::default(),
+                )
+                .await
+                .unwrap();
+            let (send, recv) = peer.accept_bi().await.unwrap();
+            let mut writer = super::super::Writer::new(send);
+            let mut reader = Reader::new(recv);
+            let _: message::Message = reader.decode().await.unwrap();
+            Session::encode_bidi_response(
+                &mut writer,
+                &message::Message::FetchOk(FetchOk {
+                    id: 0,
+                    end_of_track: false,
+                    end_location: Location::new(1, 0),
+                    params: KeyValuePairs::default(),
+                    track_extensions: properties,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tokio::time::timeout(T, fetch.ok()).await.unwrap(),
+                Err(ServeError::Closed(code))
+            );
+            assert!(
+                fetch.rejection().is_none(),
+                "the peer did not send REQUEST_ERROR"
+            );
+            assert!(
+                matches!(tokio::time::timeout(T, fetch.next()).await.unwrap(), Err(SessionError::Serve(ServeError::Closed(c))) if c == code)
+            );
+            assert_eq!(
+                tokio::time::timeout(T, writer.closed())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Some(reset as u8)
+            );
+            assert!(!run.is_finished());
+            run.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_rejects_track_properties_before_and_after_forwarding_data() {
+        use crate::{
+            coding::Encode,
+            data::{FetchHeader, FetchRecordEncoder},
+            session::Writer,
+        };
+        for after_data in [false, true] {
+            for (properties, code, reset) in super::super::test_support::rejected_track_properties()
+            {
+                let (mut relay_up, peer, run, _server) = raw_origin().await;
+                let (mut end, mut relay_down) = pair().await;
+                let range = request(Location::new(0, 0), Location::new(1, 0));
+                let mut fetch = end
+                    .fetch(range.clone(), KeyValuePairs::default())
+                    .await
+                    .unwrap();
+                let downstream = tokio::time::timeout(T, relay_down.fetch_requested())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let upstream = relay_up
+                    .fetch(range, KeyValuePairs::default())
+                    .await
+                    .unwrap();
+                let (send, recv) = peer.accept_bi().await.unwrap();
+                let mut writer = Writer::new(send);
+                let mut reader = Reader::new(recv);
+                let _: message::Message = reader.decode().await.unwrap();
+                let proxy = tokio::spawn(downstream.proxy(upstream, T));
+                let mut data = None;
+                if after_data {
+                    let mut stream = peer.open_uni().await.unwrap();
+                    let mut bytes = Vec::new();
+                    FetchHeader {
+                        header_type: crate::data::StreamHeaderType::Fetch,
+                        request_id: 0,
+                    }
+                    .encode(&mut bytes)
+                    .unwrap();
+                    let mut encoder = FetchRecordEncoder::new(None);
+                    encoder.encode(&obj(0, 0, 0), &mut bytes).unwrap();
+                    stream.write(&bytes).await.unwrap();
+                    assert_eq!(
+                        tokio::time::timeout(T, fetch.next())
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        Some(obj(0, 0, 0))
+                    );
+                    data = Some(stream);
+                }
+                Session::encode_bidi_response(
+                    &mut writer,
+                    &message::Message::FetchOk(FetchOk {
+                        id: 0,
+                        end_of_track: false,
+                        end_location: Location::new(1, 0),
+                        params: KeyValuePairs::default(),
+                        track_extensions: properties,
+                    }),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(tokio::time::timeout(T, proxy).await.unwrap().unwrap(),
+                    Err(SessionError::Serve(ServeError::Closed(c))) if c == code)
+                );
+                assert_eq!(
+                    tokio::time::timeout(T, fetch.ok()).await.unwrap(),
+                    Err(ServeError::Closed(code))
+                );
+                assert_eq!(fetch.rejection().unwrap().error_code, code);
+                if after_data {
+                    let error =
+                        tokio::time::timeout(T, fetch.reader.as_mut().unwrap().read_chunk(1))
+                            .await
+                            .unwrap()
+                            .unwrap_err();
+                    assert!(
+                        matches!(error, SessionError::WebTransport(web_transport::Error::Read(web_transport::quinn::ReadError::Reset(c))) if c == reset)
+                    );
+                }
+                assert_eq!(
+                    tokio::time::timeout(T, writer.closed())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    Some(reset as u8)
+                );
+                assert!(!run.is_finished());
+                if let Some(mut data) = data {
+                    assert_eq!(
+                        tokio::time::timeout(T, data.closed())
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        Some(reset as u8)
+                    );
+                }
+                run.abort();
+            }
+        }
     }
 
     #[test]
