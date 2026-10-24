@@ -8,6 +8,10 @@ Where QUIC qlog (see [QLOG_SETUP.md](QLOG_SETUP.md)) captures transport-layer ev
 
 This walkthrough uses `moq-test-client` against a public interop relay to demonstrate the basics. The URL below is an example — check the [moq-interop-runner registry](https://github.com/englishm/moq-interop-runner/blob/main/implementations.json) for current endpoints. You can adapt the same technique for your own relay.
 
+The sample output throughout this walkthrough was captured with draft-16 and is
+illustrative. It is not output from the draft-18 endpoint used in the commands:
+version fields, message names and parameters can differ in draft-18.
+
 ### Step 1: Run a test
 
 ```bash

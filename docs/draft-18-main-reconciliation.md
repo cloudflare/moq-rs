@@ -36,7 +36,7 @@ that main revision conflict-free; newer main changes still require revalidation.
 | Published versions and changelogs | Keep main's package version baseline and generated release history; final draft-18 release bumps remain pending. |
 | Bounded strings | Keep `ReasonPhrase::new` and UTF-8 boundary tests, plus the automatically merged TRACK_STATUS error call site. Other dynamic error sites remain in the port queue below. |
 | #217 independent error IDs | Keep the standalone `ServeError::error_id` helper and structured error-ID records. Full session correlation is deferred. |
-| Public dependency reexport | Keep `moq_transport::reexports::bytes`; does not imply the main FETCH API has been ported. |
+| Public dependency reexports | Keep `moq_transport::reexports::{bytes, uuid}` for public dependency types; does not imply the main FETCH API has been ported. |
 | #156/#221 compatible track integrity tests | Retain track round-trip, independent-track and stale-resubscribe tests. Subgroup source/tests use draft-18's different fan-out model. |
 | #199 mlog example documentation | Retain main's example-URL clarification in `deploy/MLOG_SETUP.md`; this is not a live endpoint assertion. |
 
