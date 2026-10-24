@@ -6,9 +6,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.4](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.3...moq-transport-v0.16.4) - 2026-10-06
+
+### Added
+
+- *(auth)* add generic client token presentation
+- *(auth)* add scope-configured CAT bearer authorization
+- *(moq-transport)* retain CLIENT_SETUP parameters and allow explicit PUBLISH_NAMESPACE rejection
+
 ### Fixed
 
-- *(moq-transport)* preserve subgroup Object IDs across relay forwarding
+- *(moq-transport)* use .0 to compare ReasonPhrase in reject_with test
+- *(auth)* update AuthzOperation doc for joining FETCH; add reject_with regression tests
+- *(moq-transport)* allow FetchWriter::reject_with after prepare_response; declare tokio rt
+
+### Other
+
+- *(moq-transport)* rename misleading Duplicate test; clarify scope
+
+## [0.16.3](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.2...moq-transport-v0.16.3) - 2026-10-06
+
+### Added
+
+- *(moq-transport)* add public FETCH APIs
+- *(moq-relay)* proxy joining fetches as standalone
+- *(moq-relay)* add local fetch passthrough
+- *(moq-transport)* add standalone fetch proxying
+
+### Fixed
+
+- *(moq-transport)* simplify FETCH order validation
+- *(moq-transport)* harden FETCH lifecycle boundaries
+- *(moq-transport)* harden FETCH protocol handling
+- *(moq-transport)* re-export public dependency
+- *(moq-transport)* retire failed joining subscriptions
+- *(moq-transport)* preserve joining fetch boundary
+- *(moq-transport)* retire completed joining associations
+- *(moq-transport)* clean published names on failure
+- *(moq-transport)* tolerate closed joining establishment
+- *(moq-relay)* harden concurrent fetch handling
+- *(moq-relay)* harden standalone fetch passthrough
+- *(moq-relay)* minimize fetch plumbing
+- *(moq-relay)* simplify remote fetch routing
+- *(moq-transport)* isolate benign stream errors
+- *(moq-relay)* harden remote fetch lifecycle
+- *(moq-transport)* tighten fetch proxy lifecycle
+
+### Other
+
+- *(moq-transport)* cover reset error ordering
+- *(moq-relay)* consolidate fetch passthrough coverage
+
+## [0.16.2](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.1...moq-transport-v0.16.2) - 2026-08-28
+
+### Added
+
+- *(moq-transport)* tie the client-visible error id to the session
+- *(moq-transport)* log session_id on stream and request-id paths
+- *(moq-transport)* log session_id on publisher and subscriber paths
+- *(moq-transport)* log session_id on all 35 control-plane sites
+- *(moq-transport)* thread SessionId through Session, Publisher and Subscriber
+- *(moq-transport)* add SessionId correlation id
+
+### Fixed
+
+- *(tracing)* harden session log context
+- *(tracing)* harden reason logs and share root spans
+- *(moq-transport)* preserve session constructor compatibility
+- *(moq-transport)* fix TrackName test assertions and pre-existing clippy lints
+
+### Other
+
+- *(moq-transport)* correct QUIC connection ID bounds
+- Merge pull request #156 from itzmanish/integrity-tests
+
+## [0.16.1](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.0...moq-transport-v0.16.1) - 2026-07-31
+
+### Fixed
+
+- reset subgroup streams instead of FIN-ing mid-object
+
+### Other
+
+- stream namespace paths into the formatter
 
 ## [0.16.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.15.1...moq-transport-v0.16.0) - 2026-07-19
 

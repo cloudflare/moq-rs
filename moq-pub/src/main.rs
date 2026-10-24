@@ -159,6 +159,18 @@ async fn publish_created_tracks(
     }
 }
 
+async fn run_media(mut media: Media) -> anyhow::Result<()> {
+    let mut input = tokio::io::stdin();
+    let mut buf = BytesMut::new();
+    loop {
+        input
+            .read_buf(&mut buf)
+            .await
+            .context("failed to read from stdin")?;
+        media.parse(&mut buf).context("failed to parse media")?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,17 +193,5 @@ mod tests {
         ])
         .unwrap();
         assert!(cli.publish);
-    }
-}
-
-async fn run_media(mut media: Media) -> anyhow::Result<()> {
-    let mut input = tokio::io::stdin();
-    let mut buf = BytesMut::new();
-    loop {
-        input
-            .read_buf(&mut buf)
-            .await
-            .context("failed to read from stdin")?;
-        media.parse(&mut buf).context("failed to parse media")?;
     }
 }
