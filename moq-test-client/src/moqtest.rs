@@ -347,7 +347,9 @@ impl MoqTestParams {
         // (e.g. start 0, last 5, increment 2) would emit no marker at all
         // and trip its own verifier. Without EOG a short series is
         // self-consistent, so no alignment requirement applies.
-        if self.eog_markers && (self.last_object - self.start_object) % self.object_increment != 0 {
+        if self.eog_markers
+            && !(self.last_object - self.start_object).is_multiple_of(self.object_increment)
+        {
             bail!(
                 "last object {} is unreachable from start object {} by increment {}; the EOG marker would never be generated",
                 self.last_object,
@@ -688,7 +690,7 @@ pub async fn generate(params: &MoqTestParams, track: TrackWriter) -> Result<()> 
                     })
                     .context("failed to create subgroup 1")?;
                 for object in params.objects() {
-                    let subgroup = if (object - params.start_object) % 2 == 0 {
+                    let subgroup = if (object - params.start_object).is_multiple_of(2) {
                         &mut even
                     } else {
                         &mut odd

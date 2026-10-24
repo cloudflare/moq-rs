@@ -13,6 +13,10 @@ pub mod data;
 pub mod error;
 pub mod message;
 pub mod mlog;
+pub mod reexports {
+    pub use bytes;
+    pub use uuid;
+}
 pub mod serve;
 pub mod session;
 pub mod setup;

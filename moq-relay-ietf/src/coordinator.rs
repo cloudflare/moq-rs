@@ -624,6 +624,9 @@ impl TrackSubscription {
 ///
 /// [`resolve_scope()`]: Coordinator::resolve_scope
 #[async_trait]
+// `async_trait` adds #[must_use] to methods returning an already-must-use
+// Future. Keep the same targeted allowance as main for current Clippy.
+#[allow(clippy::double_must_use)]
 pub trait Coordinator: Send + Sync {
     /// Resolve a connection path to scope information.
     ///

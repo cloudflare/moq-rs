@@ -7,9 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.14...moq-test-client-v0.1.15) - 2026-10-06
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.1.14](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.13...moq-test-client-v0.1.14) - 2026-10-06
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.1.13](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.12...moq-test-client-v0.1.13) - 2026-08-28
+
 ### Added
 
-- Add a rendezvous timeout interoperability scenario.
+- *(moq-transport)* thread SessionId through Session, Publisher and Subscriber
+
+### Fixed
+
+- *(moq-transport)* preserve session constructor compatibility
 
 ## [0.1.12](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.11...moq-test-client-v0.1.12) - 2026-07-31
 

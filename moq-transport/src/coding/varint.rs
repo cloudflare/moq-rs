@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn from_u64_always_succeeds() {
-        assert_eq!(VarInt::try_from(u64::MAX).unwrap(), VarInt::MAX);
+        assert_eq!(VarInt::from(u64::MAX), VarInt::MAX);
     }
 
     #[test]

@@ -6,6 +6,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.30](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.29...moq-relay-ietf-v0.7.30) - 2026-10-14
+
+### Added
+
+- *(moq-relay-ietf)* load CAT scope policy from a --scope-config file
+
+### Fixed
+
+- *(moq-relay-ietf)* do not reuse cached scope policy when --scope-config is set
+- *(moq-relay-ietf)* warn on multi-relay scope configs and wide policies
+- *(auth)* admit internal relay peers on scopes with a token policy
+- *(auth)* reuse the cached scope policy when the coordinator is down
+
+### Other
+
+- *(moq-relay-ietf)* fix the scope config reload table and token actions
+- *(moq-relay-ietf)* qualify the --scope-config help for cached policies
+- *(moq-relay-ietf)* describe scope config failures with the cached-policy rules
+- *(moq-relay-ietf)* tie scope config failure wording to the library cache
+- *(auth)* state that an address alone does not authenticate a relay peer
+
+## [0.7.29](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.28...moq-relay-ietf-v0.7.29) - 2026-10-12
+
+### Fixed
+
+- *(auth)* note joining FETCH also needs Fetch(7) in module docs
+- *(auth)* clarify Fetch(7) applies to both standalone and joining FETCH
+- *(auth)* reword oracle test and doc caveat per reviewer
+- *(auth)* remove stale fallback comments and duplicate test
+- *(auth)* FETCH requires Fetch(7); remove Subscribe(4) fallback
+- *(auth)* correct fetch_denied_yields_no_existence_oracle doc comment
+- *(auth)* replace guarded match arm with explicit ActionAbsent + catch-all
+- *(auth)* correct FETCH spec citation §9.7 → §9.16
+- *(auth)* address AI review nits — docs, HookFault test, dedup, metrics note
+- *(auth)* add real CAT token tests for token_has_action and map_operation Fetch
+- *(auth)* correct fallback scope — ActionAbsent only, not ScopeMismatch
+- *(auth)* authorize FETCH with Fetch(7) grant; Subscribe(4) v0.1 fallback
+
+### Other
+
+- *(auth)* add ActionAbsent to DenyReason test coverage
+
+### Changed
+
+- *(auth)* FETCH now requires the `Fetch(7)` CAT `moqt` action (draft-16 §9.16).
+  Tokens that do not grant `Fetch(7)` for the requested namespace and track are
+  denied. `Subscribe(4)` alone is not sufficient.
+
+## [0.7.28](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.27...moq-relay-ietf-v0.7.28) - 2026-10-06
+
+### Added
+
+- *(auth)* add generic client token presentation
+- *(auth)* add scope-configured CAT bearer authorization
+
+### Fixed
+
+- *(auth)* suppress clippy::double_must_use on AuthHook trait
+- *(test)* update joining-FETCH tests to use new Producer/Consumer constructors
+- *(auth)* replace broken intra-doc link to private may_fetch_track
+- *(auth)* update AuthzOperation doc for joining FETCH; add reject_with regression tests
+- *(auth)* gate standalone FETCH on CAT authorization
+- *(test)* update FETCH tests to use new Producer/Consumer constructors
+- *(auth-cat)* pin cat-token to exact =0.3.0-alpha.2
+- *(auth-cat)* format cat.rs to pass cargo fmt
+
+### Other
+
+- *(auth)* clarify no-policy scope behavior in mod.rs
+- *(relay)* qualify authorization README — add announce forward-link caveat
+- *(auth)* fix attribution in comments; add metrics; breaking-change marker note
+- *(auth-cat)* complete allowlist description in cat.rs module doc
+- *(auth)* document enforcement points; harden AuthToken API
+- *(auth-cat)* correct load-bearing-claim test rationale and document catv gap
+- *(auth-cat)* document nbf two-pass design and may_announce auth flow
+- *(auth-cat)* assert scope without nil prefix matches deeper namespace
+- *(auth-cat)* align with cat-token 0.3.0-alpha.2
+
+## [0.7.27](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.26...moq-relay-ietf-v0.7.27) - 2026-10-06
+
+### Added
+
+- *(moq-relay)* proxy fetches one remote hop
+- *(moq-relay)* add local fetch passthrough
+
+### Fixed
+
+- *(moq-relay-ietf)* replace abandoned hyper-serve with axum-server 0.7.3
+- *(moq-relay-ietf)* suppress double_must_use on Coordinator trait
+- *(moq-relay)* harden concurrent fetch handling
+- *(moq-relay)* harden standalone fetch passthrough
+- *(moq-relay)* minimize fetch plumbing
+- *(moq-relay)* simplify remote fetch routing
+- *(moq-relay)* harden remote fetch lifecycle
+- *(moq-transport)* tighten fetch proxy lifecycle
+
+### Other
+
+- Merge pull request #246 from itzmanish/feat/public-fetch-api-v2
+- Merge pull request #237 from itzmanish/feat/joining-fetch-v1
+- *(moq-relay)* rename producer coordinator fixture
+- *(moq-transport)* cover reset error ordering
+- *(moq-relay)* consolidate fetch passthrough coverage
+
+## [0.7.26](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.25...moq-relay-ietf-v0.7.26) - 2026-08-28
+
+### Added
+
+- *(moq-relay-ietf)* correlate relay sessions with a span, not per-site fields
+- *(moq-transport)* thread SessionId through Session, Publisher and Subscriber
+
+### Fixed
+
+- *(tracing)* harden session log context
+- *(tracing)* harden reason logs and share root spans
+- *(moq-relay-ietf)* harden session correlation spans
+- *(moq-transport)* preserve session constructor compatibility
+- serve a peer-forwarded PUBLISH_NAMESPACE for discovery only
+- resolve the upstream readiness gate when its sender is dropped
+
+### Other
+
+- *(moq-relay-ietf)* keep peer identity out of session spans
+
 ## [0.7.25](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.24...moq-relay-ietf-v0.7.25) - 2026-07-31
 
 ### Added
