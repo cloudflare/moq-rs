@@ -135,7 +135,7 @@ impl PublishedNamespace {
             id: self.info.request_id,
             error_code: RequestErrorCode::Uninterested as u64,
             retry_interval: 0,
-            reason: ReasonPhrase(err.to_string()),
+            reason: ReasonPhrase::new(err.to_string()),
         });
         Ok(())
     }
@@ -166,7 +166,7 @@ impl PublishedNamespace {
             id: self.info.request_id,
             error_code,
             retry_interval: 0,
-            reason: ReasonPhrase(reason.to_string()),
+            reason: ReasonPhrase::new(reason),
         });
         Ok(())
     }
@@ -197,7 +197,7 @@ impl Drop for PublishedNamespace {
             id: self.info.request_id,
             error_code: RequestErrorCode::Uninterested as u64,
             retry_interval: 0,
-            reason: ReasonPhrase(ServeError::Done.to_string()),
+            reason: ReasonPhrase::new(ServeError::Done.to_string()),
         });
         let _ = self.outgoing.try_send(StreamAction::Response(error.into()));
     }
@@ -383,6 +383,57 @@ mod tests {
             recv.outgoing.recv().await,
             Some(StreamAction::Cancel(CANCELLED_STREAM_CODE))
         ));
+    }
+
+    #[tokio::test]
+    async fn oversized_rejection_reason_reaches_the_request_stream() {
+        for explicit_code in [false, true] {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let (client, server) = loopback_session_pair().await;
+                let (published, recv) = pair().await;
+                let (mut request_send, response_recv) = client.open_bi().await.unwrap();
+                request_send.write(b"request").await.unwrap();
+                let (response_send, mut request_recv) = server.accept_bi().await.unwrap();
+                assert_eq!(
+                    request_recv.read(7).await.unwrap().unwrap().as_ref(),
+                    b"request"
+                );
+
+                let reason = format!("denied: {}", "界🦀".repeat(300));
+                let (error_code, original_reason) = if explicit_code {
+                    published
+                        .reject(RequestErrorCode::Unauthorized as u64, &reason)
+                        .unwrap();
+                    (RequestErrorCode::Unauthorized as u64, reason)
+                } else {
+                    let error = ServeError::Internal(reason);
+                    let original = error.to_string();
+                    published.close(error).unwrap();
+                    (RequestErrorCode::Uninterested as u64, original)
+                };
+
+                let run = recv.run(Writer::new(response_send), Reader::new(request_recv), None);
+                let read = async {
+                    let mut reader = Reader::new(response_recv);
+                    let Message::RequestError(error) =
+                        Session::decode_bidi_response(&mut reader, 6).await.unwrap()
+                    else {
+                        panic!("expected REQUEST_ERROR");
+                    };
+                    assert_eq!(error.id, 6);
+                    assert_eq!(error.error_code, error_code);
+                    assert_eq!(error.retry_interval, 0);
+                    assert!(error.reason.0.len() <= ReasonPhrase::MAX_LEN);
+                    assert!(error.reason.0.len() + 4 > ReasonPhrase::MAX_LEN);
+                    assert!(original_reason.starts_with(&error.reason.0));
+                    assert!(reader.done().await.unwrap());
+                };
+                let (result, ()) = tokio::join!(run, read);
+                result.unwrap();
+            })
+            .await
+            .expect("namespace rejection did not finish");
+        }
     }
 
     #[tokio::test]

@@ -300,7 +300,7 @@ fn request_error(id: u64, error_code: u64, reason: &str) -> Message {
         id,
         error_code,
         retry_interval: 0,
-        reason: ReasonPhrase(reason.to_string()),
+        reason: ReasonPhrase::new(reason),
     }
     .into()
 }
@@ -335,6 +335,27 @@ mod tests {
             active.clone(),
         );
         (send, recv, active)
+    }
+
+    #[tokio::test]
+    async fn oversized_rejection_reason_encodes_on_the_request_stream() {
+        let (request, mut recv, _) = make();
+        let reason = format!("denied: {}", "界🦀".repeat(300));
+        request
+            .reject(RequestErrorCode::Unauthorized as u64, &reason)
+            .unwrap();
+        let Some(SubscribedTracksOutput::Message(message)) = recv.outgoing.recv().await else {
+            panic!("expected response");
+        };
+        Session::encode_bidi_response_frame(&message).unwrap();
+        let Message::RequestError(error) = message else {
+            panic!("expected REQUEST_ERROR");
+        };
+        assert_eq!(error.id, 0);
+        assert_eq!(error.error_code, RequestErrorCode::Unauthorized as u64);
+        assert!(error.reason.0.len() <= ReasonPhrase::MAX_LEN);
+        assert!(error.reason.0.len() + 4 > ReasonPhrase::MAX_LEN);
+        assert!(reason.starts_with(&error.reason.0));
     }
 
     #[tokio::test]

@@ -579,7 +579,7 @@ impl Subscribed {
                 id: self.info.id,
                 status_code: Self::publish_done_code(&err),
                 stream_count,
-                reason: ReasonPhrase(err.to_string()),
+                reason: ReasonPhrase::new(err.to_string()),
             })
             .await;
         self.forwarder.publisher.drop_subscribe(self.info.id);
@@ -613,7 +613,7 @@ impl Drop for Subscribed {
                 id: self.info.id,
                 status_code: Self::publish_done_code(&err),
                 stream_count,
-                reason: ReasonPhrase(err.to_string()),
+                reason: ReasonPhrase::new(err.to_string()),
             });
         } else {
             // Draft-18 Section 10.6 uses REQUEST_ERROR for subscription rejection, not the
@@ -624,7 +624,7 @@ impl Drop for Subscribed {
                     id: self.info.id,
                     error_code: Self::request_error_code(&err),
                     retry_interval,
-                    reason: ReasonPhrase(err.to_string()),
+                    reason: ReasonPhrase::new(err.to_string()),
                 },
             );
             self.forwarder.publisher.drop_subscribe(self.info.id);
@@ -1398,8 +1398,9 @@ impl ObjectForwarderRecv {
 mod tests {
     use super::*;
     use crate::coding::Decode;
+    use crate::message::Message;
     use crate::session::test_support::{loopback_raw_session_pair, loopback_session_pair};
-    use crate::session::Reader;
+    use crate::session::{Reader, Session};
     use bytes::Bytes;
 
     async fn test_subscribed() -> (
@@ -1443,6 +1444,71 @@ mod tests {
         let mut response = responses.recv().await.unwrap();
         assert!(matches!(response.message, message::Message::SubscribeOk(_)));
         response.complete(Ok(()));
+    }
+
+    #[tokio::test]
+    async fn oversized_terminal_reason_encodes_before_and_after_acceptance() {
+        for accepted in [false, true] {
+            let (mut subscribed, _recv, mut outgoing, _responses) = test_subscribed().await;
+            // The session retains a Publisher while individual requests come and go.
+            let _publisher = subscribed.forwarder.publisher.clone();
+            subscribed.ok = accepted;
+            let error = ServeError::Internal("界🦀".repeat(300));
+            let original = error.to_string();
+            subscribed.close_with_retry(error, 5001).unwrap();
+            let response = outgoing.pop().await.unwrap();
+            Session::encode_bidi_response_frame(&response).unwrap();
+            let reason = match response {
+                Message::RequestError(error) if !accepted => {
+                    assert_eq!(error.error_code, RequestErrorCode::InternalError as u64);
+                    assert_eq!(error.retry_interval, 5001);
+                    error.reason.0
+                }
+                Message::PublishDone(done) if accepted => {
+                    assert_eq!(
+                        done.status_code,
+                        message::PublishDoneCode::InternalError as u64
+                    );
+                    assert_eq!(done.stream_count, 0);
+                    done.reason.0
+                }
+                _ => panic!("unexpected terminal response"),
+            };
+            assert!(reason.len() <= ReasonPhrase::MAX_LEN);
+            assert!(reason.len() + 4 > ReasonPhrase::MAX_LEN);
+            assert!(original.starts_with(&reason));
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_finish_reason_encodes_and_completes_receipt() {
+        let (mut subscribed, _recv, _outgoing, mut responses) = test_subscribed().await;
+        subscribed.ok = true;
+        let error = ServeError::Internal("界🦀".repeat(300));
+        let original = error.to_string();
+        subscribed.forwarder.close(error, 0).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let read = async {
+                let mut response = responses.recv().await.unwrap();
+                Session::encode_bidi_response_frame(&response.message).unwrap();
+                let Message::PublishDone(done) = &response.message else {
+                    panic!("expected PUBLISH_DONE");
+                };
+                assert_eq!(
+                    done.status_code,
+                    message::PublishDoneCode::InternalError as u64
+                );
+                assert_eq!(done.stream_count, 0);
+                assert!(done.reason.0.len() <= ReasonPhrase::MAX_LEN);
+                assert!(done.reason.0.len() + 4 > ReasonPhrase::MAX_LEN);
+                assert!(original.starts_with(&done.reason.0));
+                response.complete(Ok(()));
+            };
+            let (result, ()) = tokio::join!(subscribed.finish(), read);
+            result.unwrap();
+        })
+        .await
+        .expect("terminal response did not finish");
     }
 
     async fn forward_datagram(
