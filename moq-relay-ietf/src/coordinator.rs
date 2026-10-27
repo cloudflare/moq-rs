@@ -11,6 +11,21 @@ use url::Url;
 
 use crate::session::SessionInterface;
 
+/// A coordinator-provided, product-neutral reason to reject scope resolution.
+///
+/// Wrap this marker in [`CoordinatorError::Other`] when a connection path is
+/// absent or malformed. Other coordinator errors are treated as lookup
+/// failures by the relay.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ScopeResolutionRejection {
+    #[error("scope is missing")]
+    Missing,
+
+    #[error("scope is invalid")]
+    Invalid,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
     #[error("namespace not found")]
@@ -673,6 +688,22 @@ pub trait Coordinator: Send + Sync {
             scope_id: path.to_string(),
             permissions: ScopePermissions::ReadWrite,
         }))
+    }
+
+    /// A stable scope identifier safe to export as the `scope` metric label.
+    ///
+    /// [`ScopeInfo::scope_id`] is never used as a label directly: its format
+    /// is coordinator-defined and may contain credentials or be unbounded.
+    /// Return `None` to label the session without a scope identifier, which
+    /// is the default.
+    ///
+    /// The relay calls this only for an authorized session, and only when
+    /// [`crate::Relay::with_connection_metrics`] is enabled. Every distinct
+    /// value becomes its own metric series, so return a value drawn from a
+    /// bounded set, such as a tenant identifier, never anything a client
+    /// chooses freely.
+    fn metrics_scope_id(&self, _scope: &ScopeInfo) -> Option<String> {
+        None
     }
 
     /// Register a namespace as locally available on this relay.
@@ -2847,6 +2878,16 @@ mod tests {
         let coord = MinimalCoordinator;
         let result = coord.resolve_scope(None).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn default_scope_projection_does_not_expose_routing_scope() {
+        let coord = MinimalCoordinator;
+        let scope = ScopeInfo {
+            scope_id: "/tenant/raw-credential".to_string(),
+            permissions: ScopePermissions::ReadWrite,
+        };
+        assert_eq!(coord.metrics_scope_id(&scope), None);
     }
 
     #[tokio::test]

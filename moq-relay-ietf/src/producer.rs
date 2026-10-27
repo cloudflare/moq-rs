@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 
 use crate::auth::{authorize, AuthzOperation, DenyReason, SessionAuth};
 use crate::{
+    connection_metrics::ConnectionMetricLabels,
     metrics::{GaugeGuard, TimingGuard},
     upstream_namespaces::UpstreamNamespaces,
     Locals, NamespaceChange, RemoteManager, SessionContext, TrackChange, UpstreamReady,
@@ -33,6 +34,7 @@ pub struct Producer {
     upstream_namespaces: UpstreamNamespaces,
     /// Relay-level context for this MoQT session.
     context: SessionContext,
+    metric_labels: Option<ConnectionMetricLabels>,
     /// Token authorization state. Internal relay peers and sessions in scopes
     /// without a policy carry `None`, permitting every request.
     auth: Option<SessionAuth>,
@@ -82,8 +84,14 @@ impl Producer {
             remotes,
             upstream_namespaces,
             context,
+            metric_labels: None,
             auth,
         }
+    }
+
+    pub(crate) fn with_metric_labels(mut self, labels: Option<ConnectionMetricLabels>) -> Self {
+        self.metric_labels = labels;
+        self
     }
 
     /// Send PUBLISH_NAMESPACE for a set of tracks to the remote peer.
@@ -267,6 +275,10 @@ impl Producer {
             TimingGuard::with_label("moq_relay_subscribe_latency_seconds", "source", "not_found");
         // Track active subscriptions - decrements when this function returns
         let _sub_guard = GaugeGuard::new("moq_relay_active_subscriptions");
+        let _subscription_metrics_guard = self
+            .metric_labels
+            .as_ref()
+            .map(ConnectionMetricLabels::subscription_guard);
 
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();

@@ -95,6 +95,11 @@ implies coverage that does not exist.
 goes to logs. Never put validation internals, claim contents, or token bytes in
 a wire message — or in a `Debug` impl that might reach one.
 
+**Scope metric labels come only from `Coordinator::metrics_scope_id()`,
+applied only once a session is authorized.** Raw connection paths and routing
+scopes can carry credentials and never become metric labels, and a refused
+session's traffic is never counted against a tenant.
+
 ## Authorization
 
 Lives in `moq-relay-ietf/src/auth/`. Read `auth/mod.rs` first; it states the
