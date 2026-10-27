@@ -400,16 +400,63 @@ pub struct ConnInfo {
     pub server_name: Option<String>,
 }
 
+/// A cloneable handle for reading cumulative QUIC connection statistics.
+///
+/// The underlying Quinn connection is intentionally not exposed. The handle
+/// retains a Quinn connection clone so a final snapshot remains available as
+/// the application session shuts down. Callers of [`Server::accept_with_stats`]
+/// must release the handle when the corresponding accepted session finishes;
+/// retaining it longer also retains Quinn's connection state.
+#[derive(Clone)]
+pub struct ConnectionStatistics {
+    connection: quinn::Connection,
+}
+
+impl ConnectionStatistics {
+    /// Read the connection's current cumulative UDP byte counters.
+    pub fn snapshot(&self) -> ConnectionStatisticsSnapshot {
+        let stats = self.connection.stats();
+        ConnectionStatisticsSnapshot {
+            ingress_bytes: stats.udp_rx.bytes,
+            egress_bytes: stats.udp_tx.bytes,
+        }
+    }
+}
+
+/// A point-in-time copy of cumulative QUIC connection byte counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConnectionStatisticsSnapshot {
+    /// Total bytes received in UDP datagrams for this connection.
+    pub ingress_bytes: u64,
+
+    /// Total bytes sent in UDP datagrams for this connection.
+    pub egress_bytes: u64,
+}
+
+type AcceptedSession = (web_transport::Session, ConnInfo, ConnectionStatistics);
+
 pub struct Server {
     quic: quinn::Endpoint,
-    accept:
-        FuturesUnordered<BoxFuture<'static, anyhow::Result<(web_transport::Session, ConnInfo)>>>,
+    accept: FuturesUnordered<BoxFuture<'static, anyhow::Result<AcceptedSession>>>,
     qlog_dir: Option<Arc<PathBuf>>,
     base_server_config: Arc<quinn::ServerConfig>,
 }
 
 impl Server {
     pub async fn accept(&mut self) -> Option<(web_transport::Session, ConnInfo)> {
+        self.accept_with_stats()
+            .await
+            .map(|(session, info, _stats)| (session, info))
+    }
+
+    /// Accept a session together with a handle for cumulative QUIC statistics.
+    ///
+    /// The handle retains the underlying Quinn connection state and should be
+    /// dropped when this accepted session finishes.
+    pub async fn accept_with_stats(
+        &mut self,
+    ) -> Option<(web_transport::Session, ConnInfo, ConnectionStatistics)> {
         loop {
             tokio::select! {
                 res = self.quic.accept() => {
@@ -435,7 +482,7 @@ impl Server {
         conn: quinn::Incoming,
         qlog_dir: Option<Arc<PathBuf>>,
         base_server_config: Arc<quinn::ServerConfig>,
-    ) -> anyhow::Result<(web_transport::Session, ConnInfo)> {
+    ) -> anyhow::Result<AcceptedSession> {
         // Capture the original destination connection ID BEFORE accepting
         // This is the actual QUIC CID that can be used for qlog/mlog correlation
         let orig_dst_cid = conn.orig_dst_cid();
@@ -494,6 +541,12 @@ impl Server {
 
         // Wait for the QUIC connection to be established.
         let conn = conn.await.context("failed to establish QUIC connection")?;
+
+        // Both transport branches consume a Quinn connection. Retain one
+        // opaque clone so embedders can read cumulative byte counters later.
+        let statistics = ConnectionStatistics {
+            connection: conn.clone(),
+        };
 
         // Capture the peer's socket address before `conn` is moved into the
         // WebTransport/raw-QUIC session below. The relay uses this to classify
@@ -559,7 +612,7 @@ impl Server {
             server_name: (!server_name.is_empty()).then_some(server_name),
         };
 
-        Ok((session.into(), info))
+        Ok((session.into(), info, statistics))
     }
 
     pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {

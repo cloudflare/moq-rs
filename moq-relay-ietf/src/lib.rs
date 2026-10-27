@@ -86,6 +86,7 @@ pub(crate) use enabled_root_span;
 
 mod api;
 mod auth;
+mod connection_metrics;
 mod consumer;
 mod coordinator;
 mod covering_prefix_set;

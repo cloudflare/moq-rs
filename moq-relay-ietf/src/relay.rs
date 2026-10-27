@@ -13,8 +13,13 @@ use url::Url;
 use crate::auth::{decode_setup_tokens, ScopeAuthorizer, SessionAuth, SESSION_ERROR_UNAUTHORIZED};
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
-    metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
-    RelayInfo, RemoteManager, Session, SessionContext, SessionInterface,
+    connection_metrics::{
+        admission_labels, run_metered, ConnectionMeter, ConnectionMetricLabels,
+        ScopeResolutionFailureKind,
+    },
+    metrics::GaugeGuard,
+    ConnectionMeta, ConnectionTagger, Consumer, Coordinator, CoordinatorError, Locals, Producer,
+    RelayInfo, RemoteManager, ScopeResolutionRejection, Session, SessionContext, SessionInterface,
     DEFAULT_CACHE_IDLE_TIMEOUT,
 };
 
@@ -23,12 +28,23 @@ type ServerFuture = Pin<
     Box<
         dyn Future<
             Output = (
-                anyhow::Result<(web_transport::Session, quic::ConnInfo)>,
+                anyhow::Result<(
+                    web_transport::Session,
+                    quic::ConnInfo,
+                    quic::ConnectionStatistics,
+                )>,
                 quic::Server,
             ),
         >,
     >,
 >;
+
+fn accept_connection(mut server: quic::Server) -> ServerFuture {
+    Box::pin(async move {
+        let connection = server.accept_with_stats().await.context("accept failed");
+        (connection, server)
+    })
+}
 
 /// Configuration for the relay.
 pub struct RelayConfig {
@@ -235,6 +251,17 @@ fn normalize_scope_id(scope_info: Option<&crate::ScopeInfo>) -> Option<String> {
         .filter(|scope_id| !scope_id.is_empty())
 }
 
+fn scope_resolution_failure_kind(error: &CoordinatorError) -> ScopeResolutionFailureKind {
+    match error {
+        CoordinatorError::Other(error) => match error.downcast_ref::<ScopeResolutionRejection>() {
+            Some(ScopeResolutionRejection::Missing) => ScopeResolutionFailureKind::Missing,
+            Some(ScopeResolutionRejection::Invalid) => ScopeResolutionFailureKind::Invalid,
+            None => ScopeResolutionFailureKind::LookupFailed,
+        },
+        _ => ScopeResolutionFailureKind::LookupFailed,
+    }
+}
+
 /// MoQ Relay server.
 pub struct Relay {
     config: RelayConfig,
@@ -246,6 +273,8 @@ pub struct Relay {
     /// Per-scope authorization policy, resolved from the coordinator and
     /// cached. Shared by every connection task.
     authorizer: Arc<ScopeAuthorizer>,
+
+    connection_metrics: bool,
 }
 
 impl Relay {
@@ -320,7 +349,19 @@ impl Relay {
             upstream_namespaces,
             upstream_namespaces_runner,
             authorizer,
+            connection_metrics: false,
         })
+    }
+
+    /// Emit the per-scope `moq_relay_connection_*` metrics.
+    ///
+    /// Off by default. Each accepted connection then reads its QUIC byte
+    /// counters every ten seconds, on relabel and on close. The `scope` label
+    /// comes from [`Coordinator::metrics_scope_id`]; see [`crate::metrics`]
+    /// for the metric names and labels.
+    pub fn with_connection_metrics(mut self) -> Self {
+        self.connection_metrics = true;
+        self
     }
 
     /// Run the relay server.
@@ -332,6 +373,7 @@ impl Relay {
             upstream_namespaces,
             upstream_namespaces_runner,
             authorizer,
+            connection_metrics,
         } = self;
 
         let RelayConfig {
@@ -431,6 +473,8 @@ impl Relay {
                     }
                 }
 
+                let forward_labels = connection_metrics
+                    .then(|| ConnectionMetricLabels::internal_link(forward_scope.is_some()));
                 let forward_context = SessionContext::internal(
                     forward_scope,
                     Some(RelayInfo::new(url.clone())),
@@ -448,15 +492,18 @@ impl Relay {
                         // Operator-configured peer; see the warning above.
                         None,
                     )),
-                    consumer: Some(Consumer::new(
-                        subscriber,
-                        locals.clone(),
-                        forward_coordinator,
-                        remote_manager.clone(),
-                        None,
-                        forward_context.clone(),
-                        None,
-                    )),
+                    consumer: Some(
+                        Consumer::new(
+                            subscriber,
+                            locals.clone(),
+                            forward_coordinator,
+                            remote_manager.clone(),
+                            None,
+                            forward_context.clone(),
+                            None,
+                        )
+                        .with_metric_labels(forward_labels),
+                    ),
                     // Forward connections are always full read-write relay peers,
                     // so no reject loops needed.
                     reject_publishes: None,
@@ -487,34 +534,21 @@ impl Relay {
 
             // This will hold the futures for all our listening servers.
             let mut accepts: FuturesUnordered<ServerFuture> = FuturesUnordered::new();
-            for mut server in servers {
+            for server in servers {
                 tracing::info!("listening on {}", server.local_addr()?);
 
-                // Create a future, box it, and push it to the collection.
-                accepts.push(
-                    async move {
-                        let conn = server.accept().await.context("accept failed");
-                        (conn, server)
-                    }
-                    .boxed(),
-                );
+                accepts.push(accept_connection(server));
             }
 
             loop {
                 tokio::select! {
                     // This branch polls all the `accept` futures concurrently.
-                    Some((conn_result, mut server)) = accepts.next() => {
+                    Some((conn_result, server)) = accepts.next() => {
                         // An accept operation has completed.
                         // First, immediately queue up the next accept() call for this server.
-                        accepts.push(
-                            async move {
-                                let conn = server.accept().await.context("accept failed");
-                                (conn, server)
-                            }
-                            .boxed(),
-                        );
+                        accepts.push(accept_connection(server));
 
-                        let (conn, info) = conn_result.context("failed to accept QUIC connection")?;
+                        let (conn, info, connection_statistics) = conn_result.context("failed to accept QUIC connection")?;
                         let quic::ConnInfo {
                             id: connection_id,
                             transport,
@@ -565,6 +599,9 @@ impl Relay {
                                 Err(err) => {
                                     tracing::warn!(session_id = %session_id, error = %err, "failed to accept MoQ session: {}", err);
                                     metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
+                                    // Interface classification may depend on the
+                                    // MoQT connection path, which is unavailable until setup
+                                    // succeeds. Setup-failure bytes are therefore not observed.
                                     // Maintain invariant: connections_total - connections_closed_total == active_connections
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                     return Ok(());
@@ -574,46 +611,16 @@ impl Relay {
                             // Create our MoQ relay session
                             let moq_session = session;
 
-                            // Resolve the connection path to a scope (identity + permissions).
-                            // This translates the raw transport-level path into an application-level
-                            // scope_id and determines what the connection is allowed to do.
-                            let scope_info = match coordinator.resolve_scope(moq_session.connection_path()).await {
-                                Ok(info) => info,
-                                Err(err) => {
-                                    tracing::warn!(
-                                        session_id = %session_id,
-                                        connection_path = moq_session.connection_path(),
-                                        error = %err,
-                                        "scope resolution failed, rejecting session"
-                                    );
-                                    // Close with PROTOCOL_VIOLATION (0x3) so the client
-                                    // gets a meaningful error instead of an abrupt reset.
-                                    // This is a QUIC APPLICATION_CLOSE, not a MoQT SESSION_CLOSE
-                                    // control message. Sending a proper SESSION_CLOSE would require
-                                    // running the MoQ session's send loop, which is not warranted
-                                    // for a pre-session rejection. The QUIC close code and reason
-                                    // string are visible to the client's transport layer.
-                                    raw_conn.close(0x3, "scope resolution failed");
-                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "scope_resolve").increment(1);
-                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
-                                    return Ok(());
-                                }
-                            };
-
-                            let can_publish = scope_info.as_ref().is_none_or(|s| s.permissions.can_publish());
-                            let can_subscribe = scope_info.as_ref().is_none_or(|s| s.permissions.can_subscribe());
-
                             // Classify the connection interface (public client vs internal
                             // relay peer). This is deliberately separate from scope
-                            // resolution above: resolve_scope() returns identity +
+                            // resolution below: resolve_scope() returns identity +
                             // permissions, while the embedder-supplied tagger decides the
                             // transport interface from the peer socket address, TLS SNI, and
                             // connection path. With no tagger configured every inbound
                             // connection is treated as a public client. For connections
                             // classified internal, the peer relay identity is derived from
                             // the inbound socket address (see RelayInfo::from_socket_addr).
-                            let scope = normalize_scope_id(scope_info.as_ref());
-                            let context = match connection_tagger.as_ref() {
+                            let mut context = match connection_tagger.as_ref() {
                                 Some(tagger) => {
                                     let meta = ConnectionMeta::new(
                                         Some(remote_addr),
@@ -623,13 +630,16 @@ impl Relay {
                                     .with_local_ip(local_ip);
                                     let tags = tagger.tag(&meta);
                                     SessionContext::from_tags(
-                                        scope,
+                                        None,
                                         &tags,
                                         Some(remote_addr),
                                     )
                                 }
-                                None => SessionContext::public(scope),
+                                None => SessionContext::public(None),
                             };
+
+                            let mut connection_meter = connection_metrics
+                                .then(|| ConnectionMeter::new(connection_statistics, context.interface));
 
                             // The resolved interface decides whether a
                             // PUBLISH_NAMESPACE on this session is treated as
@@ -670,6 +680,43 @@ impl Relay {
                                 ),
                             }
 
+                            // Resolve the connection path to a scope (identity + permissions).
+                            // This translates the raw transport-level path into an application-level
+                            // scope_id and determines what the connection is allowed to do. The
+                            // interface is classified first so that a rejected resolution can
+                            // still be attributed to an interface in connection metrics.
+                            let scope_info = match coordinator.resolve_scope(moq_session.connection_path()).await {
+                                Ok(info) => info,
+                                Err(err) => {
+                                    if let Some(meter) = connection_meter.as_mut() {
+                                        meter.relabel(ConnectionMetricLabels::unresolved(
+                                            scope_resolution_failure_kind(&err),
+                                            context.interface,
+                                        ));
+                                    }
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        connection_path = moq_session.connection_path(),
+                                        error = %err,
+                                        "scope resolution failed, rejecting session"
+                                    );
+                                    // Close with PROTOCOL_VIOLATION (0x3) so the client
+                                    // gets a meaningful error instead of an abrupt reset.
+                                    // This is a QUIC APPLICATION_CLOSE, not a MoQT SESSION_CLOSE
+                                    // control message. Sending a proper SESSION_CLOSE would require
+                                    // running the MoQ session's send loop, which is not warranted
+                                    // for a pre-session rejection. The QUIC close code and reason
+                                    // string are visible to the client's transport layer.
+                                    raw_conn.close(0x3, "scope resolution failed");
+                                    metrics::counter!("moq_relay_connection_errors_total", "stage" => "scope_resolve").increment(1);
+                                    metrics::counter!("moq_relay_connections_closed_total").increment(1);
+                                    return Ok(());
+                                }
+                            };
+
+                            let can_publish = scope_info.as_ref().is_none_or(|s| s.permissions.can_publish());
+                            let can_subscribe = scope_info.as_ref().is_none_or(|s| s.permissions.can_subscribe());
+
                             if let Some(ref info) = scope_info {
                                 tracing::debug!(
                                     session_id = %session_id,
@@ -679,6 +726,8 @@ impl Relay {
                                     "scope resolved"
                                 );
                             }
+
+                            context.scope = normalize_scope_id(scope_info.as_ref());
 
                             // Authorize the session, if this scope requires it.
                             //
@@ -695,6 +744,14 @@ impl Relay {
                             ).await {
                                 Ok(auth) => auth,
                                 Err(rejection) => {
+                                    if let Some(meter) = connection_meter.as_mut() {
+                                        meter.relabel(admission_labels(
+                                            coordinator.as_ref(),
+                                            scope_info.as_ref(),
+                                            context.interface,
+                                            false,
+                                        ));
+                                    }
                                     tracing::info!(
                                         connection_path = moq_session.connection_path(),
                                         scope = context.scope(),
@@ -709,6 +766,18 @@ impl Relay {
                                 }
                             };
 
+                            // The tenant's scope label is applied only now that
+                            // the session is authorized.
+                            let metric_labels = connection_meter.as_mut().map(|meter| {
+                                meter.relabel(admission_labels(
+                                    coordinator.as_ref(),
+                                    scope_info.as_ref(),
+                                    context.interface,
+                                    true,
+                                ));
+                                meter.labels().clone()
+                            });
+
                             // Gate Producer/Consumer creation on permissions.
                             // Note the intentional inversion:
                             // - Producer serves SUBSCRIBEs → gated on can_subscribe
@@ -718,13 +787,19 @@ impl Relay {
                             // to the Session's reject fields so unauthorized messages get
                             // an explicit error response instead of being silently ignored.
                             let (producer, reject_subscribes) = if can_subscribe {
-                                (publisher.map(|publisher| Producer::new_with_upstream_namespaces(publisher, locals.clone(), remotes.clone(), upstream_namespaces, context.clone(), session_auth.clone())), None)
+                                (publisher.map(|publisher| {
+                                    Producer::new_with_upstream_namespaces(publisher, locals.clone(), remotes.clone(), upstream_namespaces, context.clone(), session_auth.clone())
+                                        .with_metric_labels(metric_labels.clone())
+                                }), None)
                             } else {
                                 (None, publisher)
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context.clone(), session_auth)), None)
+                                (subscriber.map(|subscriber| {
+                                    Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context.clone(), session_auth)
+                                        .with_metric_labels(metric_labels)
+                                }), None)
                             } else {
                                 (None, subscriber)
                             };
@@ -737,7 +812,7 @@ impl Relay {
                                 reject_subscribes,
                             };
 
-                            match session.run_with_context(&context).await {
+                            match run_metered(session.run_with_context(&context), connection_meter.as_mut()).await {
                                 Ok(()) => {
                                     // Session ended cleanly (uncommon - usually ends via close)
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
@@ -1005,6 +1080,34 @@ mod tests {
         assert_eq!(
             normalize_scope_id(None).as_deref().unwrap_or(""),
             normalized.as_deref().unwrap_or(""),
+        );
+    }
+
+    #[test]
+    fn typed_scope_rejections_are_classified() {
+        let missing = CoordinatorError::Other(ScopeResolutionRejection::Missing.into());
+        let invalid = CoordinatorError::Other(ScopeResolutionRejection::Invalid.into());
+
+        assert_eq!(
+            scope_resolution_failure_kind(&missing),
+            ScopeResolutionFailureKind::Missing
+        );
+        assert_eq!(
+            scope_resolution_failure_kind(&invalid),
+            ScopeResolutionFailureKind::Invalid
+        );
+    }
+
+    #[test]
+    fn unmarked_scope_errors_are_lookup_failures() {
+        let error = CoordinatorError::Other(anyhow::anyhow!("coordinator unavailable"));
+        assert_eq!(
+            scope_resolution_failure_kind(&error),
+            ScopeResolutionFailureKind::LookupFailed
+        );
+        assert_eq!(
+            scope_resolution_failure_kind(&CoordinatorError::NamespaceNotFound),
+            ScopeResolutionFailureKind::LookupFailed
         );
     }
 }

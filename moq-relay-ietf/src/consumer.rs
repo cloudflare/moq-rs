@@ -14,8 +14,8 @@ use tokio::sync::Semaphore;
 
 use crate::auth::{authorize, AuthzOperation, SessionAuth};
 use crate::{
-    metrics::GaugeGuard, Coordinator, Locals, Producer, RemoteManager, SessionContext,
-    SessionInterface, TrackRequest,
+    connection_metrics::ConnectionMetricLabels, metrics::GaugeGuard, Coordinator, Locals, Producer,
+    RemoteManager, SessionContext, SessionInterface, TrackRequest,
 };
 
 const MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION: usize = 1024;
@@ -32,6 +32,7 @@ pub struct Consumer {
     forward: Option<Producer>, // Forward all announcements to this subscriber
     /// Relay-level context for this MoQT session.
     context: SessionContext,
+    metric_labels: Option<ConnectionMetricLabels>,
     /// Token authorization state. Internal relay peers and sessions in scopes
     /// without a policy carry `None`, permitting every request.
     auth: Option<SessionAuth>,
@@ -64,9 +65,15 @@ impl Consumer {
             remotes,
             forward,
             context,
+            metric_labels: None,
             auth,
             publish_track_permits: Arc::new(Semaphore::new(MAX_INBOUND_PUBLISH_TRACKS_PER_SESSION)),
         }
+    }
+
+    pub(crate) fn with_metric_labels(mut self, labels: Option<ConnectionMetricLabels>) -> Self {
+        self.metric_labels = labels;
+        self
     }
 
     /// Run the consumer to handle inbound PUBLISH_NAMESPACE and PUBLISH requests.
@@ -189,6 +196,10 @@ impl Consumer {
     async fn serve(mut self, mut published_ns: PublishedNamespace) -> Result<(), anyhow::Error> {
         // Track active publishers - decrements when this function returns.
         let _publisher_guard = GaugeGuard::new("moq_relay_active_publishers");
+        let _publisher_metrics_guard = self
+            .metric_labels
+            .as_ref()
+            .map(ConnectionMetricLabels::publisher_guard);
 
         let mut tasks: FuturesUnordered<
             futures::future::BoxFuture<'static, Result<(), anyhow::Error>>,

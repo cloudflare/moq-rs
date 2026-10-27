@@ -4,9 +4,9 @@
 //! Metrics instrumentation for moq-relay-ietf
 //!
 //! Metrics are always compiled in via the [`metrics`] crate facade. When no
-//! recorder is installed the overhead is negligible (an atomic load + early
-//! return per call site), similar to how the `log` crate works when no logger
-//! is configured.
+//! recorder is installed, each facade call is only an atomic load and early
+//! return. The per-scope `moq_relay_connection_*` metrics are opt-in: they are
+//! emitted only after [`crate::Relay::with_connection_metrics`].
 //!
 //! To actually collect metrics, install a recorder at startup. The optional
 //! `metrics-prometheus` feature adds a Prometheus exporter — see the binary
@@ -43,6 +43,9 @@
 //! | `moq_relay_lease_registry_lock_poisoned_total` | `operation` | Upstream namespace lease registry lock found poisoned (operation: acquire, release) |
 //! | `moq_relay_auth_denied_total` | `phase`, `operation`, `reason` | Operations refused by the authorization hook. `phase`: setup, request. `operation`: client_setup, publish_namespace, publish, subscribe, subscribe_namespace, track_status. `reason`: token_missing, token_invalid, token_expired, token_replayed, token_malformed, scope_mismatch, issuer_unknown, policy_denied, hook_fault, alias_in_setup, too_many_tokens |
 //! | `moq_relay_auth_errors_total` | `stage` | Authorization could not reach a verdict (stage: scope_config, setup, request). Distinct from `auth_denied_total`: these indicate a relay or configuration fault, not a rejected peer, and are the ones worth alerting on |
+//! | `moq_relay_connection_ingress_bytes_total` | `scope`, `scope_state`, `interface` | QUIC ingress bytes, added by each connection every 10 s, on relabel and on close |
+//! | `moq_relay_connection_egress_bytes_total` | `scope`, `scope_state`, `interface` | QUIC egress bytes, added the same way |
+//! | `moq_relay_connection_metrics_errors_total` | `reason` | Connection metric faults (reason: counter_regression) |
 //!
 //! ## Gauges
 //!
@@ -55,6 +58,17 @@
 //! | `moq_relay_active_published_tracks` | Current number of exact tracks registered from PUBLISH |
 //! | `moq_relay_announced_namespaces` | Current number of namespaces registered via PUBLISH_NAMESPACE |
 //! | `moq_relay_upstream_connections` | Current number of upstream/origin connections |
+//! | `moq_relay_connection_active` | Active connections by `scope`, `scope_state`, and `interface` |
+//! | `moq_relay_connection_active_publishers` | Active publishers by `scope`, `scope_state`, and `interface` |
+//! | `moq_relay_connection_active_subscriptions` | Active subscriptions by `scope`, `scope_state`, and `interface` |
+//!
+//! Scoped metrics use exactly `scope`, `scope_state`, and `interface` labels;
+//! their names and values are in [`connection`]. `scope` is supplied only by
+//! [`crate::Coordinator::metrics_scope_id`], and only once the session is
+//! authorized. It is `<unscoped>` when the session has no scope (`scope_state`
+//! `missing`) and empty otherwise. `moq_relay_connection_active` counts only
+//! sessions past MoQT setup, so it can be lower than
+//! `moq_relay_active_connections`.
 //!
 //! ## Histograms
 //!
@@ -63,6 +77,46 @@
 //! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, unauthorized, route_error, upstream_error, downstream_left) |
 
 use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+
+/// Names and label values of the per-scope connection metrics, for recorders
+/// that route them.
+pub mod connection {
+    pub const INGRESS_BYTES: &str = "moq_relay_connection_ingress_bytes_total";
+    pub const EGRESS_BYTES: &str = "moq_relay_connection_egress_bytes_total";
+    pub const ACTIVE: &str = "moq_relay_connection_active";
+    pub const ACTIVE_PUBLISHERS: &str = "moq_relay_connection_active_publishers";
+    pub const ACTIVE_SUBSCRIPTIONS: &str = "moq_relay_connection_active_subscriptions";
+    pub const ERRORS: &str = "moq_relay_connection_metrics_errors_total";
+
+    pub const LABEL_SCOPE: &str = "scope";
+    pub const LABEL_SCOPE_STATE: &str = "scope_state";
+    pub const LABEL_INTERFACE: &str = "interface";
+    pub const LABEL_REASON: &str = "reason";
+
+    /// The `scope` value for a session with no scope (`scope_state` `missing`).
+    pub const UNSCOPED: &str = crate::auth::UNSCOPED;
+
+    /// The only `reason` on [`ERRORS`]: a QUIC byte counter went backwards.
+    pub const REASON_COUNTER_REGRESSION: &str = "counter_regression";
+
+    /// Values of the `scope_state` label.
+    pub mod scope_state {
+        /// Authorized, with a metrics scope ID in `scope`.
+        pub const RESOLVED: &str = "resolved";
+        /// Scope resolution and authorization have not finished yet.
+        pub const PRE_RESOLUTION: &str = "pre_resolution";
+        /// The connection has no routing scope.
+        pub const MISSING: &str = "missing";
+        /// Authorized, but the coordinator supplied no metrics scope ID.
+        pub const UNPROJECTED: &str = "unprojected";
+        /// The coordinator rejected the scope as invalid.
+        pub const INVALID: &str = "invalid";
+        /// The coordinator failed while resolving the scope.
+        pub const LOOKUP_FAILED: &str = "lookup_failed";
+        /// The session was refused at authorization.
+        pub const UNAUTHORIZED: &str = "unauthorized";
+    }
+}
 
 // ============================================================================
 // describe_metrics - Register metric descriptions for Prometheus HELP text
@@ -207,6 +261,30 @@ pub fn describe_metrics() {
         "moq_relay_fetch_errors_total",
         "Standalone FETCH requests rejected by the relay, by phase (phase: auth)"
     );
+
+    describe_counter!(
+        connection::INGRESS_BYTES,
+        Unit::Bytes,
+        "QUIC ingress bytes by scope and interface"
+    );
+    describe_counter!(
+        connection::EGRESS_BYTES,
+        Unit::Bytes,
+        "QUIC egress bytes by scope and interface"
+    );
+    describe_gauge!(
+        connection::ACTIVE,
+        "Active connections by scope and interface"
+    );
+    describe_gauge!(
+        connection::ACTIVE_PUBLISHERS,
+        "Active publishers by scope and interface"
+    );
+    describe_gauge!(
+        connection::ACTIVE_SUBSCRIPTIONS,
+        "Active subscriptions by scope and interface"
+    );
+    describe_counter!(connection::ERRORS, "Connection metric faults by reason");
 }
 
 // ============================================================================
@@ -216,19 +294,23 @@ pub fn describe_metrics() {
 /// RAII guard that increments a gauge on creation and decrements on drop.
 #[must_use = "GaugeGuard must be held for the duration you want the gauge incremented"]
 pub struct GaugeGuard {
-    name: &'static str,
+    gauge: metrics::Gauge,
 }
 
 impl GaugeGuard {
     pub fn new(name: &'static str) -> Self {
-        metrics::gauge!(name).increment(1.0);
-        Self { name }
+        Self::from_gauge(metrics::gauge!(name))
+    }
+
+    pub(crate) fn from_gauge(gauge: metrics::Gauge) -> Self {
+        gauge.increment(1.0);
+        Self { gauge }
     }
 }
 
 impl Drop for GaugeGuard {
     fn drop(&mut self) {
-        metrics::gauge!(self.name).decrement(1.0);
+        self.gauge.decrement(1.0);
     }
 }
 
