@@ -13,7 +13,7 @@ use std::{
 use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::{
-    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
+    coding::{KeyValuePairs, ReasonPhrase, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message},
     mlog,
     serve::{FullTrackName, ServeError, TrackReader, TracksReader},
@@ -620,13 +620,15 @@ impl Publisher {
             track_name: info.track_name.clone(),
             track_alias,
             params,
-            track_extensions: Default::default(),
+            track_extensions: track.track_extensions()?,
         };
         let abort = AbortPublishedOnDrop {
             publisher: self.clone(),
             request_id: Some(request_id),
         };
-        let stream = self.open_publish_stream(request_id, msg, abort).await?;
+        let stream = self
+            .open_publish_stream(request_id, msg, abort, track.clone())
+            .await?;
 
         Ok(Published::new(
             self.clone(),
@@ -648,6 +650,7 @@ impl Publisher {
         request_id: u64,
         msg: message::Publish,
         abort: AbortPublishedOnDrop,
+        track: TrackReader,
     ) -> Result<super::RequestStreamSink, SessionError> {
         // Validate local parameters before consuming a peer request-stream slot.
         let frame = super::encode_request_frame(&Message::Publish(msg))?;
@@ -662,7 +665,11 @@ impl Publisher {
             .bidi_task_tx
             .send(Box::pin(async move {
                 let mut abort = abort;
-                let mut reader = super::Reader::new(recv_stream);
+                let responses = futures::stream::unfold(super::Reader::new(recv_stream), move |mut reader| async move {
+                    let response = Session::decode_bidi_response(&mut reader, request_id).await;
+                    Some((response, reader))
+                });
+                tokio::pin!(responses);
                 // The peer may finish its half as soon as it has replied
                 // PUBLISH_OK. That does not end the request, so reading stops
                 // while the write half stays open for PUBLISH_DONE.
@@ -702,11 +709,41 @@ impl Publisher {
                             }
                             outgoing.complete(Ok(()));
                         }
-                        // Not cancellation-safe: a frame half-read when the
-                        // write branch wins is lost. Safe only because that
-                        // branch always breaks out of the loop.
-                        response = Session::decode_bidi_response(&mut reader, request_id), if reading => {
+                        // The stream retains an in-progress decode when a write
+                        // wins the select, including nonterminal update replies.
+                        response = responses.next(), if reading => {
+                            let Some(response) = response else { break Ok(()) };
                             match response {
+                                Ok(Message::RequestUpdate(update)) => {
+                                    this.request_id.validate_incoming(update.id)?;
+                                    match super::apply_new_group_update(&track, &update.params).await {
+                                        Ok(()) => Session::encode_bidi_response(&mut writer, &message::RequestOk {
+                                            id: request_id, params: KeyValuePairs::default(),
+                                        }.into()).await?,
+                                        Err(err) => {
+                                            Session::encode_bidi_response(&mut writer, &message::RequestError {
+                                                id: request_id,
+                                                error_code: RequestErrorCode::NotSupported as u64,
+                                                retry_interval: 0,
+                                                reason: ReasonPhrase::new("subscription update failed"),
+                                            }.into()).await?;
+                                            if let Some(entry) = this.publisheds.lock().map_err(|_| SessionError::Internal)?.get_mut(&request_id) {
+                                                entry.recv.recv_error(ServeError::Closed(message::PublishDoneCode::UpdateFailed as u64))?;
+                                                if let Some(forwarder) = &mut entry.forwarder { forwarder.fail_update(); }
+                                            }
+                                            tracing::debug!(request_id, error = %err, "PUBLISH update failed");
+                                        }
+                                    }
+                                }
+                                Ok(Message::RequestOk(ok)) => {
+                                    if let Some(value) = ok.params.new_group_request()? {
+                                        if track.track_extensions()?.dynamic_groups()? != Some(true) {
+                                            break Err(SessionError::ProtocolViolation("NEW_GROUP_REQUEST on a Track without dynamic Groups".into()));
+                                        }
+                                        track.request_new_group(value).await?;
+                                    }
+                                    if let Err(err) = this.recv_request_ok(ok) { break Err(err); }
+                                }
                                 Ok(msg) => match TryInto::<message::Subscriber>::try_into(msg) {
                                     Ok(sub_msg) => {
                                         if let Err(err) = this.recv_message(sub_msg) {
@@ -1059,14 +1096,76 @@ impl Publisher {
         self.add_mlog_event(|time| mlog::events::request_error_created(time, 0, request_kind, msg));
     }
 
-    pub(super) fn send_request_ok(&mut self, request_kind: &str, msg: message::RequestOk) {
-        self.add_mlog_event(|time| mlog::events::request_ok_created(time, 0, request_kind, &msg));
-        self.send_message(msg);
+    pub(super) fn send_track_status_ok(
+        &mut self,
+        msg: message::RequestOk,
+        properties: message::TrackExtensions,
+    ) -> Result<(), SessionError> {
+        self.add_mlog_event(|time| mlog::events::request_ok_created(time, 0, "track_status", &msg));
+        let stream = self
+            .bidi_response_map
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&msg.id)
+            .cloned()
+            .ok_or(ServeError::Cancel)?;
+        let mut response = BidiResponse::new(msg.into());
+        response.track_properties = Some(properties);
+        stream.send(response).map_err(|_| ServeError::Cancel.into())
     }
 
     pub(super) fn send_request_error(&mut self, request_kind: &str, msg: message::RequestError) {
         self.log_request_error_created(request_kind, &msg);
         self.send_message(msg);
+    }
+
+    pub(super) async fn recv_new_group_update(
+        &mut self,
+        update: message::RequestUpdate,
+    ) -> Result<(), SessionError> {
+        let parent_id = update.existing_request_id;
+        let track = self
+            .subscribeds
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&parent_id)
+            .and_then(ObjectForwarderRecv::dynamic_track);
+        let result = match track {
+            Some(track) => super::apply_new_group_update(&track, &update.params).await,
+            None => Err(ServeError::Cancel),
+        };
+        match result {
+            Ok(()) => {
+                self.send_bidi_response(
+                    message::RequestOk {
+                        id: parent_id,
+                        params: KeyValuePairs::default(),
+                    }
+                    .into(),
+                )?;
+            }
+            Err(err) => {
+                self.send_bidi_response(
+                    message::RequestError {
+                        id: parent_id,
+                        error_code: RequestErrorCode::NotSupported as u64,
+                        retry_interval: 0,
+                        reason: ReasonPhrase::new("subscription update failed"),
+                    }
+                    .into(),
+                )?;
+                if let Some(recv) = self
+                    .subscribeds
+                    .lock()
+                    .map_err(|_| SessionError::Internal)?
+                    .get_mut(&parent_id)
+                {
+                    recv.fail_update();
+                }
+                tracing::debug!(parent_id, error = %err, "SUBSCRIBE update failed");
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn recv_message(&mut self, msg: message::Subscriber) -> Result<(), SessionError> {

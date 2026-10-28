@@ -76,6 +76,9 @@ pub struct TrackRequest {
     /// Writer the upstream subscription should fill.
     pub writer: TrackWriter,
 
+    /// Dynamic-group feedback to carry on the initial upstream SUBSCRIBE.
+    pub new_group_request: Option<u64>,
+
     /// Lease on the pull-through cache entry backing this request.
     ///
     /// The requester should hold the upstream subscription open until
@@ -1103,6 +1106,17 @@ impl Locals {
         namespace: TrackNamespace,
         track_name: impl Into<moq_transport::coding::TrackName>,
     ) -> Option<LocalTrack> {
+        self.get_or_request_track_with_new_group(scope, namespace, track_name, None)
+            .await
+    }
+
+    pub(crate) async fn get_or_request_track_with_new_group(
+        &mut self,
+        scope: Option<&str>,
+        namespace: TrackNamespace,
+        track_name: impl Into<moq_transport::coding::TrackName>,
+        new_group_request: Option<u64>,
+    ) -> Option<LocalTrack> {
         let track_name = track_name.into();
         let full_name = FullTrackName {
             namespace: namespace.clone(),
@@ -1230,6 +1244,7 @@ impl Locals {
                 .requests
                 .send(TrackRequest {
                     writer,
+                    new_group_request,
                     lease,
                     upstream: upstream_tx,
                 })
@@ -1851,7 +1866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_or_request_track_uses_namespace_source_and_caches_reader() {
+    async fn get_or_request_track_carries_initial_new_group_and_caches_reader() {
         let mut locals = Locals::new();
         let namespace = ns("room/123");
         let (_registration, mut requests) = locals
@@ -1860,7 +1875,7 @@ mod tests {
             .expect("namespace source should register");
 
         let local = locals
-            .get_or_request_track(None, namespace.clone(), "video")
+            .get_or_request_track_with_new_group(None, namespace.clone(), "video", Some(7))
             .await
             .expect("missing track should be requested from namespace source");
         let reader = local.reader;
@@ -1879,6 +1894,7 @@ mod tests {
             .expect("source should get TrackRequest");
         assert_eq!(requested.writer.namespace, namespace);
         assert_eq!(requested.writer.name, TrackName::from("video"));
+        assert_eq!(requested.new_group_request, Some(7));
 
         let key = full(&namespace, "video");
         let cached = locals
@@ -2880,6 +2896,7 @@ mod tests {
             writer,
             lease,
             upstream,
+            ..
         } = requests.recv().await.expect("first request received");
 
         drop(writer);

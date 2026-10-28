@@ -216,6 +216,7 @@ macro_rules! message_types {
             /// messages and session-level messages.
             pub fn response_target_id(&self) -> Option<u64> {
                 match self {
+                    Self::RequestUpdate(m) => Some(m.existing_request_id),
                     Self::RequestOk(m) => Some(m.id),
                     Self::RequestError(m) => Some(m.id),
                     Self::SubscribeOk(m) => Some(m.id),

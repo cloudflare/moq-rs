@@ -846,6 +846,24 @@ impl RemoteManager {
         track_name: impl Into<TrackName>,
         coordinator_lookup_succeeded: &mut bool,
     ) -> Result<Option<(TrackReader, TrackInterestGuard)>, RemoteSubscribeError> {
+        self.subscribe_with_new_group(
+            scope,
+            namespace,
+            track_name,
+            coordinator_lookup_succeeded,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn subscribe_with_new_group(
+        &self,
+        scope: Option<&str>,
+        namespace: &TrackNamespace,
+        track_name: impl Into<TrackName>,
+        coordinator_lookup_succeeded: &mut bool,
+        new_group_request: Option<u64>,
+    ) -> Result<Option<(TrackReader, TrackInterestGuard)>, RemoteSubscribeError> {
         let track_name = track_name.into();
 
         // Coordinator::lookup_track is the ergonomic routing entry point: it
@@ -878,7 +896,10 @@ impl RemoteManager {
             }
         };
 
-        match remote.subscribe(namespace.clone(), track_name).await {
+        match remote
+            .subscribe(namespace.clone(), track_name, new_group_request)
+            .await
+        {
             Ok(reader) => {
                 *coordinator_lookup_succeeded = true;
                 Ok(reader)
@@ -1420,6 +1441,7 @@ impl Remote {
         &self,
         namespace: TrackNamespace,
         track_name: TrackName,
+        new_group_request: Option<u64>,
     ) -> Result<Option<(TrackReader, TrackInterestGuard)>, RemoteSubscribeError> {
         let key = (namespace.clone(), track_name.clone());
 
@@ -1490,8 +1512,12 @@ impl Remote {
             tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
 
             let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
+            let mut params = KeyValuePairs::default();
+            if let Some(value) = new_group_request {
+                params.set_new_group_request(value);
+            }
             let subscribe_result = tokio::select! {
-                result = subscriber.subscribe_start(writer) => result,
+                result = subscriber.subscribe_start_with_params(writer, params) => result,
                 _ = cancel.cancelled() => {
                     Err(moq_transport::serve::ServeError::Cancel)
                 }

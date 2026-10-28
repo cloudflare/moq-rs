@@ -18,7 +18,7 @@ use super::Subscriber;
 use super::{DoneOutcome, StreamDrain};
 
 const SUBSCRIBE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-type SubscribeRequestSink = tokio::sync::mpsc::Sender<message::Message>;
+type SubscribeRequestSink = tokio::sync::mpsc::Sender<super::BidiResponse>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFilter {
@@ -203,6 +203,7 @@ struct SubscribeState {
     /// The PUBLISH_DONE received from the publisher, if one arrives.
     publish_done: Option<PublishDoneInfo>,
     closed: Result<(), ServeError>,
+    new_group_sender: Option<serve::NewGroupHandler>,
 }
 
 impl Default for SubscribeState {
@@ -214,6 +215,7 @@ impl Default for SubscribeState {
             subscribe_ok: None,
             publish_done: None,
             closed: Ok(()),
+            new_group_sender: None,
         }
     }
 }
@@ -279,6 +281,8 @@ impl Subscribe {
 
         let recv = SubscribeRecv {
             state: recv,
+            control: track.control.clone(),
+            initial_new_group: send.info.params.new_group_request().ok().flatten(),
             writer: Some(track.into()),
             default_publisher_priority: data::DEFAULT_PUBLISHER_PRIORITY,
             drain: StreamDrain::default(),
@@ -293,6 +297,34 @@ impl Subscribe {
         request_done: tokio::sync::oneshot::Receiver<()>,
         request_cancel: tokio::sync::oneshot::Sender<u32>,
     ) {
+        let request_ids = self.subscriber.request_ids();
+        let parent_id = self.info.id;
+        let sink = stream.clone();
+        // Avoid retaining Subscriber here: its map owns the same track.
+        if let Some(mut state) = self.state.lock_mut() {
+            state.new_group_sender = Some(std::sync::Arc::new(move |value| {
+                let sink = sink.clone();
+                let request_ids = request_ids.clone();
+                Box::pin(async move {
+                    let mut params = KeyValuePairs::default();
+                    params.set_new_group_request(value);
+                    let id = request_ids.allocate().map_err(ServeError::from)?;
+                    let (update, receipt) = super::BidiResponse::with_completion(
+                        message::RequestUpdate {
+                            id,
+                            existing_request_id: parent_id,
+                            params,
+                        }
+                        .into(),
+                    );
+                    sink.send(update).await.map_err(|_| ServeError::Cancel)?;
+                    receipt
+                        .await
+                        .map_err(|_| ServeError::Cancel)?
+                        .map_err(|err| ServeError::from(err.into_session_error()))
+                })
+            }));
+        }
         self.stream = Some(stream);
         self.request_done = Some(request_done);
         self.request_cancel = Some(request_cancel);
@@ -350,7 +382,9 @@ impl Subscribe {
         let stream = self.stream.take();
         if self.state.lock().closed.is_ok() {
             if let Some(stream) = &stream {
-                let _ = stream.try_send(message::Unsubscribe { id: self.info.id }.into());
+                let _ = stream.try_send(super::BidiResponse::new(
+                    message::Unsubscribe { id: self.info.id }.into(),
+                ));
             }
         }
     }
@@ -397,10 +431,8 @@ impl Subscribe {
     /// The SUBSCRIBE_OK the publisher acknowledged this subscription with, if
     /// it has arrived.
     ///
-    /// Parameters the transport does not itself consume — LARGEST_OBJECT,
-    /// EXPIRES, DELIVERY_TIMEOUT, NEW_GROUP_REQUEST, GROUP_ORDER,
-    /// MAX_CACHE_DURATION, DYNAMIC_GROUPS — are only observable here. Await
-    /// [`ok`](Self::ok) first to know one is coming.
+    /// The transport retains these properties in the shared track and forwards
+    /// dynamic-group feedback. Await [`ok`](Self::ok) before inspecting them.
     pub fn subscribe_ok(&self) -> Option<SubscribeOkInfo> {
         self.state.lock().subscribe_ok.clone()
     }
@@ -434,6 +466,8 @@ impl ops::Deref for Subscribe {
 
 pub(super) struct SubscribeRecv {
     state: State<SubscribeState>,
+    control: std::sync::Arc<serve::TrackControl>,
+    initial_new_group: Option<u64>,
     writer: Option<TrackWriterMode>,
     pub(super) default_publisher_priority: u8,
     /// PUBLISH_DONE Stream Count accounting (draft-18 §10.11).
@@ -441,6 +475,14 @@ pub(super) struct SubscribeRecv {
 }
 
 impl SubscribeRecv {
+    pub(super) fn is_established(&self) -> bool {
+        self.state.lock().ok
+    }
+
+    pub(super) fn observe_largest(&self, largest: Option<Location>) -> Result<(), ServeError> {
+        self.control.observe_largest(largest).map(|_| ())
+    }
+
     pub fn ok(
         &mut self,
         msg: &message::SubscribeOk,
@@ -450,6 +492,15 @@ impl SubscribeRecv {
         if state.ok {
             return Err(ServeError::Duplicate);
         }
+
+        self.control.initial_request(
+            self.initial_new_group,
+            msg.params
+                .largest_object()
+                .map_err(|_| ServeError::internal_ctx("invalid largest object"))?,
+        )?;
+        self.control
+            .configure(msg.track_extensions.clone(), state.new_group_sender.clone())?;
 
         if let Some(mut state) = state.into_mut() {
             state.ok = true;

@@ -542,6 +542,7 @@ impl Producer {
 
         let namespace = subscribed.track_namespace.clone();
         let track_name = subscribed.track_name.clone();
+        let new_group_request = subscribed.params.new_group_request()?;
 
         // Authorize before any lookup or rendezvous hold: deciding after would
         // let response timing reveal whether a track the peer may not access
@@ -615,10 +616,11 @@ impl Producer {
                     match Self::await_rendezvous_work(
                         &subscribed,
                         deadline,
-                        locals.get_or_request_track(
+                        locals.get_or_request_track_with_new_group(
                             self.context.scope(),
                             namespace.clone(),
                             &track_name,
+                            new_group_request,
                         ),
                     )
                     .await
@@ -645,7 +647,12 @@ impl Producer {
                     }
                 } else {
                     locals
-                        .get_or_request_track(self.context.scope(), namespace.clone(), &track_name)
+                        .get_or_request_track_with_new_group(
+                            self.context.scope(),
+                            namespace.clone(),
+                            &track_name,
+                            new_group_request,
+                        )
                         .await
                 };
 
@@ -738,11 +745,12 @@ impl Producer {
                 return self.reject_unresolved_overload(subscribed, &mut timing_guard);
             }
 
-            let remote_lookup = self.remotes.subscribe_with_lookup_status(
+            let remote_lookup = self.remotes.subscribe_with_new_group(
                 self.context.scope(),
                 &namespace,
                 &track_name,
                 &mut coordinator_lookup_succeeded,
+                new_group_request,
             );
             let remote = if let Some(deadline) = deadline {
                 match Self::await_rendezvous_work(&subscribed, deadline, remote_lookup).await {
@@ -2538,6 +2546,7 @@ mod tests {
                 writer,
                 lease,
                 upstream,
+                ..
             }) = requests.recv().await
             {
                 tokio::spawn(async move {
@@ -2576,6 +2585,81 @@ mod tests {
 
         drop(registration);
         requests_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_dynamic_groups_forward_initial_request_and_later_updates() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (server_wire, client_wire) = loopback_webtransport_pair().await;
+            let (server, client) = tokio::join!(
+                TransportSession::accept(server_wire, None, Transport::WebTransport),
+                TransportSession::connect(client_wire, None, Transport::WebTransport),
+            );
+            let (server, mut upstream_publisher, _) = server.unwrap();
+            let (client, remote_publisher, remote_subscriber) = client.unwrap();
+            let remote_url = url::Url::parse("https://relay.example.com/live").unwrap();
+            let coordinator = Arc::new(RemoteCoordinator {
+                url: remote_url.clone(),
+            });
+            let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+            remotes
+                .insert_test_remote(remote_url, remote_publisher, remote_subscriber)
+                .await;
+            let server_task = tokio::spawn(server.run());
+            let client_task = tokio::spawn(client.run());
+            let mut subscriber =
+                spawn_relay_session(Locals::new(), remotes, coordinator as Arc<dyn Coordinator>)
+                    .await;
+            let namespace = TrackNamespace::from_utf8_path("admission");
+            let (source, track) = Track::new(namespace.clone(), "video").produce();
+            let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+            source
+                .enable_dynamic_groups(move |value| {
+                    let tx = tx.clone();
+                    async move { tx.send(value).map_err(|_| ServeError::Cancel) }
+                })
+                .unwrap();
+            let _objects = source.datagrams().unwrap();
+            let serving = tokio::spawn(async move {
+                let subscribed = upstream_publisher
+                    .as_mut()
+                    .unwrap()
+                    .subscribed()
+                    .await
+                    .unwrap();
+                assert_eq!(subscribed.params.new_group_request().unwrap(), Some(6));
+                subscribed.serve(track).await
+            });
+            let (writer, reader) = Track::new(namespace, "video").produce();
+            let mut params = KeyValuePairs::default();
+            params.set_new_group_request(6);
+            let subscription = subscriber
+                .subscribe_open_with_params(writer, params)
+                .await
+                .unwrap();
+            assert_eq!(
+                subscription
+                    .subscribe_ok()
+                    .unwrap()
+                    .track_extensions
+                    .dynamic_groups()
+                    .unwrap(),
+                Some(true)
+            );
+            assert_eq!(requests.recv().await, Some(6));
+            reader.request_new_group(7).await.unwrap();
+            assert_eq!(
+                requests.recv().await,
+                Some(7),
+                "initial request must not be sent twice"
+            );
+            subscription.unsubscribe().await;
+            serving.abort();
+            server_task.abort();
+            client_task.abort();
+        })
+        .await
+        .expect("dynamic-group remote forwarding timed out");
     }
 
     #[tokio::test(flavor = "multi_thread")]

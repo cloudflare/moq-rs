@@ -22,7 +22,7 @@ use crate::{
     data,
     message::{self, RequestErrorCode},
     serve::{self, ServeError, TrackReader, TrackWriterMode},
-    watch::State,
+    watch::{State, StateWeak},
 };
 
 use super::{DoneOutcome, StreamDrain, Subscriber};
@@ -32,6 +32,7 @@ use super::{DoneOutcome, StreamDrain, Subscriber};
 /// State shared between `PublishReceived` (application handle) and
 /// `PublishReceivedRecv` (transport handle).
 pub(crate) struct PublishReceivedState {
+    accepted: bool,
     /// True once PUBLISH_DONE has been received from the publisher.
     done: bool,
     /// Terminal result; set when `done` becomes true.
@@ -41,6 +42,7 @@ pub(crate) struct PublishReceivedState {
 impl Default for PublishReceivedState {
     fn default() -> Self {
         Self {
+            accepted: false,
             done: false,
             closed: Ok(()),
         }
@@ -121,9 +123,9 @@ impl PublishReceived {
     ///   - `true` the publisher may start transmitting Objects immediately.
     ///   - `false` the publisher pauses until Forward is later set to 1.
     ///
-    /// Note: post-establishment `REQUEST_UPDATE` is not supported yet, so
-    /// passing `false` keeps the publisher paused for the lifetime of the
-    /// subscription in this implementation.
+    /// Only dynamic-group feedback is supported by post-establishment
+    /// `REQUEST_UPDATE` so far; Forward updates remain unsupported. Passing
+    /// `false` keeps the publisher paused for the lifetime of the subscription.
     ///
     /// Track Properties stay empty. §10.5 requires that of every REQUEST_OK
     /// except TRACK_STATUS_OK, and sending them here would oblige the peer to
@@ -143,6 +145,11 @@ impl PublishReceived {
             }
             .into(),
         )?;
+        // Even an early PUBLISH_DONE still requires the initial response. Its
+        // transport state may already have been released by the time we accept.
+        if let Some(mut state) = self.state.lock_mut() {
+            state.accepted = true;
+        }
         self.ok = true;
 
         Ok(())
@@ -255,6 +262,7 @@ impl Drop for PublishReceived {
 /// Stored in `Subscriber::publishes_received`. Stream and datagram receive
 /// paths write Objects directly into the `TrackWriterMode` here.
 pub(crate) struct PublishReceivedRecv {
+    control: std::sync::Arc<serve::TrackControl>,
     /// Shared state so both the transport and app can observe PUBLISH_DONE.
     state: State<PublishReceivedState>,
 
@@ -269,6 +277,13 @@ pub(crate) struct PublishReceivedRecv {
 }
 
 impl PublishReceivedRecv {
+    pub(super) fn acceptance(&self) -> PublishAcceptance {
+        PublishAcceptance(self.state.downgrade())
+    }
+    pub(super) fn observe_largest(&self, largest: Option<Location>) -> Result<(), ServeError> {
+        self.control.observe_largest(largest).map(|_| ())
+    }
+
     /// Create a `PublishReceived` / `PublishReceivedRecv` pair from a PUBLISH
     /// message. Both handles share the same state.
     #[allow(clippy::too_many_arguments)]
@@ -298,6 +313,7 @@ impl PublishReceivedRecv {
             app_state,
         );
         let recv = Self {
+            control: writer.control.clone(),
             state: transport_state,
             writer: Some(writer.into()),
             default_publisher_priority,
@@ -494,6 +510,26 @@ impl PublishReceivedRecv {
         }
         // Drop the writer to signal end-of-track to any downstream readers.
         self.writer = None;
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct PublishAcceptance(StateWeak<PublishReceivedState>);
+
+impl PublishAcceptance {
+    pub(super) async fn ready(&self) -> Result<(), ServeError> {
+        loop {
+            let notified = {
+                let state = self.0.upgrade().ok_or(ServeError::Cancel)?;
+                let state = state.lock();
+                state.closed.clone()?;
+                if state.accepted {
+                    return Ok(());
+                }
+                state.modified().ok_or(ServeError::Cancel)?
+            };
+            notified.await;
+        }
     }
 }
 
