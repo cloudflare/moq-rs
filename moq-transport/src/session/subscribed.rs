@@ -1374,8 +1374,8 @@ impl JoiningHandle {
     /// buffers the Joining FETCH); the caller bounds the wait.
     pub async fn snapshot(&self) -> Result<JoiningSnapshot, JoiningError> {
         if !self.forward {
-            // REQUEST_UPDATE is not supported, so the Forward State set by
-            // SUBSCRIBE is final.
+            // Forward updates are still rejected, so the Forward State set by
+            // SUBSCRIBE is final. NEW_GROUP_REQUEST updates do not change it.
             return Err(JoiningError::NotForwarding);
         }
         loop {
