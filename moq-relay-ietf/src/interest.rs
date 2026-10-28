@@ -159,6 +159,13 @@ pub struct TrackInterestGuard {
     inner: Arc<InterestInner>,
 }
 
+#[cfg(test)]
+impl TrackInterestGuard {
+    pub(crate) fn count(&self) -> usize {
+        *self.inner.count.borrow()
+    }
+}
+
 impl Drop for TrackInterestGuard {
     fn drop(&mut self) {
         self.inner.count.send_modify(|count| {

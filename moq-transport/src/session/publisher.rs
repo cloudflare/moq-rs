@@ -10,8 +10,6 @@ use std::{
     },
 };
 
-use futures::{stream::FuturesUnordered, StreamExt};
-
 use crate::{
     coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message},
@@ -304,55 +302,7 @@ impl Publisher {
         let publish_ns = self
             .publish_namespace_start(tracks.namespace.clone())
             .await?;
-
-        let mut subscribe_tasks = FuturesUnordered::new();
-        let mut status_tasks = FuturesUnordered::new();
-        let mut subscribe_done = false;
-        let mut status_done = false;
-
-        loop {
-            tokio::select! {
-                res = publish_ns.subscribed(), if !subscribe_done => {
-                    match res? {
-                        Some(subscribed) => {
-                            let tracks = tracks.clone();
-                            subscribe_tasks.push(async move {
-                                let info = subscribed.info.clone();
-                                if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
-                                    tracing::warn!(
-                                        subscribe_info = ?info,
-                                        error = %err,
-                                        "failed serving subscribe"
-                                    );
-                                }
-                            });
-                        }
-                        None => subscribe_done = true,
-                    }
-                },
-                res = publish_ns.track_status_requested(), if !status_done => {
-                    match res? {
-                        Some(status) => {
-                            let tracks = tracks.clone();
-                            status_tasks.push(async move {
-                                let request_msg = status.request_msg.clone();
-                                if let Err(err) = Self::serve_track_status(status, tracks).await {
-                                    tracing::warn!(
-                                        request = ?request_msg,
-                                        error = %err,
-                                        "failed serving track status request"
-                                    );
-                                }
-                            });
-                        }
-                        None => status_done = true,
-                    }
-                },
-                Some(res) = subscribe_tasks.next() => res,
-                Some(res) = status_tasks.next() => res,
-                else => return Ok(()),
-            }
-        }
+        publish_ns.serve(tracks).await
     }
 
     /// Send PUBLISH_NAMESPACE and return the request handle without serving
@@ -472,6 +422,7 @@ impl Publisher {
                             request_stopped = true;
                         }
                         PublishNamespaceEvent::Response(Ok(Message::RequestOk(msg))) => {
+                            super::validate_propertyless_request_ok(&msg)?;
                             if responded {
                                 return Err(SessionError::ProtocolViolation(
                                     "multiple responses to PUBLISH_NAMESPACE".to_string(),
@@ -620,7 +571,7 @@ impl Publisher {
             track_name: info.track_name.clone(),
             track_alias,
             params,
-            track_extensions: Default::default(),
+            track_extensions: track.track_extensions(),
         };
         let abort = AbortPublishedOnDrop {
             publisher: self.clone(),
@@ -1119,10 +1070,7 @@ impl Publisher {
                     request_id = msg.id,
                     "PUBLISH accepted with the draft-16 PUBLISH_OK type"
                 );
-                let msg = message::RequestOk {
-                    id: msg.id,
-                    params: msg.params,
-                };
+                let msg = message::RequestOk::new(msg.id, msg.params);
                 self.recv_publish_ok(&msg)?;
             }
         }
@@ -1314,6 +1262,7 @@ impl Publisher {
     /// from the type instead would resolve a PUBLISH as a namespace
     /// registration and leave the publish waiting forever.
     fn recv_request_ok(&mut self, msg: message::RequestOk) -> Result<(), SessionError> {
+        super::validate_propertyless_request_ok(&msg)?;
         if self.recv_publish_namespace_ok(&msg)? {
             return Ok(());
         }
@@ -1808,6 +1757,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publish_sends_track_extensions_snapshot_and_preserves_empty_wire_output() {
+        use crate::coding::{Decode, Encode};
+        use crate::session::test_support::TRACK_PROPERTY_BYTES;
+
+        for property_bytes in [TRACK_PROPERTY_BYTES, &[][..]] {
+            let (publisher_session, peer_session) = loopback_session_pair().await;
+            let (outgoing, _outgoing_recv) = Queue::default().split();
+            let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut publisher = Publisher::new(
+                outgoing,
+                publisher_session,
+                None,
+                RequestId::new(0, 1),
+                bidi_task_tx,
+            );
+            let (mut writer, track) =
+                serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+            let mut input = property_bytes;
+            writer.set_track_extensions(message::TrackExtensions::decode(&mut input).unwrap());
+            let _published = publisher
+                .publish(track, KeyValuePairs::default())
+                .await
+                .unwrap();
+            writer.set_track_extensions(message::TrackExtensions::new());
+
+            let (_send, recv) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), peer_session.accept_bi())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut reader = Reader::new(recv);
+            let Message::Publish(publish) = reader.decode().await.unwrap() else {
+                panic!("expected PUBLISH");
+            };
+            let mut forwarded = Vec::new();
+            publish.track_extensions.encode(&mut forwarded).unwrap();
+            assert_eq!(forwarded, property_bytes);
+
+            if property_bytes.is_empty() {
+                let mut frame = Vec::new();
+                Message::Publish(publish).encode(&mut frame).unwrap();
+                // Original empty-property PUBLISH for request/alias 0, namespace ("test"), name "track".
+                assert_eq!(frame, b"\x1d\x00\x0f\x00\x01\x04test\x05track\x00\x00");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn publish_reservation_guard_cleans_up_before_driver_installation() {
         let (publisher_session, _peer_session) = loopback_session_pair().await;
         let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
@@ -1894,10 +1891,10 @@ mod tests {
                 let mut writer = Writer::new(send_stream);
                 Session::encode_bidi_response(
                     &mut writer,
-                    &Message::RequestOk(message::RequestOk {
-                        id: publish.id,
-                        params: KeyValuePairs::default(),
-                    }),
+                    &Message::RequestOk(message::RequestOk::new(
+                        publish.id,
+                        KeyValuePairs::default(),
+                    )),
                 )
                 .await
                 .unwrap();
@@ -2006,10 +2003,10 @@ mod tests {
             let mut writer = Writer::new(send_stream);
             Session::encode_bidi_response(
                 &mut writer,
-                &Message::RequestOk(message::RequestOk {
-                    id: publish.id,
-                    params: KeyValuePairs::default(),
-                }),
+                &Message::RequestOk(message::RequestOk::new(
+                    publish.id,
+                    KeyValuePairs::default(),
+                )),
             )
             .await
             .unwrap();
@@ -2068,10 +2065,10 @@ mod tests {
             let mut writer = Writer::new(send_stream);
             Session::encode_bidi_response(
                 &mut writer,
-                &Message::RequestOk(message::RequestOk {
-                    id: publish.id,
-                    params: KeyValuePairs::default(),
-                }),
+                &Message::RequestOk(message::RequestOk::new(
+                    publish.id,
+                    KeyValuePairs::default(),
+                )),
             )
             .await
             .unwrap();
@@ -2161,6 +2158,105 @@ mod tests {
         ));
     }
 
+    async fn open_namespace_request() -> (
+        Publisher,
+        PublishNamespace,
+        web_transport::Session,
+        Writer,
+        Reader,
+        tokio::task::JoinHandle<Result<(), crate::session::SessionError>>,
+    ) {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut publisher = Publisher::new(
+            Queue::default(),
+            client,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+        );
+        let namespace = TrackNamespace::from_utf8_path("test/response");
+        let publish = publisher
+            .publish_namespace_start(namespace.clone())
+            .await
+            .unwrap();
+        let pump = tokio::spawn(bidi_task_rx.recv().await.unwrap());
+        let (peer_send, peer_recv) = server.accept_bi().await.unwrap();
+        let mut reader = Reader::new(peer_recv);
+        match reader.decode::<Message>().await.unwrap() {
+            Message::PublishNamespace(msg) => {
+                assert_eq!(msg.track_namespace, namespace);
+                assert_eq!(msg.id, publish.request_id);
+            }
+            msg => panic!("unexpected request: {msg:?}"),
+        }
+        (
+            publisher,
+            publish,
+            server,
+            Writer::new(peer_send),
+            reader,
+            pump,
+        )
+    }
+
+    #[tokio::test]
+    async fn publish_namespace_start_reports_ok_while_serving() {
+        let (_publisher, publish, _server, mut writer, _reader, pump) =
+            open_namespace_request().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), publish.ok())
+                .await
+                .is_err()
+        );
+        Session::encode_bidi_response(
+            &mut writer,
+            &Message::RequestOk(message::RequestOk::new(
+                publish.request_id,
+                Default::default(),
+            )),
+        )
+        .await
+        .unwrap();
+        publish.ok().await.unwrap();
+        let (_, _, tracks) = Tracks::new(publish.namespace.clone()).produce();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), publish.serve(tracks))
+                .await
+                .is_err()
+        );
+        pump.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_namespace_start_reports_request_error() {
+        let (_publisher, publish, _server, mut writer, _reader, pump) =
+            open_namespace_request().await;
+        Session::encode_bidi_response(
+            &mut writer,
+            &Message::RequestError(message::RequestError {
+                id: publish.request_id,
+                error_code: message::RequestErrorCode::Uninterested as u64,
+                retry_interval: 0,
+                reason: ReasonPhrase("not interested".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(publish.ok().await, Err(ServeError::Closed(code))
+            if code == message::RequestErrorCode::Uninterested as u64));
+        pump.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_namespace_start_fails_if_session_ends_before_response() {
+        let (_publisher, publish, _server, _writer, _reader, pump) = open_namespace_request().await;
+        // Session::run owns this pump; dropping the session drops it too.
+        pump.abort();
+        assert!(pump.await.unwrap_err().is_cancelled());
+        assert!(matches!(publish.ok().await, Err(ServeError::Cancel)));
+    }
+
     #[tokio::test]
     async fn accepted_namespace_survives_response_fin_until_local_cancel() {
         let (client, server) = loopback_session_pair().await;
@@ -2194,10 +2290,7 @@ mod tests {
         ));
         Session::encode_bidi_response(
             &mut peer_writer,
-            &Message::RequestOk(message::RequestOk {
-                id: 0,
-                params: Default::default(),
-            }),
+            &Message::RequestOk(message::RequestOk::new(0, Default::default())),
         )
         .await
         .unwrap();
@@ -2334,10 +2427,7 @@ mod tests {
         ));
         Session::encode_bidi_response(
             &mut peer_writer,
-            &Message::RequestOk(message::RequestOk {
-                id: 0,
-                params: Default::default(),
-            }),
+            &Message::RequestOk(message::RequestOk::new(0, Default::default())),
         )
         .await
         .unwrap();

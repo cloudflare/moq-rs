@@ -6,9 +6,13 @@ use std::{collections::VecDeque, ops};
 
 use crate::coding::TrackNamespace;
 use crate::watch::State;
-use crate::{message, serve::ServeError};
+use crate::{
+    message,
+    serve::{ServeError, TracksReader},
+};
+use futures::{stream::FuturesUnordered, StreamExt};
 
-use super::{Subscribed, TrackStatusRequested, CANCELLED_STREAM_CODE};
+use super::{Publisher, SessionError, Subscribed, TrackStatusRequested, CANCELLED_STREAM_CODE};
 
 /// Information about an outbound PUBLISH_NAMESPACE request.
 #[derive(Debug, Clone)]
@@ -109,6 +113,68 @@ impl PublishNamespace {
         (send, recv, recv_cancel)
     }
 
+    /// Serve subscriptions and track status requests until withdrawal or an error.
+    ///
+    /// The tracks must belong to this request's namespace. This does not wait
+    /// for acceptance first; callers that need that ordering can await `ok()`.
+    /// `Session::run` must be driven concurrently.
+    pub async fn serve(self, tracks: TracksReader) -> Result<(), SessionError> {
+        if tracks.namespace != self.info.namespace {
+            return Err(ServeError::Internal(
+                "PUBLISH_NAMESPACE tracks have a different namespace".to_string(),
+            )
+            .into());
+        }
+        let mut subscribe_tasks = FuturesUnordered::new();
+        let mut status_tasks = FuturesUnordered::new();
+        let mut subscribe_done = false;
+        let mut status_done = false;
+
+        loop {
+            tokio::select! {
+                res = self.subscribed(), if !subscribe_done => {
+                    match res? {
+                        Some(subscribed) => {
+                            let tracks = tracks.clone();
+                            subscribe_tasks.push(async move {
+                                let info = subscribed.info.clone();
+                                if let Err(err) = Publisher::serve_subscribe(subscribed, tracks).await {
+                                    tracing::warn!(
+                                        subscribe_info = ?info,
+                                        error = %err,
+                                        "failed serving subscribe"
+                                    );
+                                }
+                            });
+                        }
+                        None => subscribe_done = true,
+                    }
+                },
+                res = self.track_status_requested(), if !status_done => {
+                    match res? {
+                        Some(status) => {
+                            let tracks = tracks.clone();
+                            status_tasks.push(async move {
+                                let request_msg = status.request_msg.clone();
+                                if let Err(err) = Publisher::serve_track_status(status, tracks).await {
+                                    tracing::warn!(
+                                        request = ?request_msg,
+                                        error = %err,
+                                        "failed serving track status request"
+                                    );
+                                }
+                            });
+                        }
+                        None => status_done = true,
+                    }
+                },
+                Some(res) = subscribe_tasks.next() => res,
+                Some(res) = status_tasks.next() => res,
+                else => return Ok(()),
+            }
+        }
+    }
+
     /// Wait until the namespace publish is closed (error or peer disconnect).
     pub async fn closed(&self) -> Result<(), ServeError> {
         loop {
@@ -168,6 +234,7 @@ impl PublishNamespace {
     }
 
     /// Wait until the peer has sent REQUEST_OK for this namespace.
+    /// Returns an error on rejection or closure before acceptance.
     pub async fn ok(&self) -> Result<(), ServeError> {
         loop {
             {
@@ -179,7 +246,7 @@ impl PublishNamespace {
 
                 match state.modified() {
                     Some(notified) => notified,
-                    None => return Ok(()),
+                    None => return Err(ServeError::Cancel),
                 }
             }
             .await;
@@ -263,6 +330,17 @@ mod tests {
     use crate::coding::TrackNamespace;
 
     use super::PublishNamespace;
+
+    #[tokio::test]
+    async fn ok_fails_if_response_state_ends_without_acceptance() {
+        let (publish, recv, _cancel) =
+            PublishNamespace::new(6, TrackNamespace::from_utf8_path("test"));
+        drop(recv);
+        assert!(matches!(
+            publish.ok().await,
+            Err(crate::serve::ServeError::Cancel)
+        ));
+    }
 
     #[tokio::test]
     async fn drop_cancels_request_stream() {
