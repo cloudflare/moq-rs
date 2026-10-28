@@ -80,11 +80,7 @@ impl SubscribedTracks {
         self.responded()?;
         self.outgoing
             .try_send(SubscribedTracksOutput::Message(
-                message::RequestOk {
-                    id: self.request_id,
-                    params: Default::default(),
-                }
-                .into(),
+                message::RequestOk::new(self.request_id, Default::default()).into(),
             ))
             .map_err(|_| ServeError::Cancel)
     }

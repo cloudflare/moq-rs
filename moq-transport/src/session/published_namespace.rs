@@ -106,11 +106,7 @@ impl PublishedNamespace {
 
         self.outgoing
             .try_send(StreamAction::Response(
-                message::RequestOk {
-                    id: self.info.request_id,
-                    params: Default::default(),
-                }
-                .into(),
+                message::RequestOk::new(self.info.request_id, Default::default()).into(),
             ))
             .map_err(|_| ServeError::Cancel)?;
         self.ok = true;

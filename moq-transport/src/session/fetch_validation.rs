@@ -136,7 +136,7 @@ impl FetchValidator {
         Ok(())
     }
 
-    /// Validate FETCH_OK. Violations are session-fatal (§10.13).
+    /// Validate FETCH_OK. Range and known-value violations are session-fatal.
     pub fn validate_ok(
         &mut self,
         end: Location,
@@ -157,9 +157,7 @@ impl FetchValidator {
         if self.largest.is_some_and(|l| l > inclusive_end(end)) {
             return Err(Self::invalid_ok("FETCH_OK does not cover streamed records"));
         }
-        extensions.default_publisher_priority()?;
-        extensions.default_publisher_group_order()?;
-        extensions.dynamic_groups()?;
+        extensions.validate_values()?;
         self.response_end = Some(end);
         Ok(())
     }

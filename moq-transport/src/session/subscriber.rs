@@ -938,6 +938,16 @@ impl Subscriber {
                                     let terminal = matches!(msg, Message::PublishDone(_) | Message::RequestError(_));
                                     if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
                                         if let Err(err) = subscriber_clone.recv_message(pub_msg) {
+                                            if let SessionError::Serve(ServeError::Closed(code)) = &err {
+                                                let code = if *code == message::RequestErrorCode::MalformedTrack as u64 {
+                                                    data::DataStreamResetCode::MalformedTrack as u32
+                                                } else {
+                                                    super::CANCELLED_STREAM_CODE
+                                                };
+                                                request_writer.reset(code);
+                                                response_reader.stop(code);
+                                                writing = false;
+                                            }
                                             break Err(err);
                                         }
                                     }
@@ -1070,6 +1080,7 @@ impl Subscriber {
             cancel_tx,
         );
 
+        let subscriber = self.clone();
         let response = async move {
             let mut cancel_open = true;
             let mut answered = false;
@@ -1091,7 +1102,14 @@ impl Subscriber {
                             // STOP_SENDING it, which cancels the FETCH. So keep
                             // reading until FIN, or until the caller cancels.
                             Ok(Message::FetchOk(ok)) if !answered => {
-                                recv.recv_ok(ok)?;
+                                if let Err(err) = recv.recv_ok(ok) {
+                                    if let Some(code) = recv.properties_error() {
+                                        reader.stop(super::track_properties_reset_code(code));
+                                        subscriber.cancel_fetch_stream(id);
+                                        return Ok(());
+                                    }
+                                    return Err(err);
+                                }
                                 answered = true;
                             }
                             Ok(Message::RequestError(error)) if !answered => {
@@ -1288,6 +1306,13 @@ impl Subscriber {
 
     /// Handle the reception of a SubscribeOk message from the publisher.
     fn recv_subscribe_ok(&mut self, msg: &message::SubscribeOk) -> Result<(), SessionError> {
+        msg.track_extensions.validate_values()?;
+        if let Some(code) = super::track_properties_error(&msg.track_extensions) {
+            if let Some(mut subscribe) = self.remove_subscribe(msg.id) {
+                subscribe.finish(ServeError::Closed(code as u64));
+            }
+            return Err(ServeError::Closed(code as u64).into());
+        }
         if let Some(subscribe) = self
             .subscribes
             .lock()
@@ -1707,6 +1732,11 @@ impl Subscriber {
     /// SUBSCRIBE_OK message (§9.10) and does not come through this handler.
     /// Full routing for the other request types is wired up (TODO itzmanish).
     fn recv_request_ok(&mut self, msg: &message::RequestOk) -> Result<(), SessionError> {
+        // TRACK_STATUS_OK reaches this generic receive path. Out-of-range values
+        // close the session (Sections 12.5 and 12.6). A status response creates no
+        // track here, so there is nothing to refuse or cancel for a mandatory or
+        // malformed property (Sections 2.5.1 and 2.4.2).
+        msg.track_extensions.validate_values()?;
         self.log_request_ok_parsed("unknown", msg);
         tracing::debug!(
             target: "moq_transport::control",
@@ -1748,30 +1778,24 @@ impl Subscriber {
     /// This establishes a publisher-initiated subscription: the peer offers a
     /// track and this endpoint becomes its subscriber.
     fn recv_publish(&mut self, msg: &message::Publish) -> Result<(), SessionError> {
+        msg.track_extensions.validate_values()?;
+        if let Some(code) = super::track_properties_error(&msg.track_extensions) {
+            self.send_request_error(
+                "publish",
+                message::RequestError::new(
+                    msg.id,
+                    code,
+                    0,
+                    "unsupported or malformed track properties",
+                ),
+            );
+            return Ok(());
+        }
         let default_publisher_priority = msg
             .track_extensions
             .default_publisher_priority()
             .map_err(SessionError::Decode)?
             .unwrap_or(data::DEFAULT_PUBLISHER_PRIORITY);
-        // DEFAULT_PUBLISHER_PRIORITY is consumed by subgroup decoding. Keep
-        // rejecting properties the serve model cannot preserve yet.
-        if !msg
-            .track_extensions
-            .contains_only(&[message::extension_type::DEFAULT_PUBLISHER_PRIORITY])
-        {
-            self.send_request_error(
-                "publish",
-                message::RequestError {
-                    id: msg.id,
-                    error_code: message::RequestErrorCode::NotSupported as u64,
-                    retry_interval: 0,
-                    reason: crate::coding::ReasonPhrase(
-                        "track extensions not supported".to_string(),
-                    ),
-                },
-            );
-            return Ok(());
-        }
 
         let full_name = FullTrackName {
             namespace: msg.track_namespace.clone(),
@@ -1835,8 +1859,10 @@ impl Subscriber {
 
         // Allocate the track. The transport owns the writer; the application
         // gets the reader from PublishReceived::ok.
-        let (writer, reader) =
+        let (mut writer, reader) =
             serve::Track::new(msg.track_namespace.clone(), msg.track_name.clone()).produce();
+        // Store properties before exposing the track to the application or Object routing.
+        writer.set_track_extensions(msg.track_extensions.clone());
 
         let (publish_received, recv) = PublishReceivedRecv::produce(
             self.clone(),
@@ -2009,11 +2035,8 @@ impl Subscriber {
     /// consumed by [`route_fetch_stream`](Self::route_fetch_stream) or by
     /// [`FetchStreamCleanup::drop`]) this is a no-op.
     ///
-    /// Production code relies on [`FetchStreamCleanup::drop`] when the owning
-    /// [`FetchStreamReg`] goes out of scope; a cancelled [`super::Fetch`]
-    /// signals through its own channel. This exists to test the explicit
-    /// removal path of the routing table.
-    #[cfg(test)]
+    /// Rejected Track Properties retire the route even while the application
+    /// keeps its FETCH handle. Ordinary teardown uses [`FetchStreamCleanup::drop`].
     pub(super) fn cancel_fetch_stream(&self, request_id: u64) {
         match self.fetch_streams.lock() {
             Ok(mut map) => {
@@ -3713,6 +3736,145 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_ok_rejects_unsupported_and_malformed_track_properties() {
+        use super::super::{test_support::rejected_track_properties, Transport};
+        for (properties, code, reset) in rejected_track_properties() {
+            let (client_t, peer_t) = loopback_session_pair().await;
+            let peer = peer_t.clone();
+            let (client, server) = tokio::join!(
+                Session::connect(client_t, None, Transport::WebTransport),
+                Session::accept(peer_t, None, Transport::WebTransport),
+            );
+            let (session, _, mut subscriber) = client.unwrap();
+            let _server = server.unwrap();
+            let run = tokio::spawn(session.run());
+            let (writer, track) =
+                serve::Track::new(TrackNamespace::from_utf8_path("test"), "reject").produce();
+            let subscribe = subscriber.subscribe_start(writer).await.unwrap();
+            let (send, recv) = peer.accept_bi().await.unwrap();
+            let mut writer = Writer::new(send);
+            let mut reader = Reader::new(recv);
+            let _: Message = reader.decode().await.unwrap();
+            Session::encode_bidi_response(
+                &mut writer,
+                &Message::SubscribeOk(message::SubscribeOk {
+                    id: 0,
+                    track_alias: 42,
+                    params: KeyValuePairs::default(),
+                    track_extensions: properties,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), subscribe.ok())
+                    .await
+                    .unwrap(),
+                Err(ServeError::Closed(code))
+            );
+            assert!(subscribe.subscribe_ok().is_none());
+            assert!(
+                !subscribe.peer_rejected(),
+                "this is a local refusal of SUBSCRIBE_OK"
+            );
+            assert!(track.track_extensions().is_empty());
+            assert!(matches!(track.mode().await, Err(ServeError::Closed(c)) if c == code));
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), writer.closed())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Some(reset as u8)
+            );
+            let error = reader.decode::<Message>().await.unwrap_err();
+            assert!(
+                matches!(error, SessionError::WebTransport(web_transport::Error::Read(web_transport::quinn::ReadError::Reset(c))) if c == reset)
+            );
+            assert!(subscriber.subscribes.lock().unwrap().is_empty());
+            assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
+            assert!(
+                !run.is_finished(),
+                "refusing a track must not close the session"
+            );
+            run.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn immutable_priority_drives_subgroups_with_mutable_precedence() {
+        use super::super::test_support::immutable_properties;
+        for mutable in [None, Some(17)] {
+            let (receiver, peer) = loopback_session_pair().await;
+            let mut subscriber = test_subscriber(receiver.clone());
+            let (writer, track) =
+                serve::Track::new(TrackNamespace::from_utf8_path("test"), "priority").produce();
+            let (subscribe, recv, _) =
+                Subscribe::new(subscriber.clone(), 0, writer, KeyValuePairs::default()).unwrap();
+            subscriber.subscribes.lock().unwrap().insert(0, recv);
+            let mut inner = message::TrackExtensions::new();
+            inner.set_default_publisher_priority(200);
+            inner.set_delivery_timeout(9);
+            inner.set_max_cache_duration(10);
+            inner
+                .set_default_publisher_group_order(message::GroupOrder::Descending)
+                .unwrap();
+            inner.set_dynamic_groups(true);
+            // Track-level nesting is allowed; only Objects prohibit it (Section 12.7).
+            inner.set_bytes_extension(message::extension_type::IMMUTABLE_EXTENSIONS, vec![2]);
+            let mut properties = immutable_properties(inner);
+            if let Some(priority) = mutable {
+                properties.set_default_publisher_priority(priority);
+            }
+            subscriber
+                .recv_subscribe_ok(&message::SubscribeOk {
+                    id: 0,
+                    track_alias: 42,
+                    params: KeyValuePairs::default(),
+                    track_extensions: properties,
+                })
+                .unwrap();
+            subscribe.ok().await.unwrap();
+            let properties = track.track_extensions();
+            assert_eq!(properties.delivery_timeout().unwrap(), Some(9));
+            assert_eq!(properties.max_cache_duration().unwrap(), Some(10));
+            assert_eq!(
+                properties.default_publisher_group_order().unwrap(),
+                Some(message::GroupOrder::Descending)
+            );
+            assert_eq!(properties.dynamic_groups().unwrap(), Some(true));
+            let send = async {
+                let mut stream = peer.open_uni().await.unwrap();
+                // Type 0x38 omits publisher priority and therefore inherits it.
+                stream.write(&[0x38, 42, 0, 0, 1, b'x']).await.unwrap();
+                stream.finish().unwrap();
+            };
+            let receive = async {
+                Subscriber::recv_stream(subscriber, receiver.accept_uni().await.unwrap())
+                    .await
+                    .unwrap();
+            };
+            tokio::join!(send, receive);
+            let serve::TrackReaderMode::Subgroups(mut groups) = track.mode().await.unwrap() else {
+                panic!("expected subgroups")
+            };
+            let mut group = groups.next().await.unwrap().unwrap();
+            assert_eq!(group.priority, mutable.unwrap_or(200));
+            assert_eq!(
+                group
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .read_all()
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"x"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn malformed_subgroup_type_stops_stream_with_protocol_violation() {
         let (receiver_session, peer_session) = loopback_session_pair().await;
         let subscriber = test_subscriber(receiver_session.clone());
@@ -4313,6 +4475,133 @@ mod tests {
         let publish = subscriber.publish_received().await.expect("queued PUBLISH");
         assert_eq!(publish.track_alias(), 7);
         assert_eq!(publish.name(), &TrackName::from("video"));
+    }
+
+    #[tokio::test]
+    async fn recv_publish_stores_track_extensions_before_exposing_track() {
+        use crate::coding::Encode;
+        use crate::session::test_support::TRACK_PROPERTY_BYTES;
+
+        let mut subscriber = test_subscriber(loopback_session().await);
+        let mut input = TRACK_PROPERTY_BYTES;
+        subscriber
+            .recv_publish(&message::Publish {
+                id: 1,
+                track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+                track_name: "video".into(),
+                track_alias: 7,
+                params: Default::default(),
+                track_extensions: message::TrackExtensions::decode(&mut input).unwrap(),
+            })
+            .unwrap();
+
+        let mut publish =
+            tokio::time::timeout(Duration::from_secs(2), subscriber.publish_received())
+                .await
+                .expect("PUBLISH must reach the application")
+                .unwrap();
+        let reader = publish.take_reader().unwrap();
+        let mut forwarded = Vec::new();
+        reader.track_extensions().encode(&mut forwarded).unwrap();
+        assert_eq!(forwarded, TRACK_PROPERTY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn recv_publish_rejects_mandatory_track_extensions_without_reservations() {
+        for (key, error) in [
+            (0x4000, Some(0x33)),
+            (0x7fff, Some(0x33)),
+            (0x3fff, None),
+            (0x8000, None),
+        ] {
+            let mut extensions = message::TrackExtensions::new();
+            if key % 2 == 0 {
+                extensions.set_int_extension(key, 7);
+            } else {
+                extensions.set_bytes_extension(key, vec![7]);
+            }
+            assert_publish_property_admission(extensions, error).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_publish_rejects_mandatory_properties_inside_immutable_properties() {
+        use crate::coding::Encode;
+
+        for key in [0x4000, 0x7fff] {
+            let mut inner = message::TrackExtensions::new();
+            if key % 2 == 0 {
+                inner.set_int_extension(key, 7);
+            } else {
+                inner.set_bytes_extension(key, vec![7]);
+            }
+            let mut bytes = Vec::new();
+            inner.encode(&mut bytes).unwrap();
+            let mut extensions = message::TrackExtensions::new();
+            extensions.set_bytes_extension(message::extension_type::IMMUTABLE_EXTENSIONS, bytes);
+            assert_publish_property_admission(extensions, Some(0x33)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_publish_rejects_unparseable_immutable_properties_as_malformed_track() {
+        let mut malformed = message::TrackExtensions::new();
+        // An inner KVP with a type but no value is a malformed track (Section 12.7).
+        malformed.set_bytes_extension(message::extension_type::IMMUTABLE_EXTENSIONS, vec![2]);
+        assert_publish_property_admission(malformed, Some(0x12)).await;
+    }
+
+    async fn assert_publish_property_admission(
+        extensions: message::TrackExtensions,
+        expected_error: Option<u64>,
+    ) {
+        let mut subscriber = test_subscriber(loopback_session().await);
+        let (outgoing, mut responses) = Queue::default().split();
+        subscriber.outgoing = outgoing;
+        let mut msg = message::Publish {
+            id: 1,
+            track_namespace: TrackNamespace::from_utf8_path("test/ns"),
+            track_name: "video".into(),
+            track_alias: 7,
+            params: Default::default(),
+            track_extensions: extensions,
+        };
+        subscriber.recv_publish(&msg).unwrap();
+
+        if let Some(code) = expected_error {
+            let Some(Message::RequestError(error)) =
+                tokio::time::timeout(Duration::from_secs(2), responses.pop())
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected REQUEST_ERROR");
+            };
+            assert_eq!(error.id, msg.id);
+            assert_eq!(error.error_code, code);
+            assert!(subscriber.publishes_received.lock().unwrap().is_empty());
+            assert!(subscriber.track_alias_map.lock().unwrap().is_empty());
+            assert!(!subscriber.has_subscriber_name(&FullTrackName {
+                namespace: msg.track_namespace.clone(),
+                name: msg.track_name.clone(),
+            }));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), subscriber.publish_received())
+                    .await
+                    .is_err(),
+                "rejected PUBLISH must not reach the application"
+            );
+
+            // A new request can use the rejected name and alias on the same session.
+            msg.id = 3;
+            msg.track_extensions = Default::default();
+            subscriber.recv_publish(&msg).unwrap();
+        }
+        let publish = tokio::time::timeout(Duration::from_secs(2), subscriber.publish_received())
+            .await
+            .expect("accepted PUBLISH must reach the application")
+            .unwrap();
+        assert_eq!(publish.track_alias(), msg.track_alias);
+        assert_eq!(publish.name(), &msg.track_name);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

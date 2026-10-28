@@ -535,7 +535,7 @@ impl Subscribed {
                 id: self.info.id,
                 track_alias: self.info.id, // use subscription id as track alias
                 params,
-                track_extensions: Default::default(),
+                track_extensions: track.track_extensions(),
             })?;
 
         self.ok = true;
@@ -2764,6 +2764,56 @@ mod tests {
             web_transport::Error::Read(web_transport::quinn::ReadError::Reset(code))
                 if code == DataStreamResetCode::Cancelled as u32
         ));
+    }
+
+    #[tokio::test]
+    async fn subscribe_ok_forwards_track_extensions_with_and_without_largest_object() {
+        let property_bytes = super::super::test_support::TRACK_PROPERTY_BYTES;
+        let mut input = property_bytes;
+        let properties = message::TrackExtensions::decode(&mut input).unwrap();
+
+        for with_deadline in [false, true] {
+            for largest in [None, Some(Location::new(7, 3))] {
+                let (mut subscribed, mut recv, _outgoing, mut responses) = test_subscribed().await;
+                let (mut writer, reader) = serve::Track::new(
+                    crate::coding::TrackNamespace::from_utf8_path("test"),
+                    "track",
+                )
+                .produce();
+                writer.set_track_extensions(properties.clone());
+                let deadline = with_deadline
+                    .then(|| tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+                let serve =
+                    tokio::spawn(
+                        async move { subscribed.serve_inner(reader, deadline, largest).await },
+                    );
+                let mut response =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), responses.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let message::Message::SubscribeOk(ok) = &response.message else {
+                    panic!("expected SUBSCRIBE_OK, got {:?}", response.message);
+                };
+                assert_eq!(ok.params.largest_object().unwrap(), largest);
+                let mut forwarded = Vec::new();
+                ok.track_extensions.encode(&mut forwarded).unwrap();
+                assert_eq!(forwarded, property_bytes);
+
+                writer.set_track_extensions(message::TrackExtensions::new());
+                assert_eq!(ok.track_extensions, properties);
+                let _subgroups = writer.subgroups().unwrap();
+                response.complete(Ok(()));
+                recv.recv_unsubscribe().unwrap();
+                assert!(matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), serve)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    Err(SessionError::Serve(ServeError::Cancel))
+                ));
+            }
+        }
     }
 
     #[tokio::test]

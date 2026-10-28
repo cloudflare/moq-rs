@@ -23,6 +23,7 @@ use super::{
     StreamWriter, Subgroups, SubgroupsReader, SubgroupsWriter,
 };
 use crate::coding::{Location, TrackName, TrackNamespace};
+use crate::message::TrackExtensions;
 use paste::paste;
 use std::{ops::Deref, sync::Arc};
 
@@ -57,6 +58,7 @@ impl Track {
 struct TrackState {
     /// The ReaderMode for this track. Set to None on creation.
     reader_mode: Option<TrackReaderMode>,
+    track_extensions: TrackExtensions,
     /// Watchable closed state
     closed: Result<(), ServeError>,
 }
@@ -65,6 +67,7 @@ impl Default for TrackState {
     fn default() -> Self {
         Self {
             reader_mode: None,
+            track_extensions: TrackExtensions::default(),
             closed: Ok(()),
         }
     }
@@ -80,6 +83,12 @@ impl TrackWriter {
     /// Create a track with the given name (info/Track)
     fn new(state: State<TrackState>, info: Arc<Track>) -> Self {
         Self { state, info }
+    }
+
+    /// Replace the whole Track Properties set (draft-18 Section 2.5).
+    /// Existing snapshots, including those sent to established subscribers, are unchanged.
+    pub fn set_track_extensions(&mut self, track_extensions: TrackExtensions) {
+        self.state.lock().into_mut_closed().track_extensions = track_extensions;
     }
 
     /// Create a new stream with the given priority, inserting it into the track.
@@ -192,6 +201,11 @@ pub struct TrackReader {
 impl TrackReader {
     fn new(state: State<TrackState>, info: Arc<Track>) -> Self {
         Self { state, info }
+    }
+
+    /// Snapshot the current Track Properties, preserving their order and values.
+    pub fn track_extensions(&self) -> TrackExtensions {
+        self.state.lock().track_extensions.clone()
     }
 
     /// Get the current mode of the track, waiting if necessary.
@@ -334,6 +348,43 @@ mod tests {
     use super::*;
     use crate::coding::TrackNamespace;
     use crate::serve::Subgroup;
+
+    #[test]
+    fn track_extensions_replace_the_whole_set() {
+        let (mut writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let mut first = TrackExtensions::new();
+        first.set_int_extension(0x38, 42);
+        first.set_bytes_extension(0x39, vec![0x00, 0xff]);
+        writer.set_track_extensions(first);
+
+        let mut replacement = TrackExtensions::new();
+        replacement.set_bytes_extension(0x39, vec![0x80]);
+        writer.set_track_extensions(replacement.clone());
+        assert_eq!(reader.track_extensions(), replacement);
+
+        writer.set_track_extensions(TrackExtensions::new());
+        assert!(reader.track_extensions().is_empty());
+    }
+
+    #[test]
+    fn track_extensions_snapshots_survive_replacement_and_mode_transition() {
+        let (mut writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let mut first = TrackExtensions::new();
+        first.set_bytes_extension(0x39, vec![0x00, 0xff]);
+        writer.set_track_extensions(first.clone());
+        let snapshot = reader.track_extensions();
+
+        let mut replacement = TrackExtensions::new();
+        replacement.set_int_extension(0x38, 7);
+        writer.set_track_extensions(replacement.clone());
+        let subgroups = writer.subgroups().unwrap();
+        drop(subgroups);
+
+        assert_eq!(snapshot, first);
+        assert_eq!(reader.clone().track_extensions(), replacement);
+    }
 
     #[test]
     fn test_is_closed_false_before_mode_set() {
