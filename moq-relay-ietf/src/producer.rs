@@ -1985,7 +1985,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::Client>)> {
             Err(CoordinatorError::NamespaceNotFound)
         }
 
@@ -1994,7 +1994,7 @@ mod tests {
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
             track: &str,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::Client>)> {
             self.track_lookups
                 .lock()
                 .map_err(|_| anyhow::anyhow!("track lookup lock poisoned"))?
@@ -2026,7 +2026,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             namespace: &TrackNamespace,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::Client>)> {
             Ok((
                 NamespaceOrigin::new(namespace.clone(), self.url.clone(), None),
                 None,

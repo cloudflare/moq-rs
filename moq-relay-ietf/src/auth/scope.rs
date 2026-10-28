@@ -299,7 +299,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use moq_native_ietf::quic;
+    use moq_native_ietf::Client;
     use moq_transport::coding::TrackNamespace;
 
     use crate::{
@@ -360,7 +360,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
             Err(CoordinatorError::NamespaceNotFound)
         }
 
@@ -400,7 +400,7 @@ mod tests {
             &self,
             scope: Option<&str>,
             namespace: &TrackNamespace,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
             self.0.lookup(scope, namespace).await
         }
 

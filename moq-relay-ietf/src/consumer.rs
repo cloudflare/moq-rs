@@ -790,8 +790,7 @@ mod tests {
                 &self,
                 _scope: Option<&str>,
                 _namespace: &TrackNamespace,
-            ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::quic::Client>)>
-            {
+            ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::Client>)> {
                 Err(crate::CoordinatorError::NamespaceNotFound)
             }
         }
