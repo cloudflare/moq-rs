@@ -35,8 +35,11 @@ ok 1 - setup-only
 
 ### Step 3: Fetch your mlog
 
+Replace `<connection_id>` with the `connection_id` printed by your own test run.
+The IDs in the sample output are illustrative; they do not identify your connection.
+
 ```bash
-curl https://draft-18-interop.cloudflare.mediaoverquic.com:443/mlog/22c73802597dcd91ef662a3cd67a03e0
+curl "https://draft-18-interop.cloudflare.mediaoverquic.com:443/mlog/<connection_id>"
 ```
 
 ### Step 4: Read the results
@@ -176,14 +179,16 @@ ok 1 - publish-namespace-subscribe
   ...
 ```
 
-Fetch both mlogs to see each side of the exchange:
+Fetch both mlogs to see each side of the exchange. Replace
+`<publisher_connection_id>` and `<subscriber_connection_id>` with the corresponding
+values printed by your own test run:
 
 ```bash
 # Publisher's view
-curl https://draft-18-interop.cloudflare.mediaoverquic.com:443/mlog/71d4b5eb1a807779af03331c330d5fa9
+curl "https://draft-18-interop.cloudflare.mediaoverquic.com:443/mlog/<publisher_connection_id>"
 
 # Subscriber's view
-curl https://draft-18-interop.cloudflare.mediaoverquic.com:443/mlog/08d0b03ede133f0839435bff64ed2fc5
+curl "https://draft-18-interop.cloudflare.mediaoverquic.com:443/mlog/<subscriber_connection_id>"
 ```
 
 **Publisher mlog** (after SETUP):
@@ -312,10 +317,10 @@ cargo run --bin moq-test-client -- \
   --test setup-only
 ```
 
-And fetch the mlog:
+And fetch the mlog, replacing `<connection_id>` with the ID your local test prints:
 
 ```bash
-curl -k https://localhost:4443/mlog/<connection_id>
+curl -k "https://localhost:4443/mlog/<connection_id>"
 ```
 
 You can also pass extra arguments directly:
