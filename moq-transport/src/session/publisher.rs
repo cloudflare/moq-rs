@@ -675,6 +675,10 @@ impl Publisher {
                 // while the write half stays open for PUBLISH_DONE.
                 let mut reading = true;
                 let mut writer_closed = false;
+                // Keep one handler in flight without blocking PUBLISH_DONE or
+                // peer STOP_SENDING. Later responses remain serialized behind it.
+                let mut new_group: Option<futures::future::BoxFuture<'static, Result<(), ServeError>>> = None;
+                let mut replying_to_update = false;
 
                 let result = loop {
                     tokio::select! {
@@ -709,40 +713,88 @@ impl Publisher {
                             }
                             outgoing.complete(Ok(()));
                         }
+                        result = async {
+                            match new_group.as_mut() {
+                                Some(handler) => handler.await,
+                                None => std::future::pending().await,
+                            }
+                        }, if new_group.is_some() => {
+                            new_group = None;
+                            let failed = result.is_err();
+                            let response = if replying_to_update {
+                                Some(match &result {
+                                    Ok(()) => message::RequestOk {
+                                        id: request_id, params: KeyValuePairs::default(),
+                                    }.into(),
+                                    Err(_) => message::RequestError {
+                                        id: request_id,
+                                        error_code: RequestErrorCode::NotSupported as u64,
+                                        retry_interval: 0,
+                                        reason: ReasonPhrase::new("subscription update failed"),
+                                    }.into(),
+                                })
+                            } else {
+                                // PUBLISH_OK is already a response: there is no
+                                // REQUEST_ERROR reply to it, only PUBLISH_DONE.
+                                None
+                            };
+                            if let Some(response) = response {
+                                if let Err(err) = Session::encode_bidi_response(&mut writer, &response).await {
+                                    break Err(err);
+                                }
+                            }
+                            if failed {
+                                if let Err(err) = this.fail_published_update(request_id) {
+                                    break Err(err);
+                                }
+                                if let Err(err) = result {
+                                    tracing::debug!(request_id, error = %err, "PUBLISH dynamic-group feedback failed");
+                                }
+                            }
+                        }
                         // The stream retains an in-progress decode when a write
                         // wins the select, including nonterminal update replies.
-                        response = responses.next(), if reading => {
+                        response = responses.next(), if reading && new_group.is_none() => {
                             let Some(response) = response else { break Ok(()) };
                             match response {
                                 Ok(Message::RequestUpdate(update)) => {
-                                    this.request_id.validate_incoming(update.id)?;
-                                    match super::apply_new_group_update(&track, &update.params).await {
-                                        Ok(()) => Session::encode_bidi_response(&mut writer, &message::RequestOk {
-                                            id: request_id, params: KeyValuePairs::default(),
-                                        }.into()).await?,
-                                        Err(err) => {
-                                            Session::encode_bidi_response(&mut writer, &message::RequestError {
-                                                id: request_id,
-                                                error_code: RequestErrorCode::NotSupported as u64,
-                                                retry_interval: 0,
-                                                reason: ReasonPhrase::new("subscription update failed"),
-                                            }.into()).await?;
-                                            if let Some(entry) = this.publisheds.lock().map_err(|_| SessionError::Internal)?.get_mut(&request_id) {
-                                                entry.recv.recv_error(ServeError::Closed(message::PublishDoneCode::UpdateFailed as u64))?;
-                                                if let Some(forwarder) = &mut entry.forwarder { forwarder.fail_update(); }
-                                            }
-                                            tracing::debug!(request_id, error = %err, "PUBLISH update failed");
-                                        }
+                                    if let Err(err) = this.request_id.validate_incoming(update.id) {
+                                        break Err(err);
                                     }
+                                    let track = track.clone();
+                                    new_group = Some(Box::pin(async move {
+                                        super::apply_new_group_update(&track, &update.params).await
+                                    }));
+                                    replying_to_update = true;
                                 }
                                 Ok(Message::RequestOk(ok)) => {
-                                    if let Some(value) = ok.params.new_group_request()? {
-                                        if track.track_extensions()?.dynamic_groups()? != Some(true) {
+                                    let value = match ok.params.new_group_request() {
+                                        Ok(value) => value,
+                                        Err(err) => break Err(err.into()),
+                                    };
+                                    if value.is_some() {
+                                        let dynamic = track.track_extensions().map_err(SessionError::from)
+                                            .and_then(|properties| properties.dynamic_groups().map_err(SessionError::from));
+                                        let dynamic = match dynamic {
+                                            Ok(dynamic) => dynamic,
+                                            Err(err) => break Err(err),
+                                        };
+                                        // §10.2.13 permits speculative initial SUBSCRIBE
+                                        // feedback, but PUBLISH_OK requires advertised support.
+                                        if dynamic != Some(true) {
                                             break Err(SessionError::ProtocolViolation("NEW_GROUP_REQUEST on a Track without dynamic Groups".into()));
                                         }
-                                        track.request_new_group(value).await?;
                                     }
+                                    // Establish first: handler failure must still send
+                                    // PUBLISH_DONE, rather than resemble a rejected PUBLISH.
                                     if let Err(err) = this.recv_request_ok(ok) { break Err(err); }
+                                    if let Some(value) = value {
+                                        let track = track.clone();
+                                        new_group = Some(Box::pin(async move {
+                                            track.request_new_group(value).await
+                                        }));
+                                        replying_to_update = false;
+                                    }
                                 }
                                 Ok(msg) => match TryInto::<message::Subscriber>::try_into(msg) {
                                     Ok(sub_msg) => {
@@ -796,6 +848,19 @@ impl Publisher {
         }
 
         Ok(stream_tx)
+    }
+
+    fn fail_published_update(&mut self, request_id: u64) -> Result<(), SessionError> {
+        let mut publisheds = self.publisheds.lock().map_err(|_| SessionError::Internal)?;
+        if let Some(entry) = publisheds.get_mut(&request_id) {
+            entry.recv.recv_error(ServeError::Closed(
+                message::PublishDoneCode::UpdateFailed as u64,
+            ))?;
+            if let Some(forwarder) = &mut entry.forwarder {
+                forwarder.fail_update();
+            }
+        }
+        Ok(())
     }
 
     /// Attach the data-plane half of an outbound PUBLISH so a later

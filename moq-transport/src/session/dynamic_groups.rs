@@ -48,6 +48,67 @@ async fn endpoints() -> (Endpoint, Endpoint) {
     )
 }
 
+// Drive only the publisher side so tests can supply initial PUBLISH_OK params
+// and control the peer's request-stream lifecycle directly.
+async fn publisher_with_raw_peer() -> (Endpoint, Session) {
+    let (client, server) = test_support::loopback_session_pair().await;
+    let wire = client.clone();
+    let (client, server) = tokio::join!(
+        Session::connect(client, None, Transport::WebTransport),
+        Session::accept(server, None, Transport::WebTransport),
+    );
+    let (session, publisher, subscriber) = client.unwrap();
+    (
+        Endpoint {
+            publisher,
+            subscriber,
+            driver: tokio::spawn(session.run()),
+            wire,
+        },
+        server.unwrap().0,
+    )
+}
+
+async fn accept_raw_publish(peer: &Session) -> (Writer, Reader, message::Publish) {
+    let (send, recv) = peer.webtransport.accept_bi().await.unwrap();
+    let mut reader = Reader::new(recv);
+    let Message::Publish(publish) = reader.decode().await.unwrap() else {
+        panic!("expected PUBLISH")
+    };
+    (Writer::new(send), reader, publish)
+}
+
+async fn send_publish_ok(writer: &mut Writer, id: u64, new_group: Option<u64>) {
+    let mut params = KeyValuePairs::default();
+    if let Some(value) = new_group {
+        params.set_new_group_request(value);
+    }
+    Session::encode_bidi_response(writer, &message::RequestOk { id, params }.into())
+        .await
+        .unwrap();
+}
+
+async fn assert_another_publish_works(origin: &mut Endpoint, peer: &Session) {
+    let (_source, track) =
+        serve::Track::new(TrackNamespace::from_utf8_path("dynamic"), "other").produce();
+    let mut published = origin
+        .publisher
+        .publish(track, KeyValuePairs::default())
+        .await
+        .unwrap();
+    let (mut writer, mut reader, request) = accept_raw_publish(peer).await;
+    send_publish_ok(&mut writer, request.id, None).await;
+    published.ok().await.unwrap();
+    drop(published);
+    assert!(matches!(
+        Session::decode_bidi_response(&mut reader, request.id)
+            .await
+            .unwrap(),
+        Message::PublishDone(_)
+    ));
+    assert!(reader.done().await.unwrap());
+}
+
 fn dynamic_track() -> (
     serve::TrackWriter,
     serve::TrackReader,
@@ -242,6 +303,201 @@ async fn failed_publish_update_delivers_update_failed_done() {
             ServeError::Closed(message::PublishDoneCode::UpdateFailed as u64)
         );
         assert!(serving.await.unwrap().is_err());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_publish_ok_delivers_new_group_request() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut origin, peer) = publisher_with_raw_peer().await;
+        let (_source, track, mut requests) = dynamic_track();
+        let mut published = origin
+            .publisher
+            .publish(track, KeyValuePairs::default())
+            .await
+            .unwrap();
+        let (mut writer, mut reader, request) = accept_raw_publish(&peer).await;
+        assert_eq!(
+            request.track_extensions.dynamic_groups().unwrap(),
+            Some(true)
+        );
+        send_publish_ok(&mut writer, request.id, Some(0)).await;
+        published.ok().await.unwrap();
+        request_seen(&mut requests, 0).await;
+        drop(published);
+        assert!(matches!(
+            Session::decode_bidi_response(&mut reader, request.id)
+                .await
+                .unwrap(),
+            Message::PublishDone(_)
+        ));
+        assert!(reader.done().await.unwrap());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_publish_ok_handler_failure_is_request_local() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut origin, peer) = publisher_with_raw_peer().await;
+        let (source, track) =
+            serve::Track::new(TrackNamespace::from_utf8_path("dynamic"), "video").produce();
+        source
+            .enable_dynamic_groups(|_| async { Err(ServeError::Cancel) })
+            .unwrap();
+        let published = origin
+            .publisher
+            .publish(track, KeyValuePairs::default())
+            .await
+            .unwrap();
+        let serving = tokio::spawn(published.serve());
+        let (mut writer, mut reader, request) = accept_raw_publish(&peer).await;
+        send_publish_ok(&mut writer, request.id, Some(1)).await;
+        let Message::PublishDone(done) = Session::decode_bidi_response(&mut reader, request.id)
+            .await
+            .unwrap()
+        else {
+            panic!("expected PUBLISH_DONE, not a response to PUBLISH_OK")
+        };
+        assert_eq!(
+            done.status_code,
+            message::PublishDoneCode::UpdateFailed as u64
+        );
+        assert!(reader.done().await.unwrap());
+        assert!(serving.await.unwrap().is_err());
+        assert_another_publish_works(&mut origin, &peer).await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_publish_ok_requires_advertised_dynamic_groups() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut origin, peer) = publisher_with_raw_peer().await;
+        let (_source, track) =
+            serve::Track::new(TrackNamespace::from_utf8_path("dynamic"), "video").produce();
+        let _published = origin
+            .publisher
+            .publish(track, KeyValuePairs::default())
+            .await
+            .unwrap();
+        let (mut writer, _reader, request) = accept_raw_publish(&peer).await;
+        assert_eq!(request.track_extensions.dynamic_groups().unwrap(), None);
+        send_publish_ok(&mut writer, request.id, Some(0)).await;
+        assert!(matches!(
+            (&mut origin.driver).await.unwrap(),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn speculative_subscribe_feedback_is_ignored_without_dynamic_groups() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut subscriber, mut publisher) = endpoints().await;
+        let (source, track) =
+            serve::Track::new(TrackNamespace::from_utf8_path("dynamic"), "video").produce();
+        let _objects = source.datagrams().unwrap();
+        let (writer, _reader) =
+            serve::Track::new(TrackNamespace::from_utf8_path("dynamic"), "video").produce();
+        let mut params = KeyValuePairs::default();
+        params.set_new_group_request(0);
+        let subscription = subscriber
+            .subscriber
+            .subscribe_start_with_params(writer, params)
+            .await
+            .unwrap();
+        let subscribed = publisher.publisher.subscribed().await.unwrap();
+        let serving = tokio::spawn(subscribed.serve(track));
+        subscription.ok().await.unwrap();
+        assert_eq!(
+            subscription
+                .subscribe_ok()
+                .unwrap()
+                .track_extensions
+                .dynamic_groups()
+                .unwrap(),
+            None
+        );
+        subscription.unsubscribe().await;
+        assert!(matches!(
+            serving.await.unwrap(),
+            Ok(()) | Err(SessionError::Serve(ServeError::Cancel))
+        ));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_publish_feedback_does_not_block_done_or_peer_stop() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for update in [false, true] {
+            for peer_stop in [false, true] {
+                let (mut origin, peer) = publisher_with_raw_peer().await;
+                let (source, track) =
+                    serve::Track::new(TrackNamespace::from_utf8_path("dynamic"), "video").produce();
+                let (started, mut requests) = tokio::sync::mpsc::unbounded_channel();
+                source
+                    .enable_dynamic_groups(move |value| {
+                        let started = started.clone();
+                        async move {
+                            started.send(value).unwrap();
+                            std::future::pending::<Result<(), ServeError>>().await
+                        }
+                    })
+                    .unwrap();
+                let mut published = origin
+                    .publisher
+                    .publish(track, KeyValuePairs::default())
+                    .await
+                    .unwrap();
+                let (mut writer, mut reader, request) = accept_raw_publish(&peer).await;
+                send_publish_ok(&mut writer, request.id, if update { None } else { Some(0) }).await;
+                published.ok().await.unwrap();
+                if update {
+                    let mut params = KeyValuePairs::default();
+                    params.set_new_group_request(0);
+                    Session::encode_bidi_response(
+                        &mut writer,
+                        &message::RequestUpdate {
+                            id: 1,
+                            existing_request_id: request.id,
+                            params,
+                        }
+                        .into(),
+                    )
+                    .await
+                    .unwrap();
+                }
+                request_seen(&mut requests, 0).await;
+                if peer_stop {
+                    reader.stop(CANCELLED_STREAM_CODE);
+                    assert_eq!(published.closed().await, Err(ServeError::Cancel));
+                } else {
+                    published.close(ServeError::Done).unwrap();
+                    let Message::PublishDone(done) =
+                        Session::decode_bidi_response(&mut reader, request.id)
+                            .await
+                            .unwrap()
+                    else {
+                        panic!("pending handler blocked PUBLISH_DONE")
+                    };
+                    assert_eq!(
+                        done.status_code,
+                        message::PublishDoneCode::TrackEnded as u64
+                    );
+                    assert!(reader.done().await.unwrap());
+                }
+                assert_another_publish_works(&mut origin, &peer).await;
+            }
+        }
     })
     .await
     .unwrap();

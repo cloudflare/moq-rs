@@ -89,7 +89,8 @@ presentation/minting and test-client scenarios. Those are not conflicts to undo.
 - Existing FETCH limitations: publisher passthrough without relay history cache,
   restricted parameter forwarding, no Joining FETCH for relay-sent PUBLISH,
   whole-response timeout and post-FETCH_OK/no-data waiter cleanup concerns.
-- REQUEST_UPDATE remains unsupported by the existing draft-18 publisher path.
+- REQUEST_UPDATE now supports NEW_GROUP_REQUEST for dynamic-group feedback.
+  Other update parameters, including FORWARD, remain unsupported and are rejected.
 
 These are release-scope decisions and follow-up work, not fixes implicitly supplied
 by recording main as an ancestor.

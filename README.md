@@ -23,12 +23,14 @@ This repository provides:
 - SUBSCRIBE
 - SUBSCRIBE_NAMESPACE
 - PUBLISH / REQUEST_OK / PUBLISH_DONE (publisher-initiated tracks)
+- Dynamic groups: DYNAMIC_GROUPS advertisement and NEW_GROUP_REQUEST feedback,
+  including subscription REQUEST_UPDATE for that parameter
 - FETCH, standalone and joining (the relay forwards it to the track's origin)
 - WebTransport and raw QUIC transport layers
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
-- REQUEST_UPDATE (so a Joining FETCH can only join a subscription whose Forward State was set by SUBSCRIBE)
+- REQUEST_UPDATE parameters other than NEW_GROUP_REQUEST, including FORWARD (so a Joining FETCH can only join a subscription whose Forward State was set by SUBSCRIBE)
 - Joining FETCH for a subscription created by PUBLISH (answered with NOT_SUPPORTED)
 
 ## Interoperability
