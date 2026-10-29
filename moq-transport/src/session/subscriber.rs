@@ -6,12 +6,13 @@ use std::{
     collections::{hash_map, HashMap, HashSet, VecDeque},
     io,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
 };
 
+use futures::StreamExt;
 use tokio::sync::Notify;
 
 use crate::{
@@ -186,9 +187,24 @@ struct OpeningRequestStream {
     reader: Option<Reader>,
 }
 
+// Preserve partial decodes across writes and explicitly STOP_SENDING on cancel.
+struct SubscribeResponseReader {
+    reader: Reader,
+    stop_code: Arc<AtomicU64>,
+}
+
+impl Drop for SubscribeResponseReader {
+    fn drop(&mut self) {
+        let code = self.stop_code.load(Ordering::Acquire);
+        if code != 0 {
+            self.reader.stop((code - 1) as u32);
+        }
+    }
+}
+
 enum SubscribeStreamEvent {
     Cancel(Result<u32, tokio::sync::oneshot::error::RecvError>),
-    Outgoing(Option<Message>),
+    Outgoing(Option<BidiResponse>),
     Response(Result<Message, SessionError>),
 }
 
@@ -544,6 +560,9 @@ impl Drop for ReceivedSubgroup {
 }
 
 impl Subscriber {
+    pub(super) fn request_ids(&self) -> RequestId {
+        self.request_id.clone()
+    }
     pub(super) fn new(
         outgoing: Queue<Message>,
         webtransport: web_transport::Session,
@@ -774,7 +793,7 @@ impl Subscriber {
             .await
     }
 
-    async fn subscribe_start_with_params(
+    pub async fn subscribe_start_with_params(
         &mut self,
         track: serve::TrackWriter,
         params: KeyValuePairs,
@@ -819,7 +838,7 @@ impl Subscriber {
         // Subscribe::new, so it is not reconstructed here. The request writer
         // (send side) is held here so error paths can finish it explicitly.
         let subscribe_msg: Message = subscribe.into();
-        let (mut request_writer, mut response_reader) =
+        let (mut request_writer, response_reader) =
             match self.open_request_stream(&subscribe_msg).await {
                 Ok(streams) => streams,
                 Err(e) => {
@@ -848,9 +867,10 @@ impl Subscriber {
             }
         }
 
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<Message>(2);
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<BidiResponse>(2);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+        send.set_stream(stream_tx, done_rx, cancel_tx);
 
         // Hand a reader future for bidi stream responses (draft-18) to
         // Session::run, which polls it cooperatively (structured concurrency).
@@ -861,8 +881,15 @@ impl Subscriber {
         if self
             .bidi_task_tx
             .send(Box::pin(async move {
+                let stop_code = Arc::new(AtomicU64::new(0));
+                let responses = futures::stream::unfold(SubscribeResponseReader { reader: response_reader, stop_code: stop_code.clone() }, move |mut reader| async move {
+                    let response = Session::decode_bidi_response(&mut reader.reader, request_id).await;
+                    Some((response, reader))
+                });
+                tokio::pin!(responses);
                 let mut writing = true;
                 let mut cancellation_open = true;
+                let mut established = false;
                 let result = 'response: loop {
                     let event = tokio::select! {
                         biased;
@@ -872,7 +899,8 @@ impl Subscriber {
                         outgoing = stream_rx.recv(), if writing => {
                             SubscribeStreamEvent::Outgoing(outgoing)
                         }
-                        response = Session::decode_bidi_response(&mut response_reader, request_id) => {
+                        response = responses.next() => {
+                            let Some(response) = response else { break Ok(()) };
                             SubscribeStreamEvent::Response(response)
                         }
                     };
@@ -882,7 +910,7 @@ impl Subscriber {
                             match cancel {
                                 Ok(code) => {
                                     request_writer.reset(code);
-                                    response_reader.stop(code);
+                                    stop_code.store(u64::from(code) + 1, Ordering::Release);
                                     writing = false;
                                     break Ok(());
                                 }
@@ -890,14 +918,15 @@ impl Subscriber {
                             }
                         }
                         SubscribeStreamEvent::Outgoing(outgoing) => {
-                            let Some(outgoing) = outgoing else {
+                            let Some(mut outgoing) = outgoing else {
                                 let _ = request_writer.finish();
                                 writing = false;
                                 continue;
                             };
+                            let terminal = matches!(outgoing.message, Message::Unsubscribe(_));
                             let mut write = Box::pin(Session::encode_bidi_response(
                                 &mut request_writer,
-                                &outgoing,
+                                &outgoing.message,
                             ));
                             let write_result: Result<Result<(), SessionError>, u32> = loop {
                                 tokio::select! {
@@ -916,26 +945,32 @@ impl Subscriber {
                             match write_result {
                                 Err(code) => {
                                     request_writer.reset(code);
-                                    response_reader.stop(code);
+                                    stop_code.store(u64::from(code) + 1, Ordering::Release);
                                     writing = false;
                                     break 'response Ok(());
                                 }
                                 Ok(Err(err)) => {
+                                    outgoing.complete(Err(super::DeliveryError::from_session_error(&err)));
                                     tracing::debug!(request_id, error = %err, "failed writing on SUBSCRIBE request stream");
                                     request_writer.reset(super::CANCELLED_STREAM_CODE);
-                                    response_reader.stop(super::CANCELLED_STREAM_CODE);
+                                    stop_code.store(u64::from(super::CANCELLED_STREAM_CODE) + 1, Ordering::Release);
                                     writing = false;
                                     break 'response Ok(());
                                 }
                                 Ok(Ok(())) => {}
                             }
-                            let _ = request_writer.finish();
-                            writing = false;
+                            outgoing.complete(Ok(()));
+                            if terminal {
+                                let _ = request_writer.finish();
+                                writing = false;
+                            }
                         }
                         SubscribeStreamEvent::Response(response) => {
                             match response {
                                 Ok(msg) => {
-                                    let terminal = matches!(msg, Message::PublishDone(_) | Message::RequestError(_));
+                                    let terminal = matches!(msg, Message::PublishDone(_))
+                                        || (!established && matches!(msg, Message::RequestError(_)));
+                                    if matches!(msg, Message::SubscribeOk(_)) { established = true; }
                                     if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
                                         if let Err(err) = subscriber_clone.recv_message(pub_msg) {
                                             break Err(err);
@@ -966,7 +1001,6 @@ impl Subscriber {
             ));
         }
 
-        send.set_stream(stream_tx, done_rx, cancel_tx);
         Ok(send)
     }
 
@@ -1288,6 +1322,9 @@ impl Subscriber {
 
     /// Handle the reception of a SubscribeOk message from the publisher.
     fn recv_subscribe_ok(&mut self, msg: &message::SubscribeOk) -> Result<(), SessionError> {
+        msg.track_extensions
+            .dynamic_groups()
+            .map_err(SessionError::Decode)?;
         if let Some(subscribe) = self
             .subscribes
             .lock()
@@ -1707,6 +1744,23 @@ impl Subscriber {
     /// SUBSCRIBE_OK message (§9.10) and does not come through this handler.
     /// Full routing for the other request types is wired up (TODO itzmanish).
     fn recv_request_ok(&mut self, msg: &message::RequestOk) -> Result<(), SessionError> {
+        let largest = msg.params.largest_object()?;
+        if let Some(subscribe) = self
+            .subscribes
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&msg.id)
+        {
+            subscribe.observe_largest(largest)?;
+        }
+        if let Some(publish) = self
+            .publishes_received
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&msg.id)
+        {
+            publish.observe_largest(largest)?;
+        }
         self.log_request_ok_parsed("unknown", msg);
         tracing::debug!(
             target: "moq_transport::control",
@@ -1723,6 +1777,19 @@ impl Subscriber {
     /// exists, otherwise logs and ignores.  Full per-flow routing is
     /// wired up (TODO itzmanish).
     fn recv_request_error(&mut self, msg: &message::RequestError) -> Result<(), SessionError> {
+        let established = self
+            .subscribes
+            .lock()
+            .map_err(|_| SessionError::Internal)?
+            .get(&msg.id)
+            .is_some_and(SubscribeRecv::is_established);
+        if established {
+            // A failed update is followed by PUBLISH_DONE(UPDATE_FAILED).
+            // Keep receiving until then so stream accounting and the terminal
+            // status survive, rather than treating it as initial rejection.
+            self.log_request_error_parsed("request_update", msg);
+            return Ok(());
+        }
         // Route to a matching subscribe if present.
         if let Some(subscribe) = self.remove_subscribe(msg.id) {
             self.log_request_error_parsed("subscribe", msg);
@@ -1753,12 +1820,13 @@ impl Subscriber {
             .default_publisher_priority()
             .map_err(SessionError::Decode)?
             .unwrap_or(data::DEFAULT_PUBLISHER_PRIORITY);
-        // DEFAULT_PUBLISHER_PRIORITY is consumed by subgroup decoding. Keep
-        // rejecting properties the serve model cannot preserve yet.
-        if !msg
-            .track_extensions
-            .contains_only(&[message::extension_type::DEFAULT_PUBLISHER_PRIORITY])
-        {
+        msg.track_extensions
+            .dynamic_groups()
+            .map_err(SessionError::Decode)?;
+        if !msg.track_extensions.contains_only(&[
+            message::extension_type::DEFAULT_PUBLISHER_PRIORITY,
+            message::extension_type::DYNAMIC_GROUPS,
+        ]) {
             self.send_request_error(
                 "publish",
                 message::RequestError {
@@ -1838,6 +1906,7 @@ impl Subscriber {
         let (writer, reader) =
             serve::Track::new(msg.track_namespace.clone(), msg.track_name.clone()).produce();
 
+        let control = writer.control.clone();
         let (publish_received, recv) = PublishReceivedRecv::produce(
             self.clone(),
             msg.id,
@@ -1850,6 +1919,48 @@ impl Subscriber {
             writer,
             reader,
         );
+        let acceptance = recv.acceptance();
+
+        let responses = Arc::downgrade(&self.bidi_response_map);
+        let request_ids = self.request_id.clone();
+        let parent_id = msg.id;
+        control.observe_largest(largest_location)?;
+        control.configure(
+            msg.track_extensions.clone(),
+            Some(Arc::new(move |value| {
+                let responses = responses.clone();
+                let request_ids = request_ids.clone();
+                let acceptance = acceptance.clone();
+                Box::pin(async move {
+                    // Registration may expose the reader before the application
+                    // accepts PUBLISH. Queue updates only after its REQUEST_OK.
+                    acceptance.ready().await?;
+                    let mut params = KeyValuePairs::default();
+                    params.set_new_group_request(value);
+                    let id = request_ids.allocate().map_err(ServeError::from)?;
+                    let responses = responses.upgrade().ok_or(ServeError::Cancel)?;
+                    let stream = responses
+                        .lock()
+                        .map_err(|_| ServeError::internal_ctx("request stream lock poisoned"))?
+                        .get(&parent_id)
+                        .cloned()
+                        .ok_or(ServeError::Cancel)?;
+                    let (update, receipt) = BidiResponse::with_completion(
+                        message::RequestUpdate {
+                            id,
+                            existing_request_id: parent_id,
+                            params,
+                        }
+                        .into(),
+                    );
+                    stream.send(update).map_err(|_| ServeError::Cancel)?;
+                    receipt
+                        .await
+                        .map_err(|_| ServeError::Cancel)?
+                        .map_err(|err| ServeError::from(err.into_session_error()))
+                })
+            })),
+        )?;
 
         // The alias is live before the handle is queued, so Object streams that
         // race the PUBLISH (§5.1 permits delivery before PUBLISH_OK) resolve.

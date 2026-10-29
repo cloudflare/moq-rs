@@ -433,7 +433,7 @@ impl Consumer {
                     tracing::info!(namespace = %ns, "PUBLISH_NAMESPACE closed");
                     return Ok(());
                 },
-                Some(TrackRequest { writer, lease, upstream }) = requests.recv() => {
+                Some(TrackRequest { writer, lease, upstream, new_group_request }) = requests.recv() => {
                     let mut subscriber = self.subscriber.clone();
 
                     tasks.push(async move {
@@ -455,9 +455,13 @@ impl Consumer {
                                 "cache subscription cleanup is missing its lease".to_string(),
                             )
                         })?;
+                        let mut params = moq_transport::coding::KeyValuePairs::default();
+                        if let Some(value) = new_group_request {
+                            params.set_new_group_request(value);
+                        }
                         let subscribe_result = tokio::select! {
                             biased;
-                            result = subscriber.subscribe_start(writer) => Some(result),
+                            result = subscriber.subscribe_start_with_params(writer, params) => Some(result),
                             _ = lease.abandoned() => None,
                         };
                         let Some(subscribe_result) = subscribe_result else {
@@ -684,6 +688,7 @@ mod tests {
             writer,
             lease,
             upstream,
+            ..
         } = requests.recv().await.expect("receive track request");
         drop(local);
         lease.abandoned().await;

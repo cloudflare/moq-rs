@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#[cfg(test)]
+mod dynamic_groups;
 mod error;
 mod fetch;
 mod fetch_requested;
@@ -69,6 +71,8 @@ pub(super) const CANCELLED_STREAM_CODE: u32 = crate::data::DataStreamResetCode::
 pub(crate) struct BidiResponse {
     message: Message,
     completion: Option<tokio::sync::oneshot::Sender<Result<(), DeliveryError>>>,
+    /// Only TRACK_STATUS_OK can populate properties in a shared REQUEST_OK.
+    track_properties: Option<message::TrackExtensions>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -99,6 +103,7 @@ impl BidiResponse {
         Self {
             message,
             completion: None,
+            track_properties: None,
         }
     }
 
@@ -113,6 +118,7 @@ impl BidiResponse {
             Self {
                 message,
                 completion: Some(completion),
+                track_properties: None,
             },
             receipt,
         )
@@ -132,6 +138,30 @@ pub(crate) type RequestStreamSink = tokio::sync::mpsc::UnboundedSender<BidiRespo
 /// this map: if the response's target request ID has a registered sender, the
 /// response is forwarded to the bidi handler task that owns the Writer.
 pub(crate) type BidiResponseMap = Arc<Mutex<HashMap<u64, RequestStreamSink>>>;
+
+/// Only the dynamic-group update is implemented here. Other parameters must
+/// fail rather than be acknowledged while silently retaining their old values.
+async fn apply_new_group_update(
+    track: &crate::serve::TrackReader,
+    params: &KeyValuePairs,
+) -> Result<(), crate::serve::ServeError> {
+    if params
+        .0
+        .iter()
+        .any(|pair| pair.key != message::parameter_type::NEW_GROUP_REQUEST)
+    {
+        return Err(crate::serve::ServeError::not_implemented_ctx(
+            "subscription update parameters",
+        ));
+    }
+    if let Some(value) = params
+        .new_group_request()
+        .map_err(|_| crate::serve::ServeError::internal_ctx("invalid NEW_GROUP_REQUEST"))?
+    {
+        track.request_new_group(value).await?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 enum BidiRequestKind {
@@ -1341,8 +1371,13 @@ impl Session {
         if dispatch_result.is_ok() {
             if let Some(id) = req_id {
                 if let Some(ref mut rx) = rx {
-                    let follow_ups =
-                        Self::read_request_follow_ups(&mut reader, id, publisher, subscriber);
+                    let follow_ups = Self::read_request_follow_ups(
+                        &mut reader,
+                        id,
+                        publisher,
+                        subscriber,
+                        request_id,
+                    );
                     tokio::pin!(follow_ups);
 
                     // Keep a selected response write indivisible with respect
@@ -1352,6 +1387,7 @@ impl Session {
                         let mut deferred_publish_done = false;
                         let mut publish_response_sent = false;
                         let mut fetch_ok_sent = false;
+                        let mut subscribe_response_sent = false;
                         loop {
                             tokio::select! {
                                 biased;
@@ -1369,16 +1405,17 @@ impl Session {
                                     let is_fetch_ok = matches!(response.message, Message::FetchOk(_));
                                     let is_terminal = matches!(
                                         response.message,
-                                        Message::RequestError(_)
-                                            | Message::PublishDone(_)
+                                        Message::PublishDone(_)
                                             | Message::PublishNamespaceDone(_)
                                             | Message::Unsubscribe(_)
-                                    ) || (is_fetch_ok && fetch_served.is_none())
+                                    ) || (matches!(response.message, Message::RequestError(_)) && !subscribe_response_sent)
+                                        || (is_fetch_ok && fetch_served.is_none())
                                         || (bounded_response
                                             && matches!(response.message, Message::RequestOk(_)));
-                                    if let Err(err) = Self::encode_bidi_response(
+                                    if let Err(err) = Self::encode_bidi_response_with_properties(
                                         &mut writer,
                                         &response.message,
+                                        response.track_properties.as_ref(),
                                     )
                                     .await
                                     {
@@ -1407,6 +1444,9 @@ impl Session {
                                     }
                                     if is_fetch_ok {
                                         fetch_ok_sent = true;
+                                    }
+                                    if matches!(response.message, Message::SubscribeOk(_)) {
+                                        subscribe_response_sent = true;
                                     }
                                     response.complete(Ok(()));
                                     if deferred_publish_done {
@@ -1530,6 +1570,7 @@ impl Session {
         request_id: u64,
         publisher: &mut Option<Publisher>,
         subscriber: &mut Option<Subscriber>,
+        request_ids: &RequestId,
     ) -> Result<FollowupEnd, SessionError> {
         loop {
             let msg = match Self::decode_bidi_response(reader, request_id).await {
@@ -1562,6 +1603,16 @@ impl Session {
                 }
                 _ => None,
             };
+
+            if let Message::RequestUpdate(update) = msg {
+                request_ids.validate_incoming(update.id)?;
+                publisher
+                    .as_mut()
+                    .ok_or(SessionError::RoleViolation)?
+                    .recv_new_group_update(update)
+                    .await?;
+                continue;
+            }
 
             let dispatched = match TryInto::<message::Publisher>::try_into(msg) {
                 Ok(msg) => subscriber
@@ -1598,6 +1649,13 @@ impl Session {
     /// payload with Request ID omitted). Separated from the async writer
     /// so tests can verify the encoding without a QUIC stream.
     fn encode_bidi_response_frame(msg: &Message) -> Result<bytes::BytesMut, SessionError> {
+        Self::encode_bidi_response_frame_with_properties(msg, None)
+    }
+
+    fn encode_bidi_response_frame_with_properties(
+        msg: &Message,
+        properties: Option<&message::TrackExtensions>,
+    ) -> Result<bytes::BytesMut, SessionError> {
         use bytes::BufMut;
 
         if !msg.parameter_scopes_valid() {
@@ -1609,6 +1667,14 @@ impl Session {
         let mut payload = bytes::BytesMut::new();
         match msg {
             Message::RequestOk(m) => {
+                m.params.encode_message_params(&mut payload)?;
+                if let Some(properties) = properties {
+                    properties.encode(&mut payload)?;
+                }
+            }
+            Message::RequestUpdate(m) => {
+                // Unlike responses, updates consume a new Request ID (§10.1).
+                m.id.encode(&mut payload)?;
                 m.params.encode_message_params(&mut payload)?;
             }
             Message::RequestError(m) => {
@@ -1676,6 +1742,16 @@ impl Session {
         Ok(())
     }
 
+    async fn encode_bidi_response_with_properties(
+        writer: &mut Writer,
+        msg: &Message,
+        properties: Option<&message::TrackExtensions>,
+    ) -> Result<(), SessionError> {
+        let frame = Self::encode_bidi_response_frame_with_properties(msg, properties)?;
+        writer.write(&frame).await?;
+        Ok(())
+    }
+
     /// Decode a response message from a bidi request stream (draft-18).
     ///
     /// Response messages omit the Request ID field — the stream identity
@@ -1704,6 +1780,15 @@ impl Session {
         use message::wire_id;
 
         let msg = match msg_type {
+            wire_id::RequestUpdate => {
+                let id = u64::decode(&mut buf)?;
+                let params = crate::coding::KeyValuePairs::decode_message_params(&mut buf)?;
+                Ok(Message::RequestUpdate(message::RequestUpdate {
+                    id,
+                    existing_request_id: request_id,
+                    params,
+                }))
+            }
             wire_id::RequestError => {
                 let error_code = u64::decode(&mut buf)?;
                 let retry_interval = u64::decode(&mut buf)?;

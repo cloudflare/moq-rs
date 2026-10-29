@@ -23,8 +23,8 @@ use super::{DeliveryError, DeliveryFilter, Publisher, SessionError, SubscribeInf
 
 const MAX_CONCURRENT_SUBGROUPS: usize = 128;
 
-#[derive(Debug)]
 struct ObjectForwarderState {
+    track: Option<serve::TrackReader>,
     largest_location: Option<Location>,
     /// The Largest Location sent in SUBSCRIBE_OK, saved as the Joining
     /// Location (draft-18 §5.1.2). `None` until the subscription is accepted;
@@ -52,6 +52,7 @@ impl ObjectForwarderState {
 impl Default for ObjectForwarderState {
     fn default() -> Self {
         Self {
+            track: None,
             largest_location: None,
             joining_location: None,
             retry_interval: 0,
@@ -237,7 +238,12 @@ impl ObjectForwarder {
         track: serve::TrackReader,
         delivery_filter: DeliveryFilter,
     ) -> Result<(), SessionError> {
-        match track.mode().await? {
+        let mode = tokio::select! {
+            biased;
+            result = self.closed() => { result?; return Ok(()) },
+            result = track.mode() => result?,
+        };
+        match mode {
             TrackReaderMode::Stream(_stream) => Err(SessionError::Serve(
                 ServeError::not_implemented_ctx("stream track reader mode"),
             )),
@@ -516,6 +522,18 @@ impl Subscribed {
         deadline: Option<tokio::time::Instant>,
         largest_location: Option<Location>,
     ) -> Result<(), SessionError> {
+        // Initial SUBSCRIBE may ask without knowing whether the Track supports
+        // dynamic Groups. Unsupported Tracks ignore that parameter (§10.2.13).
+        if track.track_extensions()?.dynamic_groups()? == Some(true) {
+            if let Some(value) = self.info.params.new_group_request()? {
+                track.request_new_group(value).await?;
+            }
+        }
+        self.forwarder
+            .state
+            .lock_mut()
+            .ok_or(ServeError::Cancel)?
+            .track = Some(track.clone());
         self.forwarder
             .prepare_subscribe_ok(largest_location, deadline)?;
 
@@ -535,7 +553,7 @@ impl Subscribed {
                 id: self.info.id,
                 track_alias: self.info.id, // use subscription id as track alias
                 params,
-                track_extensions: Default::default(),
+                track_extensions: track.track_extensions()?,
             })?;
 
         self.ok = true;
@@ -1130,7 +1148,13 @@ impl ObjectForwarder {
         tracing::debug!("[PUBLISHER] serve_datagrams: starting");
 
         let mut datagram_count = 0;
-        while let Some(datagram) = datagrams.read().await? {
+        loop {
+            let next = tokio::select! {
+                biased;
+                result = self.closed() => { result?; None },
+                result = datagrams.read() => result?,
+            };
+            let Some(datagram) = next else { break };
             if !delivery_filter.allows(datagram.group_id, datagram.object_id) {
                 tracing::trace!(
                     "[PUBLISHER] serve_datagrams: filtered datagram group_id={}, object_id={}",
@@ -1350,8 +1374,8 @@ impl JoiningHandle {
     /// buffers the Joining FETCH); the caller bounds the wait.
     pub async fn snapshot(&self) -> Result<JoiningSnapshot, JoiningError> {
         if !self.forward {
-            // REQUEST_UPDATE is not supported, so the Forward State set by
-            // SUBSCRIBE is final.
+            // Forward updates are still rejected, so the Forward State set by
+            // SUBSCRIBE is final. NEW_GROUP_REQUEST updates do not change it.
             return Err(JoiningError::NotForwarding);
         }
         loop {
@@ -1376,6 +1400,21 @@ impl JoiningHandle {
 }
 
 impl ObjectForwarderRecv {
+    pub(super) fn dynamic_track(&self) -> Option<serve::TrackReader> {
+        let state = self.state.lock();
+        if state.closed.is_err() || state.joining_location.is_none() {
+            return None;
+        }
+        state.track.clone()
+    }
+
+    pub(super) fn fail_update(&mut self) {
+        if let Some(mut state) = self.state.lock_mut() {
+            state.closed = Err(ServeError::Closed(
+                message::PublishDoneCode::UpdateFailed as u64,
+            ));
+        }
+    }
     /// The handle a Joining FETCH resolves against, if this is a SUBSCRIBE.
     pub fn joining_handle(&self) -> Option<JoiningHandle> {
         self.joining.clone()
