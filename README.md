@@ -6,13 +6,15 @@ This codebase was originally created by [Luke Curley (@kixelated)](https://githu
 
 ## Protocol Support
 
-The `draft-18-dev` branch targets **draft-18** of the MoQT specification. The `main` branch tracks an older draft. For draft-07 compatibility (used in [Cloudflare's current production deployment](https://developers.cloudflare.com/moq/)), see the [`draft-ietf-moq-transport-07`](https://github.com/cloudflare/moq-rs/tree/draft-ietf-moq-transport-07) branch.
+This checkout targets **draft-18** of the MoQT specification. Raw QUIC uses the `moqt-18` ALPN; WebTransport uses HTTP/3 with `moqt-18` application-protocol negotiation. Both peers must support the same draft. The `DraftVersion` enum also names later drafts, but this implementation enables only draft-18.
+
+Until `draft-18-dev` merges into `main`, build draft-18 clients and relays from the same `draft-18-dev` revision. Package versions and crates.io documentation still reflect the published release baseline; they do not identify the wire draft of this checkout. For draft-07 compatibility, see the [`draft-ietf-moq-transport-07`](https://github.com/cloudflare/moq-rs/tree/draft-ietf-moq-transport-07) branch.
 
 ### What's Included
 
 This repository provides:
-- **moq-transport**: A complete MoQT protocol library implementation
-- **moq-relay-ietf**: A production-ready relay server
+- **moq-transport**: A MoQT protocol library
+- **moq-relay-ietf**: A relay server with subscription deduplication and fan-out
 - **Sample clients**: An fMP4 publisher (moq-pub) and a demonstration clock application (moq-clock-ietf)
 
 ### Protocol Feature Support
@@ -22,6 +24,7 @@ This repository provides:
 - PUBLISH_NAMESPACE
 - SUBSCRIBE
 - SUBSCRIBE_NAMESPACE
+- SUBSCRIBE_TRACKS and TRACK_STATUS
 - PUBLISH / REQUEST_OK / PUBLISH_DONE (publisher-initiated tracks)
 - Dynamic groups: DYNAMIC_GROUPS advertisement and NEW_GROUP_REQUEST feedback,
   including subscription REQUEST_UPDATE for that parameter
@@ -35,10 +38,7 @@ This repository provides:
 
 ## Interoperability
 
-A public relay instance running the latest `main` branch is available for interop testing at:
-```
-https://interop-relay.cloudflare.mediaoverquic.com:443
-```
+Check the draft supported by an interop endpoint before connecting. For a local draft-18 relay, use `https://localhost:4443` after starting `./dev/relay`. Hosts under `relay.example` in the crate READMEs are placeholders, not deployed endpoints.
 
 As an implementation targeting the IETF specification, this codebase should be compatible with other implementations targeting the same draft version. See the [moq-wg/moq-transport wiki](https://github.com/moq-wg/moq-transport/wiki/Interop) for a list of other implementations.
 
@@ -75,7 +75,13 @@ Typical development workflow:
    ```
    Add `--tls-disable-verify` if you prefer not to install local certificates.
 
-3. For playback, clone and run [moq-js](https://github.com/video-dev/moq-js) locally, then open it in a browser pointed at your local relay.
+3. Play the published broadcast in another terminal (requires `ffplay`):
+   ```bash
+   ./dev/sub
+   ```
+   Use the same `NAME` and `URL` environment variables for `./dev/pub` and `./dev/sub` when overriding the defaults. Browser players also need a branch compatible with draft-18; matching the media format alone is insufficient.
+
+For a smoke test without a media player or ffmpeg, start `./dev/clock --publish` and `./dev/clock` in separate terminals. Add `--tls-disable-verify` to native clients only when testing with an untrusted local certificate.
 
 See the [dev helper scripts](dev/README.md) for more options and workflows.
 
@@ -86,7 +92,7 @@ For detailed usage information, see the README in each crate directory:
 - [moq-relay-ietf](moq-relay-ietf/README.md) - Relay server configuration
 - [moq-pub](moq-pub/README.md) - Publisher client usage
 
-The moq-transport crate is also published on [crates.io](https://crates.io/crates/moq-transport) with [API documentation](https://docs.rs/moq-transport/latest/moq_transport/).
+The moq-transport crate is also published on [crates.io](https://crates.io/crates/moq-transport) with [API documentation](https://docs.rs/moq-transport/latest/moq_transport/). To read the API for this checkout, run `cargo doc -p moq-transport --no-deps --open`.
 
 ## License
 
