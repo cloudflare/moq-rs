@@ -88,6 +88,11 @@ cargo run --bin moq-test-client -- \
 ```
 The relay parsed your CLIENT_SETUP. It offered version DRAFT_16. The `parameters` array contains SETUP parameters as `[id, value]` pairs (here, PATH with max length 100).
 
+In current draft-18 mlog output, SETUP PATH (`0x1`) and AUTHORITY (`0x5`)
+values are replaced with `[REDACTED]` because they can carry credentials or
+identify a peer. Authorization token values are also redacted. Use the
+connection ID to correlate sessions rather than expecting these values in logs.
+
 ```json
 {
   "time": 0.216,
