@@ -25,7 +25,8 @@ tokio = { version = "1", features = ["macros", "io-util", "sync", "time"] }
 tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 
-web-transport = { workspace = true }
+web-transport-trait = { workspace = true }
+url = "2"
 
 paste = "1"
 futures = "0.3"
@@ -33,11 +34,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = "3"
 
+[target.'cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))'.dependencies]
+# Existing backend; construction and compatibility live at the transport seam.
+web-transport-quinn = "0.11.8"
+
+[target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]
+# The retained browser backend predates web-transport-trait. Keep its existing
+# adapter until browser transport injection can be validated independently.
+web-transport = "0.10.4"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 # Loopback web_transport::Session for session-cleanup unit tests.
 rcgen = "0.13"
-url = "2"
 # Needed so the loopback TLS handshake has an unambiguous rustls crypto
 # provider when the workspace links both `ring` and `aws-lc-rs` (feature
 # unification under `cargo test --workspace`).

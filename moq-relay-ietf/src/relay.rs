@@ -7,6 +7,7 @@ use anyhow::Context;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
+use moq_transport::session::transport as web_transport;
 use moq_transport::session::SessionConfig;
 use url::Url;
 

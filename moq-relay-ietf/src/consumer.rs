@@ -711,6 +711,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod auth_gates {
+        use moq_transport::session::transport as web_transport;
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,

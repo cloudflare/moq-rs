@@ -15,6 +15,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::transport as web_transport;
 use crate::{
     coding::Location,
     data::{FetchRecord, FetchRecordDecoder, FetchRecordObject},

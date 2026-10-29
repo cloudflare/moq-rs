@@ -1715,7 +1715,6 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "web-transport",
  "web-transport-quinn",
  "webpki",
 ]
@@ -1772,7 +1771,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "web-transport",
 ]
 
 [[package]]
@@ -1806,7 +1804,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "web-transport",
 ]
 
 [[package]]
@@ -1827,6 +1824,8 @@ dependencies = [
  "url",
  "uuid",
  "web-transport",
+ "web-transport-quinn",
+ "web-transport-trait",
 ]
 
 [[package]]
