@@ -3,6 +3,7 @@
 
 //! Per-session authorization state, carried by the producer and consumer.
 
+use moq_transport::session::LogSafe;
 use std::sync::Arc;
 
 use super::{AuthHook, AuthRequest, AuthzOperation, DenyReason, Principal};
@@ -62,8 +63,8 @@ impl SessionAuth {
 
         let decision = match self.hook.on_request(&request).await {
             Ok(decision) => decision,
-            Err(_err) => {
-                tracing::error!(operation = label, "authorization hook failed; denying");
+            Err(err) => {
+                tracing::error!(operation = label, error = %LogSafe(err.to_string().as_bytes()), "authorization hook failed; denying");
                 metrics::counter!(
                     "moq_relay_auth_errors_total",
                     "stage" => "request"

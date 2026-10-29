@@ -910,7 +910,6 @@ impl Publisher {
         message: Message,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<(), DeliveryError>>, SessionError> {
         let id = message.response_target_id().ok_or(SessionError::Internal)?;
-        Session::log_control_message(self.session_id(), &message, "sent");
         if let Message::SubscribeOk(msg) = &message {
             self.add_mlog_event(|time| mlog::events::subscribe_ok_created(time, msg.id, msg));
         }

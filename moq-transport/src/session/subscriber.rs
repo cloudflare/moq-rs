@@ -685,7 +685,6 @@ impl Subscriber {
                 ))
             }
         }
-        Session::log_control_message(self.session_id(), &message, "sent");
         let stream = self
             .bidi_response_map
             .lock()

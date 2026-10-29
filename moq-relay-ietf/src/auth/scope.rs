@@ -3,6 +3,7 @@
 
 //! Resolves a scope's authorization policy into a hook, and caches it.
 
+use moq_transport::session::LogSafe;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -134,6 +135,7 @@ impl ScopeAuthorizer {
                         )));
                         tracing::error!(
                             scope_present = scope.is_some(),
+                            error = %LogSafe(err.to_string().as_bytes()),
                             "could not refresh the scope's authorization policy; reuse cap reached, \
                              refusing new sessions in this scope"
                         );
@@ -146,6 +148,7 @@ impl ScopeAuthorizer {
                         };
                         tracing::warn!(
                             scope_present = scope.is_some(),
+                            error = %LogSafe(err.to_string().as_bytes()),
                             "could not refresh the scope's authorization policy; retaining the cached state"
                         );
                     }
@@ -182,6 +185,7 @@ impl ScopeAuthorizer {
                     Err(err) => {
                         tracing::error!(
                             scope_present = scope.is_some(),
+                            error = %LogSafe(err.to_string().as_bytes()),
                             "scope requires token authorization but its configuration is unusable; \
                              refusing all sessions in this scope"
                         );
