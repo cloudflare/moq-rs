@@ -12,11 +12,15 @@ use std::{
 };
 
 use moq_native_ietf::{
-    client::{ConnectFuture, Connector},
+    client::{ConnectFuture, Connection, Connector},
+    reexports::{
+        anyhow,
+        moq_transport::session::{transport, Transport},
+        url::Url,
+    },
     Client,
 };
 use tokio::sync::Notify;
-use url::Url;
 
 type Calls = Arc<Mutex<Vec<(Url, Option<SocketAddr>)>>>;
 struct RefusingConnector(Calls);
@@ -25,7 +29,18 @@ impl Connector for RefusingConnector {
     fn connect<'a>(&'a self, url: &'a Url, addr: Option<SocketAddr>) -> ConnectFuture<'a> {
         Box::pin(async move {
             self.0.lock().unwrap().push((url.clone(), addr));
-            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "custom policy").into())
+            // Type the backend result through the public dependency reexports,
+            // as an external connector mapping its carrier into Connection would.
+            let result: anyhow::Result<(transport::Session, Transport)> = Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "custom policy",
+            )
+            .into());
+            result.map(|(session, transport)| Connection {
+                session,
+                transport,
+                initial_destination_cid: None,
+            })
         })
     }
 }
