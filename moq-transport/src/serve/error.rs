@@ -112,8 +112,8 @@ impl ServeError {
         let loc = std::panic::Location::caller();
         tracing::warn!(
             error_id = %id,
-            "Not found: {} at {}:{}",
-            context,
+            context = %crate::session::LogSafe(context.as_bytes()),
+            "Not found at {}:{}",
             loc.file(),
             loc.line()
         );
@@ -135,8 +135,8 @@ impl ServeError {
         let loc = std::panic::Location::caller();
         tracing::warn!(
             error_id = %id,
-            "Not found: {} at {}:{}",
-            context,
+            context = %crate::session::LogSafe(context.as_bytes()),
+            "Not found at {}:{}",
             loc.file(),
             loc.line()
         );
@@ -154,8 +154,8 @@ impl ServeError {
         let loc = std::panic::Location::caller();
         tracing::error!(
             error_id = %id,
-            "Internal error: {} at {}:{}",
-            context,
+            context = %crate::session::LogSafe(context.as_bytes()),
+            "Internal error at {}:{}",
             loc.file(),
             loc.line()
         );
@@ -173,8 +173,8 @@ impl ServeError {
         let loc = std::panic::Location::caller();
         tracing::warn!(
             error_id = %id,
-            "Not implemented: {} at {}:{}",
-            feature,
+            feature = %crate::session::LogSafe(feature.as_bytes()),
+            "Not implemented at {}:{}",
             loc.file(),
             loc.line()
         );
@@ -185,7 +185,9 @@ impl ServeError {
     ///
     /// The same id is embedded in [`Display`](std::fmt::Display), which is what
     /// goes on the wire as the reason phrase, so a client can quote it back and
-    /// an operator can find the session that produced it.
+    /// an operator can find matching error records. Session lookup additionally
+    /// requires a session-correlated record when the reason is sent; the UUID
+    /// itself is an error identity, not a session identity.
     pub fn error_id(&self) -> Option<uuid::Uuid> {
         match self {
             Self::NotFoundWithId(_, id)

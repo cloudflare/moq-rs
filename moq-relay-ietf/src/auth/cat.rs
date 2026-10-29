@@ -37,7 +37,7 @@ use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix};
 
 use super::{
     AuthDecision, AuthError, AuthHook, AuthRequest, AuthToken, AuthzOperation, DenyReason,
-    Principal, CAT_TOKEN_TYPE, UNSCOPED,
+    Principal, CAT_TOKEN_TYPE,
 };
 use crate::{
     AuthKeyAlgorithm, AuthPublicKey, ScopeAuthConfig, SessionContext, MAX_SCOPE_AUTH_KEYS,
@@ -211,7 +211,7 @@ impl CatAuthHook {
         let moqt_validator = MoqtValidator::new().disable_revalidation_support();
 
         tracing::info!(
-            scope = scope.unwrap_or(UNSCOPED),
+            scope_present = scope.is_some(),
             keys = keys.len(),
             issuers = config.issuers.len(),
             audiences = config.audiences.len(),
@@ -261,7 +261,7 @@ impl CatAuthHook {
         for key in self.candidate_keys(kid.as_deref()) {
             if *budget == 0 {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
+                    scope_present = self.scope.is_some(),
                     "exhausted the signature verification budget for this session"
                 );
                 return Err(DenyReason::TokenInvalid);
@@ -282,9 +282,8 @@ impl CatAuthHook {
             None => {
                 let err = best_error.unwrap_or(CatError::SignatureVerificationFailed);
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                    kid = kid.as_deref(),
-                    error = %err,
+                    scope_present = self.scope.is_some(),
+                    deny_reason = map_cat_error(err.clone()).label(),
                     "CAT token failed to verify against every configured key"
                 );
                 return Err(map_cat_error(err));
@@ -297,8 +296,7 @@ impl CatAuthHook {
         // leaked token to its lifetime.
         let Some(expires_at) = verified.claims().core.exp else {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                subject = verified.claims().informational.sub.as_deref(),
+                scope_present = self.scope.is_some(),
                 "CAT token has no expiry"
             );
             return Err(DenyReason::TokenInvalid);
@@ -312,8 +310,7 @@ impl CatAuthHook {
 
         if expires_at > horizon {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                subject = verified.claims().informational.sub.as_deref(),
+                scope_present = self.scope.is_some(),
                 "CAT token expiry is implausibly distant"
             );
             return Err(DenyReason::TokenInvalid);
@@ -334,8 +331,7 @@ impl CatAuthHook {
         if let Some(not_before) = verified.claims().core.nbf {
             if !(now.saturating_sub(MAX_TOKEN_LIFETIME_SECS)..=horizon).contains(&not_before) {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                    subject = verified.claims().informational.sub.as_deref(),
+                    scope_present = self.scope.is_some(),
                     "CAT token not-before is implausibly distant"
                 );
                 return Err(DenyReason::TokenInvalid);
@@ -343,8 +339,7 @@ impl CatAuthHook {
 
             if expires_at.saturating_sub(not_before) > MAX_TOKEN_LIFETIME_SECS {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                    subject = verified.claims().informational.sub.as_deref(),
+                    scope_present = self.scope.is_some(),
                     "CAT token lifetime exceeds the supported maximum"
                 );
                 return Err(DenyReason::TokenInvalid);
@@ -355,8 +350,7 @@ impl CatAuthHook {
         // verified token into the validated trust state.
         if let Some(claim) = unenforceable_claim(token.expose_value()) {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                subject = verified.claims().informational.sub.as_deref(),
+                scope_present = self.scope.is_some(),
                 claim,
                 "CAT token carries a restriction this relay cannot enforce"
             );
@@ -368,8 +362,8 @@ impl CatAuthHook {
         // Standard CWT claims: exp, nbf, iss, aud, plus CAT extensions.
         let validated = verified.validate(&self.token_validator).map_err(|err| {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                error = %err,
+                scope_present = self.scope.is_some(),
+                deny_reason = map_cat_error(err.clone()).label(),
                 "CAT token claims rejected"
             );
             map_cat_error(err)
@@ -389,9 +383,8 @@ impl CatAuthHook {
             .validate_moqt_claims(validated.claims())
             .map_err(|err| {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                    subject = validated.claims().informational.sub.as_deref(),
-                    error = %err,
+                    scope_present = self.scope.is_some(),
+                    deny_reason = map_cat_error(err.clone()).label(),
                     "CAT token MOQT claims rejected"
                 );
                 map_cat_error(err)
@@ -441,7 +434,7 @@ impl CatAuthHook {
         // setup, so this check always applies.
         let Some(now) = try_now_unix() else {
             tracing::error!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
+                scope_present = self.scope.is_some(),
                 "system clock is before the UNIX epoch; cannot evaluate token expiry"
             );
             return AuthDecision::deny(DenyReason::HookFault {
@@ -451,8 +444,7 @@ impl CatAuthHook {
 
         if now > principal.expires_at.saturating_add(principal.clock_skew) {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                subject = principal.token.informational.sub.as_deref(),
+                scope_present = self.scope.is_some(),
                 operation = operation.label(),
                 "CAT token expired mid-session"
             );
@@ -464,8 +456,7 @@ impl CatAuthHook {
             AuthDecision::allow(established.clone())
         } else {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                subject = principal.token.informational.sub.as_deref(),
+                scope_present = self.scope.is_some(),
                 operation = operation.label(),
                 deny_reason = DenyReason::ScopeMismatch.label(),
                 "CAT authorization denied"
@@ -479,7 +470,7 @@ impl std::fmt::Debug for CatAuthHook {
     /// Reports the shape of the configuration without its key material.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CatAuthHook")
-            .field("scope", &self.scope)
+            .field("scope_present", &self.scope.is_some())
             .field("keys", &self.keys.len())
             .field(
                 "kids",
@@ -536,7 +527,7 @@ impl AuthHook for CatAuthHook {
 
         if candidates.peek().is_none() {
             tracing::debug!(
-                scope = session.scope().unwrap_or(UNSCOPED),
+                scope_present = session.scope().is_some(),
                 presented = tokens.len(),
                 "no CAT token in CLIENT_SETUP"
             );
@@ -572,16 +563,14 @@ impl AuthHook for CatAuthHook {
         // predicate, as the namespace-level actions are.
         if !scope_authorizes(&decoded, MoqtAction::ClientSetup, None, None) {
             tracing::debug!(
-                scope = session.scope().unwrap_or(UNSCOPED),
-                subject = decoded.informational.sub.as_deref(),
+                scope_present = session.scope().is_some(),
                 "CAT token does not authorize CLIENT_SETUP"
             );
             return Ok(AuthDecision::deny(DenyReason::ScopeMismatch));
         }
 
         tracing::debug!(
-            scope = session.scope().unwrap_or(UNSCOPED),
-            subject = decoded.informational.sub.as_deref(),
+            scope_present = session.scope().is_some(),
             "CAT token accepted"
         );
 

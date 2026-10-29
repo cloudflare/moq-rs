@@ -530,9 +530,9 @@ impl UpstreamNamespacesRunner {
             Ok(subscription) => Some(subscription),
             Err(error) => {
                 tracing::error!(
-                    scope = key.group.scope.as_deref().unwrap_or("<unscoped>"),
+                    scope_present = key.group.scope.is_some(),
                     prefix = %key.prefix,
-                    error = %error,
+                    error = %moq_transport::session::LogSafe(error.to_string().as_bytes()),
                     "failed to register shared upstream namespace interest"
                 );
                 None
@@ -625,7 +625,7 @@ impl UpstreamNamespacesRunner {
                     Err(error) => {
                         tracing::error!(
                             namespace = %namespace,
-                            error = %error,
+                            error = %moq_transport::session::LogSafe(error.to_string().as_bytes()),
                             "failed to register upstream namespace source"
                         );
                     }
@@ -857,43 +857,47 @@ async fn run_pull_inner(
             match result {
                 Ok(handle) => handle,
                 Err(error) => {
-                    tracing::warn!(upstream = %relay.url, error = %error, "failed to open shared upstream SUBSCRIBE_NAMESPACE");
+                    tracing::warn!(error = %moq_transport::session::LogSafe(error.to_string().as_bytes()), "failed to open shared upstream SUBSCRIBE_NAMESPACE");
                     return PullOutcome::OpenFailed;
                 }
             }
         }
     };
     let mut handle = handle;
+    use tracing::Instrument;
+    let span = handle.session_id().span();
+    async move {
 
     let accepted = tokio::select! {
-        _ = &mut *cancel => return cancel_pull(&mut handle, relay).await,
+        _ = &mut *cancel => return cancel_pull(&mut handle).await,
         result = handle.ok() => result,
     };
     if let Err(error) = accepted {
-        tracing::debug!(upstream = %relay.url, error = %error, "shared upstream SUBSCRIBE_NAMESPACE rejected");
+        tracing::debug!(error = %moq_transport::session::LogSafe(error.to_string().as_bytes()), "shared upstream SUBSCRIBE_NAMESPACE rejected");
         return PullOutcome::Rejected;
     }
 
     loop {
         tokio::select! {
-            _ = &mut *cancel => return cancel_pull(&mut handle, relay).await,
+            _ = &mut *cancel => return cancel_pull(&mut handle).await,
             event = handle.next() => {
                 match event {
                     Ok(Some(event)) => send_command(commands, Command::PullEvent { root_id, pull_id, event }),
                     Ok(None) => return PullOutcome::Ended,
                     Err(error) => {
-                        tracing::debug!(upstream = %relay.url, error = %error, "shared upstream SUBSCRIBE_NAMESPACE ended");
+                        tracing::debug!(error = %moq_transport::session::LogSafe(error.to_string().as_bytes()), "shared upstream SUBSCRIBE_NAMESPACE ended");
                         return PullOutcome::Ended;
                     }
                 }
             }
         }
     }
+    }.instrument(span).await
 }
 
-async fn cancel_pull(handle: &mut SubscribeNamespace, relay: &RelayInfo) -> PullOutcome {
+async fn cancel_pull(handle: &mut SubscribeNamespace) -> PullOutcome {
     if let Err(error) = handle.finish_request() {
-        tracing::debug!(upstream = %relay.url, error = %error, "failed to finish upstream namespace request stream");
+        tracing::debug!(error = %moq_transport::session::LogSafe(error.to_string().as_bytes()), "failed to finish upstream namespace request stream");
         return PullOutcome::Intentional { timed_out: false };
     }
 
@@ -914,7 +918,6 @@ async fn cancel_pull(handle: &mut SubscribeNamespace, relay: &RelayInfo) -> Pull
 
     metrics::counter!("moq_relay_namespace_transition_timeouts_total").increment(1);
     tracing::error!(
-        upstream = %relay.url,
         timeout_seconds = TRANSITION_TIMEOUT.as_secs(),
         "timed out draining upstream namespace transition; resetting request stream"
     );

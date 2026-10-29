@@ -473,31 +473,37 @@ impl Subscribed {
         deadline: tokio::time::Instant,
         largest_location: Option<Location>,
     ) -> Result<(), ServeWithDeadlineError> {
-        let result = self
-            .serve_inner(track, Some(deadline), largest_location)
-            .await;
-        let deadline_expired =
-            !self.ok && matches!(result, Err(SessionError::Serve(ServeError::Timeout)));
+        use tracing::Instrument;
+        let span = self.forwarder.publisher.session_id().span();
+        async move {
+            let result = self
+                .serve_inner(track, Some(deadline), largest_location)
+                .await;
+            let deadline_expired =
+                !self.ok && matches!(result, Err(SessionError::Serve(ServeError::Timeout)));
 
-        if deadline_expired {
-            // Simultaneous request cancellation may have closed the shared state first,
-            // but the relay still needs the deadline result for its response and metric.
+            if deadline_expired {
+                // Simultaneous request cancellation may have closed the shared state first,
+                // but the relay still needs the deadline result for its response and metric.
+                if let Err(err) = &result {
+                    let _ = self.forwarder.close(err.clone().into(), 0);
+                }
+                return Err(ServeWithDeadlineError::DeadlineExpired);
+            }
+
             if let Err(err) = &result {
+                // The forwarding error remains authoritative if a concurrent
+                // request cancellation already closed the shared state.
                 let _ = self.forwarder.close(err.clone().into(), 0);
             }
-            return Err(ServeWithDeadlineError::DeadlineExpired);
+            let terminal = self.finish().await;
+            match result {
+                Ok(()) => terminal.map_err(ServeWithDeadlineError::Session),
+                Err(err) => Err(ServeWithDeadlineError::Session(err)),
+            }
         }
-
-        if let Err(err) = &result {
-            // The forwarding error remains authoritative if a concurrent
-            // request cancellation already closed the shared state.
-            let _ = self.forwarder.close(err.clone().into(), 0);
-        }
-        let terminal = self.finish().await;
-        match result {
-            Ok(()) => terminal.map_err(ServeWithDeadlineError::Session),
-            Err(err) => Err(ServeWithDeadlineError::Session(err)),
-        }
+        .instrument(span)
+        .await
     }
 
     async fn serve_before(
@@ -506,14 +512,20 @@ impl Subscribed {
         deadline: Option<tokio::time::Instant>,
         largest_location: Option<Location>,
     ) -> Result<(), SessionError> {
-        let res = self.serve_inner(track, deadline, largest_location).await;
-        if let Err(err) = &res {
-            // The forwarding error remains authoritative if a concurrent
-            // request cancellation already closed the shared state.
-            let _ = self.forwarder.close(err.clone().into(), 0);
+        use tracing::Instrument;
+        let span = self.forwarder.publisher.session_id().span();
+        async move {
+            let res = self.serve_inner(track, deadline, largest_location).await;
+            if let Err(err) = &res {
+                // The forwarding error remains authoritative if a concurrent
+                // request cancellation already closed the shared state.
+                let _ = self.forwarder.close(err.clone().into(), 0);
+            }
+            let terminal = self.finish().await;
+            res.and(terminal)
         }
-        let terminal = self.finish().await;
-        res.and(terminal)
+        .instrument(span)
+        .await
     }
 
     async fn serve_inner(
@@ -737,9 +749,9 @@ impl ObjectForwarder {
                             let res = Self::serve_subgroup(track_alias, subgroup, publisher, state, stream_count, mlog, delivery_filter).await;
                             if let Err(err) = &res {
                                 if Subscribed::is_expected_serve_shutdown(err) {
-                                    tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
+                                    tracing::debug!(subgroup_info = ?info, error = %super::LogSafe(err.to_string().as_bytes()), "stopped serving subgroup");
                                 } else {
-                                    tracing::warn!(subgroup_info = ?info, error = %err, "failed to serve subgroup");
+                                    tracing::warn!(subgroup_info = ?info, error = %super::LogSafe(err.to_string().as_bytes()), "failed to serve subgroup");
                                 }
                             }
                             res
@@ -834,7 +846,10 @@ impl ObjectForwarder {
         // TODO figure out u32 vs u64 priority
         send_stream.set_priority(subgroup_reader.priority as i32);
 
-        let mut output = SubgroupOutput::stream(Writer::new(send_stream));
+        let mut output = SubgroupOutput::stream(Writer::with_session_id(
+            send_stream,
+            publisher.session_id().clone(),
+        ));
         stream_count.opened();
         let state_status = state.lock().closed.clone();
         let res = if let Err(err) = state_status {
@@ -2002,11 +2017,15 @@ mod tests {
         )
         .produce();
         let mut subgroups_writer = track_writer.subgroups().unwrap();
-        let serve::TrackReaderMode::Subgroups(subgroups_reader) =
+        let serve::TrackReaderMode::Subgroups(mut subgroups_reader) =
             track_reader.mode().await.unwrap()
         else {
             panic!("expected subgroup delivery");
         };
+        // Claim the forwarder's cursor before cloning the healthy reader. A
+        // clone claiming the template first makes the original an inactive
+        // template, which cannot be used to test lag isolation.
+        let forwarder_cursor = subgroups_reader.delivery_cursor();
         let mut healthy = subgroups_reader.clone();
 
         let mut blocked = Vec::new();
@@ -2036,7 +2055,17 @@ mod tests {
                 )
                 .await
         });
-        tokio::task::yield_now().await;
+        // A yield does not guarantee the spawned task filled its forwarding
+        // slots. Wait for that precondition before overflowing its backlog.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while forwarder_cursor.load(std::sync::atomic::Ordering::Relaxed)
+                < MAX_CONCURRENT_SUBGROUPS
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
         for offset in 0..=serve::MAX_PENDING_SUBGROUPS as u64 {
             let group_id = MAX_CONCURRENT_SUBGROUPS as u64 + offset;

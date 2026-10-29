@@ -128,6 +128,7 @@ pub struct FetchOkInfo {
 /// requester always receives exactly one response (§5.2).
 #[must_use = "respond to, reject, or proxy the FETCH request"]
 pub struct FetchRequested {
+    session_id: super::SessionId,
     webtransport: web_transport::Session,
     outgoing: Queue<Message>,
     active: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
@@ -200,10 +201,12 @@ impl FetchRequested {
         active: Arc<Mutex<HashMap<u64, FetchRequestedRecv>>>,
         request: message::Fetch,
         joining: Option<JoiningTarget>,
+        session_id: super::SessionId,
     ) -> (Self, FetchRequestedRecv) {
         let (send, recv) = State::default().split();
         (
             Self {
+                session_id,
                 webtransport,
                 outgoing,
                 active,
@@ -539,7 +542,10 @@ impl FetchRequested {
             return Err(ServeError::Cancel.into());
         }
         let mut stream = FetchStream {
-            writer: Writer::new(self.webtransport.open_uni().await?),
+            writer: Writer::with_session_id(
+                self.webtransport.open_uni().await?,
+                self.session_id.clone(),
+            ),
             reset: DataStreamResetCode::InternalError,
             finished: false,
         };
@@ -782,8 +788,14 @@ mod tests {
         let (outgoing, outgoing_rx) = Queue::default().split();
         let keepalive = outgoing.clone();
         let active = Arc::new(Mutex::new(HashMap::new()));
-        let (request, recv) =
-            FetchRequested::new(session, outgoing, active.clone(), standalone(id), None);
+        let (request, recv) = FetchRequested::new(
+            session,
+            outgoing,
+            active.clone(),
+            standalone(id),
+            None,
+            super::super::SessionId::generate(),
+        );
         (request, recv, Sent(outgoing_rx, keepalive), active)
     }
 

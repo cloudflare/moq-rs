@@ -324,6 +324,12 @@ impl Producer {
 
     /// Run the producer to serve subscribe requests.
     pub async fn run(self) -> Result<(), SessionError> {
+        use tracing::Instrument;
+        let span = self.context.span(self.publisher.session_id());
+        self.run_inner().instrument(span).await
+    }
+
+    async fn run_inner(self) -> Result<(), SessionError> {
         let mut tasks: FuturesUnordered<ProducerTask> = FuturesUnordered::new();
         // A SUBSCRIBE_TRACKS child acquires a permit from the semaphore with
         // this same bound before sending, so the parent cannot stall here.
@@ -354,9 +360,9 @@ impl Producer {
                         // Serve the subscribe request
                         if let Err(err) = this.serve_subscribe(subscribed).await {
                             if Self::is_expected_serve_shutdown(&err) {
-                                tracing::debug!(namespace = %namespace, track = %track_name, subscribe_info = ?info, error = %err, "stopped serving subscribe");
+                                tracing::debug!(namespace = %namespace, track = %track_name, subscribe_info = ?info, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "stopped serving subscribe");
                             } else {
-                                tracing::warn!(namespace = %namespace, track = %track_name, subscribe_info = ?info, error = %err, "failed serving subscribe");
+                                tracing::warn!(namespace = %namespace, track = %track_name, subscribe_info = ?info, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed serving subscribe");
                             }
                         }
                     }.boxed())
@@ -374,7 +380,7 @@ impl Producer {
 
                         // Serve the track_status request
                         if let Err(err) = this.serve_track_status(track_status_requested).await {
-                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving track_status: {:?}, error: {}", info, err)
+                            tracing::warn!(namespace = %namespace, track = %track_name, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed serving track_status")
                         }
                     }.boxed())
                 },
@@ -388,9 +394,9 @@ impl Producer {
 
                         if let Err(err) = this.serve_subscribe_namespace(subscribed_namespace).await {
                             if Self::is_expected_serve_shutdown(&err) {
-                                tracing::debug!(namespace_prefix = %prefix, error = %err, "stopped serving subscribe namespace");
+                                tracing::debug!(namespace_prefix = %prefix, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "stopped serving subscribe namespace");
                             } else {
-                                tracing::warn!(namespace_prefix = %prefix, error = %err, "failed serving subscribe namespace");
+                                tracing::warn!(namespace_prefix = %prefix, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed serving subscribe namespace");
                             }
                         }
                     }.boxed())
@@ -403,9 +409,9 @@ impl Producer {
                         tracing::info!(namespace_prefix = %prefix, "serving subscribe tracks");
                         if let Err(err) = this.serve_subscribe_tracks(subscribed_tracks, child_tasks).await {
                             if Self::is_expected_serve_shutdown(&err) {
-                                tracing::debug!(namespace_prefix = %prefix, error = %err, "stopped serving subscribe tracks");
+                                tracing::debug!(namespace_prefix = %prefix, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "stopped serving subscribe tracks");
                             } else {
-                                tracing::warn!(namespace_prefix = %prefix, error = %err, "failed serving subscribe tracks");
+                                tracing::warn!(namespace_prefix = %prefix, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed serving subscribe tracks");
                             }
                         }
                     }.boxed())
@@ -416,7 +422,7 @@ impl Producer {
                     tasks.push(async move {
                         let id = fetch.id();
                         if let Err(err) = this.serve_fetch(fetch).await {
-                            tracing::debug!(request_id = id, error = %err, "failed serving FETCH");
+                            tracing::debug!(request_id = id, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed serving FETCH");
                         }
                     }.boxed())
                 },
@@ -700,12 +706,12 @@ impl Producer {
                         // and skip the upstream-error counter.
                         let err = match outcome {
                             UpstreamWait::DownstreamLeft(err) => {
-                                tracing::debug!(namespace = %ns, track = %track_name, error = %err, "downstream subscriber left before the upstream subscription was established");
+                                tracing::debug!(namespace = %ns, track = %track_name, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "downstream subscriber left before the upstream subscription was established");
                                 timing_guard.set_label("source", "downstream_left");
                                 err
                             }
                             UpstreamWait::UpstreamFailed(err) => {
-                                tracing::warn!(namespace = %ns, track = %track_name, error = %err, "upstream subscription could not be established");
+                                tracing::warn!(namespace = %ns, track = %track_name, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "upstream subscription could not be established");
                                 metrics::counter!("moq_relay_subscribe_upstream_errors_total")
                                     .increment(1);
                                 timing_guard.set_label("source", "upstream_error");
@@ -815,7 +821,7 @@ impl Producer {
                 Ok(None) => coordinator_lookup_succeeded = true,
                 Err(RemoteSubscribeError::Peer(err)) => {
                     let ns = namespace.to_utf8_path();
-                    tracing::debug!(namespace = %ns, track = %track_name, error = %err, "upstream relay rejected subscribe");
+                    tracing::debug!(namespace = %ns, track = %track_name, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "upstream relay rejected subscribe");
                     metrics::counter!("moq_relay_subscribe_upstream_errors_total").increment(1);
                     timing_guard.set_label("source", "upstream_error");
                     let _ = subscribed.close(err.clone());
@@ -825,7 +831,7 @@ impl Producer {
                     // Route error = infrastructure failure (couldn't reach coordinator/upstream)
                     // This is different from "not found" - we don't know if the track exists
                     let ns = namespace.to_utf8_path();
-                    tracing::error!(namespace = %ns, track = %track_name, error = %e, "failed to route to remote: {}", e);
+                    tracing::error!(namespace = %ns, track = %track_name, error = %moq_transport::session::LogSafe(e.to_string().as_bytes()), "failed to route to remote");
                     metrics::counter!("moq_relay_subscribe_route_errors_total").increment(1);
 
                     // A hold turns this from an answer into a retry. The subscriber
@@ -1160,7 +1166,7 @@ impl Producer {
             Err(error) => {
                 tracing::error!(
                     prefix = %subscribed_namespace.namespace_prefix,
-                    error = %error,
+                    error = %moq_transport::session::LogSafe(error.to_string().as_bytes()),
                     "failed to acquire shared upstream namespace lease; serving local state only"
                 );
                 None
@@ -1668,7 +1674,7 @@ impl Producer {
                 tracing::warn!(
                     namespace = %full_name.namespace.to_utf8_path(),
                     track = %full_name.name,
-                    error = %error,
+                    error = %moq_transport::session::LogSafe(error.to_string().as_bytes()),
                     "failed to start generated PUBLISH; keeping SUBSCRIBE_TRACKS active"
                 );
                 slots.remove(full_name);
@@ -1699,7 +1705,7 @@ impl Producer {
                     let _permit = permit;
                     match published.serve().await {
                         Ok(()) => tracing::debug!(namespace = %namespace, track = %track_name, "finished serving PUBLISH for SUBSCRIBE_TRACKS"),
-                        Err(error) => tracing::warn!(namespace = %namespace, track = %track_name, error = %error, "failed serving PUBLISH for SUBSCRIBE_TRACKS"),
+                        Err(error) => tracing::warn!(namespace = %namespace, track = %track_name, error = %moq_transport::session::LogSafe(error.to_string().as_bytes()), "failed serving PUBLISH for SUBSCRIBE_TRACKS"),
                     }
                     let _ = completed.send(completion).await;
                 }

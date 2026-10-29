@@ -14,6 +14,7 @@ use std::{
 
 use futures::StreamExt;
 use tokio::sync::Notify;
+use tracing::Instrument;
 
 use crate::{
     coding::{Decode, KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix},
@@ -249,11 +250,12 @@ impl OpeningRequestStream {
         session: web_transport::Session,
         send: web_transport::SendStream,
         recv: web_transport::RecvStream,
+        session_id: super::SessionId,
     ) -> Self {
         Self {
             session,
-            writer: Some(Writer::new(send)),
-            reader: Some(Reader::new(recv)),
+            writer: Some(Writer::with_session_id(send, session_id.clone())),
+            reader: Some(Reader::with_session_id(recv, session_id)),
         }
     }
 
@@ -560,6 +562,11 @@ impl Drop for ReceivedSubgroup {
 }
 
 impl Subscriber {
+    /// Stable identity shared with the session and publisher role.
+    pub fn session_id(&self) -> &super::SessionId {
+        self.request_id.session_id()
+    }
+
     pub(super) fn request_ids(&self) -> RequestId {
         self.request_id.clone()
     }
@@ -678,7 +685,7 @@ impl Subscriber {
                 ))
             }
         }
-        Session::log_control_message(&message, "sent");
+        Session::log_control_message(self.session_id(), &message, "sent");
         let stream = self
             .bidi_response_map
             .lock()
@@ -710,10 +717,15 @@ impl Subscriber {
         // Validate and encode before allocating a QUIC stream, so malformed
         // local parameters cannot consume a request-stream slot.
         let frame = super::encode_request_frame(msg)?;
+        Session::log_control_message(self.session_id(), msg, "sent");
 
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
-        let mut opening =
-            OpeningRequestStream::new(self.webtransport.clone(), send_stream, recv_stream);
+        let mut opening = OpeningRequestStream::new(
+            self.webtransport.clone(),
+            send_stream,
+            recv_stream,
+            self.session_id().clone(),
+        );
         let writer = opening.writer.as_mut().ok_or(SessionError::Internal)?;
         writer.write(&frame).await?;
         opening.into_parts()
@@ -951,7 +963,7 @@ impl Subscriber {
                                 }
                                 Ok(Err(err)) => {
                                     outgoing.complete(Err(super::DeliveryError::from_session_error(&err)));
-                                    tracing::debug!(request_id, error = %err, "failed writing on SUBSCRIBE request stream");
+                                    tracing::debug!(request_id, error = %super::LogSafe(err.to_string().as_bytes()), "failed writing on SUBSCRIBE request stream");
                                     request_writer.reset(super::CANCELLED_STREAM_CODE);
                                     stop_code.store(u64::from(super::CANCELLED_STREAM_CODE) + 1, Ordering::Release);
                                     writing = false;
@@ -1142,13 +1154,13 @@ impl Subscriber {
                             // a reset means it failed (its data stream may be
                             // unidentifiable).
                             Err(err) if answered && err.is_stream_error() => {
-                                tracing::debug!(request_id = id, error = %err, "FETCH response aborted after FETCH_OK");
+                                tracing::debug!(request_id = id, error = %super::LogSafe(err.to_string().as_bytes()), "FETCH response aborted after FETCH_OK");
                                 recv.recv_abort();
                                 return Ok(());
                             }
                             Err(err) if err.is_stream_ended() => {
                                 if !answered {
-                                    tracing::debug!(request_id = id, error = %err, "FETCH request stream ended without a response");
+                                    tracing::debug!(request_id = id, error = %super::LogSafe(err.to_string().as_bytes()), "FETCH request stream ended without a response");
                                 }
                                 return Ok(());
                             }
@@ -1220,7 +1232,7 @@ impl Subscriber {
                 match recv.run(reader, mlog).await {
                     Ok(()) => Ok(()),
                     Err(err) if err.is_stream_ended() => {
-                        tracing::debug!(request_id, error = %err, "SUBSCRIBE_NAMESPACE response reader ended");
+                        tracing::debug!(request_id, error = %super::LogSafe(err.to_string().as_bytes()), "SUBSCRIBE_NAMESPACE response reader ended");
                         Ok(())
                     }
                     Err(err) => Err(err),
@@ -1804,7 +1816,8 @@ impl Subscriber {
             request_id = msg.id,
             error_code = msg.error_code,
             retry_interval = msg.retry_interval,
-            reason = %msg.reason.0,
+            session_id = %self.session_id(),
+            reason = %super::LogSafe(msg.reason.0.as_bytes()),
             "received REQUEST_ERROR"
         );
         Ok(())
@@ -2313,7 +2326,7 @@ impl Subscriber {
         stream: web_transport::RecvStream,
     ) -> Result<(), SessionError> {
         tracing::trace!("[SUBSCRIBER] recv_stream: new stream received, decoding header");
-        let mut reader = Reader::new(stream);
+        let mut reader = Reader::with_session_id(stream, self.session_id().clone());
 
         // A complete malformed stream header is a session error. Stop this
         // stream explicitly before closing the session so dropping the receive
@@ -2844,19 +2857,26 @@ impl Subscriber {
         // `PendingSlot` decrements the counter when dropped — whether the
         // task completes normally, panics, or is cancelled via `.abort()`.
         let _slot = PendingSlot(subscriber.pending_datagrams.clone());
-        tokio::spawn(async move {
-            let _slot = _slot; // move into task; drop releases the slot
-            let origin = subscriber
-                .get_track_origin_by_alias(datagram.track_alias, Some(DEFAULT_ALIAS_WAIT_TIME_MS))
-                .await;
-            let res = match origin {
-                Ok(origin) => subscriber.deliver_datagram(origin, datagram),
-                Err(err) => Err(err),
-            };
-            if let Err(err) = res {
-                tracing::warn!(%err, "[SUBSCRIBER] recv_datagram: late datagram not delivered");
+        let span = subscriber.session_id().span();
+        tokio::spawn(
+            async move {
+                let _slot = _slot; // move into task; drop releases the slot
+                let origin = subscriber
+                    .get_track_origin_by_alias(
+                        datagram.track_alias,
+                        Some(DEFAULT_ALIAS_WAIT_TIME_MS),
+                    )
+                    .await;
+                let res = match origin {
+                    Ok(origin) => subscriber.deliver_datagram(origin, datagram),
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = res {
+                    tracing::warn!(%err, "[SUBSCRIBER] recv_datagram: late datagram not delivered");
+                }
             }
-        });
+            .instrument(span),
+        );
     }
 
     /// Hand a decoded datagram to the subscription that owns its alias.
@@ -3886,7 +3906,12 @@ mod tests {
     async fn dropping_an_opening_request_resets_a_partial_frame() {
         let (client, server) = loopback_session_pair().await;
         let (send, recv) = client.open_bi().await.unwrap();
-        let mut opening = OpeningRequestStream::new(client.clone(), send, recv);
+        let mut opening = OpeningRequestStream::new(
+            client.clone(),
+            send,
+            recv,
+            super::super::SessionId::generate(),
+        );
         opening
             .writer
             .as_mut()

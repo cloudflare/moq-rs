@@ -8,6 +8,7 @@ use anyhow::Context;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
 use moq_transport::session::SessionConfig;
+use tracing::Instrument;
 use url::Url;
 
 use crate::auth::{decode_setup_tokens, ScopeAuthorizer, SessionAuth, SESSION_ERROR_UNAUTHORIZED};
@@ -126,7 +127,7 @@ async fn authorize_session(
             // A wire-format violation, so the close code comes from the draft
             // rather than being UNAUTHORIZED.
             tracing::debug!(
-                scope = context.scope(),
+                scope_present = context.scope().is_some(),
                 error = %err,
                 "invalid AUTHORIZATION TOKEN option in SETUP"
             );
@@ -154,12 +155,11 @@ async fn authorize_session(
         Ok(Some(hook)) => hook,
         // The scope did not opt in to token authorization.
         Ok(None) => return Ok(None),
-        Err(err) => {
+        Err(_err) => {
             // We could not learn whether this scope requires a token, so we
             // must not assume it does not.
             tracing::error!(
-                scope = context.scope(),
-                error = %err,
+                scope_present = context.scope().is_some(),
                 "could not determine the scope's authorization policy"
             );
             metrics::counter!("moq_relay_auth_errors_total", "stage" => "scope_config")
@@ -171,10 +171,9 @@ async fn authorize_session(
         }
     };
 
-    let decision = hook.on_setup(context, &tokens).await.map_err(|err| {
+    let decision = hook.on_setup(context, &tokens).await.map_err(|_err| {
         tracing::error!(
-            scope = context.scope(),
-            error = %err,
+            scope_present = context.scope().is_some(),
             "authorization hook failed during setup"
         );
         metrics::counter!("moq_relay_auth_errors_total", "stage" => "setup").increment(1);
@@ -187,16 +186,15 @@ async fn authorize_session(
     match decision.into_principal() {
         Ok(principal) => {
             tracing::debug!(
-                scope = context.scope(),
-                subject = principal.subject(),
+                scope_present = context.scope().is_some(),
                 "session authorized"
             );
             Ok(Some(SessionAuth::new(hook, principal)))
         }
         Err(reason) => {
             tracing::debug!(
-                scope = context.scope(),
-                reason = %reason,
+                scope_present = context.scope().is_some(),
+                reason = reason.label(),
                 "session authorization denied"
             );
             metrics::counter!(
@@ -362,21 +360,22 @@ impl Relay {
 
             // Start the forwarder, if any
             let forward_producer = if let Some(url) = &announce_url {
-                tracing::info!("forwarding PUBLISH_NAMESPACE messages to {}", url);
+                tracing::info!("forwarding PUBLISH_NAMESPACE messages to configured relay");
 
                 // Establish a QUIC connection to the forward URL
-                let (session, _quic_client_initial_cid, transport) = quic_endpoints[0]
+                let (session, quic_client_initial_cid, transport) = quic_endpoints[0]
                     .client
                     .connect(url, None)
                     .await
                     .context("failed to establish forward connection")?;
 
                 // Create the MoQ session over the connection
-                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config(
+                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config_and_session_id(
                     session,
                     None,
                     transport,
                     session_config,
+                    moq_transport::session::SessionId::new(quic_client_initial_cid),
                 )
                 .await
                 .context("failed to establish forward session")?;
@@ -405,8 +404,7 @@ impl Relay {
                 match coordinator.get_scope_config(forward_scope.as_deref()).await {
                     Ok(config) if config.auth.is_some() => {
                         tracing::warn!(
-                            url = %url,
-                            scope = forward_scope.as_deref(),
+                            session_id = %session.session_id(),
                             "--announce targets a scope that requires token authorization, but \
                              the forward link is not authorized: the upstream relay can publish \
                              and subscribe in this scope without presenting a token. Ensure the \
@@ -414,14 +412,12 @@ impl Relay {
                         );
                     }
                     Ok(_) => {}
-                    Err(err) => {
+                    Err(_err) => {
                         // Not fatal — the link is operator-configured either
                         // way — but the warning above is the only signal that
                         // this path exists, so its absence must not be silent.
                         tracing::warn!(
-                            url = %url,
-                            scope = forward_scope.as_deref(),
-                            error = %err,
+                            session_id = %session.session_id(),
                             "could not determine whether the --announce target's scope requires \
                              token authorization; the forward link is unauthorized regardless"
                         );
@@ -451,7 +447,7 @@ impl Relay {
                         forward_coordinator,
                         remote_manager.clone(),
                         None,
-                        forward_context,
+                        forward_context.clone(),
                         None,
                     )),
                     // Forward connections are always full read-write relay peers,
@@ -462,7 +458,7 @@ impl Relay {
 
                 let forward_producer = session.producer.clone();
 
-                tasks.push(async move { session.run().await.context("forwarding failed") }.boxed());
+                tasks.push(async move { session.run_with_context(&forward_context).await.context("forwarding failed") }.boxed());
 
                 forward_producer
             } else {
@@ -528,6 +524,8 @@ impl Relay {
                         let upstream_namespaces = upstream_namespaces.clone();
                         let connection_tagger = connection_tagger.clone();
                         let authorizer = authorizer.clone();
+                        let session_id = moq_transport::session::SessionId::new(connection_id);
+                        let accept_span = session_id.span();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -539,10 +537,10 @@ impl Relay {
                             let raw_conn = conn.clone();
 
                             // Create the MoQ session over the connection (setup handshake etc)
-                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config(conn, mlog_path, transport, session_config).await {
+                            let (session, publisher, subscriber) = match moq_transport::session::Session::accept_with_config_and_session_id(conn, mlog_path, transport, session_config, session_id.clone()).await {
                                 Ok(session) => session,
-                                Err(err) => {
-                                    tracing::warn!(error = %err, "failed to accept MoQ session: {}", err);
+                                Err(_err) => {
+                                    tracing::warn!(session_id = %session_id, "failed to accept MoQ session");
                                     metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_accept").increment(1);
                                     // Maintain invariant: connections_total - connections_closed_total == active_connections
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
@@ -558,10 +556,9 @@ impl Relay {
                             // scope_id and determines what the connection is allowed to do.
                             let scope_info = match coordinator.resolve_scope(moq_session.connection_path()).await {
                                 Ok(info) => info,
-                                Err(err) => {
+                                Err(_err) => {
                                     tracing::warn!(
-                                        connection_path = moq_session.connection_path(),
-                                        error = %err,
+                                        session_id = %session_id,
                                         "scope resolution failed, rejecting session"
                                     );
                                     // Close with PROTOCOL_VIOLATION (0x3) so the client
@@ -613,9 +610,9 @@ impl Relay {
                             macro_rules! log_session_accepted {
                                 ($level:ident) => {
                                     tracing::$level!(
+                                    session_id = %session_id,
                                     interface = ?context.interface,
                                     local_ip = ?local_ip,
-                                    remote_addr = %remote_addr,
                                     tagger = connection_tagger.is_some(),
                                     "session accepted"
                                     )
@@ -632,8 +629,7 @@ impl Relay {
 
                             if let Some(ref info) = scope_info {
                                 tracing::debug!(
-                                    connection_path = moq_session.connection_path(),
-                                    scope_id = %info.scope_id,
+                                    session_id = %session_id,
                                     permissions = ?info.permissions,
                                     "scope resolved"
                                 );
@@ -655,8 +651,7 @@ impl Relay {
                                 Ok(auth) => auth,
                                 Err(rejection) => {
                                     tracing::info!(
-                                        connection_path = moq_session.connection_path(),
-                                        scope = context.scope(),
+                                        session_id = %session_id,
                                         code = rejection.code,
                                         reason = rejection.reason,
                                         "session authorization failed, closing"
@@ -687,7 +682,7 @@ impl Relay {
                             };
 
                             let (consumer, reject_publishes) = if can_publish {
-                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context, session_auth)), None)
+                                (subscriber.map(|subscriber| Consumer::new(subscriber, locals, coordinator, remotes.clone(), forward, context.clone(), session_auth)), None)
                             } else {
                                 (None, subscriber)
                             };
@@ -700,26 +695,26 @@ impl Relay {
                                 reject_subscribes,
                             };
 
-                            match session.run().await {
+                            match session.run_with_context(&context).await {
                                 Ok(()) => {
                                     // Session ended cleanly (uncommon - usually ends via close)
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }
                                 Err(err) if err.is_graceful_close() => {
                                     // Graceful close - peer sent APPLICATION_CLOSE with code 0
-                                    tracing::debug!("MoQ session closed gracefully");
+                                    tracing::debug!(session_id = %session_id, "MoQ session closed gracefully");
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }
-                                Err(err) => {
+                                Err(_err) => {
                                     // Actual error - protocol violation, timeout, etc.
-                                    tracing::warn!(error = %err, "MoQ session error: {}", err);
+                                    tracing::warn!(session_id = %session_id, "MoQ session error");
                                     metrics::counter!("moq_relay_connection_errors_total", "stage" => "session_run").increment(1);
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);
                                 }
                             }
 
                             Ok(())
-                        }.boxed());
+                        }.instrument(accept_span).boxed());
                     },
                     res = tasks.next(), if !tasks.is_empty() => res.unwrap()?,
                 }

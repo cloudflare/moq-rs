@@ -312,7 +312,6 @@ fn convert_scope(
     if let Some(secs) = auth.ttl_secs {
         if secs > WARN_TTL_SECS {
             tracing::warn!(
-                scope = label,
                 ttl_secs = secs,
                 "ttl_secs is above {WARN_TTL_SECS}; a removed key keeps admitting new sessions \
                  for up to this long"
@@ -324,7 +323,6 @@ fn convert_scope(
     for (field, values) in [("issuers", &auth.issuers), ("audiences", &auth.audiences)] {
         if values.is_empty() {
             tracing::warn!(
-                scope = label,
                 "auth.{field} is empty, so tokens with any {} are accepted",
                 if field == "issuers" { "iss" } else { "aud" }
             );

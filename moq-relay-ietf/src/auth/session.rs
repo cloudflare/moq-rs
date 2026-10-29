@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use super::{AuthHook, AuthRequest, AuthzOperation, DenyReason, Principal, UNSCOPED};
+use super::{AuthHook, AuthRequest, AuthzOperation, DenyReason, Principal};
 use crate::SessionContext;
 
 /// The authorization state of one established session.
@@ -34,7 +34,7 @@ impl SessionAuth {
         Self { hook, principal }
     }
 
-    /// The authenticated subject, for logging.
+    #[cfg(all(test, feature = "auth-cat"))]
     pub(crate) fn subject(&self) -> Option<&str> {
         self.principal.subject()
     }
@@ -62,14 +62,8 @@ impl SessionAuth {
 
         let decision = match self.hook.on_request(&request).await {
             Ok(decision) => decision,
-            Err(err) => {
-                tracing::error!(
-                    scope = session.scope().unwrap_or(UNSCOPED),
-                    subject = self.subject(),
-                    operation = label,
-                    error = %err,
-                    "authorization hook failed; denying"
-                );
+            Err(_err) => {
+                tracing::error!(operation = label, "authorization hook failed; denying");
                 metrics::counter!(
                     "moq_relay_auth_errors_total",
                     "stage" => "request"
@@ -84,13 +78,7 @@ impl SessionAuth {
         match decision.into_principal() {
             Ok(_) => Ok(()),
             Err(reason) => {
-                tracing::debug!(
-                    scope = session.scope().unwrap_or(UNSCOPED),
-                    subject = self.subject(),
-                    operation = label,
-                    reason = %reason,
-                    "request denied"
-                );
+                tracing::debug!(operation = label, reason = reason.label(), "request denied");
                 metrics::counter!(
                     "moq_relay_auth_denied_total",
                     "phase" => "request",

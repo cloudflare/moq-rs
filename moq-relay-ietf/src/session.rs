@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_transport::session::{Publisher, SessionError, Subscriber};
+use tracing::Instrument;
 
 use crate::{Consumer, CoordinatorContext, Producer, RelayInfo};
 
@@ -301,6 +302,32 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
+    /// Root context for one relay session. Neither routing scope nor peer
+    /// identity is recorded: either can contain credentials.
+    /// Enable `moq_relay_ietf::session` alongside target-specific event filters.
+    pub fn span(&self, session_id: &moq_transport::session::SessionId) -> tracing::Span {
+        macro_rules! span {
+            ($level:ident) => {
+                tracing::span!(target: "moq_relay_ietf::session", parent: None,
+                    tracing::Level::$level, "moq_relay_session", session_id = %session_id,
+                    interface = ?self.interface, scope_present = self.scope.is_some())
+            };
+        }
+        if tracing::enabled!(target: "moq_relay_ietf::session", tracing::Level::TRACE) {
+            span!(TRACE)
+        } else if tracing::enabled!(target: "moq_relay_ietf::session", tracing::Level::DEBUG) {
+            span!(DEBUG)
+        } else if tracing::enabled!(target: "moq_relay_ietf::session", tracing::Level::INFO) {
+            span!(INFO)
+        } else if tracing::enabled!(target: "moq_relay_ietf::session", tracing::Level::WARN) {
+            span!(WARN)
+        } else if tracing::enabled!(target: "moq_relay_ietf::session", tracing::Level::ERROR) {
+            span!(ERROR)
+        } else {
+            tracing::Span::none()
+        }
+    }
+
     /// Build a public, client-facing context for the given scope.
     pub fn public(scope: Option<String>) -> Self {
         Self {
@@ -394,6 +421,22 @@ pub struct Session {
 impl Session {
     /// Run the session, producer, and consumer as necessary.
     pub async fn run(self) -> Result<(), SessionError> {
+        let span = self.session.session_id().span();
+        self.run_inner().instrument(span).await
+    }
+
+    /// Run all session-owned relay tasks inside their own correlation root.
+    pub async fn run_with_context(self, context: &SessionContext) -> Result<(), SessionError> {
+        let span = context.span(self.session.session_id());
+        self.run_inner().instrument(span).await
+    }
+
+    async fn run_inner(self) -> Result<(), SessionError> {
+        tracing::info!(
+            publish_permitted = self.consumer.is_some(),
+            subscribe_permitted = self.producer.is_some(),
+            "session established"
+        );
         let mut tasks = FuturesUnordered::new();
         tasks.push(self.session.run().boxed());
 
@@ -496,6 +539,82 @@ impl Session {
 mod tests {
     use super::*;
     use url::Url;
+
+    #[derive(Clone)]
+    struct LogOutput(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture(filter: &str, f: impl FnOnce()) -> String {
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = LogOutput(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .with_writer(move || output.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let out = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        out
+    }
+
+    #[test]
+    fn relay_roots_preserve_only_safe_context_under_restrictive_filters() {
+        let context = SessionContext::internal(
+            Some("/scope-secret/eyJsecret.payload.signature".to_string()),
+            Some(RelayInfo::new(
+                Url::parse("https://peer-identity.test/path-secret?query-secret").unwrap(),
+            )),
+        );
+        let id = moq_transport::session::SessionId::new("safe-session-identity");
+        for filter in [
+            "info",
+            "warn",
+            "error",
+            "off,moq_relay_ietf::session=warn,moq_relay_ietf::consumer=warn",
+        ] {
+            let out = capture(filter, || {
+                let span = context.span(&id);
+                let _guard = span.enter();
+                tracing::error!(target: "moq_relay_ietf::consumer", "session-owned event");
+            });
+            assert!(out.contains("session_id=safe-session-identity"), "{out}");
+            assert!(out.contains("scope_present=true"), "{out}");
+            for secret in [
+                "scope-secret",
+                "eyJsecret",
+                "peer-identity",
+                "path-secret",
+                "query-secret",
+            ] {
+                assert!(!out.contains(secret), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_relay_root_is_independent_of_its_requesting_downstream() {
+        let out = capture("warn", || {
+            let downstream = SessionContext::public(None)
+                .span(&moq_transport::session::SessionId::new("downstream-id"));
+            let _downstream = downstream.enter();
+            let upstream = SessionContext::internal(None, None)
+                .span(&moq_transport::session::SessionId::new("upstream-id"));
+            let _upstream = upstream.enter();
+            tracing::warn!("upstream event");
+        });
+        assert!(out.contains("upstream-id"));
+        assert!(!out.contains("downstream-id"), "{out}");
+    }
 
     #[test]
     fn connection_tags_default_interface_is_public() {
