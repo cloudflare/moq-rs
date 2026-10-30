@@ -72,6 +72,7 @@ pub mod message;
 pub mod mlog;
 pub mod reexports {
     pub use bytes;
+    pub use tracing;
     pub use url;
     pub use uuid;
     pub use web_transport_trait;

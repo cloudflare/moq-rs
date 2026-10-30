@@ -103,6 +103,7 @@ impl SubscribeNamespaceState {
 /// request streams and are surfaced via [`Subscriber::publish_received`].
 #[must_use = "cancels SUBSCRIBE_NAMESPACE on drop"]
 pub struct SubscribeNamespace {
+    session_id: super::SessionId,
     state: State<SubscribeNamespaceState>,
     // Keep the request half after FIN so a cancellation timeout can still reset it (§6.1).
     writer: Option<Writer>,
@@ -119,6 +120,7 @@ impl SubscribeNamespace {
         writer: Writer,
     ) -> (Self, SubscribeNamespaceRecv) {
         let (send_state, recv_state) = State::default().split();
+        let session_id = subscriber.session_id().clone();
         let (force_reset, recv_force_reset) = oneshot::channel();
         let recv = SubscribeNamespaceRecv {
             state: recv_state,
@@ -131,6 +133,7 @@ impl SubscribeNamespace {
             force_reset: Some(recv_force_reset),
         };
         let send = Self {
+            session_id,
             state: send_state,
             writer: Some(writer),
             request_finished: false,
@@ -139,6 +142,11 @@ impl SubscribeNamespace {
         };
 
         (send, recv)
+    }
+
+    /// The upstream session that owns this namespace subscription.
+    pub fn session_id(&self) -> &super::SessionId {
+        &self.session_id
     }
 
     pub async fn ok(&self) -> Result<(), ServeError> {
@@ -473,6 +481,7 @@ mod tests {
 
         (
             SubscribeNamespace {
+                session_id: super::super::SessionId::generate(),
                 state: send_state,
                 writer: None,
                 request_finished: false,

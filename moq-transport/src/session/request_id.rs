@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use crate::session::SessionError;
+use crate::session::{SessionError, SessionId};
 
 /// Maximum number of distinct request IDs tracked per session (~512 KB).
 const MAX_REQUEST_IDS_PER_SESSION: usize = 65536;
@@ -26,6 +26,7 @@ pub struct RequestId {
 
 #[derive(Debug)]
 struct RequestIdInner {
+    session_id: SessionId,
     send: Mutex<SendState>,
     recv: Mutex<RecvState>,
 }
@@ -52,8 +53,14 @@ impl RequestId {
     /// `local_first_id` is 0 for clients and 1 for servers.
     /// `peer_first_id` is 0 if the peer is client, 1 if the peer is server.
     pub fn new(local_first_id: u64, peer_first_id: u64) -> Self {
+        Self::with_session_id(local_first_id, peer_first_id, SessionId::generate())
+    }
+
+    /// Create a manager using the session's correlation identity.
+    pub fn with_session_id(local_first_id: u64, peer_first_id: u64, session_id: SessionId) -> Self {
         Self {
             inner: Arc::new(RequestIdInner {
+                session_id,
                 send: Mutex::new(SendState {
                     next: local_first_id,
                 }),
@@ -63,6 +70,11 @@ impl RequestId {
                 }),
             }),
         }
+    }
+
+    /// The stable correlation identity shared by both session roles.
+    pub fn session_id(&self) -> &SessionId {
+        &self.inner.session_id
     }
 
     /// Allocate the next outbound request ID.

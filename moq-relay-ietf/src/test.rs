@@ -7,6 +7,38 @@ use std::sync::Arc;
 use moq_native_ietf::quic;
 use url::Url;
 
+/// Capture events on each poll, including after an async task yields.
+pub(crate) async fn capture_logs<T>(future: impl std::future::Future<Output = T>) -> (T, String) {
+    use std::io::Write;
+    use std::sync::Mutex;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct Output(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let output = Output(bytes.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || output.clone())
+        .finish();
+    let result = future.with_subscriber(subscriber).await;
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    (result, text)
+}
+
 pub(crate) struct TestEndpoint {
     pub client: quic::Client,
     pub server: quic::Server,

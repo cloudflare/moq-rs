@@ -222,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
     let coordinator: Arc<dyn Coordinator> = if let Some(api_url) = &cli.api_url {
         let config = ApiCoordinatorConfig::new(api_url.clone(), relay_url).with_ttl(cli.api_ttl);
         let api_coordinator = ApiCoordinator::new(config).with_scope_config(scope_config);
-        tracing::info!("using API coordinator: {}", api_url);
+        tracing::info!("using API coordinator");
         Arc::new(api_coordinator)
     } else {
         tracing::info!("using file coordinator: {}", cli.coordinator_file.display());

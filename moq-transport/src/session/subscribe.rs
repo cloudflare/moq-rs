@@ -233,6 +233,11 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
+    /// The identity of the upstream session that owns this subscription.
+    pub fn session_id(&self) -> &super::SessionId {
+        self.subscriber.session_id()
+    }
+
     fn build_info(
         request_id: u64,
         track: &TrackWriter,
@@ -606,7 +611,7 @@ impl SubscribeRecv {
         self.drain.mark_finished();
         if let Some(writer) = self.writer.take() {
             if let Err(err) = writer.close(err.clone()) {
-                tracing::debug!(error = %err, "failed to close subscribe writer");
+                tracing::debug!(error = %super::LogSafe(err.to_string().as_bytes()), "failed to close subscribe writer");
             }
         }
 

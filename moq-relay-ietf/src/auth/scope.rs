@@ -3,11 +3,12 @@
 
 //! Resolves a scope's authorization policy into a hook, and caches it.
 
+use moq_transport::session::LogSafe;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use super::{AuthError, AuthHook, DenyAllAuthHook, UNSCOPED};
+use super::{AuthError, AuthHook, DenyAllAuthHook};
 use crate::{Coordinator, ScopeAuthConfig};
 
 /// Retry interval for an unusable configuration, or for a failed refresh that
@@ -133,8 +134,8 @@ impl ScopeAuthorizer {
                             "scope authorization policy is too old",
                         )));
                         tracing::error!(
-                            scope = scope.unwrap_or(UNSCOPED),
-                            error = %err,
+                            scope_present = scope.is_some(),
+                            error = %LogSafe(err.to_string().as_bytes()),
                             "could not refresh the scope's authorization policy; reuse cap reached, \
                              refusing new sessions in this scope"
                         );
@@ -146,8 +147,8 @@ impl ScopeAuthorizer {
                             _ => retry_at,
                         };
                         tracing::warn!(
-                            scope = scope.unwrap_or(UNSCOPED),
-                            error = %err,
+                            scope_present = scope.is_some(),
+                            error = %LogSafe(err.to_string().as_bytes()),
                             "could not refresh the scope's authorization policy; retaining the cached state"
                         );
                     }
@@ -170,7 +171,7 @@ impl ScopeAuthorizer {
                 // `get_scope_config`, so it should be visible in logs rather
                 // than inferred from the absence of anything.
                 tracing::info!(
-                    scope = scope.unwrap_or(UNSCOPED),
+                    scope_present = scope.is_some(),
                     "scope has no token authorization policy; admitting sessions on \
                      scope permissions alone"
                 );
@@ -183,8 +184,8 @@ impl ScopeAuthorizer {
                     // must refuse every session, not run unauthenticated.
                     Err(err) => {
                         tracing::error!(
-                            scope = scope.unwrap_or(UNSCOPED),
-                            error = %err,
+                            scope_present = scope.is_some(),
+                            error = %LogSafe(err.to_string().as_bytes()),
                             "scope requires token authorization but its configuration is unusable; \
                              refusing all sessions in this scope"
                         );

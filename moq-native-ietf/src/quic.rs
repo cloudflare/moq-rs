@@ -448,7 +448,7 @@ impl Server {
                     match res? {
                         Ok(result) => return Some(result),
                         Err(err) => {
-                            tracing::warn!("failed to accept QUIC connection: {}", err.root_cause());
+                            tracing::warn!(error = %moq_transport::session::LogSafe(err.root_cause().to_string().as_bytes()), "failed to accept QUIC connection");
                             continue;
                         }
                     }
@@ -511,11 +511,9 @@ impl Server {
         let server_name = handshake.server_name.unwrap_or_default();
 
         tracing::debug!(
-            "received QUIC handshake: cid={} ip={} alpn={} server={}",
-            connection_id_hex,
-            conn.remote_address(),
-            alpn,
-            server_name,
+            session_id = %connection_id_hex,
+            alpn = %moq_transport::session::LogSafe(alpn.as_bytes()),
+            "received QUIC handshake"
         );
 
         // Wait for the QUIC connection to be established.
@@ -532,13 +530,10 @@ impl Server {
         let local_ip = conn.local_ip();
 
         tracing::debug!(
-            "established QUIC connection: cid={} stable_id={} ip={} local_ip={:?} alpn={} server={}",
-            connection_id_hex,
-            conn.stable_id(),
-            remote_address,
-            local_ip,
-            alpn,
-            server_name,
+            session_id = %connection_id_hex,
+            stable_id = conn.stable_id(),
+            alpn = %moq_transport::session::LogSafe(alpn.as_bytes()),
+            "established QUIC connection"
         );
 
         let alpn_bytes = alpn.as_bytes();
@@ -589,8 +584,7 @@ impl Server {
                     // peer sees an abrupt close and the log names no cause.
                     tracing::warn!(
                         cid = %connection_id_hex,
-                        ip = %remote_address,
-                        offered = %offered,
+                        offered = %moq_transport::session::LogSafe(offered.as_bytes()),
                         supported = ?moq_transport::setup::SUPPORTED_ALPNS,
                         "rejecting WebTransport CONNECT: no mutually supported MoQT version in WT-Available-Protocols"
                     );
@@ -600,7 +594,7 @@ impl Server {
                         .reject(web_transport_quinn::http::StatusCode::NOT_ACCEPTABLE)
                         .await
                     {
-                        tracing::debug!(cid = %connection_id_hex, error = %err, "failed to reject WebTransport CONNECT");
+                        tracing::debug!(cid = %connection_id_hex, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed to reject WebTransport CONNECT");
                     }
 
                     // `reject` only queues the response, and both `close` and
@@ -622,7 +616,7 @@ impl Server {
 
                     anyhow::bail!(
                         "no mutually supported MoQT version in WT-Available-Protocols (offered: {}, supported: {:?})",
-                        offered,
+                        moq_transport::session::LogSafe(offered.as_bytes()),
                         moq_transport::setup::SUPPORTED_ALPNS,
                     );
                 }
@@ -651,7 +645,7 @@ impl Server {
         } else {
             anyhow::bail!(
                 "unsupported ALPN: {} (supported: {:?} or {})",
-                alpn,
+                moq_transport::session::LogSafe(alpn.as_bytes()),
                 moq_transport::setup::SUPPORTED_ALPNS,
                 web_transport_quinn::ALPN,
             )
@@ -808,8 +802,6 @@ impl Client {
         port: u16,
         address_family: AddressFamily,
     ) -> anyhow::Result<net::SocketAddr> {
-        let local_addr = self.local_addr()?;
-
         // Collect all DNS results
         let addrs: Vec<net::SocketAddr> = match Self::parse_socket_addr(host, port) {
             Ok(addr) => {
@@ -822,24 +814,14 @@ impl Client {
         };
 
         if addrs.is_empty() {
-            anyhow::bail!("DNS lookup for host '{}' returned no addresses", host);
+            anyhow::bail!("DNS lookup returned no addresses");
         }
 
-        // Log all DNS results for debugging
         tracing::debug!(
-            "DNS lookup for {}, family {:?}: found {} results",
-            host,
-            address_family,
-            addrs.len()
+            ?address_family,
+            results = addrs.len(),
+            "DNS lookup completed"
         );
-        for (i, addr) in addrs.iter().enumerate() {
-            tracing::debug!(
-                "  DNS[{}]: {} ({})",
-                i,
-                addr,
-                if addr.is_ipv4() { "IPv4" } else { "IPv6" }
-            );
-        }
 
         // Filter DNS results to match our local socket's address family
         let compatible_addr = match address_family {
@@ -849,14 +831,11 @@ impl Client {
                     .iter()
                     .find(|a| a.is_ipv4())
                     .cloned()
-                    .context(format!(
-                        "No IPv4 address found for host '{}' (local socket is IPv4: {})",
-                        host, local_addr
-                    ))?
+                    .context("No IPv4 address found for an IPv4 socket")?
             }
             AddressFamily::Ipv6DualStack => {
                 // Dual-stack socket: any address family works, use first result
-                tracing::debug!("Using first DNS result (IPv6 dual-stack): {}", addrs[0]);
+                tracing::debug!("Using first DNS result (IPv6 dual-stack)");
                 addrs[0]
             }
             AddressFamily::Ipv6 => {
@@ -865,19 +844,11 @@ impl Client {
                     .iter()
                     .find(|a| a.is_ipv6())
                     .cloned()
-                    .context(format!(
-                        "No IPv6 address found for host '{}' (local socket is IPv6: {})",
-                        host, local_addr
-                    ))?
+                    .context("No IPv6 address found for an IPv6 socket")?
             }
         };
 
-        tracing::debug!(
-            "Connecting from {} to {} (selected from {} DNS results)",
-            local_addr,
-            compatible_addr,
-            addrs.len()
-        );
+        tracing::debug!(results = addrs.len(), "selected compatible DNS result");
 
         Ok(compatible_addr)
     }

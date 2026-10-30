@@ -3,9 +3,10 @@
 
 //! Per-session authorization state, carried by the producer and consumer.
 
+use moq_transport::session::LogSafe;
 use std::sync::Arc;
 
-use super::{AuthHook, AuthRequest, AuthzOperation, DenyReason, Principal, UNSCOPED};
+use super::{AuthHook, AuthRequest, AuthzOperation, DenyReason, Principal};
 use crate::SessionContext;
 
 /// The authorization state of one established session.
@@ -34,7 +35,6 @@ impl SessionAuth {
         Self { hook, principal }
     }
 
-    /// The authenticated subject, for logging.
     pub(crate) fn subject(&self) -> Option<&str> {
         self.principal.subject()
     }
@@ -64,10 +64,12 @@ impl SessionAuth {
             Ok(decision) => decision,
             Err(err) => {
                 tracing::error!(
-                    scope = session.scope().unwrap_or(UNSCOPED),
-                    subject = self.subject(),
+                    subject = %LogSafe(self.subject().unwrap_or("<unknown>").as_bytes()),
+                    scope = %LogSafe(session.scope().unwrap_or("<unscoped>").as_bytes()),
                     operation = label,
-                    error = %err,
+                    outcome = "denied",
+                    reason = "hook_fault",
+                    error = %LogSafe(err.to_string().as_bytes()),
                     "authorization hook failed; denying"
                 );
                 metrics::counter!(
@@ -85,10 +87,11 @@ impl SessionAuth {
             Ok(_) => Ok(()),
             Err(reason) => {
                 tracing::debug!(
-                    scope = session.scope().unwrap_or(UNSCOPED),
-                    subject = self.subject(),
+                    subject = %LogSafe(self.subject().unwrap_or("<unknown>").as_bytes()),
+                    scope = %LogSafe(session.scope().unwrap_or("<unscoped>").as_bytes()),
                     operation = label,
-                    reason = %reason,
+                    outcome = "denied",
+                    reason = reason.label(),
                     "request denied"
                 );
                 metrics::counter!(
@@ -148,6 +151,100 @@ mod tests {
 
     fn session() -> SessionContext {
         SessionContext::public(Some("scope".to_string()))
+    }
+
+    #[tokio::test]
+    async fn denial_audit_records_actor_and_scope_without_credentials() {
+        for (subject, scope, logged_subject, logged_scope) in [
+            ("audit-user", "scope-a", "audit-user", "scope-a"),
+            (
+                "audit-user",
+                "/eyJheader.payload.signature?token=secret",
+                "audit-user",
+                "[redacted]",
+            ),
+            (
+                "audit-user",
+                "/tenant/eyJheader.payload.signature",
+                "audit-user",
+                "[redacted]",
+            ),
+            (
+                "eyJheader.payload.signature",
+                "scope-a",
+                "[redacted]",
+                "scope-a",
+            ),
+        ] {
+            let auth = SessionAuth::new(
+                Arc::new(DenyAllAuthHook::new("nope")),
+                Principal::new(Some(subject.to_string()), ()),
+            );
+            let context = SessionContext::public(Some(scope.to_string()));
+            let namespace = TrackNamespace::from_utf8_path("sports");
+            let (result, output) = crate::test::capture_logs(auth.authorize(
+                &context,
+                AuthzOperation::PublishNamespace {
+                    namespace: &namespace,
+                },
+                Some(7),
+            ))
+            .await;
+            assert!(result.is_err());
+            let denial = output
+                .lines()
+                .find(|line| line.contains("request denied"))
+                .unwrap();
+            assert!(
+                denial.contains(&format!("subject=\"{logged_subject}\"")),
+                "{output}"
+            );
+            assert!(
+                denial.contains(&format!("scope=\"{logged_scope}\"")),
+                "{output}"
+            );
+            assert!(
+                denial.contains("operation=\"publish_namespace\""),
+                "{output}"
+            );
+            assert!(
+                denial.contains("outcome=\"denied\"") && denial.contains("reason="),
+                "{output}"
+            );
+            assert!(
+                !output.contains("eyJheader") && !output.contains("secret"),
+                "{output}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_fault_audit_quotes_hostile_actor_and_redacts_scope() {
+        let auth = SessionAuth::new(
+            Arc::new(FaultyHook),
+            Principal::new(Some("audit-user\r\nforged\0\x1b".to_string()), ()),
+        );
+        let context = SessionContext::public(Some("/tenant?token=secret".to_string()));
+        let namespace = TrackNamespace::from_utf8_path("sports");
+        let (result, output) = crate::test::capture_logs(auth.authorize(
+            &context,
+            AuthzOperation::PublishNamespace {
+                namespace: &namespace,
+            },
+            Some(7),
+        ))
+        .await;
+        assert!(matches!(result, Err(DenyReason::HookFault { .. })));
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert!(
+            output.contains(r#"subject="audit-user\r\nforged\0\u{1b}""#),
+            "{output}"
+        );
+        assert!(
+            output.contains("scope=\"[redacted]\"") && output.contains("boom"),
+            "{output}"
+        );
+        assert!(!output.contains("secret"), "{output}");
     }
 
     #[tokio::test]

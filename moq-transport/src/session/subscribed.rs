@@ -475,31 +475,37 @@ impl Subscribed {
         deadline: tokio::time::Instant,
         largest_location: Option<Location>,
     ) -> Result<(), ServeWithDeadlineError> {
-        let result = self
-            .serve_inner(track, Some(deadline), largest_location)
-            .await;
-        let deadline_expired =
-            !self.ok && matches!(result, Err(SessionError::Serve(ServeError::Timeout)));
+        use tracing::Instrument;
+        let span = self.forwarder.publisher.session_id().span();
+        async move {
+            let result = self
+                .serve_inner(track, Some(deadline), largest_location)
+                .await;
+            let deadline_expired =
+                !self.ok && matches!(result, Err(SessionError::Serve(ServeError::Timeout)));
 
-        if deadline_expired {
-            // Simultaneous request cancellation may have closed the shared state first,
-            // but the relay still needs the deadline result for its response and metric.
+            if deadline_expired {
+                // Simultaneous request cancellation may have closed the shared state first,
+                // but the relay still needs the deadline result for its response and metric.
+                if let Err(err) = &result {
+                    let _ = self.forwarder.close(err.clone().into(), 0);
+                }
+                return Err(ServeWithDeadlineError::DeadlineExpired);
+            }
+
             if let Err(err) = &result {
+                // The forwarding error remains authoritative if a concurrent
+                // request cancellation already closed the shared state.
                 let _ = self.forwarder.close(err.clone().into(), 0);
             }
-            return Err(ServeWithDeadlineError::DeadlineExpired);
+            let terminal = self.finish().await;
+            match result {
+                Ok(()) => terminal.map_err(ServeWithDeadlineError::Session),
+                Err(err) => Err(ServeWithDeadlineError::Session(err)),
+            }
         }
-
-        if let Err(err) = &result {
-            // The forwarding error remains authoritative if a concurrent
-            // request cancellation already closed the shared state.
-            let _ = self.forwarder.close(err.clone().into(), 0);
-        }
-        let terminal = self.finish().await;
-        match result {
-            Ok(()) => terminal.map_err(ServeWithDeadlineError::Session),
-            Err(err) => Err(ServeWithDeadlineError::Session(err)),
-        }
+        .instrument(span)
+        .await
     }
 
     async fn serve_before(
@@ -508,14 +514,20 @@ impl Subscribed {
         deadline: Option<tokio::time::Instant>,
         largest_location: Option<Location>,
     ) -> Result<(), SessionError> {
-        let res = self.serve_inner(track, deadline, largest_location).await;
-        if let Err(err) = &res {
-            // The forwarding error remains authoritative if a concurrent
-            // request cancellation already closed the shared state.
-            let _ = self.forwarder.close(err.clone().into(), 0);
+        use tracing::Instrument;
+        let span = self.forwarder.publisher.session_id().span();
+        async move {
+            let res = self.serve_inner(track, deadline, largest_location).await;
+            if let Err(err) = &res {
+                // The forwarding error remains authoritative if a concurrent
+                // request cancellation already closed the shared state.
+                let _ = self.forwarder.close(err.clone().into(), 0);
+            }
+            let terminal = self.finish().await;
+            res.and(terminal)
         }
-        let terminal = self.finish().await;
-        res.and(terminal)
+        .instrument(span)
+        .await
     }
 
     async fn serve_inner(
@@ -739,9 +751,9 @@ impl ObjectForwarder {
                             let res = Self::serve_subgroup(track_alias, subgroup, publisher, state, stream_count, mlog, delivery_filter).await;
                             if let Err(err) = &res {
                                 if Subscribed::is_expected_serve_shutdown(err) {
-                                    tracing::debug!(subgroup_info = ?info, error = %err, "stopped serving subgroup");
+                                    tracing::debug!(subgroup_info = ?info, error = %super::LogSafe(err.to_string().as_bytes()), "stopped serving subgroup");
                                 } else {
-                                    tracing::warn!(subgroup_info = ?info, error = %err, "failed to serve subgroup");
+                                    tracing::warn!(subgroup_info = ?info, error = %super::LogSafe(err.to_string().as_bytes()), "failed to serve subgroup");
                                 }
                             }
                             res
@@ -839,7 +851,10 @@ impl ObjectForwarder {
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         send_stream.set_priority(i32::from(subgroup_reader.priority));
 
-        let mut output = SubgroupOutput::stream(Writer::new(send_stream));
+        let mut output = SubgroupOutput::stream(Writer::with_session_id(
+            send_stream,
+            publisher.session_id().clone(),
+        ));
         stream_count.opened();
         let state_status = state.lock().closed.clone();
         let res = if let Err(err) = state_status {

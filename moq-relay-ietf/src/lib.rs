@@ -64,4 +64,6 @@ pub use producer::*;
 pub use relay::*;
 pub use remote::RemoteManager;
 pub use session::*;
+// SessionContext::span exposes tracing::Span in the public API.
+pub use tracing;
 pub use web::*;

@@ -44,6 +44,7 @@ web-transport-quinn = "0.11.8"
 web-transport = "0.10.4"
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 # Loopback web_transport::Session for session-cleanup unit tests.
 rcgen = "0.13"

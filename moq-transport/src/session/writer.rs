@@ -7,23 +7,42 @@ use std::{io, ops};
 use crate::coding::{Encode, EncodeError};
 
 use super::transport as web_transport;
-use super::SessionError;
+use super::{SessionError, SessionId};
 use bytes::Buf;
+use tracing::Instrument;
 
 pub struct Writer {
+    session_id: SessionId,
+    span: tracing::Span,
     stream: web_transport::SendStream,
     buffer: bytes::BytesMut,
 }
 
 impl Writer {
+    #[cfg(test)]
     pub fn new(stream: web_transport::SendStream) -> Self {
+        Self::with_session_id(stream, SessionId::generate())
+    }
+
+    pub fn with_session_id(stream: web_transport::SendStream, session_id: SessionId) -> Self {
         Self {
+            span: session_id.span(),
+            session_id,
             stream,
             buffer: Default::default(),
         }
     }
 
     pub async fn encode<T: Encode>(&mut self, msg: &T) -> Result<(), SessionError> {
+        let span = self.span.clone();
+        self.encode_inner(msg).instrument(span).await
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    async fn encode_inner<T: Encode>(&mut self, msg: &T) -> Result<(), SessionError> {
         self.buffer.clear();
         tracing::trace!(
             "[WRITER] encode: encoding {} to buffer",
@@ -61,6 +80,11 @@ impl Writer {
     }
 
     pub async fn write(&mut self, buf: &[u8]) -> Result<(), SessionError> {
+        let span = self.span.clone();
+        self.write_inner(buf).instrument(span).await
+    }
+
+    async fn write_inner(&mut self, buf: &[u8]) -> Result<(), SessionError> {
         tracing::trace!("[WRITER] write: writing {} bytes to stream", buf.len());
 
         let mut cursor = io::Cursor::new(buf);

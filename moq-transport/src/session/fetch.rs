@@ -154,6 +154,17 @@ impl Fetch {
             return Ok(None);
         }
         self.ensure_reader().await?;
+        use tracing::Instrument;
+        let span = self
+            .reader
+            .as_ref()
+            .ok_or(SessionError::Internal)?
+            .session_id()
+            .span();
+        self.next_record().instrument(span).await
+    }
+
+    async fn next_record(&mut self) -> Result<Option<FetchRecord>, SessionError> {
         let reader = self.reader.as_mut().ok_or(SessionError::Internal)?;
         let record = match reader.decode_fetch(&mut self.decoder).await {
             Ok(Some(record)) => record,
