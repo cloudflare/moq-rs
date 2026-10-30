@@ -2398,7 +2398,8 @@ mod tests {
             end_group_id: None,
         };
 
-        let receive = async move {
+        // Borrow the session so it stays live until the sender sees FIN's ACK.
+        let receive = async {
             let stream = peer_session.accept_uni().await.unwrap();
             let mut reader = Reader::new(stream);
             let stream_header: data::StreamHeader = reader.decode().await.unwrap();
@@ -2443,8 +2444,6 @@ mod tests {
             [(None, true), (Some(Location::new(0, 5)), false)]
         {
             let (publisher_session, peer_session) = loopback_session_pair().await;
-            // Keep the connection alive until the sender observes the FIN ACK.
-            let _peer_keepalive = peer_session.clone();
             let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
             let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
             let publisher = Publisher::new(
@@ -2482,7 +2481,8 @@ mod tests {
                 start_location,
                 end_group_id: None,
             };
-            let receive = async move {
+            // Borrow the session through the sender's FIN-ACK wait.
+            let receive = async {
                 let stream = peer_session.accept_uni().await.unwrap();
                 let mut reader = Reader::new(stream);
                 let stream_header: data::StreamHeader = reader.decode().await.unwrap();
