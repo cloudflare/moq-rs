@@ -1087,11 +1087,13 @@ mod tests {
         }
     }
 
+    type PerOpDecision = dyn Fn(&str) -> Result<AuthDecision, AuthError> + Send + Sync;
+
     /// A hook that makes decisions per operation label, allowing precise control
     /// over which operations are allowed and which are denied.
     struct PerOpHook {
         seen: Mutex<Vec<String>>,
-        decide: Box<dyn Fn(&str) -> Result<AuthDecision, AuthError> + Send + Sync>,
+        decide: Box<PerOpDecision>,
     }
 
     impl PerOpHook {
