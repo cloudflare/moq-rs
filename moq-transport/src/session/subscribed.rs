@@ -24,6 +24,13 @@ use super::{DeliveryError, DeliveryFilter, Publisher, SessionError, SubscribeInf
 // This file defines Publisher handling of inbound Subscriptions
 
 const MAX_CONCURRENT_SUBGROUPS: usize = 128;
+// FIN waiters use a separate budget so a short subgroup releases its writing
+// slot without waiting an RTT. Allow eight active-set-sized bursts in flight.
+const MAX_PENDING_SUBGROUP_ACKS: usize = 1024;
+
+#[cfg(test)]
+#[path = "subgroup_lifecycle.rs"]
+mod subgroup_lifecycle;
 
 struct ObjectForwarderState {
     track: Option<serve::TrackReader>,
@@ -259,7 +266,7 @@ impl ObjectForwarder {
     }
 }
 
-/// A subgroup data stream that is reset unless it is explicitly finished.
+/// A subgroup data stream that is reset unless its FIN is acknowledged.
 ///
 /// Draft-18 Section 11.4.3 allows FIN only after all subgroup objects required
 /// by the subscription have been delivered. Dropping a QUIC send stream
@@ -281,8 +288,19 @@ impl SubgroupStream {
         if self.terminated {
             return Ok(());
         }
-        self.terminated = true;
         self.writer.finish()
+    }
+
+    async fn acknowledged(&mut self) -> Result<(), SessionError> {
+        // finish() only queues FIN. Quinn still owns buffered data until ACK,
+        // and STOP_SENDING alone does not discard that data. Keep the handle
+        // alive so a stop can reset it, or subscription cancellation can drop
+        // this guard and reset even an already-finished stream.
+        if let Some(code) = self.writer.closed().await? {
+            self.writer.reset(u32::from(code));
+        }
+        self.terminated = true;
+        Ok(())
     }
 
     fn reset(&mut self, code: DataStreamResetCode) {
@@ -400,6 +418,14 @@ impl SubgroupOutput {
             SubgroupSink::Buffer { termination, .. } => {
                 termination.get_or_insert(SubgroupTermination::Reset(code));
             }
+        }
+    }
+
+    async fn acknowledged(&mut self) -> Result<(), SessionError> {
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.acknowledged().await,
+            #[cfg(test)]
+            SubgroupSink::Buffer { .. } => Ok(()),
         }
     }
 
@@ -720,6 +746,7 @@ impl ObjectForwarder {
     ) -> Result<(), SessionError> {
         let lag_watcher = subgroups.lag_watcher();
         let mut tasks = FuturesUnordered::new();
+        let mut acknowledgements = FuturesUnordered::new();
         let mut done: Option<Result<(), ServeError>> = None;
         // A subgroup that could not be sent means the peer did not receive
         // Objects this subscription promised. Reporting `Ok` there would let
@@ -733,10 +760,23 @@ impl ObjectForwarder {
 
         loop {
             tokio::select! {
+                biased;
+                res = self.closed(), if done.is_none() || !tasks.is_empty() || !acknowledgements.is_empty() => {
+                    // Both sets own reset guards, including streams with FIN queued.
+                    return res.map_err(SessionError::from);
+                },
                 _ = lag_watcher.lagged(), if done.is_none() => {
                     return Err(ServeError::Internal(
                         "subgroup reader exceeded its pending stream limit".into(),
                     ).into());
+                },
+                // Reap ready waiters before checking the ACK budget on handoff.
+                res = acknowledgements.next(), if !acknowledgements.is_empty() => {
+                    if let Some(Err(err)) = res {
+                        if Subscribed::is_local_serve_failure(&err) && first_failure.is_none() {
+                            first_failure = Some(err);
+                        }
+                    }
                 },
                 res = subgroups.next(), if done.is_none() && tasks.len() < MAX_CONCURRENT_SUBGROUPS => match res {
                     Ok(Some(subgroup)) => {
@@ -762,23 +802,24 @@ impl ObjectForwarder {
                     Ok(None) => done = Some(Ok(())),
                     Err(err) => done = Some(Err(err)),
                 },
-                res = self.closed(), if done.is_none() || !tasks.is_empty() => {
-                    // Returning drops active subgroup futures. Their
-                    // SubgroupStream guards reset any stream that has not
-                    // reached FIN, including one blocked on a partial object.
-                    return res.map_err(SessionError::from);
-                },
                 res = tasks.next(), if !tasks.is_empty() => {
-                    // Remaining subgroups still get their chance to send; the
-                    // first local failure is reported once they settle.
-                    if let Some(Err(err)) = res {
+                    if let Some(Ok(Some(mut output))) = res {
+                        if acknowledgements.len() == MAX_PENDING_SUBGROUP_ACKS {
+                            // Do not silently forget a FIN handle: it would no
+                            // longer respond to STOP or subscription cancellation.
+                            // End this subscription instead. Dropping both sets
+                            // resets all retained streams with Cancelled, trading
+                            // continued delivery for a hard resource bound.
+                            return Err(ServeError::Closed(message::PublishDoneCode::TooFarBehind as u64).into());
+                        }
+                        acknowledgements.push(async move { output.acknowledged().await });
+                    } else if let Some(Err(err)) = res {
                         if Subscribed::is_local_serve_failure(&err) && first_failure.is_none() {
                             first_failure = Some(err);
                         }
                     }
                 },
-                // Reached once the subgroup source has ended and every active
-                // subgroup task has settled.
+                // Reached once the source, writing tasks and FIN waiters settle.
                 else => {
                     // The track's own outcome is the authoritative one; a
                     // per-subgroup fault is only reported when the track itself
@@ -802,7 +843,7 @@ impl ObjectForwarder {
         stream_count: StreamCount,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
-    ) -> Result<(), SessionError> {
+    ) -> Result<Option<SubgroupOutput>, SessionError> {
         tracing::trace!(
             "[PUBLISHER] serve_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
             subgroup_reader.group_id,
@@ -814,7 +855,7 @@ impl ObjectForwarder {
         let mut filtered_prefix = false;
         let first_object = loop {
             let Some(subgroup_object_reader) = subgroup_reader.next().await? else {
-                return Ok(());
+                return Ok(None);
             };
             if !delivery_filter.allows(subgroup_reader.group_id, subgroup_object_reader.object_id) {
                 tracing::trace!(
@@ -875,7 +916,12 @@ impl ObjectForwarder {
         // Draft-18 Section 11.4.3 requires a reset when forwarding stops before
         // all subgroup objects required by the subscription have been delivered.
         match res {
-            Ok(()) => output.finish(),
+            Ok(()) => {
+                output.finish()?;
+                // Transfer ownership to the separately bounded FIN-ACK set.
+                // The writing task releases its active slot immediately.
+                Ok(Some(output))
+            }
             Err(err) => {
                 output.reset(Self::reset_code_for(&err));
                 Err(err)
@@ -2400,7 +2446,8 @@ mod tests {
             end_group_id: None,
         };
 
-        let receive = async move {
+        // Borrow the session so it stays live until the sender sees FIN's ACK.
+        let receive = async {
             let stream = peer_session.accept_uni().await.unwrap();
             let mut reader = Reader::new(stream);
             let stream_header: data::StreamHeader = reader.decode().await.unwrap();
@@ -2435,7 +2482,7 @@ mod tests {
         );
 
         let (send_result, received_deltas) = tokio::join!(send, receive);
-        send_result.unwrap();
+        send_result.unwrap().unwrap().acknowledged().await.unwrap();
         assert_eq!(received_deltas, [5, 0, 2]);
     }
 
@@ -2482,7 +2529,8 @@ mod tests {
                 start_location,
                 end_group_id: None,
             };
-            let receive = async move {
+            // Borrow the session through the sender's FIN-ACK wait.
+            let receive = async {
                 let stream = peer_session.accept_uni().await.unwrap();
                 let mut reader = Reader::new(stream);
                 let stream_header: data::StreamHeader = reader.decode().await.unwrap();
@@ -2531,7 +2579,7 @@ mod tests {
             );
 
             let (send_result, ()) = tokio::join!(send, receive);
-            send_result.unwrap();
+            send_result.unwrap().unwrap().acknowledged().await.unwrap();
         }
     }
 
@@ -2612,7 +2660,8 @@ mod tests {
         close_result.unwrap();
         assert!(
             receive_result.is_ok(),
-            "receive failed: {receive_result:?}; send result: {send_result:?}"
+            "receive failed: {receive_result:?}; send error: {:?}",
+            send_result.as_ref().err()
         );
         assert!(send_result.is_err());
     }
