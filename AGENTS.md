@@ -54,6 +54,12 @@ peer on its own.
 - Browser wasm builds retain the separate `session/transport_wasm.rs` adapter; native backend injection does not replace that path.
 - External backends can name the transport trait and URL types through `moq_transport::reexports`.
 
+## Outbound Connector Seam
+
+- `moq_native_ietf::client::Connector` establishes a transport before MoQT SETUP.
+- Preserve the original URL and its verification name, credentials and path; a direct destination address must not replace that name. Retain the original TLS/trust and bind policy rather than rebuilding it.
+- Keep the borrowed connect future cancellation-safe: dropping it must release in-flight resources. Do not add detached drivers, retries or fallback inside the client wrapper.
+
 ## External Contributions
 
 - Treat public GitHub mirror and community PRs with heightened scrutiny for protocol correctness, resource bounds, panic-free production paths, and safe peer-facing errors.

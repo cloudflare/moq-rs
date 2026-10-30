@@ -17,7 +17,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use moq_api::{Client, Origin};
-use moq_native_ietf::quic;
 use moq_transport::coding::TrackNamespace;
 use url::Url;
 
@@ -294,7 +293,7 @@ impl Coordinator for ApiCoordinator {
         &self,
         scope: Option<&str>,
         namespace: &TrackNamespace,
-    ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+    ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::Client>)> {
         let namespace_str = Self::registry_key(scope, namespace);
         tracing::debug!(scope = scope.unwrap_or("<unscoped>"), namespace = %namespace_str, "looking up namespace in API: {}", namespace_str);
 
