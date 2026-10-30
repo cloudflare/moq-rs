@@ -2,5 +2,12 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod fetch;
 mod media;
+pub use fetch::*;
 pub use media::*;
+
+/// Dependencies used in this crate's public API.
+pub mod reexports {
+    pub use moq_transport;
+}
