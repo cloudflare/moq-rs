@@ -117,3 +117,48 @@ impl<T> Default for Queue<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::poll;
+
+    #[tokio::test]
+    async fn receipt_is_confirmed_only_when_its_item_is_popped() {
+        let (mut producer, mut consumer) = Queue::default().split();
+        producer.push("first").unwrap();
+        let receipt = producer.push_and_wait_until_popped("second");
+        tokio::pin!(receipt);
+        assert!(poll!(&mut receipt).is_pending());
+        assert_eq!(consumer.pop().await, Some("first"));
+        assert!(poll!(&mut receipt).is_pending());
+        assert_eq!(consumer.pop().await, Some("second"));
+        assert_eq!(receipt.await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn close_returns_pending_items_and_fails_their_receipts() {
+        let (mut producer, consumer) = Queue::default().split();
+        producer.push("first").unwrap();
+        let receipt = producer.push_and_wait_until_popped("second");
+        tokio::pin!(receipt);
+        assert!(poll!(&mut receipt).is_pending());
+        assert_eq!(consumer.close(), vec!["first", "second"]);
+        assert_eq!(receipt.await, Err(()));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_receipt_keeps_fifo_delivery_intact() {
+        let (mut producer, mut consumer) = Queue::default().split();
+        {
+            let receipt = producer.push_and_wait_until_popped("first");
+            tokio::pin!(receipt);
+            assert!(poll!(&mut receipt).is_pending());
+        }
+        producer.push("second").unwrap();
+        assert_eq!(consumer.pop().await, Some("first"));
+        assert_eq!(consumer.pop().await, Some("second"));
+        drop(producer);
+        assert_eq!(consumer.pop().await, None);
+    }
+}
