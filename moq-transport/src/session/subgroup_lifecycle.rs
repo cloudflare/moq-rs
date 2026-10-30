@@ -186,6 +186,21 @@ async fn source() -> (serve::SubgroupsWriter, serve::SubgroupsReader) {
     (writer, reader)
 }
 
+// Observe the reset through the backend-neutral receive API. Any payload already
+// delivered before cancellation may precede the terminal stream error.
+async fn expect_reset(stream: &mut web_transport::RecvStream, code: u32) {
+    loop {
+        match stream.read(65536).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected RESET_STREAM, received FIN"),
+            Err(err) => {
+                assert_eq!(err.stream_error(), Some(code));
+                return;
+            }
+        }
+    }
+}
+
 async fn cancelled_finished_stream(raw: bool, unsubscribe: bool) {
     let (sender, receiver, observer, _proxy) = pair(raw).await;
     let (mut forwarder, mut cancel) = forwarder(sender);
@@ -225,7 +240,7 @@ async fn cancelled_finished_stream(raw: bool, unsubscribe: bool) {
         // A locally stopped receive stream no longer exposes a reset code;
         // observe the actual incoming RESET_STREAM frame in that case.
         if unsubscribe {
-            assert_eq!(stream.closed().await.unwrap(), Some(code as u8));
+            expect_reset(&mut stream, code).await;
         }
         while observer.stats().frame_rx.reset_stream == before {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -293,10 +308,7 @@ async fn cancellation_is_scoped_and_ack_releases(raw: bool) {
     };
     let receive = async {
         cancel.recv_unsubscribe().unwrap();
-        assert_eq!(
-            stale.closed().await.unwrap(),
-            Some(u32::from(DataStreamResetCode::Cancelled) as u8)
-        );
+        expect_reset(&mut stale, u32::from(DataStreamResetCode::Cancelled)).await;
         let mut stream = receiver.accept_uni().await.unwrap();
         let mut bytes = 0;
         while let Some(chunk) = stream.read(65536).await.unwrap() {
