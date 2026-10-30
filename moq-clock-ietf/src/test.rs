@@ -45,7 +45,7 @@ impl Coordinator for LocalCoordinator {
         &self,
         _: Option<&str>,
         _: &TrackNamespace,
-    ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+    ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::Client>)> {
         Err(moq_relay_ietf::CoordinatorError::NamespaceNotFound)
     }
 }
