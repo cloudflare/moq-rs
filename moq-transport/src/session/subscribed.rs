@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
+#[cfg(test)]
+use super::transport as web_transport;
 use crate::coding::{Encode, EncodeError, KeyValuePairs, Location, ReasonPhrase};
 use crate::data::DataStreamResetCode;
 use crate::message::RequestErrorCode;
@@ -844,7 +846,10 @@ impl ObjectForwarder {
         tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
 
         // TODO figure out u32 vs u64 priority
-        send_stream.set_priority(subgroup_reader.priority as i32);
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        send_stream.set_priority(subgroup_reader.priority);
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        send_stream.set_priority(i32::from(subgroup_reader.priority));
 
         let mut output = SubgroupOutput::stream(Writer::with_session_id(
             send_stream,
@@ -2022,10 +2027,9 @@ mod tests {
         else {
             panic!("expected subgroup delivery");
         };
-        // Claim the forwarder's cursor before cloning the healthy reader. A
-        // clone claiming the template first makes the original an inactive
-        // template, which cannot be used to test lag isolation.
-        let forwarder_cursor = subgroups_reader.delivery_cursor();
+        // Claim this reader before the healthy clone can claim the template,
+        // so all initial blocked groups belong to the lagging forwarder too.
+        let delivery_cursor = subgroups_reader.delivery_cursor();
         let mut healthy = subgroups_reader.clone();
 
         let mut blocked = Vec::new();
@@ -2055,12 +2059,10 @@ mod tests {
                 )
                 .await
         });
-        // A yield does not guarantee the spawned task filled its forwarding
-        // slots. Wait for that precondition before overflowing its backlog.
+        // A scheduler yield does not guarantee the forwarder has filled its
+        // task limit. Establish that precondition before producing the backlog.
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while forwarder_cursor.load(std::sync::atomic::Ordering::Relaxed)
-                < MAX_CONCURRENT_SUBGROUPS
-            {
+            while delivery_cursor.load(Ordering::Relaxed) < MAX_CONCURRENT_SUBGROUPS {
                 tokio::task::yield_now().await;
             }
         })

@@ -12,6 +12,7 @@ use std::{
 
 use futures::{stream::FuturesUnordered, StreamExt};
 
+use super::transport as web_transport;
 use crate::{
     coding::{KeyValuePairs, ReasonPhrase, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message},
@@ -698,6 +699,8 @@ impl Publisher {
                 // while the write half stays open for PUBLISH_DONE.
                 let mut reading = true;
                 let mut writer_closed = false;
+                let mut responded = false;
+                let mut request_stopped = false;
                 // Keep one handler in flight without blocking PUBLISH_DONE or
                 // peer STOP_SENDING. Later responses remain serialized behind it.
                 let mut new_group: Option<futures::future::BoxFuture<'static, Result<(), ServeError>>> = None;
@@ -811,6 +814,11 @@ impl Publisher {
                                     // Establish first: handler failure must still send
                                     // PUBLISH_DONE, rather than resemble a rejected PUBLISH.
                                     if let Err(err) = this.recv_request_ok(ok) { break Err(err); }
+                                    responded = true;
+                                    if request_stopped {
+                                        abort.cancel_from_peer();
+                                        break Ok(());
+                                    }
                                     if let Some(value) = value {
                                         let track = track.clone();
                                         new_group = Some(Box::pin(async move {
@@ -819,10 +827,23 @@ impl Publisher {
                                         replying_to_update = false;
                                     }
                                 }
+                                Ok(Message::RequestError(error)) if !responded => {
+                                    if let Err(err) = this.recv_request_error(error) { break Err(err); }
+                                    abort.complete();
+                                    break Ok(());
+                                }
                                 Ok(msg) => match TryInto::<message::Subscriber>::try_into(msg) {
                                     Ok(sub_msg) => {
+                                        let legacy_ok = matches!(sub_msg, message::Subscriber::PublishOk(_));
                                         if let Err(err) = this.recv_message(sub_msg) {
                                             break Err(err);
+                                        }
+                                        if legacy_ok {
+                                            responded = true;
+                                            if request_stopped {
+                                                abort.cancel_from_peer();
+                                                break Ok(());
+                                            }
                                         }
                                     }
                                     Err(msg) => tracing::warn!(
@@ -838,6 +859,9 @@ impl Publisher {
                                 }
                                 Err(err) if err.is_stream_ended() => {
                                     tracing::debug!(request_id, error = %super::LogSafe(err.to_string().as_bytes()), "PUBLISH response reader ended");
+                                    if !responded {
+                                        break Ok(());
+                                    }
                                     reading = false;
                                 }
                                 // An undecodable frame is not a resynchronisation
@@ -846,13 +870,19 @@ impl Publisher {
                                 Err(err) => break Err(err),
                             }
                         }
-                        stopped = writer.closed() => {
+                        stopped = writer.closed(), if !request_stopped => {
                             match stopped {
                                 Ok(_) => {
-                                    abort.cancel_from_peer();
                                     writer.reset(0);
                                     writer_closed = true;
-                                    break Ok(());
+                                    // STOP_SENDING only closes our write half. A
+                                    // rejection and FIN can still be in flight on
+                                    // the response half (§3.3.2); preserve its code.
+                                    if responded {
+                                        abort.cancel_from_peer();
+                                        break Ok(());
+                                    }
+                                    request_stopped = true;
                                 }
                                 Err(err) => break Err(err),
                             }
@@ -1873,7 +1903,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        split_published_state, AbortPublishedOnDrop, NameRegistry, PublishNamespace,
+        split_published_state, web_transport, AbortPublishedOnDrop, NameRegistry, PublishNamespace,
         PublishedEntry, PublishedRecv, Publisher,
     };
 
@@ -2534,6 +2564,134 @@ mod tests {
 
         assert!(matches!(publish.closed().await, Err(ServeError::Cancel)));
         pump.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_stop_does_not_discard_publish_response() {
+        // STOP_SENDING closes only our write direction. Force it to arrive
+        // before the initial response instead of relying on packet scheduling.
+        enum Reply {
+            Reject,
+            Accept,
+            LegacyAccept,
+        }
+        for reply in [Reply::Reject, Reply::Accept, Reply::LegacyAccept] {
+            let (client, peer) = loopback_session_pair().await;
+            let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut publisher = Publisher::new(
+                Queue::default(),
+                client,
+                None,
+                RequestId::new(0, 1),
+                bidi_task_tx,
+            );
+            let (_writer, track) = subgroup_track();
+            let mut published = publisher.publish(track, Default::default()).await.unwrap();
+            let (peer_send, peer_recv) = peer.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            assert!(matches!(
+                peer_reader.decode::<Message>().await.unwrap(),
+                Message::Publish(_)
+            ));
+            let mut driver = bidi_task_rx.recv().await.unwrap();
+
+            peer_reader.stop(super::super::CANCELLED_STREAM_CODE);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut driver)
+                    .await
+                    .is_err(),
+                "STOP_SENDING must not discard the pending PUBLISH response"
+            );
+
+            let response = match reply {
+                Reply::Accept => Message::RequestOk(message::RequestOk {
+                    id: published.id,
+                    params: Default::default(),
+                }),
+                Reply::LegacyAccept => Message::PublishOk(message::PublishOk {
+                    id: published.id,
+                    params: Default::default(),
+                }),
+                Reply::Reject => Message::RequestError(message::RequestError::new(
+                    published.id,
+                    message::RequestErrorCode::Unauthorized,
+                    0,
+                    "unauthorized",
+                )),
+            };
+            Session::encode_bidi_response(&mut peer_writer, &response)
+                .await
+                .unwrap();
+            peer_writer.finish().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                published.ok().await,
+                Err(if matches!(reply, Reply::Reject) {
+                    ServeError::Closed(message::RequestErrorCode::Unauthorized as u64)
+                } else {
+                    ServeError::Cancel
+                })
+            );
+            assert!(publisher.publisheds.lock().unwrap().is_empty());
+            assert!(!publisher
+                .published_names
+                .lock()
+                .unwrap()
+                .contains_name(&full_track_name("test", "track")));
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_publish_without_response_cancels_on_fin_or_reset() {
+        for reset in [false, true] {
+            let (client, peer) = loopback_session_pair().await;
+            let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut publisher = Publisher::new(
+                Queue::default(),
+                client,
+                None,
+                RequestId::new(0, 1),
+                bidi_task_tx,
+            );
+            let (_writer, track) = subgroup_track();
+            let mut published = publisher.publish(track, Default::default()).await.unwrap();
+            let (peer_send, peer_recv) = peer.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            assert!(matches!(
+                peer_reader.decode::<Message>().await.unwrap(),
+                Message::Publish(_)
+            ));
+            let mut driver = bidi_task_rx.recv().await.unwrap();
+            peer_reader.stop(super::super::CANCELLED_STREAM_CODE);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut driver)
+                    .await
+                    .is_err()
+            );
+
+            if reset {
+                peer_writer.reset(super::super::CANCELLED_STREAM_CODE);
+            } else {
+                peer_writer.finish().unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(published.ok().await, Err(ServeError::Cancel));
+            assert!(publisher.publisheds.lock().unwrap().is_empty());
+            assert!(!publisher
+                .published_names
+                .lock()
+                .unwrap()
+                .contains_name(&full_track_name("test", "track")));
+        }
     }
 
     #[tokio::test]

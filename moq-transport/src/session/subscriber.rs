@@ -16,6 +16,7 @@ use futures::StreamExt;
 use tokio::sync::Notify;
 use tracing::Instrument;
 
+use super::transport as web_transport;
 use crate::{
     coding::{Decode, KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix},
     data,

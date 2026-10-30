@@ -57,6 +57,7 @@ use moq_transport::message::{GroupOrder, PublishDoneCode};
 use moq_transport::serve::{
     Datagram, ServeError, Subgroup, Track, TrackReader, TrackReaderMode, TrackWriter,
 };
+use moq_transport::session::transport as web_transport;
 use moq_transport::session::{
     PublishDoneInfo, PublishNamespace, Publisher, Session, Subscribe, Subscribed,
 };

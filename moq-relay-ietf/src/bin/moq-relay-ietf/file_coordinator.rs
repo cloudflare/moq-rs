@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fs2::FileExt;
-use moq_native_ietf::quic::Client;
+use moq_native_ietf::Client;
 use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix, TupleField};
 use serde::{Deserialize, Serialize};
 use url::Url;

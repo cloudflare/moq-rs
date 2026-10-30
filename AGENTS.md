@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Cloudflare Inc.
+SPDX-License-Identifier: MIT OR Apache-2.0
+-->
+
 # Repository Guidance
 
 ## Scope And Constraints
@@ -42,6 +47,18 @@ decoded, with malformed tokens and forbidden alias directives rejected
 (draft-18 section 10.2.2). Only an embedder that has authenticated the peer may
 tag it internal; a source subnet or listener address does not authenticate a
 peer on its own.
+
+## Session Transport Seam
+
+- Native sessions adapt `web_transport_trait::Session` through `session::transport::Session::new(backend, original_url)`. The embedder owns connection establishment and supplies truthful original URL metadata.
+- Browser wasm builds retain the separate `session/transport_wasm.rs` adapter; native backend injection does not replace that path.
+- External backends can name the transport trait and URL types through `moq_transport::reexports`.
+
+## Outbound Connector Seam
+
+- `moq_native_ietf::client::Connector` establishes a transport before MoQT SETUP.
+- Preserve the original URL and its verification name, credentials and path; a direct destination address must not replace that name. Retain the original TLS/trust and bind policy rather than rebuilding it.
+- Keep the borrowed connect future cancellation-safe: dropping it must release in-flight resources. Do not add detached drivers, retries or fallback inside the client wrapper.
 
 ## External Contributions
 

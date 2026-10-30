@@ -17,6 +17,7 @@ use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 use url::Url;
 
+use moq_transport::session::transport as web_transport;
 use moq_transport::session::Transport;
 use quinn::VarInt;
 

@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use moq_native_ietf::quic;
+use moq_native_ietf::Client;
 use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix};
 use url::Url;
 
@@ -732,13 +732,13 @@ pub trait Coordinator: Send + Sync {
     ///
     /// # Returns
     ///
-    /// - `Ok(NamespaceOrigin, Option<quic::Client>)` - Namespace origin and optional client if available
+    /// - `Ok(NamespaceOrigin, Option<Client>)` - Namespace origin and optional client if available
     /// - `Err` - Namespace not found anywhere
     async fn lookup(
         &self,
         scope: Option<&str>,
         namespace: &TrackNamespace,
-    ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)>;
+    ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)>;
 
     /// Lookup where a specific track is served from.
     ///
@@ -757,7 +757,7 @@ pub trait Coordinator: Send + Sync {
         scope: Option<&str>,
         namespace: &TrackNamespace,
         _track: &str,
-    ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+    ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
         self.lookup(scope, namespace).await
     }
 
@@ -1419,7 +1419,7 @@ mod tests {
             &self,
             scope: Option<&str>,
             namespace: &TrackNamespace,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
             let scope_key = MockState::scope_key(scope);
             let state = self.state.lock().unwrap();
 
@@ -1464,7 +1464,7 @@ mod tests {
             scope: Option<&str>,
             namespace: &TrackNamespace,
             track: &str,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
             let scope_key = MockState::scope_key(scope);
             let track_key = MockState::track_key(namespace, track);
 
@@ -2817,7 +2817,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
             Err(CoordinatorError::NamespaceNotFound)
         }
     }

@@ -7,6 +7,7 @@ use anyhow::Context;
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moq_native_ietf::quic::{self, Endpoint};
+use moq_transport::session::transport as web_transport;
 use moq_transport::session::{LogSafe, SessionConfig};
 use tracing::Instrument;
 use url::Url;
@@ -266,6 +267,41 @@ pub struct Relay {
     authorizer: Arc<ScopeAuthorizer>,
 }
 
+#[cfg(test)]
+#[path = "outbound_client_tests.rs"]
+mod outbound_client_tests;
+
+// Keep the independent announce connection's two failure stages distinct.
+async fn connect_forward(
+    client: &moq_native_ietf::Client,
+    url: &Url,
+    config: moq_transport::session::SessionConfig,
+) -> anyhow::Result<(
+    moq_transport::session::Session,
+    moq_transport::session::Publisher,
+    moq_transport::session::Subscriber,
+)> {
+    let moq_native_ietf::client::Connection {
+        session,
+        transport,
+        initial_destination_cid,
+    } = client
+        .connect(url, None)
+        .await
+        .context("failed to establish forward connection")?;
+    moq_transport::session::Session::connect_with_config_and_session_id(
+        session,
+        None,
+        transport,
+        config,
+        initial_destination_cid
+            .map(moq_transport::session::SessionId::new)
+            .unwrap_or_else(moq_transport::session::SessionId::generate),
+    )
+    .await
+    .context("failed to establish forward session")
+}
+
 impl Relay {
     pub fn new(config: RelayConfig) -> anyhow::Result<Self> {
         Self::new_with_cache_idle_timeout(config, DEFAULT_CACHE_IDLE_TIMEOUT)
@@ -379,22 +415,9 @@ impl Relay {
                 tracing::info!("forwarding PUBLISH_NAMESPACE messages to configured relay");
 
                 // Establish a QUIC connection to the forward URL
-                let (session, quic_client_initial_cid, transport) = quic_endpoints[0]
-                    .client
-                    .connect(url, None)
-                    .await
-                    .context("failed to establish forward connection")?;
-
-                // Create the MoQ session over the connection
-                let (session, publisher, subscriber) = moq_transport::session::Session::connect_with_config_and_session_id(
-                    session,
-                    None,
-                    transport,
-                    session_config,
-                    moq_transport::session::SessionId::new(quic_client_initial_cid),
-                )
-                .await
-                .context("failed to establish forward session")?;
+                let client = moq_native_ietf::Client::from(quic_endpoints[0].client.clone());
+                let (session, publisher, subscriber) =
+                    connect_forward(&client, url, session_config).await?;
 
                 // Use the connection path already validated and stored by Session::connect().
                 // The forward session is scoped to whatever path the announce URL specifies.
@@ -875,7 +898,7 @@ mod tests {
                 &self,
                 _scope: Option<&str>,
                 _namespace: &TrackNamespace,
-            ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+            ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::Client>)> {
                 Err(CoordinatorError::NamespaceNotFound)
             }
 

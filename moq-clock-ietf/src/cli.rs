@@ -71,6 +71,14 @@ pub struct Cli {
     #[arg(long)]
     pub datagrams: bool,
 
+    /// Retain this many minute groups (including the current group) for FETCH.
+    #[arg(long, default_value = "8", value_parser = clap::value_parser!(u16).range(1..=1024))]
+    pub history_groups: u16,
+
+    /// SUBSCRIBE, FETCH N preceding minute groups, then continue live.
+    #[arg(long, conflicts_with_all = ["publish", "datagrams"], value_parser = clap::value_parser!(u16).range(1..=1024))]
+    pub join_groups: Option<u16>,
+
     /// Authorization token to present in SETUP, as TYPE:BASE64URL (for a
     /// Common Access Token, TYPE is 1). May be repeated. Testing only: the
     /// token is visible in the process arguments.
@@ -124,5 +132,31 @@ mod tests {
         assert!("18446744073709551616:AQ"
             .parse::<AuthorizationTokenArg>()
             .is_err());
+    }
+
+    #[test]
+    fn joining_and_retention_flags_are_bounded_and_stream_only() {
+        let cli = Cli::try_parse_from([
+            "moq-clock-ietf",
+            "https://example.com",
+            "--join-groups",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(cli.join_groups, Some(2));
+        assert_eq!(cli.history_groups, 8);
+        for args in [
+            vec!["--join-groups", "0"],
+            vec!["--history-groups", "1025"],
+            vec!["--join-groups", "1", "--publish"],
+            vec!["--join-groups", "1", "--datagrams"],
+        ] {
+            assert!(Cli::try_parse_from(
+                ["moq-clock-ietf", "https://example.com"]
+                    .into_iter()
+                    .chain(args)
+            )
+            .is_err());
+        }
     }
 }

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use moq_native_ietf::quic;
+use moq_native_ietf::{quic, Client};
 use moq_transport::coding::{KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix};
 
 use moq_transport::message::StandaloneFetch;
@@ -23,10 +23,17 @@ use crate::interest::{TrackInterest, TrackInterestGuard};
 use crate::local::DEFAULT_CACHE_IDLE_TIMEOUT;
 use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError, RelayInfo, SessionContext};
 
+#[cfg(test)]
+#[path = "remote_client_tests.rs"]
+mod client_tests;
+
 /// Cache key for upstream relay-to-relay connections.
 ///
 /// Keyed by both URL and destination address so that connections are reused
 /// only when both match.
+/// Client/trust/bind/backend policy is not part of this legacy key: a live
+/// cached session wins before a later caller's override is selected. Opaque
+/// clients do not establish policy equivalence or repair that limitation.
 type RemoteCacheKey = (Url, Option<SocketAddr>);
 type RemoteSlot = Arc<Mutex<Option<Remote>>>;
 type TrackCacheKey = (TrackNamespace, TrackName);
@@ -202,7 +209,7 @@ pub(crate) enum RemoteSubscribeError {
 #[derive(Clone)]
 pub struct RemoteManager {
     coordinator: Arc<dyn Coordinator>,
-    clients: Vec<quic::Client>,
+    clients: Vec<Client>,
     session_config: SessionConfig,
     remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
 
@@ -246,10 +253,10 @@ mod tests {
             &self,
             _scope: Option<&str>,
             namespace: &TrackNamespace,
-        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<Client>)> {
             Ok((
                 crate::NamespaceOrigin::new(namespace.clone(), self.url.clone(), Some(self.addr)),
-                Some(self.client.clone()),
+                Some(self.client.clone().into()),
             ))
         }
     }
@@ -471,7 +478,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
-        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<Client>)> {
             Err(crate::CoordinatorError::NamespaceNotFound)
         }
     }
@@ -501,7 +508,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             namespace: &TrackNamespace,
-        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<Client>)> {
             Ok((
                 crate::NamespaceOrigin::new(
                     namespace.clone(),
@@ -774,6 +781,23 @@ impl RemoteManager {
         clients: Vec<quic::Client>,
         session_config: SessionConfig,
     ) -> Self {
+        Self::new_with_clients(
+            coordinator,
+            clients.into_iter().map(Client::from).collect(),
+            session_config,
+        )
+    }
+
+    /// Create a manager with backend-injectable default clients.
+    ///
+    /// The first client is used unless a coordinator lookup supplies an
+    /// override. Reuse retains the legacy full-URL/address key, not client
+    /// policy identity; do not mix policies assuming they are pool-isolated.
+    pub fn new_with_clients(
+        coordinator: Arc<dyn Coordinator>,
+        clients: Vec<Client>,
+        session_config: SessionConfig,
+    ) -> Self {
         Self {
             coordinator,
             clients,
@@ -1030,7 +1054,7 @@ impl RemoteManager {
     async fn get_or_connect(
         &self,
         cache_key: RemoteCacheKey,
-        client: Option<&quic::Client>,
+        client: Option<&Client>,
     ) -> anyhow::Result<Remote> {
         loop {
             // The manager lock only protects the map. The per-key slot lock protects
@@ -1285,7 +1309,7 @@ impl Remote {
     async fn connect(
         url: Url,
         addr: Option<SocketAddr>,
-        client: &quic::Client,
+        client: &Client,
         session_config: SessionConfig,
         cache_idle_timeout: Duration,
         cache: RemoteCacheHandle,
@@ -1295,7 +1319,11 @@ impl Remote {
             key: cache_key,
             slot: cache_slot,
         } = cache;
-        let (session, quic_client_initial_cid, transport) = match client.connect(&url, addr).await {
+        let moq_native_ietf::client::Connection {
+            session,
+            transport,
+            initial_destination_cid,
+        } = match client.connect(&url, addr).await {
             Ok(session) => session,
             Err(err) => {
                 metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
@@ -1315,7 +1343,9 @@ impl Remote {
                 None,
                 transport,
                 session_config,
-                moq_transport::session::SessionId::new(quic_client_initial_cid),
+                initial_destination_cid
+                    .map(moq_transport::session::SessionId::new)
+                    .unwrap_or_else(moq_transport::session::SessionId::generate),
             )
             .await
             {

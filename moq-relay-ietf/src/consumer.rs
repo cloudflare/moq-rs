@@ -727,6 +727,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod auth_gates {
+        use moq_transport::session::transport as web_transport;
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
@@ -805,8 +806,7 @@ mod tests {
                 &self,
                 _scope: Option<&str>,
                 _namespace: &TrackNamespace,
-            ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::quic::Client>)>
-            {
+            ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::Client>)> {
                 Err(crate::CoordinatorError::NamespaceNotFound)
             }
         }
