@@ -23,6 +23,12 @@ use super::{
 
 // This file defines Publisher handling of inbound Subscriptions
 
+const MAX_CONCURRENT_SUBGROUPS: usize = 128;
+
+#[cfg(test)]
+#[path = "subgroup_lifecycle.rs"]
+mod subgroup_lifecycle;
+
 #[derive(Debug)]
 struct ObjectForwarderState {
     largest_location: Option<Location>,
@@ -164,7 +170,7 @@ impl ObjectForwarder {
     }
 }
 
-/// A subgroup data stream that is reset unless it is explicitly finished.
+/// A subgroup data stream that is reset unless its FIN is acknowledged.
 ///
 /// Draft-16 §10.4.3: a FIN means "every object in this subgroup was delivered".
 /// Any earlier termination MUST be a `RESET_STREAM`, and the listed causes
@@ -177,11 +183,11 @@ impl ObjectForwarder {
 /// happened to stop. If that is mid-object the receiver has already been
 /// promised a payload length it will never get, and treats the truncated
 /// subgroup as a malformed track. This wrapper inverts that default: the stream
-/// is reset on drop unless [`SubgroupStream::finish`] ran, so the safe outcome
-/// is the automatic one.
+/// is reset on drop until FIN acknowledgement, so cancellation also discards
+/// buffered payload after a local [`SubgroupStream::finish`].
 struct SubgroupStream {
     writer: Writer,
-    /// Set once the stream has been explicitly finished or reset, after which
+    /// Set once the stream has been acknowledged or reset, after which
     /// `Drop` must not touch it again.
     terminated: bool,
 }
@@ -198,8 +204,17 @@ impl SubgroupStream {
         if self.terminated {
             return Ok(());
         }
-        self.terminated = true;
         self.writer.finish()
+    }
+
+    async fn acknowledged(&mut self) -> Result<(), SessionError> {
+        // FIN only queues the end of the stream. STOP_SENDING does not discard
+        // Quinn's buffered data, so retain the handle until ACK or cancellation.
+        if let Some(code) = self.writer.closed().await? {
+            self.writer.reset(u32::from(code));
+        }
+        self.terminated = true;
+        Ok(())
     }
 
     fn reset(&mut self, code: DataStreamResetCode) {
@@ -337,6 +352,14 @@ impl SubgroupOutput {
             SubgroupSink::Buffer { termination, .. } => {
                 termination.get_or_insert(SubgroupTermination::Reset(code));
             }
+        }
+    }
+
+    async fn acknowledged(&mut self) -> Result<(), SessionError> {
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.acknowledged().await,
+            #[cfg(test)]
+            SubgroupSink::Buffer { .. } => Ok(()),
         }
     }
 
@@ -518,7 +541,7 @@ impl ObjectForwarder {
 
         loop {
             tokio::select! {
-                res = subgroups.next(), if done.is_none() => match res {
+                res = subgroups.next(), if done.is_none() && tasks.len() < MAX_CONCURRENT_SUBGROUPS => match res {
                     Ok(Some(subgroup)) => {
                         let header = data::SubgroupHeader {
                             header_type: data::StreamHeaderType::SubgroupIdExt,  // SubGroupId = Yes, Extensions = Yes, ContainsEndOfGroup = No
@@ -547,7 +570,11 @@ impl ObjectForwarder {
                     Ok(None) => done = Some(Ok(())),
                     Err(err) => done = Some(Err(err)),
                 },
-                res = self.closed(), if done.is_none() => done = Some(res),
+                res = self.closed(), if done.is_none() || !tasks.is_empty() => {
+                    // Drop active and finished-but-unacknowledged subgroup
+                    // futures immediately instead of draining cancelled data.
+                    return res.map_err(SessionError::from);
+                },
                 _ = tasks.next(), if !tasks.is_empty() => {},
                 else => return Ok(done.unwrap()?),
             }
@@ -604,7 +631,10 @@ impl ObjectForwarder {
         // quinn would implicitly FIN wherever we stopped, which silently
         // truncates the in-flight object.
         match res {
-            Ok(()) => output.finish(),
+            Ok(()) => {
+                output.finish()?;
+                output.acknowledged().await
+            }
             Err(err) => {
                 output.reset(Self::reset_code_for(&err));
                 Err(err)
