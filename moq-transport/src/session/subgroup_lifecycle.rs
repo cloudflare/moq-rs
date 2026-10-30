@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::*;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use web_transport::quinn::{self as wt, quinn};
 
@@ -9,7 +10,10 @@ use web_transport::quinn::{self as wt, quinn};
 // delayed path keeps payload buffered after the forwarder has queued FIN.
 const PAYLOAD: usize = 512 * 1024;
 
-struct Proxy(tokio::task::JoinHandle<()>);
+struct Proxy(
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::atomic::AtomicBool>,
+);
 impl Drop for Proxy {
     fn drop(&mut self) {
         self.0.abort();
@@ -18,6 +22,18 @@ impl Drop for Proxy {
 
 async fn pair(
     raw: bool,
+) -> (
+    web_transport::Session,
+    web_transport::Session,
+    quinn::Connection,
+    Proxy,
+) {
+    pair_with_ack_control(raw, false).await
+}
+
+async fn pair_with_ack_control(
+    raw: bool,
+    controlled: bool,
 ) -> (
     web_transport::Session,
     web_transport::Session,
@@ -44,6 +60,9 @@ async fn pair(
     ));
     let mut transport = quinn::TransportConfig::default();
     transport.stream_receive_window((2 * PAYLOAD as u32).into());
+    if controlled {
+        transport.max_concurrent_uni_streams(4096u32.into());
+    }
     config.transport_config(Arc::new(transport));
     let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = server.local_addr().unwrap();
@@ -51,28 +70,38 @@ async fn pair(
     // finish locally while congestion control still holds most payload bytes.
     let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let proxy_addr = socket.local_addr().unwrap();
-    let proxy = Proxy(tokio::spawn(async move {
-        let mut client_addr = None;
-        let mut pending = FuturesUnordered::new();
-        let mut buf = vec![0; 65536];
-        loop {
-            tokio::select! {
-                result = socket.recv_from(&mut buf) => {
-                    let (len, from) = result.unwrap();
-                    let to = if from == addr { client_addr.unwrap() } else {
-                        client_addr = Some(from); addr
-                    };
-                    let packet = buf[..len].to_vec();
-                    let socket = socket.clone();
-                    pending.push(async move {
-                        tokio::time::sleep(Duration::from_millis(75)).await;
-                        socket.send_to(&packet, to).await.unwrap();
-                    });
-                },
-                _ = pending.next(), if !pending.is_empty() => {},
+    let hold_acks = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hold_reverse = hold_acks.clone();
+    let proxy = Proxy(
+        tokio::spawn(async move {
+            let mut client_addr = None;
+            let mut pending = FuturesUnordered::new();
+            let mut buf = vec![0; 65536];
+            loop {
+                tokio::select! {
+                    result = socket.recv_from(&mut buf) => {
+                        let (len, from) = result.unwrap();
+                        if from == addr && hold_reverse.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        let to = if from == addr { client_addr.unwrap() } else {
+                            client_addr = Some(from); addr
+                        };
+                        let packet = buf[..len].to_vec();
+                        let socket = socket.clone();
+                        pending.push(async move {
+                            if !controlled {
+                                tokio::time::sleep(Duration::from_millis(75)).await;
+                            }
+                            socket.send_to(&packet, to).await.unwrap();
+                        });
+                    },
+                    _ = pending.next(), if !pending.is_empty() => {},
+                }
             }
-        }
-    }));
+        }),
+        hold_acks,
+    );
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.cert.der().clone()).unwrap();
     let mut crypto = rustls::ClientConfig::builder()
@@ -80,9 +109,19 @@ async fn pair(
         .with_no_client_auth();
     crypto.alpn_protocols = vec![alpn];
     let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
-    )));
+    ));
+    if controlled {
+        // Keep congestion/stream credit from hiding the application slot limit
+        // while the proxy withholds every ACK after the handshake.
+        let mut congestion = quinn::congestion::CubicConfig::default();
+        congestion.initial_window(1024 * 1024);
+        let mut transport = quinn::TransportConfig::default();
+        transport.congestion_controller_factory(Arc::new(congestion));
+        client_config.transport_config(Arc::new(transport));
+    }
+    client.set_default_client_config(client_config);
     let accept = async { server.accept().await.unwrap().await.unwrap() };
     let connect = client.connect(proxy_addr, "localhost").unwrap();
     let (sender, receiver) = tokio::join!(connect, accept);
@@ -291,4 +330,132 @@ async fn cancellation_is_scoped_and_fin_ack_releases_raw() {
 #[tokio::test]
 async fn cancellation_is_scoped_and_fin_ack_releases_webtransport() {
     cancellation_is_scoped_and_ack_releases(false).await;
+}
+
+async fn finished_subgroups_release_active_slots(raw: bool, overflow: bool) {
+    let (sender, receiver, observer, proxy) = pair_with_ack_control(raw, true).await;
+    // Reverse packets containing ACKs are discarded from this point onward.
+    // No data stream has been opened yet, so none can already have its FIN ACKed.
+    proxy.1.store(true, Ordering::SeqCst);
+    let (mut forwarder, mut cancel) = forwarder(sender);
+    let opened = forwarder.state.clone();
+    let (writer, reader) = serve::Track::new(
+        crate::coding::TrackNamespace::from_utf8_path("test"),
+        "short-subgroups",
+    )
+    .produce();
+    let mut writer = writer.subgroups().unwrap();
+    let TrackReaderMode::Subgroups(reader) = reader.mode().await.unwrap() else {
+        panic!("expected subgroups")
+    };
+    let count = if overflow {
+        MAX_PENDING_SUBGROUP_ACKS + 1
+    } else {
+        2 * MAX_CONCURRENT_SUBGROUPS
+    };
+    let produce = async move {
+        for subgroup_id in 0..count as u64 {
+            let mut subgroup = writer
+                .create(serve::Subgroup {
+                    group_id: 0,
+                    subgroup_id,
+                    priority: 128,
+                })
+                .unwrap();
+            let mut object = subgroup.create(1, None).unwrap();
+            object.write(bytes::Bytes::from_static(b"x")).unwrap();
+            drop(object);
+            drop(subgroup);
+            // Don't overwrite the latest subgroup before the forwarder has
+            // taken its reader.
+            while opened.lock().stream_count <= subgroup_id {
+                tokio::task::yield_now().await;
+            }
+        }
+        writer
+    };
+    let receive = async {
+        for _ in 0..count {
+            let mut stream = receiver.accept_uni().await.unwrap();
+            let mut bytes = 0;
+            loop {
+                match stream.read(65536).await {
+                    Ok(Some(chunk)) => bytes += chunk.len(),
+                    Ok(None) => break,
+                    Err(_) if overflow => break,
+                    Err(err) => panic!("stream failed: {err:?}"),
+                }
+            }
+            if !overflow {
+                assert!(bytes > 1, "complete subgroup header and payload");
+            }
+        }
+    };
+    let serve = forwarder.serve_subgroups(
+        reader,
+        DeliveryFilter {
+            forward: true,
+            start_location: None,
+            end_group_id: None,
+        },
+    );
+    tokio::pin!(serve);
+    let _writer = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            (writer, ()) = async { tokio::join!(produce, receive) } => {
+                if overflow {
+                    assert!(matches!((&mut serve).await,
+                        Err(SessionError::Serve(ServeError::Closed(code)))
+                            if code == message::PublishDoneCode::TooFarBehind as u64));
+                }
+                Some(writer)
+            },
+            result = &mut serve => {
+                assert!(overflow, "forwarder ended early: {result:?}");
+                assert!(matches!(result,
+                    Err(SessionError::Serve(ServeError::Closed(code)))
+                        if code == message::PublishDoneCode::TooFarBehind as u64));
+                None
+            },
+        }
+    })
+    .await
+    .expect("more than 128 finished, unacknowledged subgroups must start");
+    if !overflow {
+        assert_eq!(observer.stats().frame_rx.reset_stream, 0);
+        cancel.recv_unsubscribe().unwrap();
+        assert!(matches!(
+            serve.await,
+            Err(SessionError::Serve(ServeError::Cancel))
+        ));
+    }
+    // Cancellation still owns and resets every FIN waiter in the separate set.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while observer.stats().frame_rx.reset_stream < count as u64 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(observer.stats().frame_rx.reset_stream, count as u64);
+}
+
+#[tokio::test]
+async fn finished_subgroups_release_active_slots_raw() {
+    finished_subgroups_release_active_slots(true, false).await;
+}
+
+#[tokio::test]
+async fn finished_subgroups_release_active_slots_webtransport() {
+    finished_subgroups_release_active_slots(false, false).await;
+}
+
+#[tokio::test]
+async fn pending_ack_budget_overflow_resets_raw() {
+    finished_subgroups_release_active_slots(true, true).await;
+}
+
+#[tokio::test]
+async fn pending_ack_budget_overflow_resets_webtransport() {
+    finished_subgroups_release_active_slots(false, true).await;
 }
