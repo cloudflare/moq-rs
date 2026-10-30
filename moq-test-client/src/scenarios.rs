@@ -14,6 +14,7 @@ use bytes::Bytes;
 use tokio::time::{timeout, Duration};
 
 use moq_native_ietf::quic;
+use moq_transport::session::transport as web_transport;
 use moq_transport::{
     coding::{KeyValuePairs, TrackNamespace},
     message::PublishDoneCode,

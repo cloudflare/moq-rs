@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
+#[cfg(test)]
+use super::transport as web_transport;
 use crate::coding::{Encode, EncodeError, KeyValuePairs, Location, ReasonPhrase};
 use crate::data::DataStreamResetCode;
 use crate::message::RequestErrorCode;
@@ -832,7 +834,10 @@ impl ObjectForwarder {
         tracing::trace!("[PUBLISHER] serve_subgroup: opened unidirectional stream");
 
         // TODO figure out u32 vs u64 priority
-        send_stream.set_priority(subgroup_reader.priority as i32);
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        send_stream.set_priority(subgroup_reader.priority);
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        send_stream.set_priority(i32::from(subgroup_reader.priority));
 
         let mut output = SubgroupOutput::stream(Writer::new(send_stream));
         stream_count.opened();
@@ -2002,11 +2007,14 @@ mod tests {
         )
         .produce();
         let mut subgroups_writer = track_writer.subgroups().unwrap();
-        let serve::TrackReaderMode::Subgroups(subgroups_reader) =
+        let serve::TrackReaderMode::Subgroups(mut subgroups_reader) =
             track_reader.mode().await.unwrap()
         else {
             panic!("expected subgroup delivery");
         };
+        // Claim this reader before the healthy clone can claim the template,
+        // so all initial blocked groups belong to the lagging forwarder too.
+        let delivery_cursor = subgroups_reader.delivery_cursor();
         let mut healthy = subgroups_reader.clone();
 
         let mut blocked = Vec::new();
@@ -2036,7 +2044,15 @@ mod tests {
                 )
                 .await
         });
-        tokio::task::yield_now().await;
+        // A scheduler yield does not guarantee the forwarder has filled its
+        // task limit. Establish that precondition before producing the backlog.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while delivery_cursor.load(Ordering::Relaxed) < MAX_CONCURRENT_SUBGROUPS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
         for offset in 0..=serve::MAX_PENDING_SUBGROUPS as u64 {
             let group_id = MAX_CONCURRENT_SUBGROUPS as u64 + offset;

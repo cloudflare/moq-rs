@@ -1897,6 +1897,7 @@ async fn may_announce_namespace(
 
 #[cfg(test)]
 mod tests {
+    use moq_transport::session::transport as web_transport;
     use std::{
         collections::HashMap,
         io::Cursor,

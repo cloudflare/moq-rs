@@ -6,6 +6,7 @@ use std::{io, ops};
 
 use crate::coding::{Encode, EncodeError};
 
+use super::transport as web_transport;
 use super::SessionError;
 use bytes::Buf;
 

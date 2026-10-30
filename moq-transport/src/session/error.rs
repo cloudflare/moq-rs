@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::transport as web_transport;
 use crate::{coding, serve};
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -104,17 +105,25 @@ impl SessionError {
     ///
     /// ## Implementation Notes
     ///
-    /// We pattern match on `web_transport_quinn::SessionError` variants. In v0.11+,
+    /// Native backends first supply application-close information through
+    /// `web_transport_trait::Error`. Quinn-specific fallback handling preserves
+    /// raw-QUIC and local-close behavior. In web-transport-quinn v0.11+,
     /// WebTransport graceful closes arrive as `WebTransportError::Closed(0, _)` because
     /// the crate decodes HTTP/3 error codes at the `SessionError` level. For raw QUIC
     /// connections, the close code is checked directly on `ConnectionError::ApplicationClosed`.
     ///
-    /// **Coupling note**: This implementation is coupled to `web-transport-quinn` and
-    /// `quinn`. When transitioning to a different WebTransport backend (e.g., tokio-quiche),
-    /// ensure the replacement provides equivalent error introspection, or update this
-    /// method to handle the new error types.
+    /// Other native backends must report application close codes through the
+    /// error trait's `session_error` method. An unclassified transport failure
+    /// is not assumed to be graceful.
     pub fn is_graceful_close(&self) -> bool {
         match self {
+            #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+            Self::WebTransport(wt_err)
+                if wt_err.session_error().is_some_and(|(code, _)| code == 0) =>
+            {
+                true
+            }
+            #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
             Self::WebTransport(wt_err) => match wt_err {
                 web_transport::Error::Session(session_err) => {
                     is_session_error_graceful(session_err)
@@ -166,6 +175,12 @@ impl SessionError {
 
     pub(crate) fn is_stream_error(&self) -> bool {
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        if let Self::WebTransport(err) = self {
+            if err.stream_error().is_some() {
+                return true;
+            }
+        }
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
             matches!(
                 self,
@@ -206,6 +221,7 @@ impl From<SessionError> for serve::ServeError {
 ///   `ConnectionError::ApplicationClosed`.
 /// - Raw QUIC connections: `ConnectionError::ApplicationClosed` with code 0
 /// - Local close: `ConnectionError::LocallyClosed`
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
 fn is_session_error_graceful(err: &web_transport::quinn::SessionError) -> bool {
     use web_transport::quinn::{SessionError, WebTransportError};
 
@@ -226,6 +242,7 @@ fn is_session_error_graceful(err: &web_transport::quinn::SessionError) -> bool {
 /// close code is usually converted to `WebTransportError::Closed` during `SessionError` conversion
 /// when decoding succeeds. This function primarily handles raw QUIC (moqt:// ALPN) connections
 /// or non-decodable cases where the close code is not HTTP/3 encoded.
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
 fn is_connection_error_graceful(err: &web_transport::quinn::quinn::ConnectionError) -> bool {
     use web_transport::quinn::quinn::ConnectionError;
 

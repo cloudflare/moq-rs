@@ -28,6 +28,7 @@ use std::{
     time::Duration,
 };
 
+use super::transport as web_transport;
 use crate::{
     coding::{KeyValuePairs, Location},
     data::{DataStreamResetCode, FetchHeader, FetchRecord, FetchRecordEncoder, StreamHeaderType},

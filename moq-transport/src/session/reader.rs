@@ -9,6 +9,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use crate::coding::{Decode, DecodeError};
 use crate::data::{FetchRecord, FetchRecordDecoder, MAX_FETCH_RECORD_HEADER_SIZE};
 
+use super::transport as web_transport;
 use super::SessionError;
 
 pub struct Reader {

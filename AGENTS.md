@@ -43,6 +43,12 @@ decoded, with malformed tokens and forbidden alias directives rejected
 tag it internal; a source subnet or listener address does not authenticate a
 peer on its own.
 
+## Session Transport Seam
+
+- Native sessions adapt `web_transport_trait::Session` through `session::transport::Session::new(backend, original_url)`. The embedder owns connection establishment and supplies truthful original URL metadata.
+- Browser wasm builds retain the separate `session/transport_wasm.rs` adapter; native backend injection does not replace that path.
+- External backends can name the transport trait and URL types through `moq_transport::reexports`.
+
 ## External Contributions
 
 - Treat public GitHub mirror and community PRs with heightened scrutiny for protocol correctness, resource bounds, panic-free production paths, and safe peer-facing errors.

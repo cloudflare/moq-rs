@@ -24,6 +24,11 @@ mod subscribed_namespace;
 mod subscribed_tracks;
 mod subscriber;
 mod track_status_requested;
+#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+pub mod transport;
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[path = "transport_wasm.rs"]
+pub mod transport;
 mod writer;
 
 pub use error::*;
@@ -49,6 +54,7 @@ pub use subscribed_tracks::*;
 pub use subscriber::*;
 pub use track_status_requested::*;
 
+use self::transport as web_transport;
 use reader::*;
 use writer::*;
 
@@ -2050,6 +2056,7 @@ impl Session {
 /// Shared helpers for session-layer unit tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use super::transport as web_transport;
     pub(crate) async fn loopback_session_pair() -> (web_transport::Session, web_transport::Session)
     {
         use web_transport::quinn::{ClientBuilder, ServerBuilder};

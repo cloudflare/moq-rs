@@ -12,6 +12,7 @@ use std::{
 
 use futures::{stream::FuturesUnordered, StreamExt};
 
+use super::transport as web_transport;
 use crate::{
     coding::{KeyValuePairs, ReasonPhrase, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message},
@@ -1879,7 +1880,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        split_published_state, AbortPublishedOnDrop, NameRegistry, PublishNamespace,
+        split_published_state, web_transport, AbortPublishedOnDrop, NameRegistry, PublishNamespace,
         PublishedEntry, PublishedRecv, Publisher,
     };
 
