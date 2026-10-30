@@ -1,20 +1,32 @@
-# moq-relay
+# moq-relay-ietf
 
 A server that connects publishing clients to subscribing clients.
-All subscriptions are deduplicated and cached, so that a single publisher can serve many subscribers.
+Subscriptions are deduplicated and cached, so that a single publisher can serve many subscribers. This checkout implements MoQT draft-18: raw QUIC uses ALPN `moqt-18`, and WebTransport uses HTTP/3 with `moqt-18` application-protocol negotiation. It does not accept older wire drafts.
 
 ## Usage
 
-The publisher must choose a unique name for their broadcast, sent as the WebTransport path when connecting to the server.
+The connection path selects a scope. Publishers and subscribers that exchange tracks must connect to the same scope and use matching track namespaces and names. The path is not the broadcast name: the sample media clients select that separately with `--name`.
 Connection paths are normalized and validated: trailing slashes are trimmed, dot segments and percent-encoded characters are rejected, and empty segments are not allowed. Capitalization matters.
 
-For example: `CONNECT https://relay.quic.video/BigBuckBunny`
+For example, `https://relay.example:4443/demo` selects scope `/demo`. This is a placeholder endpoint. WebTransport carries the path in CONNECT; raw QUIC carries it in the SETUP PATH option.
 
-The MoqTransport handshake includes a `role` parameter, which must be `publisher` or `subscriber`.
-The specification allows a `both` role but you'll get an error.
+Draft-18 uses a unified SETUP message, with requests on separate bidirectional streams. There is no publisher/subscriber role parameter in SETUP; a session can issue both kinds of requests.
 
-You can have one publisher and any number of subscribers connected to the same path.
-If the publisher disconnects, then all subscribers receive an error and will not get updates, even if a new publisher reuses the path.
+Multiple publishers can share a scope with distinct namespaces. An accepted track subscription ends when its source ends; publishing the name again does not resume the old subscription. Subscribers must request a new subscription.
+
+### Build and run
+
+Build from this checkout rather than installing an older registry release:
+
+```bash
+cargo build --locked -p moq-relay-ietf
+./target/debug/moq-relay-ietf --bind '[::]:4443' \
+  --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+```
+
+The certificate must be valid for the hostname clients use. Allow UDP on the chosen port for both raw QUIC and WebTransport. `--dev` additionally serves a development HTTPS endpoint over TCP; it is not required for MoQT delivery. For a local certificate and relay, use `./dev/relay` from the repository root.
+
+The binary defaults to `[::]:443`. `--max-request-id` is retained as an ignored compatibility flag: draft-18 has no MAX_REQUEST_ID budget. Run `./target/debug/moq-relay-ietf --help` for the current options.
 
 ## Authorization
 
