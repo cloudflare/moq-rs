@@ -128,6 +128,8 @@ async fn authorize_session(
             // rather than being UNAUTHORIZED.
             tracing::debug!(
                 scope_present = context.scope().is_some(),
+                scope = %LogSafe(context.scope().unwrap_or("<unscoped>").as_bytes()),
+                subject = "<unknown>",
                 error = %err,
                 "invalid AUTHORIZATION TOKEN option in SETUP"
             );
@@ -160,6 +162,8 @@ async fn authorize_session(
             // must not assume it does not.
             tracing::error!(
                 scope_present = context.scope().is_some(),
+                scope = %LogSafe(context.scope().unwrap_or("<unscoped>").as_bytes()),
+                subject = "<unknown>",
                 error = %LogSafe(err.to_string().as_bytes()),
                 "could not determine the scope's authorization policy"
             );
@@ -175,6 +179,8 @@ async fn authorize_session(
     let decision = hook.on_setup(context, &tokens).await.map_err(|err| {
         tracing::error!(
             scope_present = context.scope().is_some(),
+            scope = %LogSafe(context.scope().unwrap_or("<unscoped>").as_bytes()),
+            subject = "<unknown>",
             error = %LogSafe(err.to_string().as_bytes()),
             "authorization hook failed during setup"
         );
@@ -189,6 +195,10 @@ async fn authorize_session(
         Ok(principal) => {
             tracing::debug!(
                 scope_present = context.scope().is_some(),
+                scope = %LogSafe(context.scope().unwrap_or("<unscoped>").as_bytes()),
+                subject = %LogSafe(principal.subject().unwrap_or("<unknown>").as_bytes()),
+                operation = "client_setup",
+                outcome = "allowed",
                 "session authorized"
             );
             Ok(Some(SessionAuth::new(hook, principal)))
@@ -196,6 +206,10 @@ async fn authorize_session(
         Err(reason) => {
             tracing::debug!(
                 scope_present = context.scope().is_some(),
+                scope = %LogSafe(context.scope().unwrap_or("<unscoped>").as_bytes()),
+                subject = "<unknown>",
+                operation = "client_setup",
+                outcome = "denied",
                 reason = reason.label(),
                 "session authorization denied"
             );
@@ -656,6 +670,8 @@ impl Relay {
                                 Err(rejection) => {
                                     tracing::info!(
                                         session_id = %session_id,
+                                        scope = %LogSafe(context.scope().unwrap_or("<unscoped>").as_bytes()),
+                                        subject = "<unknown>",
                                         code = rejection.code,
                                         reason = rejection.reason,
                                         "session authorization failed, closing"
@@ -931,6 +947,40 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn setup_denial_audit_records_safe_scope_and_unknown_actor() {
+            for (scope, logged_scope) in [
+                ("tenant", "tenant"),
+                ("/eyJheader.payload.signature?token=secret", "[redacted]"),
+            ] {
+                let authorizer = ScopeAuthorizer::new(FixedConfig::new(enforced_with_valid_key()));
+                let context = SessionContext::public(Some(scope.to_string()));
+                let params = KeyValuePairs::default();
+                let (result, output) =
+                    crate::test::capture_logs(authorize_session(&authorizer, &context, &params))
+                        .await;
+                assert!(result.is_err());
+                let denial = output
+                    .lines()
+                    .find(|line| line.contains("session authorization denied"))
+                    .unwrap();
+                assert!(
+                    denial.contains(&format!("scope=\"{logged_scope}\"")),
+                    "{output}"
+                );
+                assert!(denial.contains("subject=\"<unknown>\""), "{output}");
+                assert!(
+                    denial.contains("operation=\"client_setup\"")
+                        && denial.contains("outcome=\"denied\""),
+                    "{output}"
+                );
+                assert!(
+                    !output.contains("eyJheader") && !output.contains("secret"),
+                    "{output}"
+                );
+            }
+        }
+
+        #[tokio::test]
         async fn internal_session_without_token_is_admitted_and_authorizes_requests() {
             let context = SessionContext::internal(Some("tenant".to_string()), None);
             let namespace = TrackNamespace::from_utf8_path("sports/football");
@@ -1153,14 +1203,23 @@ mod tests {
                 value
             };
 
-            let auth = admit(
+            let (auth, output) = crate::test::capture_logs(admit(
                 FixedConfig::new(config.clone()),
                 &setup_with(vec![mint(&signer)]),
-            )
-            .await
-            .expect("valid token admits")
-            .expect("enforced scope carries auth state");
+            ))
+            .await;
+            let auth = auth
+                .expect("valid token admits")
+                .expect("enforced scope carries auth state");
             assert_eq!(auth.subject(), Some("alice"));
+            let allowed = output
+                .lines()
+                .find(|line| line.contains("session authorized"))
+                .unwrap();
+            assert!(
+                allowed.contains("subject=\"alice\"") && allowed.contains("scope=\"tenant\""),
+                "{output}"
+            );
 
             let err = admit(
                 FixedConfig::new(config.clone()),
