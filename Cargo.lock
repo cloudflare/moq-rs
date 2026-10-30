@@ -1728,13 +1728,18 @@ name = "moq-pub"
 version = "0.9.6"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "clap",
  "moq-catalog",
  "moq-native-ietf",
+ "moq-relay-ietf",
+ "moq-sub",
  "moq-transport",
  "mp4",
+ "rcgen",
  "rfc6381-codec",
+ "rustls 0.23.31",
  "serde_json",
  "tokio",
  "tracing",

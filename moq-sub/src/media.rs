@@ -18,12 +18,15 @@ use tokio::{
 };
 use tracing::{debug, info, trace, warn};
 
+pub use crate::fetch::{FetchMode, JoiningStart};
+
 pub struct Media<O> {
     subscriber: Subscriber,
     broadcast: TracksReader,
     tracks_writer: TracksWriter,
     output: Arc<Mutex<O>>,
     request_catalog: bool,
+    fetch: Option<FetchMode>,
 }
 
 impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
@@ -33,6 +36,17 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         output: O,
         request_catalog: bool,
     ) -> anyhow::Result<Self> {
+        Self::new_with_fetch(subscriber, tracks, output, request_catalog, None).await
+    }
+
+    /// Play a finite FETCH or replay a Joining FETCH before continuing live.
+    pub async fn new_with_fetch(
+        subscriber: Subscriber,
+        tracks: Tracks,
+        output: O,
+        request_catalog: bool,
+        fetch: Option<FetchMode>,
+    ) -> anyhow::Result<Self> {
         let (tracks_writer, _tracks_request, tracks_reader) = tracks.produce();
         let broadcast = tracks_reader; // breadcrumb for navigating API name changes
         Ok(Self {
@@ -41,6 +55,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             tracks_writer,
             output: Arc::new(Mutex::new(output)),
             request_catalog,
+            fetch,
         })
     }
 
@@ -59,7 +74,13 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         };
         let moov = {
             let init_track_name: &str = match catalog {
-                Some(ref c) => &c.tracks[0].init_track.clone().unwrap(),
+                Some(ref c) => c
+                    .tracks
+                    .first()
+                    .context("catalog contains no tracks")?
+                    .init_track
+                    .as_deref()
+                    .context("catalog track has no init track")?,
                 None => "0.mp4",
             };
             let buf = self.download_first_object(init_track_name, "init").await?;
@@ -80,10 +101,16 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         let mut has_video = false;
         let mut has_audio = false;
         let mut tracks = vec![];
+        let mut fetch_tracks = Vec::new();
         for (idx, trak) in moov.traks.into_iter().enumerate() {
             let id = trak.tkhd.track_id;
             let name: String = match catalog {
-                Some(ref c) => c.tracks[idx].name.clone(),
+                Some(ref c) => c
+                    .tracks
+                    .get(idx)
+                    .context("catalog has fewer tracks than init segment")?
+                    .name
+                    .clone(),
                 None => format!("{id}.m4s"),
             };
             info!("found track {name}");
@@ -99,6 +126,10 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                 info!("using {name} for audio");
             }
             if active {
+                if self.fetch.is_some() {
+                    fetch_tracks.push(name);
+                    continue;
+                }
                 let track = self
                     .tracks_writer
                     .create(&name)
@@ -119,18 +150,40 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             }
         }
 
-        info!("playing {} tracks", tracks.len());
+        info!("playing {} tracks", tracks.len() + fetch_tracks.len());
         let mut tasks = JoinSet::new();
+        let history_complete = Arc::new(tokio::sync::Barrier::new(fetch_tracks.len().max(1)));
+        for name in fetch_tracks {
+            let subscriber = self.subscriber.clone();
+            let namespace = self.broadcast.namespace.clone();
+            let out = self.output.clone();
+            let mode = self.fetch.context("missing FETCH mode")?;
+            let history_complete = history_complete.clone();
+            tasks.spawn(async move {
+                crate::fetch::play(
+                    subscriber,
+                    namespace,
+                    name.into(),
+                    out,
+                    mode,
+                    history_complete,
+                )
+                .await
+            });
+        }
         for track in tracks {
             let out = self.output.clone();
             tasks.spawn(async move {
                 let name = track.name.clone();
-                if let Err(err) = Self::recv_track(track, out).await {
-                    warn!("failed to play track {name}: {err:?}");
-                }
+                Self::recv_track(track, out)
+                    .await
+                    .with_context(|| format!("failed to play track {name}"))
             });
         }
-        while tasks.join_next().await.is_some() {}
+        while let Some(result) = tasks.join_next().await {
+            result.context("media task panicked")??;
+        }
+        self.output.lock().await.flush().await?;
         Ok(())
     }
 
@@ -144,12 +197,11 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             .create(track_name)
             .context(format!("failed to create {alias} track"))?;
 
-        let mut subscriber = self.subscriber.clone();
-        tokio::task::spawn(async move {
-            subscriber.subscribe(track).await.unwrap_or_else(|err| {
-                warn!("failed to subscribe to {alias} track: {err:?}");
-            });
-        });
+        let _subscription = self
+            .subscriber
+            .subscribe_open(track)
+            .await
+            .with_context(|| format!("failed to subscribe to {alias} track"))?;
 
         let track = self
             .broadcast
