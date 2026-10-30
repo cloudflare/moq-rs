@@ -59,11 +59,7 @@ impl Refresh {
 
     /// Update the origin registration in moq-api.
     async fn update(&self) -> Result<(), moq_api::ApiError> {
-        tracing::debug!(
-            "registering origin: namespace={} url={}",
-            self.namespace,
-            self.origin.url
-        );
+        tracing::debug!("registering origin: namespace={}", self.namespace,);
         // Register the origin in moq-api.
         self.client
             .set_origin(&self.namespace, self.origin.clone())

@@ -26,7 +26,6 @@ path = "src/bin/moq-relay-ietf/main.rs"
 moq-transport = { path = "../moq-transport", version = "0.16" }
 moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
 moq-api = { path = "../moq-api", version = "0.2" }
-web-transport = { workspace = true }
 
 # Bearer tokens are held in a type that zeroizes on drop and redacts under
 # Debug. Not optional: the enforcement points compile without `auth-cat`, so

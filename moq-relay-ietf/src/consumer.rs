@@ -11,6 +11,7 @@ use moq_transport::{
     session::{PublishReceived, PublishedNamespace, SessionError, Subscribe, Subscriber},
 };
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 
 use crate::auth::{authorize, AuthzOperation, SessionAuth};
 use crate::{
@@ -50,12 +51,19 @@ impl CacheSubscriptionCleanup {
         let subscribe = self.subscribe.take();
         let lease = self.lease.take()?;
         lease.begin_release();
-        Some(tokio::spawn(async move {
-            if let Some(subscribe) = subscribe {
-                subscribe.unsubscribe().await;
+        let span = subscribe
+            .as_ref()
+            .map(|subscribe| subscribe.session_id().span())
+            .unwrap_or_else(tracing::Span::current);
+        Some(tokio::spawn(
+            async move {
+                if let Some(subscribe) = subscribe {
+                    subscribe.unsubscribe().await;
+                }
+                lease.finish_release();
             }
-            lease.finish_release();
-        }))
+            .instrument(span),
+        ))
     }
 }
 
@@ -69,10 +77,16 @@ impl Drop for CacheSubscriptionCleanup {
 
         if let Some(subscribe) = subscribe {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                std::mem::drop(runtime.spawn(async move {
-                    subscribe.unsubscribe().await;
-                    lease.finish_release();
-                }));
+                let span = subscribe.session_id().span();
+                std::mem::drop(
+                    runtime.spawn(
+                        async move {
+                            subscribe.unsubscribe().await;
+                            lease.finish_release();
+                        }
+                        .instrument(span),
+                    ),
+                );
                 return;
             }
 
@@ -138,6 +152,11 @@ impl Consumer {
 
     /// Run the consumer to handle inbound PUBLISH_NAMESPACE and PUBLISH requests.
     pub async fn run(self) -> Result<(), SessionError> {
+        let span = self.context.span(self.subscriber.session_id());
+        self.run_inner().instrument(span).await
+    }
+
+    async fn run_inner(self) -> Result<(), SessionError> {
         let mut tasks: FuturesUnordered<futures::future::BoxFuture<'static, ()>> =
             FuturesUnordered::new();
         let mut namespace_subscriber = self.subscriber.clone();
@@ -161,7 +180,7 @@ impl Consumer {
                         if let Err(err) = this.serve(published_ns).await {
                             tracing::warn!(
                                 namespace = %namespace,
-                                error = %err,
+                                error = %moq_transport::session::LogSafe(err.to_string().as_bytes()),
                                 "failed serving PUBLISH_NAMESPACE: {:?}", info
                             );
                         }
@@ -177,7 +196,7 @@ impl Consumer {
                         tracing::info!(namespace = %namespace, track = %track_name, "serving PUBLISH");
 
                         if let Err(err) = this.serve_track(publish).await {
-                            tracing::warn!(namespace = %namespace, track = %track_name, error = %err, "failed serving PUBLISH");
+                            tracing::warn!(namespace = %namespace, track = %track_name, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed serving PUBLISH");
                         }
                     }.boxed());
                 },
@@ -357,7 +376,7 @@ impl Consumer {
                     {
                         metrics::counter!("moq_relay_announce_errors_total", "phase" => "forward")
                             .increment(1);
-                        tracing::warn!(namespace = %namespace, error = %err, "failed forwarding PUBLISH_NAMESPACE upstream");
+                        tracing::warn!(namespace = %namespace, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed forwarding PUBLISH_NAMESPACE upstream");
                     }
                     Ok(())
                 }
@@ -402,7 +421,6 @@ impl Consumer {
                     let namespace = reader.namespace.to_utf8_path();
                     tracing::info!(
                         namespace = %namespace,
-                        remote = %relay.url,
                         "forwarding PUBLISH_NAMESPACE to peer relay"
                     );
                     // Best-effort fan-out: one downstream relay failing must not tear
@@ -411,13 +429,11 @@ impl Consumer {
                     if let Err(err) = remotes
                         .publish_namespace(&relay, reader)
                         .await
-                        .with_context(|| {
-                            format!("failed forwarding PUBLISH_NAMESPACE to {}", relay.url)
-                        })
+                        .context("failed forwarding PUBLISH_NAMESPACE to peer relay")
                     {
                         metrics::counter!("moq_relay_announce_errors_total", "phase" => "peer_fanout")
                             .increment(1);
-                        tracing::warn!(namespace = %namespace, remote = %relay.url, error = %err, "failed forwarding PUBLISH_NAMESPACE to peer relay");
+                        tracing::warn!(namespace = %namespace, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed forwarding PUBLISH_NAMESPACE to peer relay");
                     }
                     Ok(())
                 }
@@ -480,7 +496,7 @@ impl Consumer {
                                 tracing::warn!(
                                     namespace = %namespace,
                                     track = %track_name,
-                                    error = %err,
+                                    error = %moq_transport::session::LogSafe(err.to_string().as_bytes()),
                                     "failed forwarding subscribe: {:?}", info
                                 );
                                 // Release waiting downstream subscribers with the
@@ -514,7 +530,7 @@ impl Consumer {
                             tracing::warn!(
                                 namespace = %namespace,
                                 track = %track_name,
-                                error = %err,
+                                error = %moq_transport::session::LogSafe(err.to_string().as_bytes()),
                                 "failed forwarding subscribe: {:?}", info
                             );
                             upstream.failed(err);
@@ -532,7 +548,7 @@ impl Consumer {
                                     tracing::warn!(
                                         namespace = %namespace,
                                         track = %track_name,
-                                        error = %err,
+                                        error = %moq_transport::session::LogSafe(err.to_string().as_bytes()),
                                         "failed forwarding subscribe: {:?}", info
                                     )
                                 }
@@ -711,6 +727,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod auth_gates {
+        use moq_transport::session::transport as web_transport;
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
@@ -789,8 +806,7 @@ mod tests {
                 &self,
                 _scope: Option<&str>,
                 _namespace: &TrackNamespace,
-            ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::quic::Client>)>
-            {
+            ) -> CoordinatorResult<(NamespaceOrigin, Option<moq_native_ietf::Client>)> {
                 Err(crate::CoordinatorError::NamespaceNotFound)
             }
         }

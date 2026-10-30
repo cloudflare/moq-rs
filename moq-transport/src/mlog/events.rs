@@ -183,6 +183,23 @@ fn key_value_pairs_to_vec(kvps: &[coding::KeyValuePair]) -> Vec<(String, String)
         .collect()
 }
 
+// SETUP's PATH and AUTHORITY can carry credentials or identify a peer. The
+// same numeric keys have other meanings in message parameter registries.
+fn setup_parameters_to_vec(kvps: &[coding::KeyValuePair]) -> Vec<(String, String)> {
+    kvps.iter()
+        .map(|kvp| {
+            let value = if kvp.key == u64::from(setup::ParameterType::Path)
+                || kvp.key == u64::from(setup::ParameterType::Authority)
+            {
+                "[REDACTED]".to_string()
+            } else {
+                render_parameter(kvp)
+            };
+            (kvp.key.to_string(), value)
+        })
+        .collect()
+}
+
 /// Render a parameter for the log, redacting bearer credentials.
 ///
 /// `Value`'s `Debug` hex-dumps the first bytes, which for an AUTHORIZATION
@@ -238,7 +255,7 @@ pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Setup) -> Eve
         true,
         "client_setup",
         json!({
-            "parameters": key_value_pairs_to_vec(&msg.params.0),
+            "parameters": setup_parameters_to_vec(&msg.params.0),
         }),
     )
 }
@@ -252,7 +269,7 @@ pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Setup) -> Ev
         false,
         "server_setup",
         json!({
-            "parameters": key_value_pairs_to_vec(&msg.params.0),
+            "parameters": setup_parameters_to_vec(&msg.params.0),
         }),
     )
 }
@@ -476,7 +493,7 @@ fn request_error_to_json(request_kind: &str, msg: &message::RequestError) -> Jso
         "request_kind": request_kind,
         "error_code": msg.error_code,
         "retry_interval": msg.retry_interval,
-        "reason_phrase": &msg.reason.0,
+        "reason_phrase": crate::session::LogSafe(msg.reason.0.as_bytes()).to_string(),
     })
 }
 
@@ -546,7 +563,7 @@ pub fn go_away_parsed(time: f64, stream_id: u64, msg: &message::GoAway) -> Event
         true,
         "goaway",
         json!({
-                    "new_session_uri": &msg.uri.0,
+                    "new_session_uri": if msg.uri.0.is_empty() { "" } else { "[REDACTED]" },
         }),
     )
 }
@@ -559,7 +576,7 @@ pub fn go_away_created(time: f64, stream_id: u64, msg: &message::GoAway) -> Even
         false,
         "goaway",
         json!({
-                    "new_session_uri": &msg.uri.0,
+                    "new_session_uri": if msg.uri.0.is_empty() { "" } else { "[REDACTED]" },
         }),
     )
 }
@@ -907,8 +924,31 @@ mod tests {
         assert!(!token.contains("73"), "{token} looks like a hex dump");
         assert!(!token.contains("super"), "{token}");
 
-        // Other parameters are untouched: PATH is not a credential.
+        // Other message parameters are untouched; SETUP has a distinct registry.
         assert_ne!(rendered[1].1, "[REDACTED 12 bytes]");
         assert_eq!(rendered[2].1, "100");
+    }
+
+    #[test]
+    fn setup_hides_path_and_authority_without_changing_message_parameters() {
+        let kvps = vec![
+            coding::KeyValuePair::new_bytes(
+                0x1,
+                b"/eyJsecret.payload.signature?token=secret".to_vec(),
+            ),
+            coding::KeyValuePair::new_bytes(0x5, b"peer-identity.test".to_vec()),
+            coding::KeyValuePair::new_int(0x2, 100),
+        ];
+        let msg = setup::Setup {
+            params: KeyValuePairs(kvps.clone()),
+        };
+        let event = client_setup_parsed(0.0, 0, &msg);
+        let EventData::ControlMessageParsed(data) = event.data else {
+            panic!("expected SETUP event");
+        };
+        assert_eq!(data.message["parameters"][0][1], "[REDACTED]");
+        assert_eq!(data.message["parameters"][1][1], "[REDACTED]");
+        assert_eq!(data.message["parameters"][2][1], "100");
+        assert_ne!(key_value_pairs_to_vec(&kvps)[0].1, "[REDACTED]");
     }
 }

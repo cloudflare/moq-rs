@@ -9,22 +9,42 @@ use bytes::{Buf, Bytes, BytesMut};
 use crate::coding::{Decode, DecodeError};
 use crate::data::{FetchRecord, FetchRecordDecoder, MAX_FETCH_RECORD_HEADER_SIZE};
 
-use super::SessionError;
+use super::transport as web_transport;
+use super::{SessionError, SessionId};
+use tracing::Instrument;
 
 pub struct Reader {
+    session_id: SessionId,
+    span: tracing::Span,
     stream: web_transport::RecvStream,
     buffer: BytesMut,
 }
 
 impl Reader {
+    #[cfg(test)]
     pub fn new(stream: web_transport::RecvStream) -> Self {
+        Self::with_session_id(stream, SessionId::generate())
+    }
+
+    pub fn with_session_id(stream: web_transport::RecvStream, session_id: SessionId) -> Self {
         Self {
+            span: session_id.span(),
+            session_id,
             stream,
             buffer: Default::default(),
         }
     }
 
     pub async fn decode<T: Decode>(&mut self) -> Result<T, SessionError> {
+        let span = self.span.clone();
+        self.decode_inner().instrument(span).await
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    async fn decode_inner<T: Decode>(&mut self) -> Result<T, SessionError> {
         tracing::trace!(
             "[READER] decode: attempting to decode {} (buffer_len={})",
             std::any::type_name::<T>(),
@@ -101,6 +121,11 @@ impl Reader {
     }
 
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, SessionError> {
+        let span = self.span.clone();
+        self.read_chunk_inner(max).instrument(span).await
+    }
+
+    async fn read_chunk_inner(&mut self, max: usize) -> Result<Option<Bytes>, SessionError> {
         tracing::trace!(
             "[READER] read_chunk: requested max={} bytes (buffer_len={})",
             max,
@@ -134,6 +159,14 @@ impl Reader {
     /// [`MAX_FETCH_RECORD_HEADER_SIZE`], is [`SessionError::WrongSize`]. The
     /// decoder state only advances on success.
     pub(super) async fn decode_fetch(
+        &mut self,
+        decoder: &mut FetchRecordDecoder,
+    ) -> Result<Option<FetchRecord>, SessionError> {
+        let span = self.span.clone();
+        self.decode_fetch_inner(decoder).instrument(span).await
+    }
+
+    async fn decode_fetch_inner(
         &mut self,
         decoder: &mut FetchRecordDecoder,
     ) -> Result<Option<FetchRecord>, SessionError> {

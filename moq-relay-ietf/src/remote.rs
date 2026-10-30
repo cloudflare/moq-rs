@@ -7,24 +7,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use moq_native_ietf::quic;
+use moq_native_ietf::{quic, Client};
 use moq_transport::coding::{KeyValuePairs, TrackName, TrackNamespace, TrackNamespacePrefix};
 
 use moq_transport::message::StandaloneFetch;
 use moq_transport::serve::{ServeError, Track, TrackReader, TracksReader};
+use moq_transport::session::LogSafe;
 use moq_transport::session::{Fetch, Publisher, SessionConfig, Subscribe, SubscribeNamespace};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use url::Url;
 
 use crate::interest::{TrackInterest, TrackInterestGuard};
 use crate::local::DEFAULT_CACHE_IDLE_TIMEOUT;
 use crate::{metrics::GaugeGuard, Coordinator, CoordinatorError, RelayInfo, SessionContext};
 
+#[cfg(test)]
+#[path = "remote_client_tests.rs"]
+mod client_tests;
+
 /// Cache key for upstream relay-to-relay connections.
 ///
 /// Keyed by both URL and destination address so that connections are reused
 /// only when both match.
+/// Client/trust/bind/backend policy is not part of this legacy key: a live
+/// cached session wins before a later caller's override is selected. Opaque
+/// clients do not establish policy equivalence or repair that limitation.
 type RemoteCacheKey = (Url, Option<SocketAddr>);
 type RemoteSlot = Arc<Mutex<Option<Remote>>>;
 type TrackCacheKey = (TrackNamespace, TrackName);
@@ -72,7 +81,7 @@ impl Drop for EmptyRemoteSlotCleanup {
                 remove_empty_remote_slot(&remotes, &key, &slot).await;
             }));
         } else {
-            tracing::warn!(remote_url = %key.0, "could not clean up an empty remote slot outside a Tokio runtime");
+            tracing::warn!("could not clean up an empty remote slot outside a Tokio runtime");
         }
     }
 }
@@ -176,9 +185,10 @@ impl Drop for TrackSubscriptionCleanup {
         let slot = self.slot.clone();
         let interest = self.interest.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            std::mem::drop(runtime.spawn(finish_track_subscription(
-                subscribe, tracks, key, slot, interest,
-            )));
+            let span = subscribe.session_id().span();
+            std::mem::drop(runtime.spawn(
+                finish_track_subscription(subscribe, tracks, key, slot, interest).instrument(span),
+            ));
         } else {
             tracing::warn!(namespace = %self.key.0, track = %self.key.1, "could not finish remote track teardown outside a Tokio runtime");
         }
@@ -199,7 +209,7 @@ pub(crate) enum RemoteSubscribeError {
 #[derive(Clone)]
 pub struct RemoteManager {
     coordinator: Arc<dyn Coordinator>,
-    clients: Vec<quic::Client>,
+    clients: Vec<Client>,
     session_config: SessionConfig,
     remotes: Arc<Mutex<HashMap<RemoteCacheKey, RemoteSlot>>>,
 
@@ -243,10 +253,10 @@ mod tests {
             &self,
             _scope: Option<&str>,
             namespace: &TrackNamespace,
-        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<Client>)> {
             Ok((
                 crate::NamespaceOrigin::new(namespace.clone(), self.url.clone(), Some(self.addr)),
-                Some(self.client.clone()),
+                Some(self.client.clone().into()),
             ))
         }
     }
@@ -468,7 +478,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
-        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<Client>)> {
             Err(crate::CoordinatorError::NamespaceNotFound)
         }
     }
@@ -498,7 +508,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             namespace: &TrackNamespace,
-        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<quic::Client>)> {
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<Client>)> {
             Ok((
                 crate::NamespaceOrigin::new(
                     namespace.clone(),
@@ -771,6 +781,23 @@ impl RemoteManager {
         clients: Vec<quic::Client>,
         session_config: SessionConfig,
     ) -> Self {
+        Self::new_with_clients(
+            coordinator,
+            clients.into_iter().map(Client::from).collect(),
+            session_config,
+        )
+    }
+
+    /// Create a manager with backend-injectable default clients.
+    ///
+    /// The first client is used unless a coordinator lookup supplies an
+    /// override. Reuse retains the legacy full-URL/address key, not client
+    /// policy identity; do not mix policies assuming they are pool-isolated.
+    pub fn new_with_clients(
+        coordinator: Arc<dyn Coordinator>,
+        clients: Vec<Client>,
+        session_config: SessionConfig,
+    ) -> Self {
         Self {
             coordinator,
             clients,
@@ -891,7 +918,7 @@ impl RemoteManager {
         {
             Ok(remote) => remote,
             Err(err) => {
-                tracing::error!(remote_url = %url, error = %err, "failed to connect to remote relay: {}", err);
+                tracing::error!(error = %LogSafe(err.to_string().as_bytes()), "failed to connect to remote relay");
                 return Err(RemoteSubscribeError::Route(err));
             }
         };
@@ -906,11 +933,11 @@ impl RemoteManager {
             }
             Err(RemoteSubscribeError::Peer(err)) => {
                 *coordinator_lookup_succeeded = true;
-                tracing::debug!(remote_url = %url, error = %err, "remote relay rejected SUBSCRIBE");
+                tracing::debug!(error = %LogSafe(err.to_string().as_bytes()), "remote relay rejected SUBSCRIBE");
                 Err(RemoteSubscribeError::Peer(err))
             }
             Err(RemoteSubscribeError::Route(err)) => {
-                tracing::warn!(remote_url = %url, error = %err, "remote subscribe failed, removing from cache");
+                tracing::warn!(error = %LogSafe(err.to_string().as_bytes()), "remote subscribe failed, removing from cache");
                 self.remove_if_same_remote(&cache_key, &remote).await;
 
                 Err(RemoteSubscribeError::Route(err))
@@ -952,7 +979,7 @@ impl RemoteManager {
                 // Only a dead connection is evicted; a refused request (for
                 // example an invalid range) says nothing about the session.
                 if !remote.is_connected() {
-                    tracing::warn!(remote_url = %remote.url, error = %err, "remote FETCH failed on a closed connection, removing from cache");
+                    tracing::warn!(error = %LogSafe(err.to_string().as_bytes()), "remote FETCH failed on a closed connection, removing from cache");
                     self.remove_if_same_remote(&cache_key, &remote).await;
                 }
                 Err(err.into())
@@ -979,7 +1006,7 @@ impl RemoteManager {
         let remote = match self.get_or_connect(cache_key.clone(), None).await {
             Ok(remote) => remote,
             Err(err) => {
-                tracing::error!(remote_url = %relay.url, error = %err, "failed to connect to remote relay: {}", err);
+                tracing::error!(error = %LogSafe(err.to_string().as_bytes()), "failed to connect to remote relay");
                 return Err(err);
             }
         };
@@ -1008,7 +1035,7 @@ impl RemoteManager {
         let remote = match self.get_or_connect(cache_key.clone(), None).await {
             Ok(remote) => remote,
             Err(err) => {
-                tracing::error!(remote_url = %relay.url, error = %err, "failed to connect to remote relay: {}", err);
+                tracing::error!(error = %LogSafe(err.to_string().as_bytes()), "failed to connect to remote relay");
                 return Err(err);
             }
         };
@@ -1016,7 +1043,7 @@ impl RemoteManager {
         match remote.publish_namespace(tracks).await {
             Ok(()) => Ok(()),
             Err(err) => {
-                tracing::warn!(remote_url = %relay.url, error = %err, "remote publish_namespace failed, removing from cache");
+                tracing::warn!(error = %LogSafe(err.to_string().as_bytes()), "remote publish_namespace failed, removing from cache");
                 self.remove_if_same_remote(&cache_key, &remote).await;
                 Err(err)
             }
@@ -1027,7 +1054,7 @@ impl RemoteManager {
     async fn get_or_connect(
         &self,
         cache_key: RemoteCacheKey,
-        client: Option<&quic::Client>,
+        client: Option<&Client>,
     ) -> anyhow::Result<Remote> {
         loop {
             // The manager lock only protects the map. The per-key slot lock protects
@@ -1062,7 +1089,7 @@ impl RemoteManager {
                     return Ok(remote);
                 }
 
-                tracing::info!(remote_url = %cache_key.0, "removing dead connection to remote relay");
+                tracing::info!("removing dead connection to remote relay");
             };
 
             if let Some(remote) = cached.take() {
@@ -1076,7 +1103,7 @@ impl RemoteManager {
                 })?,
             };
 
-            tracing::info!(remote_url = %cache_key.0, "connecting to remote relay");
+            tracing::info!("connecting to remote relay");
             let remote = match Remote::connect(
                 cache_key.0.clone(),
                 cache_key.1,
@@ -1135,8 +1162,8 @@ impl RemoteManager {
             remotes.drain().collect::<Vec<_>>()
         };
 
-        for (cache_key, slot) in remotes {
-            tracing::info!(remote_url = %cache_key.0, "shutting down remote connection");
+        for (_cache_key, slot) in remotes {
+            tracing::info!("shutting down remote connection");
             let mut remote = slot.lock().await;
             if let Some(remote) = remote.take() {
                 remote.shutdown().await;
@@ -1282,7 +1309,7 @@ impl Remote {
     async fn connect(
         url: Url,
         addr: Option<SocketAddr>,
-        client: &quic::Client,
+        client: &Client,
         session_config: SessionConfig,
         cache_idle_timeout: Duration,
         cache: RemoteCacheHandle,
@@ -1292,8 +1319,11 @@ impl Remote {
             key: cache_key,
             slot: cache_slot,
         } = cache;
-        let (session, _quic_client_initial_cid, transport) = match client.connect(&url, addr).await
-        {
+        let moq_native_ietf::client::Connection {
+            session,
+            transport,
+            initial_destination_cid,
+        } = match client.connect(&url, addr).await {
             Ok(session) => session,
             Err(err) => {
                 metrics::counter!("moq_relay_upstream_errors_total", "stage" => "connect")
@@ -1308,11 +1338,14 @@ impl Remote {
         // PUBLISH_NAMESPACE). This mirrors the `--announce` forward path in
         // relay.rs rather than the subscriber-only upstream pull it replaces.
         let (session, publisher, subscriber) =
-            match moq_transport::session::Session::connect_with_config(
+            match moq_transport::session::Session::connect_with_config_and_session_id(
                 session,
                 None,
                 transport,
                 session_config,
+                initial_destination_cid
+                    .map(moq_transport::session::SessionId::new)
+                    .unwrap_or_else(moq_transport::session::SessionId::generate),
             )
             .await
             {
@@ -1328,8 +1361,8 @@ impl Remote {
         let cancel = CancellationToken::new();
         let upstream_guard = GaugeGuard::new("moq_relay_upstream_connections");
         let context = Self::context_for_endpoint(url.clone(), addr);
+        let span = context.span(session.session_id());
 
-        let session_url = url.clone();
         let session_connected = connected.clone();
         let session_cancel = cancel.clone();
 
@@ -1338,13 +1371,13 @@ impl Remote {
             tokio::select! {
                 result = session.run() => {
                     if let Err(err) = result {
-                        tracing::warn!(remote_url = %session_url, error = %err, "remote session closed: {}", err);
+                        tracing::warn!(error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "remote session closed");
                     } else {
-                        tracing::info!(remote_url = %session_url, "remote session closed normally");
+                        tracing::info!("remote session closed normally");
                     }
                 }
                 _ = session_cancel.cancelled() => {
-                    tracing::info!(remote_url = %session_url, "remote session cancelled");
+                    tracing::info!("remote session cancelled");
                 }
             }
 
@@ -1357,7 +1390,7 @@ impl Remote {
                 {
                     cached.take();
                     cleared = true;
-                    tracing::info!(remote_url = %session_url, "cleared closed remote connection from cache");
+                    tracing::info!("cleared closed remote connection from cache");
                 }
                 drop(cached);
 
@@ -1367,7 +1400,7 @@ impl Remote {
                     }
                 }
             }
-        });
+        }.instrument(span));
 
         Ok(Self {
             url,
@@ -1495,7 +1528,7 @@ impl Remote {
                     return Ok(result);
                 }
 
-                tracing::debug!(remote_url = %self.url, namespace = %key.0, track = %key.1, "waiting for closed remote track teardown");
+                tracing::debug!(namespace = %key.0, track = %key.1, "waiting for closed remote track teardown");
                 let closing = entry.interest.clone();
                 closing.mark_closing();
                 cleanup.disarm();
@@ -1505,11 +1538,10 @@ impl Remote {
             }
 
             let mut subscriber = self.subscriber.clone();
-            let url = self.url.clone();
             let tracks = Arc::downgrade(&self.tracks);
             let cancel = self.cancel.clone();
 
-            tracing::info!(remote_url = %url, namespace = %key.0, track = %key.1, "subscribing to remote track");
+            tracing::info!(namespace = %key.0, track = %key.1, "subscribing to remote track");
 
             let (writer, reader) = Track::new(namespace.clone(), track_name.clone()).produce();
             let mut params = KeyValuePairs::default();
@@ -1595,33 +1627,34 @@ impl Remote {
             let cleanup_key = key.clone();
             let cleanup_slot = slot.clone();
             let idle_timeout = self.cache_idle_timeout;
+            let span = self.context.span(self.subscriber.session_id());
             tokio::spawn(async move {
                 tokio::select! {
                     result = subscribe.closed() => {
                         match result {
                             Ok(()) => {
-                                tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription ended");
+                                tracing::debug!(namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription ended");
                             }
                             Err(err) => {
-                                tracing::warn!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, error = %err, "remote track subscription ended with error: {}", err);
+                                tracing::warn!(namespace = %cleanup_key.0, track = %cleanup_key.1, error = %LogSafe(err.to_string().as_bytes()), "remote track subscription ended with error");
                             }
                         }
                     }
                     _ = cancel.cancelled() => {
-                        tracing::debug!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
+                        tracing::debug!(namespace = %cleanup_key.0, track = %cleanup_key.1, "remote track subscription cancelled");
                     }
                     // Nobody downstream is watching this cross-relay track any
                     // more, so stop pulling it from the peer relay. The slot stays
                     // closing until the request stream has been torn down.
                     _ = evict_when_idle(&cleanup_slot, &interest, idle_timeout) => {
-                        tracing::info!(remote_url = %url, namespace = %cleanup_key.0, track = %cleanup_key.1, "releasing idle remote track subscription");
+                        tracing::info!(namespace = %cleanup_key.0, track = %cleanup_key.1, "releasing idle remote track subscription");
                         metrics::counter!("moq_relay_cache_idle_evictions_total", "source" => "remote").increment(1);
                     }
                 }
 
                 finish_track_subscription(subscribe, tracks, cleanup_key, cleanup_slot, interest)
                     .await;
-            });
+            }.instrument(span));
 
             return Ok(Some((reader, guard)));
         }
@@ -1643,16 +1676,16 @@ impl Remote {
         prefix: TrackNamespacePrefix,
     ) -> anyhow::Result<SubscribeNamespace> {
         if !self.is_connected() {
-            anyhow::bail!("remote connection to {} is closed", self.url);
+            anyhow::bail!("remote connection is closed");
         }
 
-        tracing::info!(remote_url = %self.url, prefix = %prefix, "forwarding SUBSCRIBE_NAMESPACE to remote relay");
+        tracing::info!(prefix = %prefix, "forwarding SUBSCRIBE_NAMESPACE to remote relay");
 
         let mut subscriber = self.subscriber.clone();
         let subscribe_namespace = tokio::select! {
             result = subscriber.subscribe_namespace(prefix, KeyValuePairs::default()) => result?,
             _ = self.cancel.cancelled() => {
-                anyhow::bail!("subscribe_namespace cancelled, remote connection to {} is closed", self.url);
+                anyhow::bail!("subscribe_namespace cancelled, remote connection is closed");
             }
         };
 
@@ -1668,16 +1701,16 @@ impl Remote {
     /// `--announce` forward path in `consumer.rs`).
     async fn publish_namespace(&self, tracks: TracksReader) -> anyhow::Result<()> {
         if !self.is_connected() {
-            anyhow::bail!("remote connection to {} is closed", self.url);
+            anyhow::bail!("remote connection is closed");
         }
 
-        tracing::info!(remote_url = %self.url, namespace = %tracks.namespace, "forwarding PUBLISH_NAMESPACE to remote relay");
+        tracing::info!(namespace = %tracks.namespace, "forwarding PUBLISH_NAMESPACE to remote relay");
 
         let mut publisher = self.publisher.clone();
         tokio::select! {
             result = publisher.publish_namespace(tracks) => result?,
             _ = self.cancel.cancelled() => {
-                anyhow::bail!("publish_namespace cancelled, remote connection to {} is closed", self.url);
+                anyhow::bail!("publish_namespace cancelled, remote connection is closed");
             }
         }
 

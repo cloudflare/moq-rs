@@ -159,7 +159,7 @@ impl PublishedNamespace {
             namespace = %self.info.namespace,
             request_id = self.info.request_id,
             error_code,
-            reason,
+            reason = %super::LogSafe(reason.as_bytes()),
             "rejecting PUBLISH_NAMESPACE"
         );
         self.error = Some(message::RequestError {

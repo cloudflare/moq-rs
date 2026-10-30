@@ -12,6 +12,7 @@ use std::{
 
 use futures::{stream::FuturesUnordered, StreamExt};
 
+use super::transport as web_transport;
 use crate::{
     coding::{KeyValuePairs, ReasonPhrase, TrackNamespace, TrackNamespacePrefix},
     message::{self, Message},
@@ -189,11 +190,12 @@ impl OpeningPublishNamespaceStream {
         session: web_transport::Session,
         send: web_transport::SendStream,
         recv: web_transport::RecvStream,
+        session_id: super::SessionId,
     ) -> Self {
         Self {
             session,
-            writer: Some(Writer::new(send)),
-            reader: Some(Reader::new(recv)),
+            writer: Some(Writer::with_session_id(send, session_id.clone())),
+            reader: Some(Reader::with_session_id(recv, session_id)),
         }
     }
 
@@ -235,6 +237,11 @@ impl Drop for PublishNamespaceCleanup {
 }
 
 impl Publisher {
+    /// Stable identity shared with the session and subscriber role.
+    pub fn session_id(&self) -> &super::SessionId {
+        self.request_id.session_id()
+    }
+
     pub(crate) fn new(
         outgoing: Queue<Message>,
         webtransport: web_transport::Session,
@@ -301,6 +308,12 @@ impl Publisher {
     /// responses from the same stream. Requires `Session::run` to be driven
     /// concurrently, since `run` polls the bidi response reader.
     pub async fn publish_namespace(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
+        use tracing::Instrument;
+        let span = self.session_id().span();
+        self.publish_namespace_inner(tracks).instrument(span).await
+    }
+
+    async fn publish_namespace_inner(&mut self, tracks: TracksReader) -> Result<(), SessionError> {
         let publish_ns = self
             .publish_namespace_start(tracks.namespace.clone())
             .await?;
@@ -321,7 +334,7 @@ impl Publisher {
                                 if let Err(err) = Self::serve_subscribe(subscribed, tracks).await {
                                     tracing::warn!(
                                         subscribe_info = ?info,
-                                        error = %err,
+                                        error = %super::LogSafe(err.to_string().as_bytes()),
                                         "failed serving subscribe"
                                     );
                                 }
@@ -339,7 +352,7 @@ impl Publisher {
                                 if let Err(err) = Self::serve_track_status(status, tracks).await {
                                     tracing::warn!(
                                         request = ?request_msg,
-                                        error = %err,
+                                        error = %super::LogSafe(err.to_string().as_bytes()),
                                         "failed serving track status request"
                                     );
                                 }
@@ -412,10 +425,16 @@ impl Publisher {
             publisher: this.clone(),
             request_id,
         };
-        let frame = super::encode_request_frame(&Message::PublishNamespace(msg))?;
+        let msg = Message::PublishNamespace(msg);
+        let frame = super::encode_request_frame(&msg)?;
+        Session::log_control_message(self.session_id(), &msg, "sent");
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
-        let mut opening =
-            OpeningPublishNamespaceStream::new(self.webtransport.clone(), send_stream, recv_stream);
+        let mut opening = OpeningPublishNamespaceStream::new(
+            self.webtransport.clone(),
+            send_stream,
+            recv_stream,
+            self.session_id().clone(),
+        );
 
         let OpeningPublishNamespaceStream { writer, reader, .. } = &mut opening;
         let writer = writer.as_mut().ok_or(SessionError::Internal)?;
@@ -653,9 +672,14 @@ impl Publisher {
         track: TrackReader,
     ) -> Result<super::RequestStreamSink, SessionError> {
         // Validate local parameters before consuming a peer request-stream slot.
-        let frame = super::encode_request_frame(&Message::Publish(msg))?;
+        let msg = Message::Publish(msg);
+        let frame = super::encode_request_frame(&msg)?;
+        Session::log_control_message(self.session_id(), &msg, "sent");
         let (send_stream, recv_stream) = self.webtransport.open_bi().await?;
-        let mut writer = super::ResetOnDropWriter::new(super::Writer::new(send_stream));
+        let mut writer = super::ResetOnDropWriter::new(super::Writer::with_session_id(
+            send_stream,
+            self.session_id().clone(),
+        ));
         writer.write(&frame).await?;
 
         let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<BidiResponse>();
@@ -665,7 +689,7 @@ impl Publisher {
             .bidi_task_tx
             .send(Box::pin(async move {
                 let mut abort = abort;
-                let responses = futures::stream::unfold(super::Reader::new(recv_stream), move |mut reader| async move {
+                let responses = futures::stream::unfold(super::Reader::with_session_id(recv_stream, this.session_id().clone()), move |mut reader| async move {
                     let response = Session::decode_bidi_response(&mut reader, request_id).await;
                     Some((response, reader))
                 });
@@ -675,6 +699,8 @@ impl Publisher {
                 // while the write half stays open for PUBLISH_DONE.
                 let mut reading = true;
                 let mut writer_closed = false;
+                let mut responded = false;
+                let mut request_stopped = false;
                 // Keep one handler in flight without blocking PUBLISH_DONE or
                 // peer STOP_SENDING. Later responses remain serialized behind it.
                 let mut new_group: Option<futures::future::BoxFuture<'static, Result<(), ServeError>>> = None;
@@ -689,7 +715,7 @@ impl Publisher {
                             let terminal = matches!(outgoing.message, Message::PublishDone(_));
                             if let Err(err) = Session::encode_bidi_response(&mut writer, &outgoing.message).await {
                                 outgoing.complete(Err(DeliveryError::from_session_error(&err)));
-                                tracing::debug!(request_id, error = %err, "failed writing on PUBLISH request stream");
+                                tracing::debug!(request_id, error = %super::LogSafe(err.to_string().as_bytes()), "failed writing on PUBLISH request stream");
                                 writer.reset(0);
                                 writer_closed = true;
                                 break Ok(());
@@ -707,7 +733,7 @@ impl Publisher {
                                         .map_err(DeliveryError::from_session_error),
                                 );
                                 if let Err(err) = finish {
-                                    tracing::debug!(request_id, error = %err, "failed to FIN PUBLISH request stream");
+                                    tracing::debug!(request_id, error = %super::LogSafe(err.to_string().as_bytes()), "failed to FIN PUBLISH request stream");
                                 }
                                 break Ok(());
                             }
@@ -748,7 +774,7 @@ impl Publisher {
                                     break Err(err);
                                 }
                                 if let Err(err) = result {
-                                    tracing::debug!(request_id, error = %err, "PUBLISH dynamic-group feedback failed");
+                                    tracing::debug!(request_id, error = %super::LogSafe(err.to_string().as_bytes()), "PUBLISH dynamic-group feedback failed");
                                 }
                             }
                         }
@@ -788,6 +814,11 @@ impl Publisher {
                                     // Establish first: handler failure must still send
                                     // PUBLISH_DONE, rather than resemble a rejected PUBLISH.
                                     if let Err(err) = this.recv_request_ok(ok) { break Err(err); }
+                                    responded = true;
+                                    if request_stopped {
+                                        abort.cancel_from_peer();
+                                        break Ok(());
+                                    }
                                     if let Some(value) = value {
                                         let track = track.clone();
                                         new_group = Some(Box::pin(async move {
@@ -796,10 +827,23 @@ impl Publisher {
                                         replying_to_update = false;
                                     }
                                 }
+                                Ok(Message::RequestError(error)) if !responded => {
+                                    if let Err(err) = this.recv_request_error(error) { break Err(err); }
+                                    abort.complete();
+                                    break Ok(());
+                                }
                                 Ok(msg) => match TryInto::<message::Subscriber>::try_into(msg) {
                                     Ok(sub_msg) => {
+                                        let legacy_ok = matches!(sub_msg, message::Subscriber::PublishOk(_));
                                         if let Err(err) = this.recv_message(sub_msg) {
                                             break Err(err);
+                                        }
+                                        if legacy_ok {
+                                            responded = true;
+                                            if request_stopped {
+                                                abort.cancel_from_peer();
+                                                break Ok(());
+                                            }
                                         }
                                     }
                                     Err(msg) => tracing::warn!(
@@ -809,12 +853,15 @@ impl Publisher {
                                     ),
                                 },
                                 Err(err) if err.is_stream_error() => {
-                                    tracing::debug!(request_id, error = %err, "PUBLISH response stream reset by peer");
+                                    tracing::debug!(request_id, error = %super::LogSafe(err.to_string().as_bytes()), "PUBLISH response stream reset by peer");
                                     abort.cancel_from_peer();
                                     break Ok(());
                                 }
                                 Err(err) if err.is_stream_ended() => {
-                                    tracing::debug!(request_id, error = %err, "PUBLISH response reader ended");
+                                    tracing::debug!(request_id, error = %super::LogSafe(err.to_string().as_bytes()), "PUBLISH response reader ended");
+                                    if !responded {
+                                        break Ok(());
+                                    }
                                     reading = false;
                                 }
                                 // An undecodable frame is not a resynchronisation
@@ -823,13 +870,19 @@ impl Publisher {
                                 Err(err) => break Err(err),
                             }
                         }
-                        stopped = writer.closed() => {
+                        stopped = writer.closed(), if !request_stopped => {
                             match stopped {
                                 Ok(_) => {
-                                    abort.cancel_from_peer();
                                     writer.reset(0);
                                     writer_closed = true;
-                                    break Ok(());
+                                    // STOP_SENDING only closes our write half. A
+                                    // rejection and FIN can still be in flight on
+                                    // the response half (§3.3.2); preserve its code.
+                                    if responded {
+                                        abort.cancel_from_peer();
+                                        break Ok(());
+                                    }
+                                    request_stopped = true;
                                 }
                                 Err(err) => break Err(err),
                             }
@@ -887,7 +940,6 @@ impl Publisher {
         message: Message,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<(), DeliveryError>>, SessionError> {
         let id = message.response_target_id().ok_or(SessionError::Internal)?;
-        Session::log_control_message(&message, "sent");
         if let Message::SubscribeOk(msg) = &message {
             self.add_mlog_event(|time| mlog::events::subscribe_ok_created(time, msg.id, msg));
         }
@@ -941,7 +993,7 @@ impl Publisher {
             "PUBLISH request stream closed before completion"
         );
         if let Err(err) = published.recv.recv_error(ServeError::Cancel) {
-            tracing::debug!(request_id = id, error = %err, "failed to fail aborted PUBLISH");
+            tracing::debug!(request_id = id, error = %super::LogSafe(err.to_string().as_bytes()), "failed to fail aborted PUBLISH");
         }
     }
 
@@ -950,7 +1002,7 @@ impl Publisher {
             return;
         };
         if let Err(err) = published.recv_unsubscribe() {
-            tracing::debug!(request_id = id, error = %err, "failed to cancel reset PUBLISH");
+            tracing::debug!(request_id = id, error = %super::LogSafe(err.to_string().as_bytes()), "failed to cancel reset PUBLISH");
         }
     }
 
@@ -1227,7 +1279,7 @@ impl Publisher {
                 {
                     recv.fail_update();
                 }
-                tracing::debug!(parent_id, error = %err, "SUBSCRIBE update failed");
+                tracing::debug!(parent_id, error = %super::LogSafe(err.to_string().as_bytes()), "SUBSCRIBE update failed");
             }
         }
         Ok(())
@@ -1411,6 +1463,7 @@ impl Publisher {
             self.fetches.clone(),
             msg,
             joining,
+            self.session_id().clone(),
         );
         self.fetches
             .lock()
@@ -1817,7 +1870,7 @@ impl Publisher {
         if let Err(err) = recv.recv_error(ServeError::Cancel) {
             tracing::debug!(
                 request_id = id,
-                error = %err,
+                error = %super::LogSafe(err.to_string().as_bytes()),
                 "failed to fail aborted PUBLISH_NAMESPACE"
             );
         }
@@ -1850,7 +1903,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        split_published_state, AbortPublishedOnDrop, NameRegistry, PublishNamespace,
+        split_published_state, web_transport, AbortPublishedOnDrop, NameRegistry, PublishNamespace,
         PublishedEntry, PublishedRecv, Publisher,
     };
 
@@ -2511,6 +2564,134 @@ mod tests {
 
         assert!(matches!(publish.closed().await, Err(ServeError::Cancel)));
         pump.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_stop_does_not_discard_publish_response() {
+        // STOP_SENDING closes only our write direction. Force it to arrive
+        // before the initial response instead of relying on packet scheduling.
+        enum Reply {
+            Reject,
+            Accept,
+            LegacyAccept,
+        }
+        for reply in [Reply::Reject, Reply::Accept, Reply::LegacyAccept] {
+            let (client, peer) = loopback_session_pair().await;
+            let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut publisher = Publisher::new(
+                Queue::default(),
+                client,
+                None,
+                RequestId::new(0, 1),
+                bidi_task_tx,
+            );
+            let (_writer, track) = subgroup_track();
+            let mut published = publisher.publish(track, Default::default()).await.unwrap();
+            let (peer_send, peer_recv) = peer.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            assert!(matches!(
+                peer_reader.decode::<Message>().await.unwrap(),
+                Message::Publish(_)
+            ));
+            let mut driver = bidi_task_rx.recv().await.unwrap();
+
+            peer_reader.stop(super::super::CANCELLED_STREAM_CODE);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut driver)
+                    .await
+                    .is_err(),
+                "STOP_SENDING must not discard the pending PUBLISH response"
+            );
+
+            let response = match reply {
+                Reply::Accept => Message::RequestOk(message::RequestOk {
+                    id: published.id,
+                    params: Default::default(),
+                }),
+                Reply::LegacyAccept => Message::PublishOk(message::PublishOk {
+                    id: published.id,
+                    params: Default::default(),
+                }),
+                Reply::Reject => Message::RequestError(message::RequestError::new(
+                    published.id,
+                    message::RequestErrorCode::Unauthorized,
+                    0,
+                    "unauthorized",
+                )),
+            };
+            Session::encode_bidi_response(&mut peer_writer, &response)
+                .await
+                .unwrap();
+            peer_writer.finish().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                published.ok().await,
+                Err(if matches!(reply, Reply::Reject) {
+                    ServeError::Closed(message::RequestErrorCode::Unauthorized as u64)
+                } else {
+                    ServeError::Cancel
+                })
+            );
+            assert!(publisher.publisheds.lock().unwrap().is_empty());
+            assert!(!publisher
+                .published_names
+                .lock()
+                .unwrap()
+                .contains_name(&full_track_name("test", "track")));
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_publish_without_response_cancels_on_fin_or_reset() {
+        for reset in [false, true] {
+            let (client, peer) = loopback_session_pair().await;
+            let (bidi_task_tx, mut bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut publisher = Publisher::new(
+                Queue::default(),
+                client,
+                None,
+                RequestId::new(0, 1),
+                bidi_task_tx,
+            );
+            let (_writer, track) = subgroup_track();
+            let mut published = publisher.publish(track, Default::default()).await.unwrap();
+            let (peer_send, peer_recv) = peer.accept_bi().await.unwrap();
+            let mut peer_writer = Writer::new(peer_send);
+            let mut peer_reader = Reader::new(peer_recv);
+            assert!(matches!(
+                peer_reader.decode::<Message>().await.unwrap(),
+                Message::Publish(_)
+            ));
+            let mut driver = bidi_task_rx.recv().await.unwrap();
+            peer_reader.stop(super::super::CANCELLED_STREAM_CODE);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut driver)
+                    .await
+                    .is_err()
+            );
+
+            if reset {
+                peer_writer.reset(super::super::CANCELLED_STREAM_CODE);
+            } else {
+                peer_writer.finish().unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(published.ok().await, Err(ServeError::Cancel));
+            assert!(publisher.publisheds.lock().unwrap().is_empty());
+            assert!(!publisher
+                .published_names
+                .lock()
+                .unwrap()
+                .contains_name(&full_track_name("test", "track")));
+        }
     }
 
     #[tokio::test]

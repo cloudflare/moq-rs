@@ -1210,6 +1210,149 @@ mod tests {
         }
     }
 
+    // Integrity coverage uses arrival order rather than latest-only delivery.
+    // Each reader must receive every queued subgroup and its original metadata.
+    #[tokio::test]
+    async fn integrity_fanout_preserves_all_objects_and_metadata() {
+        let (mut writer, template) = subgroups();
+        let first = template.clone();
+        let second = template.clone();
+        let arrivals = [(5, 1), (3, 0), (5, 0)];
+        let objects = [(7, 0), (9, 1), (42, 1024), (100, 4096)];
+        let mut properties = crate::data::ExtensionHeaders::new();
+        properties.set_intvalue(2, 42);
+
+        for (group_id, subgroup_id) in arrivals {
+            let mut subgroup = create_subgroup(&mut writer, group_id, subgroup_id);
+            for (object_id, size) in objects {
+                let payload = Bytes::from(vec![(group_id + subgroup_id + object_id) as u8; size]);
+                let mut object = subgroup
+                    .create_with_id(object_id, size, Some(properties.clone()))
+                    .unwrap();
+                object.write(payload).unwrap();
+            }
+            drop(
+                subgroup
+                    .create_with_id_and_status(101, 0, ObjectStatus::EndOfGroup, None)
+                    .unwrap(),
+            );
+            subgroup.finish().unwrap();
+        }
+        drop(writer);
+
+        let verify = |mut reader: SubgroupsReader| async move {
+            for (group_id, subgroup_id) in arrivals {
+                let mut subgroup = reader.next().await.unwrap().unwrap();
+                assert_eq!(
+                    (subgroup.group_id, subgroup.subgroup_id),
+                    (group_id, subgroup_id)
+                );
+                assert_eq!(subgroup.priority, 128);
+                for (object_id, size) in objects {
+                    let mut object = subgroup.next().await.unwrap().unwrap();
+                    assert_eq!(object.object_id, object_id);
+                    assert_eq!(object.status, ObjectStatus::NormalObject);
+                    assert_eq!(object.size, size);
+                    let mut expected_properties = crate::data::ExtensionHeaders::new();
+                    expected_properties.set_intvalue(2, 42);
+                    assert_eq!(object.extension_headers, expected_properties);
+                    assert_eq!(
+                        object.read_all().await.unwrap(),
+                        Bytes::from(vec![(group_id + subgroup_id + object_id) as u8; size])
+                    );
+                }
+                let mut end = subgroup.next().await.unwrap().unwrap();
+                assert_eq!(end.object_id, 101);
+                assert_eq!(end.status, ObjectStatus::EndOfGroup);
+                assert_eq!(end.size, 0);
+                assert!(end.extension_headers.is_empty());
+                assert_eq!(end.read_all().await.unwrap(), Bytes::new());
+                assert!(subgroup.next().await.unwrap().is_none());
+            }
+            assert!(reader.next().await.unwrap().is_none());
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(verify(first), verify(second));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn integrity_chunk_cursors_are_independent_after_reader_drop() {
+        let (mut writer, mut reader) = subgroup();
+        let mut object_writer = writer.create_with_id(7, 11, None).unwrap();
+        object_writer.write(Bytes::from_static(b"hello ")).unwrap();
+        let mut first = reader.next().await.unwrap().unwrap();
+        let mut second = first.clone();
+        assert_eq!(first.read().await.unwrap().unwrap(), b"hello "[..]);
+        drop(first);
+
+        object_writer.write(Bytes::from_static(b"world")).unwrap();
+        drop(object_writer);
+        writer.finish().unwrap();
+
+        assert_eq!(second.object_id, 7);
+        assert_eq!(second.read_all().await.unwrap(), b"hello world"[..]);
+        assert!(reader.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn integrity_short_object_reports_size_to_each_reader() {
+        let (mut writer, template) = subgroups();
+        let mut first = template.clone();
+        let mut second = template.clone();
+        let mut short = create_subgroup(&mut writer, 0, 0);
+        let mut object = short.create_with_id(7, 10, None).unwrap();
+        object.write(Bytes::from_static(b"short")).unwrap();
+        drop(object);
+        short.finish().unwrap();
+        let mut healthy = create_subgroup(&mut writer, 1, 0);
+        healthy.write(Bytes::from_static(b"healthy")).unwrap();
+        healthy.finish().unwrap();
+        drop(writer);
+
+        for reader in [&mut first, &mut second] {
+            let mut short = reader.next().await.unwrap().unwrap();
+            let mut object = short.next().await.unwrap().unwrap();
+            assert_eq!(object.object_id, 7);
+            assert_eq!(object.size, 10);
+            assert_eq!(object.read().await.unwrap().unwrap(), b"short"[..]);
+            assert_eq!(object.read().await.unwrap_err(), ServeError::Size);
+            let mut healthy = reader.next().await.unwrap().unwrap();
+            assert_eq!(healthy.group_id, 1);
+            assert_eq!(healthy.read_next().await.unwrap().unwrap(), b"healthy"[..]);
+            assert!(healthy.next().await.unwrap().is_none());
+            assert!(reader.next().await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn integrity_cancelled_subgroup_does_not_replace_buffered_payloads() {
+        let (mut writer, template) = subgroups();
+        let mut first = template.clone();
+        let mut second = template.clone();
+        let mut old = create_subgroup(&mut writer, 0, 0);
+        old.write(Bytes::from_static(b"old")).unwrap();
+        old.close(ServeError::Cancel).unwrap();
+        let mut new = create_subgroup(&mut writer, 1, 0);
+        new.write(Bytes::from_static(b"new")).unwrap();
+        new.finish().unwrap();
+        drop(writer);
+
+        for reader in [&mut first, &mut second] {
+            let mut old = reader.next().await.unwrap().unwrap();
+            assert_eq!(old.group_id, 0);
+            assert_eq!(old.read_next().await.unwrap().unwrap(), b"old"[..]);
+            assert!(matches!(old.next().await, Err(ServeError::Cancel)));
+            let mut new = reader.next().await.unwrap().unwrap();
+            assert_eq!(new.group_id, 1);
+            assert_eq!(new.read_next().await.unwrap().unwrap(), b"new"[..]);
+            assert!(new.next().await.unwrap().is_none());
+            assert!(reader.next().await.unwrap().is_none());
+        }
+    }
+
     #[test]
     fn locally_created_subgroup_begins_with_first_object() {
         let (_writer, reader) = subgroup();

@@ -1685,11 +1685,15 @@ name = "moq-clock-ietf"
 version = "0.6.23"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "chrono",
  "clap",
  "moq-native-ietf",
+ "moq-relay-ietf",
  "moq-transport",
+ "rcgen",
+ "rustls 0.23.31",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1715,7 +1719,6 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "web-transport",
  "web-transport-quinn",
  "webpki",
 ]
@@ -1772,7 +1775,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "web-transport",
 ]
 
 [[package]]
@@ -1806,7 +1808,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "web-transport",
 ]
 
 [[package]]
@@ -1824,9 +1825,12 @@ dependencies = [
  "thiserror 1.0.61",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "web-transport",
+ "web-transport-quinn",
+ "web-transport-trait",
 ]
 
 [[package]]

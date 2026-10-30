@@ -131,12 +131,18 @@ impl Published {
     /// before PUBLISH_OK but does not require it; waiting keeps the first cut
     /// simple.
     pub async fn serve(mut self) -> Result<(), SessionError> {
-        let res = self.serve_inner().await;
-        if let Err(err) = &res {
-            let _ = self.close_state(err.clone().into());
+        use tracing::Instrument;
+        let span = self.publisher.session_id().span();
+        async move {
+            let res = self.serve_inner().await;
+            if let Err(err) = &res {
+                let _ = self.close_state(err.clone().into());
+            }
+            let terminal = self.finish().await;
+            res.and(terminal)
         }
-        let terminal = self.finish().await;
-        res.and(terminal)
+        .instrument(span)
+        .await
     }
 
     async fn serve_inner(&mut self) -> Result<(), SessionError> {

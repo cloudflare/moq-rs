@@ -7,6 +7,9 @@ use anyhow::Context;
 
 mod cli;
 mod clock;
+mod history;
+#[cfg(test)]
+mod test;
 
 use clap::Parser;
 use cli::Cli;
@@ -88,12 +91,18 @@ async fn main() -> anyhow::Result<()> {
             .produce();
 
             let track_writer = tracks_writer.create(&config.track).unwrap();
-            let clock_publisher = clock::Publisher::new(track_writer.subgroups()?);
+            let history = history::History::new(config.history_groups as usize);
+            let clock_publisher = clock::Publisher::new(track_writer.subgroups()?, history.clone());
+            publisher.accept_fetch();
+            let fetch_publisher = publisher.clone();
+            let fetch_namespace = TrackNamespace::from_utf8_path(&config.namespace);
+            let fetch_track = config.track.clone().into();
 
             tokio::select! {
                 res = session.run() => res.context("session error")?,
                 res = clock_publisher.run() => res.context("clock error")?,
                 res = publisher.publish_namespace(tracks_reader) => res.context("failed to serve tracks")?,
+                res = history.run(fetch_publisher, fetch_namespace, fetch_track) => res.context("failed to serve FETCH")?,
             }
         }
     } else {
@@ -117,8 +126,16 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::select! {
             res = session.run() => res.context("session error")?,
-            res = clock_subscriber.run() => res.context("clock error")?,
-            res = subscriber.subscribe(track_writer) => res.context("failed to subscribe to track")?,
+            res = async {
+                if let Some(groups) = config.join_groups {
+                    clock_subscriber.run_joined(subscriber, track_writer, groups as u64).await
+                } else {
+                    tokio::select! {
+                        res = clock_subscriber.run() => res,
+                        res = subscriber.subscribe(track_writer) => res.context("failed to subscribe to track"),
+                    }
+                }
+            } => res.context("clock error")?,
         }
     }
 

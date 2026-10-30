@@ -137,8 +137,6 @@ pub(crate) use session::{authorize, SessionAuth};
 
 use crate::DEFAULT_SCOPE_AUTH_TTL;
 
-const UNSCOPED: &str = "<unscoped>";
-
 /// Session termination code for UNAUTHORIZED (draft-18 §3.5, §15.10.1;
 /// unchanged from draft-16).
 pub(crate) const SESSION_ERROR_UNAUTHORIZED: u32 = 0x2;
