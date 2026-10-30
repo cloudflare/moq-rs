@@ -39,9 +39,16 @@ the handoff. All selected tracks finish history before any releases live data.
 
 This media profile uses one subgroup (ID 0) per group and consecutive group
 and Object IDs, as produced by `moq-pub`. Unavailable history, gaps, unsupported
-subgroups, oversized Objects and buffer exhaustion are errors. Per track,
-live buffering is bounded to 32 Objects and 16 MiB, and each fetched Object is
-limited to 16 MiB. Warm-up and FETCH have ten-second deadlines.
+subgroups and oversized Objects are errors. Per track, live buffering uses a
+32-slot queue and a 16 MiB payload budget. When either fills, collection waits
+for playback to drain it; a slow history FETCH does not cause queue-exhaustion
+errors. Each fetched Object is limited to 16 MiB. Warm-up and FETCH have
+ten-second deadlines.
+
+FETCH modes propagate metadata SUBSCRIBE and playback failures, because a
+missing track or history prefix would invalidate the requested replay. Live-only
+playback retains warning-only SUBSCRIBE/track failure handling so other tracks
+can continue.
 
 Library callers use
 `Media::new_with_fetch(subscriber, tracks, output, request_catalog, Some(mode))`.
@@ -52,3 +59,6 @@ variants. **Migration from draft-16:** import `JoiningStart` from
 `JoiningStart::Relative(0)` still means the boundary group, while the CLI's
 `fetch relative 1` expresses the same choice as a group count. `Media::new`
 continues to select live playback.
+
+The `moq_sub::reexports::moq_transport` module exposes the transport types used
+by these public APIs, including `Location`, `Subscriber` and `Tracks`.

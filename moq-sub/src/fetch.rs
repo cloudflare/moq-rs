@@ -20,6 +20,8 @@ use tokio::{
 };
 
 const MAX_BYTES: usize = 16 * 1024 * 1024;
+// Queue slots bound per-Object metadata, including zero-length payloads.
+// Full queues and exhausted payload budgets backpressure the collector.
 const MAX_OBJECTS: usize = 32;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -154,15 +156,17 @@ async fn collect_live(
             ensure!(object.size <= MAX_BYTES, "oversized live media Object");
             let permit = budget
                 .clone()
-                .try_acquire_many_owned(object.size as u32)
-                .context("live media byte buffer exhausted")?;
+                .acquire_many_owned(object.size as u32)
+                .await
+                .context("live media byte buffer closed")?;
             let payload = object.read_all().await?.to_vec();
-            send.try_send(Ok(BufferedObject {
+            send.send(Ok(BufferedObject {
                 location,
                 payload,
                 _permit: permit,
             }))
-            .map_err(|_| anyhow::anyhow!("live media Object buffer exhausted"))?;
+            .await
+            .map_err(|_| anyhow::anyhow!("live media Object buffer closed"))?;
         }
     }
     Ok(())
@@ -367,24 +371,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_collector_bounds_objects_and_discards_history_overlap() {
+    async fn live_collector_backpressures_then_delivers_more_than_32_objects() {
         let namespace = TrackNamespace::from_utf8_path("test");
         let (writer, reader) = Track::new(namespace, "1.m4s").produce();
         let mut groups = writer.subgroups().unwrap();
         let mut group = groups.append(127).unwrap();
-        for _ in 0..MAX_OBJECTS + 2 {
-            group.write(vec![1].into()).unwrap();
+        let total = MAX_OBJECTS * 4;
+        for object in 0..=total {
+            group.write(vec![object as u8].into()).unwrap();
         }
+        drop(group);
+        drop(groups);
         let (send, mut receive) = mpsc::channel(MAX_OBJECTS);
-        // Object zero is the boundary; exactly 32 successors fit, the next
-        // Object fails explicitly instead of silently dropping media.
-        let result = collect_live(reader, send, Location::new(0, 0)).await;
-        assert!(result.unwrap_err().to_string().contains("buffer exhausted"));
-        assert_eq!(receive.len(), MAX_OBJECTS);
-        assert_eq!(
-            receive.recv().await.unwrap().unwrap().location,
-            Location::new(0, 1)
-        );
+        let collector = tokio::spawn(collect_live(reader, send, Location::new(0, 0)));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receive.len() != MAX_OBJECTS {
+                tokio::task::yield_now().await;
+            }
+            // Hold history's gate closed until the live queue fills. A full
+            // queue must suspend the producer rather than fail playback.
+            assert!(!collector.is_finished());
+            for object in 1..=total {
+                let buffered = receive.recv().await.unwrap().unwrap();
+                assert_eq!(buffered.location, Location::new(0, object as u64));
+                assert_eq!(buffered.payload, [object as u8]);
+            }
+            collector.await.unwrap().unwrap();
+            assert!(receive.recv().await.is_none());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_collector_waits_for_byte_budget_then_resumes() {
+        let (writer, reader) =
+            Track::new(TrackNamespace::from_utf8_path("test/bytes"), "1.m4s").produce();
+        let mut groups = writer.subgroups().unwrap();
+        let mut group = groups.append(127).unwrap();
+        group.write(vec![0].into()).unwrap();
+        for value in 1..=3 {
+            group.write(vec![value; MAX_BYTES / 2].into()).unwrap();
+        }
+        drop(group);
+        drop(groups);
+        let (send, mut receive) = mpsc::channel(MAX_OBJECTS);
+        let collector = tokio::spawn(collect_live(reader, send, Location::new(0, 0)));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receive.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(receive.len(), 2);
+            assert!(!collector.is_finished());
+            for value in 1..=3 {
+                let buffered = receive.recv().await.unwrap().unwrap();
+                assert_eq!(buffered.location, Location::new(0, value));
+                assert_eq!(buffered.payload.len(), MAX_BYTES / 2);
+                assert!(buffered.payload.iter().all(|&byte| byte == value as u8));
+                // Drop the permit before receiving the next Object.
+                drop(buffered);
+            }
+            collector.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

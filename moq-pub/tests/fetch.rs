@@ -13,9 +13,12 @@ use moq_relay_ietf::{
     Coordinator, CoordinatorContext, CoordinatorResult, NamespaceOrigin, NamespaceRegistration,
     RelayConfig,
 };
-use moq_sub::media::{FetchMode, JoiningStart};
+use moq_sub::{
+    media::{FetchMode, JoiningStart},
+    reexports::moq_transport::coding::Location,
+};
 use moq_transport::{
-    coding::{Location, TrackNamespace},
+    coding::TrackNamespace,
     serve::Tracks,
     session::{Publisher, Subscriber},
 };
@@ -139,7 +142,7 @@ async fn read_exact_media(reader: &mut tokio::io::DuplexStream, expected: &[u8])
     assert_eq!(received, expected);
 }
 
-async fn exercise(mode: FetchMode) {
+async fn exercise(mode: FetchMode, slow_history: bool) {
     let tls = tls_config();
     let endpoint = quic::Endpoint::new(
         quic::Config::new("127.0.0.1:0".parse().unwrap(), None, tls.clone()).unwrap(),
@@ -203,7 +206,9 @@ async fn exercise(mode: FetchMode) {
         let (wire, _, transport) = endpoint.client.connect(&url, None).await.unwrap();
         let (session, subscriber) = Subscriber::connect(wire, transport).await.unwrap();
         tasks.spawn(session.run());
-        let (out, mut received) = tokio::io::duplex(64 * 1024);
+        // A one-byte output pipe deliberately stalls historical FETCH draining
+        // while live Objects continue arriving through the relay.
+        let (out, mut received) = tokio::io::duplex(if slow_history { 1 } else { 64 * 1024 });
         let mut playback = moq_sub::media::Media::new_with_fetch(
             subscriber,
             Tracks::new(namespace),
@@ -217,12 +222,34 @@ async fn exercise(mode: FetchMode) {
         tokio::pin!(run);
         let verify = async {
             let expected = [init.as_ref(), &chunks.concat()].concat();
-            read_exact_media(&mut received, &expected).await;
+            if slow_history {
+                let first = init.len() + 1;
+                read_exact_media(&mut received, &expected[..first]).await;
+                let mut live = Vec::new();
+                for sequence in 4..132 {
+                    let next = chunk(sequence, false);
+                    media.parse(&mut next.clone()).unwrap();
+                    live.extend_from_slice(&next);
+                }
+                let next = chunk(132, true);
+                media.parse(&mut next.clone()).unwrap();
+                live.extend_from_slice(&next);
+                // Keep history blocked long enough for the live collector to
+                // encounter the queue limit. Only the receiver is slowed;
+                // the sessions and relay continue to be polled by the test.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                read_exact_media(&mut received, &expected[first..]).await;
+                read_exact_media(&mut received, &live).await;
+            } else {
+                read_exact_media(&mut received, &expected).await;
+            }
             if matches!(mode, FetchMode::Joining(_)) {
                 // Live starts inside the boundary group, then crosses a group.
-                for next in [chunk(4, false), chunk(5, true)] {
-                    media.parse(&mut next.clone()).unwrap();
-                    read_exact_media(&mut received, &next).await;
+                if !slow_history {
+                    for next in [chunk(4, false), chunk(5, true)] {
+                        media.parse(&mut next.clone()).unwrap();
+                        read_exact_media(&mut received, &next).await;
+                    }
                 }
                 assert!(
                     tokio::time::timeout(Duration::from_millis(50), received.read_u8())
@@ -247,19 +274,27 @@ async fn exercise(mode: FetchMode) {
 
 #[tokio::test]
 async fn cold_relay_relative_join_replays_then_continues_without_gaps_or_duplicates() {
-    exercise(FetchMode::Joining(JoiningStart::Relative(1))).await;
+    exercise(FetchMode::Joining(JoiningStart::Relative(1)), false).await;
 }
 
 #[tokio::test]
 async fn cold_relay_absolute_join_replays_then_continues_without_gaps_or_duplicates() {
-    exercise(FetchMode::Joining(JoiningStart::Absolute(0))).await;
+    exercise(FetchMode::Joining(JoiningStart::Absolute(0)), false).await;
+}
+
+#[tokio::test]
+async fn slow_history_join_preserves_more_than_32_live_objects() {
+    exercise(FetchMode::Joining(JoiningStart::Relative(1)), true).await;
 }
 
 #[tokio::test]
 async fn standalone_fetch_media_playback_is_finite_and_exact() {
-    exercise(FetchMode::Standalone {
-        start: Location::new(0, 0),
-        end: Location::new(1, 0),
-    })
+    exercise(
+        FetchMode::Standalone {
+            start: Location::new(0, 0),
+            end: Location::new(1, 0),
+        },
+        false,
+    )
     .await;
 }
