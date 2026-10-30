@@ -18,6 +18,11 @@ use tokio::{
 };
 use tracing::{debug, info, trace, warn};
 
+/// Live CMAF playback over MoQT draft-18.
+///
+/// The draft-16 `FetchMode` and `Media::new_with_fetch` API have been removed.
+/// Use [`Self::new`] for live playback; this media pipeline no longer supports
+/// standalone or joining FETCH playback.
 pub struct Media<O> {
     subscriber: Subscriber,
     broadcast: TracksReader,
