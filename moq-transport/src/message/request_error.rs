@@ -56,12 +56,13 @@ pub struct RequestError {
 
 impl RequestError {
     /// Convenience constructor from a [`RequestErrorCode`].
+    /// Truncates the reason to 1024 bytes on a UTF-8 character boundary.
     pub fn new(id: u64, code: RequestErrorCode, retry_interval: u64, reason: &str) -> Self {
         Self {
             id,
             error_code: code as u64,
             retry_interval,
-            reason: ReasonPhrase(reason.to_string()),
+            reason: ReasonPhrase::new(reason),
         }
     }
 
@@ -100,6 +101,22 @@ impl Encode for RequestError {
 mod tests {
     use super::*;
     use bytes::BytesMut;
+
+    #[test]
+    fn oversized_reason_round_trips_as_a_utf8_prefix() {
+        let reason = format!("denied: {}", "界🦀".repeat(300));
+        let msg = RequestError::new(42, RequestErrorCode::Unauthorized, 5001, &reason);
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = RequestError::decode(&mut buf).unwrap();
+        assert_eq!(decoded.id, 42);
+        assert_eq!(decoded.error_code, RequestErrorCode::Unauthorized as u64);
+        assert_eq!(decoded.retry_interval, 5001);
+        assert!(decoded.reason.0.len() <= ReasonPhrase::MAX_LEN);
+        assert!(decoded.reason.0.len() + 4 > ReasonPhrase::MAX_LEN);
+        assert!(reason.starts_with(&decoded.reason.0));
+        assert!(buf.is_empty());
+    }
 
     #[test]
     fn encode_decode() {
