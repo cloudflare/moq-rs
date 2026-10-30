@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use base64::{engine::general_purpose, Engine};
 use clap::Parser;
 use std::{net, str::FromStr};
 use url::Url;
 
-use base64::{engine::general_purpose, Engine};
-
+/// An `--auth-token` value: `TYPE:BASE64URL`.
 #[derive(Clone)]
 pub struct AuthorizationTokenArg {
     pub token_type: u64,
@@ -20,15 +20,11 @@ impl FromStr for AuthorizationTokenArg {
         let (token_type, value) = input
             .split_once(':')
             .ok_or_else(|| "expected TYPE:BASE64URL".to_string())?;
-        let token_type = if let Some(hex) = token_type.strip_prefix("0x") {
-            u64::from_str_radix(hex, 16)
-        } else {
-            token_type.parse()
+        let token_type = match token_type.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16),
+            None => token_type.parse(),
         }
         .map_err(|_| "token type must be a decimal or 0x-prefixed integer".to_string())?;
-        if token_type > (1 << 62) - 1 {
-            return Err("token type exceeds the QUIC varint range".to_string());
-        }
         let value = general_purpose::URL_SAFE_NO_PAD
             .decode(value)
             .or_else(|_| general_purpose::URL_SAFE.decode(value))
@@ -38,6 +34,8 @@ impl FromStr for AuthorizationTokenArg {
     }
 }
 
+// Not `Clone`: the tokens are moved out once after parsing, so no stray copy
+// of a credential is left behind.
 #[derive(Parser)]
 pub struct Cli {
     /// Listen for UDP packets on the given address.
@@ -73,8 +71,17 @@ pub struct Cli {
     #[arg(long)]
     pub datagrams: bool,
 
-    /// Authorization token as TYPE:BASE64URL. May be repeated. Testing only:
-    /// the token is visible in the process arguments.
+    /// Retain this many minute groups (including the current group) for FETCH.
+    #[arg(long, default_value = "8", value_parser = clap::value_parser!(u16).range(1..=1024))]
+    pub history_groups: u16,
+
+    /// SUBSCRIBE, FETCH N preceding minute groups, then continue live.
+    #[arg(long, conflicts_with_all = ["publish", "datagrams"], value_parser = clap::value_parser!(u16).range(1..=1024))]
+    pub join_groups: Option<u16>,
+
+    /// Authorization token to present in SETUP, as TYPE:BASE64URL (for a
+    /// Common Access Token, TYPE is 1). May be repeated. Testing only: the
+    /// token is visible in the process arguments.
     #[arg(long = "auth-token", value_name = "TYPE:BASE64URL")]
     pub authorization_tokens: Vec<AuthorizationTokenArg>,
 }
@@ -92,6 +99,10 @@ mod tests {
         let hex: AuthorizationTokenArg = "0x63346d:c2VjcmV0".parse().unwrap();
         assert_eq!(hex.token_type, 0x63346d);
         assert_eq!(hex.value, b"secret");
+
+        // vi64 (draft-18) represents every u64.
+        let max: AuthorizationTokenArg = format!("{}:AQ", u64::MAX).parse().unwrap();
+        assert_eq!(max.token_type, u64::MAX);
     }
 
     #[test]
@@ -116,9 +127,36 @@ mod tests {
     #[test]
     fn rejects_malformed_authorization_tokens() {
         assert!("1".parse::<AuthorizationTokenArg>().is_err());
+        assert!("x:AQI".parse::<AuthorizationTokenArg>().is_err());
         assert!("1:not+base64".parse::<AuthorizationTokenArg>().is_err());
-        assert!("4611686018427387904:AQ"
+        assert!("18446744073709551616:AQ"
             .parse::<AuthorizationTokenArg>()
             .is_err());
+    }
+
+    #[test]
+    fn joining_and_retention_flags_are_bounded_and_stream_only() {
+        let cli = Cli::try_parse_from([
+            "moq-clock-ietf",
+            "https://example.com",
+            "--join-groups",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(cli.join_groups, Some(2));
+        assert_eq!(cli.history_groups, 8);
+        for args in [
+            vec!["--join-groups", "0"],
+            vec!["--history-groups", "1025"],
+            vec!["--join-groups", "1", "--publish"],
+            vec!["--join-groups", "1", "--datagrams"],
+        ] {
+            assert!(Cli::try_parse_from(
+                ["moq-clock-ietf", "https://example.com"]
+                    .into_iter()
+                    .chain(args)
+            )
+            .is_err());
+        }
     }
 }

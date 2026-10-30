@@ -180,10 +180,10 @@ mod tests {
         // key=0 (even,int): delta=0 (1B), value=0 (1B) = 2B
         // key=1 (odd,bytes): delta=1 (1B), length=5 (1B), 5 bytes = 7B
         // key=100 (even,int): delta=99 (2B, since 99≥64), value=100 (2B, since 100≥64) = 4B
-        // total KVP bytes = 13; length prefix = 1B (13 < 64 so 1B varint)
+        // total KVP bytes = 11; length prefix = 1B (11 <= 127)
         let buf_vec = buf.to_vec();
-        assert_eq!(buf_vec[0], 13); // 13 bytes of KVP data
-        assert_eq!(buf_vec.len(), 14); // 1 (length prefix) + 13
+        assert_eq!(buf_vec[0], 11); // 11 bytes of KVP data
+        assert_eq!(buf_vec.len(), 12); // 1 (length prefix) + 11
 
         // Decode and verify all three pairs survive
         let decoded = ExtensionHeaders::decode(&mut buf).unwrap();

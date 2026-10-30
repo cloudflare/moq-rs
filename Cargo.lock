@@ -1663,6 +1663,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moq-cat-mint"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "cat-token",
+ "clap",
+ "p256",
+]
+
+[[package]]
 name = "moq-catalog"
 version = "0.2.3"
 dependencies = [
@@ -1674,11 +1685,15 @@ name = "moq-clock-ietf"
 version = "0.6.23"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "chrono",
  "clap",
  "moq-native-ietf",
+ "moq-relay-ietf",
  "moq-transport",
+ "rcgen",
+ "rustls 0.23.31",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1704,7 +1719,6 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "web-transport",
  "web-transport-quinn",
  "webpki",
 ]
@@ -1720,9 +1734,7 @@ dependencies = [
  "moq-native-ietf",
  "moq-transport",
  "mp4",
- "rcgen",
  "rfc6381-codec",
- "rustls 0.23.31",
  "serde_json",
  "tokio",
  "tracing",
@@ -1763,7 +1775,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "web-transport",
 ]
 
 [[package]]
@@ -1792,11 +1803,11 @@ dependencies = [
  "clap",
  "moq-native-ietf",
  "moq-transport",
+ "rand 0.8.5",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "url",
- "web-transport",
 ]
 
 [[package]]
@@ -1806,16 +1817,20 @@ dependencies = [
  "bytes",
  "futures",
  "paste",
+ "rcgen",
+ "rustls 0.23.31",
  "serde",
  "serde_json",
  "serde_with",
  "thiserror 1.0.61",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "web-transport",
+ "web-transport-quinn",
+ "web-transport-trait",
 ]
 
 [[package]]

@@ -8,8 +8,7 @@
 // - RequestUpdate (parsed/created)
 // - Fetch, FetchOk, FetchCancel (parsed/created)
 // - Publish, PublishOk, PublishDone (parsed/created)
-// - MaxRequestId (parsed/created)
-// - RequestsBlocked (parsed/created)
+// Note: MaxRequestId/RequestsBlocked removed in draft-18 (#1471)
 // - Namespace and NamespaceDone are implemented for SUBSCRIBE_NAMESPACE response streams.
 //
 // TODO: Unimplemented data plane events (from draft-pardue-moq-qlog-moq-events):
@@ -171,10 +170,10 @@ pub struct LogLevelEvent {
     pub message: String,
 }
 
-/// Parameter type carrying an AUTHORIZATION TOKEN.
+/// Option/parameter type carrying an AUTHORIZATION TOKEN.
 ///
-/// The same code point in both registries — draft-16 §9.3.1.5 for setup
-/// parameters and §9.2.2.1 for message parameters — so one rule covers both.
+/// The same code point in both registries — draft-18 §10.3.1.4 for setup
+/// options and §10.2.2 for message parameters — so one rule covers both.
 const AUTHORIZATION_TOKEN_PARAM: u64 = 0x3;
 
 // Helper functions to create vector of string pairs from KVPs
@@ -184,14 +183,30 @@ fn key_value_pairs_to_vec(kvps: &[coding::KeyValuePair]) -> Vec<(String, String)
         .collect()
 }
 
+// SETUP's PATH and AUTHORITY can carry credentials or identify a peer. The
+// same numeric keys have other meanings in message parameter registries.
+fn setup_parameters_to_vec(kvps: &[coding::KeyValuePair]) -> Vec<(String, String)> {
+    kvps.iter()
+        .map(|kvp| {
+            let value = if kvp.key == u64::from(setup::ParameterType::Path)
+                || kvp.key == u64::from(setup::ParameterType::Authority)
+            {
+                "[REDACTED]".to_string()
+            } else {
+                render_parameter(kvp)
+            };
+            (kvp.key.to_string(), value)
+        })
+        .collect()
+}
+
 /// Render a parameter for the log, redacting bearer credentials.
 ///
-/// `Value`'s `Debug` hex-dumps the first 16 bytes, which for an AUTHORIZATION
+/// `Value`'s `Debug` hex-dumps the first bytes, which for an AUTHORIZATION
 /// TOKEN is a prefix of the credential itself. mlog files are written to disk
-/// with no expiry and are served over HTTP by the relay's `--mlog-serve`
-/// endpoint, so that prefix would outlive the session and cross a trust
-/// boundary. The length is kept because it is useful for debugging and
-/// discloses nothing.
+/// with no expiry and can be served over HTTP by the relay, so that prefix
+/// would outlive the session and cross a trust boundary. The length is kept
+/// because it is useful for debugging and discloses nothing.
 fn render_parameter(kvp: &coding::KeyValuePair) -> String {
     match (&kvp.value, kvp.key) {
         (coding::Value::BytesValue(bytes), AUTHORIZATION_TOKEN_PARAM) => {
@@ -233,28 +248,28 @@ fn create_control_message_event(
 
 /// Create a control_message_parsed event for CLIENT_SETUP.
 /// From draft-16 the setup payload carries only parameters; version is agreed via ALPN.
-pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Client) -> Event {
+pub fn client_setup_parsed(time: f64, stream_id: u64, msg: &setup::Setup) -> Event {
     create_control_message_event(
         time,
         stream_id,
         true,
         "client_setup",
         json!({
-            "parameters": key_value_pairs_to_vec(&msg.params.0),
+            "parameters": setup_parameters_to_vec(&msg.params.0),
         }),
     )
 }
 
 /// Create a control_message_created event for SERVER_SETUP.
 /// From draft-16 the setup payload carries only parameters; version is agreed via ALPN.
-pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Server) -> Event {
+pub fn server_setup_created(time: f64, stream_id: u64, msg: &setup::Setup) -> Event {
     create_control_message_event(
         time,
         stream_id,
         false,
         "server_setup",
         json!({
-            "parameters": key_value_pairs_to_vec(&msg.params.0),
+            "parameters": setup_parameters_to_vec(&msg.params.0),
         }),
     )
 }
@@ -354,7 +369,6 @@ fn subscribe_namespace_to_json(msg: &message::SubscribeNamespace) -> JsonValue {
     json!({
         "request_id": msg.id,
         "track_namespace_prefix": msg.track_namespace_prefix.to_string(),
-        "subscribe_options": format!("{:?}", msg.subscribe_options),
         "parameters": key_value_pairs_to_vec(&msg.params.0),
     })
 }
@@ -479,7 +493,7 @@ fn request_error_to_json(request_kind: &str, msg: &message::RequestError) -> Jso
         "request_kind": request_kind,
         "error_code": msg.error_code,
         "retry_interval": msg.retry_interval,
-        "reason_phrase": &msg.reason.0,
+        "reason_phrase": crate::session::LogSafe(msg.reason.0.as_bytes()).to_string(),
     })
 }
 
@@ -549,7 +563,7 @@ pub fn go_away_parsed(time: f64, stream_id: u64, msg: &message::GoAway) -> Event
         true,
         "goaway",
         json!({
-                    "new_session_uri": &msg.uri.0,
+                    "new_session_uri": if msg.uri.0.is_empty() { "" } else { "[REDACTED]" },
         }),
     )
 }
@@ -562,7 +576,7 @@ pub fn go_away_created(time: f64, stream_id: u64, msg: &message::GoAway) -> Even
         false,
         "goaway",
         json!({
-                    "new_session_uri": &msg.uri.0,
+                    "new_session_uri": if msg.uri.0.is_empty() { "" } else { "[REDACTED]" },
         }),
     )
 }
@@ -573,9 +587,14 @@ pub fn go_away_created(time: f64, stream_id: u64, msg: &message::GoAway) -> Even
 fn subgroup_header_to_json(header: &data::SubgroupHeader) -> JsonValue {
     let mut json = json!({
         "header_type": format!("{:?}", header.header_type),
+        "header_type_value": header.header_type.value(),
         "track_alias": header.track_alias,
         "group_id": header.group_id,
         "publisher_priority": header.publisher_priority,
+        "has_properties": header.header_type.has_properties(),
+        "end_of_group": header.header_type.end_of_group(),
+        "default_priority": header.header_type.uses_default_priority(),
+        "first_object": header.header_type.begins_with_first_object(),
     });
 
     if let Some(subgroup_id) = header.subgroup_id {
@@ -830,14 +849,16 @@ pub fn loglevel_event(time: f64, level: LogLevel, message: String) -> Event {
 mod tests {
     use super::*;
     use crate::coding::{KeyValuePairs, TrackNamespacePrefix};
-    use crate::message::{SubscribeNamespace, SubscribeOptions};
+    use crate::{
+        data::{StreamHeaderType, SubgroupHeader, SubgroupIdMode},
+        message::SubscribeNamespace,
+    };
 
     #[test]
-    fn subscribe_namespace_event_includes_prefix_and_options() {
+    fn subscribe_namespace_event_includes_prefix() {
         let msg = SubscribeNamespace {
             id: 10,
             track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("example.com/meeting"),
-            subscribe_options: SubscribeOptions::Both,
             params: KeyValuePairs::default(),
         };
 
@@ -853,12 +874,40 @@ mod tests {
             data.message["track_namespace_prefix"],
             "/example.com/meeting"
         );
-        assert_eq!(data.message["subscribe_options"], "Both");
+    }
+
+    #[test]
+    fn subgroup_header_event_preserves_legacy_name_and_exposes_modifiers() {
+        let legacy = subgroup_header_to_json(&SubgroupHeader {
+            header_type: StreamHeaderType::SubgroupIdExt,
+            track_alias: 1,
+            group_id: 2,
+            subgroup_id: Some(3),
+            publisher_priority: 4,
+        });
+        assert_eq!(legacy["header_type"], "SubgroupIdExt");
+        assert_eq!(legacy["header_type_value"], 0x15);
+
+        let modified = subgroup_header_to_json(&SubgroupHeader {
+            header_type: StreamHeaderType::subgroup(SubgroupIdMode::Zero, false, true, true, true),
+            track_alias: 1,
+            group_id: 2,
+            subgroup_id: None,
+            publisher_priority: 200,
+        });
+        assert_eq!(
+            modified["header_type"],
+            "SubgroupZeroIdEndOfGroupDefaultPriorityFirstObject"
+        );
+        assert_eq!(modified["header_type_value"], 0x78);
+        assert_eq!(modified["end_of_group"], true);
+        assert_eq!(modified["default_priority"], true);
+        assert_eq!(modified["first_object"], true);
     }
 
     /// An AUTHORIZATION TOKEN must not reach the log. mlog files persist on
-    /// disk and are served over HTTP by `--mlog-serve`, so a credential
-    /// prefix written here outlives the session and crosses a trust boundary.
+    /// disk and can be served over HTTP, so a credential prefix written here
+    /// outlives the session and crosses a trust boundary.
     #[test]
     fn authorization_tokens_are_redacted_in_logs() {
         let secret = b"super-secret-bearer-token-value".to_vec();
@@ -872,13 +921,34 @@ mod tests {
 
         let token = &rendered[0].1;
         assert_eq!(token, &format!("[REDACTED {} bytes]", secret.len()));
-        // No byte of the credential, in any rendering.
         assert!(!token.contains("73"), "{token} looks like a hex dump");
         assert!(!token.contains("super"), "{token}");
 
-        // Other parameters are untouched: PATH is not a credential and is
-        // needed for debugging.
-        assert!(rendered[1].1.contains("2F"), "path should still be dumped");
+        // Other message parameters are untouched; SETUP has a distinct registry.
+        assert_ne!(rendered[1].1, "[REDACTED 12 bytes]");
         assert_eq!(rendered[2].1, "100");
+    }
+
+    #[test]
+    fn setup_hides_path_and_authority_without_changing_message_parameters() {
+        let kvps = vec![
+            coding::KeyValuePair::new_bytes(
+                0x1,
+                b"/eyJsecret.payload.signature?token=secret".to_vec(),
+            ),
+            coding::KeyValuePair::new_bytes(0x5, b"peer-identity.test".to_vec()),
+            coding::KeyValuePair::new_int(0x2, 100),
+        ];
+        let msg = setup::Setup {
+            params: KeyValuePairs(kvps.clone()),
+        };
+        let event = client_setup_parsed(0.0, 0, &msg);
+        let EventData::ControlMessageParsed(data) = event.data else {
+            panic!("expected SETUP event");
+        };
+        assert_eq!(data.message["parameters"][0][1], "[REDACTED]");
+        assert_eq!(data.message["parameters"][1][1], "[REDACTED]");
+        assert_eq!(data.message["parameters"][2][1], "100");
+        assert_ne!(key_value_pairs_to_vec(&kvps)[0].1, "[REDACTED]");
     }
 }

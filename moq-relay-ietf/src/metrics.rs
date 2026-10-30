@@ -24,24 +24,25 @@
 //! | `moq_relay_connections_closed_total` | - | Total connections that have closed (graceful or error) |
 //! | `moq_relay_connection_errors_total` | `stage` | Connection failures (stage: session_accept, scope_resolve, auth_setup, session_run) |
 //! | `moq_relay_publishers_total` | - | Total publishers (PUBLISH_NAMESPACE requests) received |
-//! | `moq_relay_published_tracks_total` | - | Total tracks offered via PUBLISH |
 //! | `moq_relay_announce_ok_total` | `kind` | Successful REQUEST_OK responses sent for PUBLISH_NAMESPACE (kind: client, proxied) |
 //! | `moq_relay_announce_errors_total` | `phase` | PUBLISH_NAMESPACE failures (phase: auth, local_register, remote_register, coordinator_register, coordinator_lookup, send_ok, forward, peer_fanout) |
 //! | `moq_relay_publish_errors_total` | `phase` | PUBLISH failures (phase: auth, auth_fanout, session_limit, take_reader, local_register, coordinator_register, send_ok) |
-//! | `moq_relay_subscribers_total` | - | Total subscribers (SUBSCRIBE requests) received |
 //! | `moq_relay_subscribe_errors_total` | `phase` | SUBSCRIBE rejected by the relay (phase: auth) |
 //! | `moq_relay_subscribe_namespace_errors_total` | `phase` | SUBSCRIBE_NAMESPACE rejected by the relay (phase: auth) |
+//! | `moq_relay_subscribe_tracks_errors_total` | `phase` | SUBSCRIBE_TRACKS rejected by the relay (phase: auth) |
 //! | `moq_relay_track_status_errors_total` | `phase` | TRACK_STATUS rejected by the relay (phase: auth) |
-//! | `moq_relay_fetch_errors_total` | `phase` | Standalone FETCH rejected by the relay (phase: auth) |
+//! | `moq_relay_subscribers_total` | - | Total subscribers (SUBSCRIBE requests) received |
 //! | `moq_relay_subscribe_not_found_total` | - | Track not found after checking all sources |
 //! | `moq_relay_subscribe_route_errors_total` | - | Infrastructure failure when routing to remote |
 //! | `moq_relay_subscribe_upstream_errors_total` | - | Upstream subscription could not be established, so the downstream SUBSCRIBE was rejected |
+//! | `moq_relay_rendezvous_timeouts_total` | - | Rendezvous holds that ended with REQUEST_ERROR TIMEOUT |
+//! | `moq_relay_rendezvous_rejections_total` | - | Rendezvous requests rejected with EXCESSIVE_LOAD because relay or session capacity was full |
 //! | `moq_relay_upstream_errors_total` | `stage` | Upstream connection failures (stage: connect, session) |
 //! | `moq_relay_namespace_transition_timeouts_total` | - | Namespace pull streams reset after graceful transition timeout |
 //! | `moq_relay_cache_idle_evictions_total` | `source` | Unwatched cache entries evicted, releasing an upstream subscription (source: local, remote) |
 //! | `moq_relay_change_channel_lagged_total` | `channel` | Change notifications skipped by a lagging receiver, forcing a resync (channel: namespace, track) |
 //! | `moq_relay_lease_registry_lock_poisoned_total` | `operation` | Upstream namespace lease registry lock found poisoned (operation: acquire, release) |
-//! | `moq_relay_auth_denied_total` | `phase`, `operation`, `reason` | Operations refused by the authorization hook. `phase`: setup, request. `operation`: client_setup, publish_namespace, publish, subscribe, subscribe_namespace, track_status. `reason`: token_missing, token_invalid, token_expired, token_replayed, token_malformed, scope_mismatch, issuer_unknown, policy_denied, hook_fault, alias_in_setup, too_many_tokens |
+//! | `moq_relay_auth_denied_total` | `phase`, `operation`, `reason` | Operations refused by authorization. `phase`: setup, request. `operation`: client_setup, publish_namespace, publish, subscribe, subscribe_namespace, track_status, fetch (SUBSCRIBE_TRACKS is counted as subscribe_namespace, its interim gate). `reason`: token_missing, token_invalid, token_expired, token_replayed, token_malformed, scope_mismatch, issuer_unknown, policy_denied, hook_fault, alias_in_setup, too_many_tokens |
 //! | `moq_relay_auth_errors_total` | `stage` | Authorization could not reach a verdict (stage: scope_config, setup, request). Distinct from `auth_denied_total`: these indicate a relay or configuration fault, not a rejected peer, and are the ones worth alerting on |
 //!
 //! ## Gauges
@@ -51,8 +52,8 @@
 //! | `moq_relay_active_connections` | Current number of active client connections |
 //! | `moq_relay_active_publishers` | Current number of active publishers |
 //! | `moq_relay_active_subscriptions` | Current number of active subscriptions |
+//! | `moq_relay_active_rendezvous_holds` | Current SUBSCRIBE requests waiting for a publisher |
 //! | `moq_relay_active_tracks` | Current number of tracks being served |
-//! | `moq_relay_active_published_tracks` | Current number of exact tracks registered from PUBLISH |
 //! | `moq_relay_announced_namespaces` | Current number of namespaces registered via PUBLISH_NAMESPACE |
 //! | `moq_relay_upstream_connections` | Current number of upstream/origin connections |
 //!
@@ -60,7 +61,7 @@
 //!
 //! | Name | Labels | Description |
 //! |------|--------|-------------|
-//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, unauthorized, route_error, upstream_error, downstream_left) |
+//! | `moq_relay_subscribe_latency_seconds` | `source` | Time to resolve subscription (source: local, remote, not_found, route_error, upstream_error, downstream_left, rendezvous_timeout, rendezvous_overloaded) |
 
 use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
 
@@ -96,7 +97,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "moq_relay_publish_errors_total",
-        "Publisher-initiated PUBLISH failures by phase (session_limit, auth, auth_fanout, take_reader, local_register, coordinator_register, send_ok)"
+        "PUBLISH failures by phase (auth, auth_fanout, session_limit, take_reader, local_register, coordinator_register, send_ok)"
     );
     describe_counter!(
         "moq_relay_announce_ok_total",
@@ -126,6 +127,14 @@ pub fn describe_metrics() {
         "Upstream subscription could not be established, so the downstream SUBSCRIBE was rejected"
     );
     describe_counter!(
+        "moq_relay_rendezvous_timeouts_total",
+        "Rendezvous holds that ended with REQUEST_ERROR TIMEOUT"
+    );
+    describe_counter!(
+        "moq_relay_rendezvous_rejections_total",
+        "Rendezvous requests rejected with EXCESSIVE_LOAD because relay or session capacity was full"
+    );
+    describe_counter!(
         "moq_relay_upstream_errors_total",
         "Upstream connection failures by stage (connect, session)"
     );
@@ -147,7 +156,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "moq_relay_auth_denied_total",
-        "Operations denied by the authorization hook, by phase (setup, request), operation, and reason"
+        "Operations denied by authorization, by phase (setup, request), operation, and reason"
     );
     describe_counter!(
         "moq_relay_auth_errors_total",
@@ -161,6 +170,10 @@ pub fn describe_metrics() {
     describe_counter!(
         "moq_relay_subscribe_namespace_errors_total",
         "SUBSCRIBE_NAMESPACE requests rejected by the relay, by phase (auth)"
+    );
+    describe_counter!(
+        "moq_relay_subscribe_tracks_errors_total",
+        "SUBSCRIBE_TRACKS requests rejected by the relay, by phase (auth)"
     );
     describe_counter!(
         "moq_relay_track_status_errors_total",
@@ -179,6 +192,10 @@ pub fn describe_metrics() {
     describe_gauge!(
         "moq_relay_active_subscriptions",
         "Current number of active subscriptions"
+    );
+    describe_gauge!(
+        "moq_relay_active_rendezvous_holds",
+        "Current SUBSCRIBE requests waiting for a publisher"
     );
     describe_gauge!(
         "moq_relay_active_tracks",
@@ -201,11 +218,7 @@ pub fn describe_metrics() {
     describe_histogram!(
         "moq_relay_subscribe_latency_seconds",
         Unit::Seconds,
-        "Time to resolve subscription by source (local, remote, not_found, unauthorized, route_error, upstream_error, downstream_left)"
-    );
-    describe_counter!(
-        "moq_relay_fetch_errors_total",
-        "Standalone FETCH requests rejected by the relay, by phase (phase: auth)"
+        "Time to resolve subscription by source (local, remote, not_found, route_error, upstream_error, downstream_left, rendezvous_timeout, rendezvous_overloaded)"
     );
 }
 

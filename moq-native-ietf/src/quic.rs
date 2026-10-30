@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashSet,
-    fmt,
+    fmt::{self, Write as _},
     fs::File,
     io::BufWriter,
     net::{self, IpAddr},
@@ -17,7 +17,9 @@ use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 use url::Url;
 
+use moq_transport::session::transport as web_transport;
 use moq_transport::session::Transport;
+use quinn::VarInt;
 
 use crate::tls;
 
@@ -109,6 +111,29 @@ fn bind_smart(addr: net::SocketAddr) -> anyhow::Result<(net::UdpSocket, bool)> {
 
     Ok((socket.into(), is_dual_stack))
 }
+
+/// HTTP/3 `H3_NO_ERROR` ([RFC 9114] §8.1): the H3 layer completed normally, the
+/// request was simply refused.
+///
+/// Wire hygiene rather than a behaviour fix — §8 already requires an unknown
+/// code to be read as H3_NO_ERROR, so a conformant peer read the previous 0
+/// the same way. `H3_REQUEST_REJECTED` would be wrong here: §4.1.1 reserves it
+/// for requests the server did not process, and this one was answered with 406.
+///
+/// [RFC 9114]: https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1
+const H3_NO_ERROR: u32 = 0x100;
+
+/// How long a rejected WebTransport CONNECT is given to reach the peer before
+/// the connection is closed underneath it.
+const REJECT_FLUSH_TIMEOUT: time::Duration = time::Duration::from_millis(250);
+
+/// Caps the offered protocol identifiers logged when a CONNECT is rejected.
+///
+/// The list is peer-controlled on a pre-authentication path. H3 bounds the
+/// whole header block to 64 KiB, but that is still ~104 KiB of decoded text in
+/// one entry, so both the entry count and each entry's length are capped.
+const MAX_LOGGED_PROTOCOLS: usize = 16;
+const MAX_LOGGED_PROTOCOL_LEN: usize = 64;
 
 /// Build a TransportConfig with our standard settings
 ///
@@ -308,10 +333,11 @@ impl Endpoint {
         let mut server_config = None;
 
         if let Some(mut config) = config.tls.server {
-            config.alpn_protocols = vec![
-                web_transport_quinn::ALPN.as_bytes().to_vec(),
-                moq_transport::setup::ALPN.to_vec(),
-            ];
+            // Offer WebTransport ALPN plus all supported MoQT versions for raw QUIC.
+            config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+            for alpn in moq_transport::setup::SUPPORTED_ALPNS {
+                config.alpn_protocols.push(alpn.as_bytes().to_vec());
+            }
             config.key_log = Arc::new(rustls::KeyLogFile::new());
 
             let config: quinn::crypto::rustls::QuicServerConfig = config.try_into()?;
@@ -422,7 +448,7 @@ impl Server {
                     match res? {
                         Ok(result) => return Some(result),
                         Err(err) => {
-                            tracing::warn!("failed to accept QUIC connection: {}", err.root_cause());
+                            tracing::warn!(error = %moq_transport::session::LogSafe(err.root_cause().to_string().as_bytes()), "failed to accept QUIC connection");
                             continue;
                         }
                     }
@@ -485,11 +511,9 @@ impl Server {
         let server_name = handshake.server_name.unwrap_or_default();
 
         tracing::debug!(
-            "received QUIC handshake: cid={} ip={} alpn={} server={}",
-            connection_id_hex,
-            conn.remote_address(),
-            alpn,
-            server_name,
+            session_id = %connection_id_hex,
+            alpn = %moq_transport::session::LogSafe(alpn.as_bytes()),
+            "received QUIC handshake"
         );
 
         // Wait for the QUIC connection to be established.
@@ -506,30 +530,99 @@ impl Server {
         let local_ip = conn.local_ip();
 
         tracing::debug!(
-            "established QUIC connection: cid={} stable_id={} ip={} local_ip={:?} alpn={} server={}",
-            connection_id_hex,
-            conn.stable_id(),
-            remote_address,
-            local_ip,
-            alpn,
-            server_name,
+            session_id = %connection_id_hex,
+            stable_id = conn.stable_id(),
+            alpn = %moq_transport::session::LogSafe(alpn.as_bytes()),
+            "established QUIC connection"
         );
 
         let alpn_bytes = alpn.as_bytes();
         let (session, transport) = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
+            // `Request::accept` takes the connection, so keep a handle for the
+            // rejection path: closing with a reason tells the peer why, which a
+            // bare drop does not.
+            let conn_for_reject = conn.clone();
+
             // Wait for the WebTransport CONNECT request (includes H3 SETTINGS exchange).
             let request = web_transport_quinn::Request::accept(conn)
                 .await
                 .context("failed to receive WebTransport request")?;
 
-            let moqt_protocol = std::str::from_utf8(moq_transport::setup::ALPN)
-                .context("invalid MoQT ALPN")?
-                .to_string();
-            let response = if request.protocols.contains(&moqt_protocol) {
-                web_transport_quinn::proto::ConnectResponse::OK.with_protocol(moqt_protocol)
-            } else {
-                web_transport_quinn::proto::ConnectResponse::OK
+            // Negotiate the MoQT version from the client's offered protocols. Rejecting here
+            // rather than accepting without a protocol keeps a non-MoQT WebTransport client
+            // from getting a successful CONNECT only to fail later at MoQT SETUP.
+            //
+            // draft-18 §3.1.3 has the client put its MoQT protocol identifiers in
+            // WT-Available-Protocols; draft-ietf-webtrans-http3 §3.3 lets the server
+            // "reject the request if the client did not include a suitable protocol".
+            let selected = match moq_transport::setup::negotiate_version(&request.protocols) {
+                Some(selected) => selected,
+                None => {
+                    // `reject` consumes the request, so render the offer now,
+                    // bounded in both directions: the peer chooses how many
+                    // entries it sends and how long each one is.
+                    let offered = {
+                        let total = request.protocols.len();
+                        let shown: Vec<String> = request
+                            .protocols
+                            .iter()
+                            .take(MAX_LOGGED_PROTOCOLS)
+                            .map(|p| match p.char_indices().nth(MAX_LOGGED_PROTOCOL_LEN) {
+                                Some((cut, _)) => format!("{}…", &p[..cut]),
+                                None => p.clone(),
+                            })
+                            .collect();
+                        let mut rendered = format!("{shown:?}");
+                        if total > MAX_LOGGED_PROTOCOLS {
+                            let _ = write!(rendered, " (+{} more)", total - MAX_LOGGED_PROTOCOLS);
+                        }
+                        rendered
+                    };
+
+                    // Answer the CONNECT instead of dropping the connection, so the
+                    // peer learns why, and record what it offered: without this the
+                    // peer sees an abrupt close and the log names no cause.
+                    tracing::warn!(
+                        cid = %connection_id_hex,
+                        offered = %moq_transport::session::LogSafe(offered.as_bytes()),
+                        supported = ?moq_transport::setup::SUPPORTED_ALPNS,
+                        "rejecting WebTransport CONNECT: no mutually supported MoQT version in WT-Available-Protocols"
+                    );
+
+                    // 406: the client's offer could not be satisfied.
+                    if let Err(err) = request
+                        .reject(web_transport_quinn::http::StatusCode::NOT_ACCEPTABLE)
+                        .await
+                    {
+                        tracing::debug!(cid = %connection_id_hex, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed to reject WebTransport CONNECT");
+                    }
+
+                    // `reject` only queues the response, and both `close` and
+                    // dropping the connection stop sending immediately, which
+                    // would truncate it. Give the peer a bounded moment to read
+                    // the 406 and close, then close with a reason so its logs
+                    // name the cause rather than a truncated H3 exchange.
+                    if tokio::time::timeout(REJECT_FLUSH_TIMEOUT, conn_for_reject.closed())
+                        .await
+                        .is_err()
+                    {
+                        // H3_NO_ERROR: the H3 layer did its job and answered the
+                        // CONNECT; 0 is not a defined HTTP/3 error code.
+                        conn_for_reject.close(
+                            VarInt::from_u32(H3_NO_ERROR),
+                            b"no mutually supported MoQT version in WT-Available-Protocols",
+                        );
+                    }
+
+                    anyhow::bail!(
+                        "no mutually supported MoQT version in WT-Available-Protocols (offered: {}, supported: {:?})",
+                        moq_transport::session::LogSafe(offered.as_bytes()),
+                        moq_transport::setup::SUPPORTED_ALPNS,
+                    );
+                }
             };
+            let response =
+                web_transport_quinn::proto::ConnectResponse::OK.with_protocol(selected.to_string());
 
             // Accept the CONNECT request.
             let session = request
@@ -537,7 +630,10 @@ impl Server {
                 .await
                 .context("failed to respond to WebTransport request")?;
             (session, Transport::WebTransport)
-        } else if alpn_bytes == moq_transport::setup::ALPN {
+        } else if moq_transport::setup::SUPPORTED_ALPNS
+            .iter()
+            .any(|v| v.as_bytes() == alpn_bytes)
+        {
             // Raw QUIC mode — create a "fake" WebTransport session with no H3 framing.
             let request = url::Url::parse("moqt://localhost").unwrap();
             let session = web_transport_quinn::Session::raw(
@@ -547,7 +643,12 @@ impl Server {
             );
             (session, Transport::RawQuic)
         } else {
-            anyhow::bail!("unsupported ALPN: {}", alpn)
+            anyhow::bail!(
+                "unsupported ALPN: {} (supported: {:?} or {})",
+                moq_transport::session::LogSafe(alpn.as_bytes()),
+                moq_transport::setup::SUPPORTED_ALPNS,
+                web_transport_quinn::ALPN,
+            )
         };
 
         let info = ConnInfo {
@@ -614,7 +715,9 @@ impl Client {
         // TODO support connecting to both ALPNs at the same time
         config.alpn_protocols = vec![match url.scheme() {
             "https" => web_transport_quinn::ALPN.as_bytes().to_vec(),
-            "moqt" => moq_transport::setup::ALPN.to_vec(),
+            "moqt" => moq_transport::setup::DraftVersion::Draft18
+                .alpn_bytes()
+                .to_vec(),
             _ => anyhow::bail!("url scheme must be 'https' or 'moqt'"),
         }];
 
@@ -667,11 +770,12 @@ impl Client {
 
         let (session, transport) = match url.scheme() {
             "https" => {
-                let moqt_protocol = std::str::from_utf8(moq_transport::setup::ALPN)
-                    .context("invalid MoQT ALPN")?
-                    .to_string();
-                let request = web_transport_quinn::proto::ConnectRequest::new(url.clone())
-                    .with_protocol(moqt_protocol);
+                // Offer all supported MoQT versions via WT-Available-Protocols so the server
+                // can pick by its own preference order.
+                let mut request = web_transport_quinn::proto::ConnectRequest::new(url.clone());
+                for alpn in moq_transport::setup::SUPPORTED_ALPNS {
+                    request = request.with_protocol(alpn.to_string());
+                }
                 (
                     web_transport_quinn::Session::connect(connection, request).await?,
                     Transport::WebTransport,
@@ -698,8 +802,6 @@ impl Client {
         port: u16,
         address_family: AddressFamily,
     ) -> anyhow::Result<net::SocketAddr> {
-        let local_addr = self.local_addr()?;
-
         // Collect all DNS results
         let addrs: Vec<net::SocketAddr> = match Self::parse_socket_addr(host, port) {
             Ok(addr) => {
@@ -712,24 +814,14 @@ impl Client {
         };
 
         if addrs.is_empty() {
-            anyhow::bail!("DNS lookup for host '{}' returned no addresses", host);
+            anyhow::bail!("DNS lookup returned no addresses");
         }
 
-        // Log all DNS results for debugging
         tracing::debug!(
-            "DNS lookup for {}, family {:?}: found {} results",
-            host,
-            address_family,
-            addrs.len()
+            ?address_family,
+            results = addrs.len(),
+            "DNS lookup completed"
         );
-        for (i, addr) in addrs.iter().enumerate() {
-            tracing::debug!(
-                "  DNS[{}]: {} ({})",
-                i,
-                addr,
-                if addr.is_ipv4() { "IPv4" } else { "IPv6" }
-            );
-        }
 
         // Filter DNS results to match our local socket's address family
         let compatible_addr = match address_family {
@@ -739,14 +831,11 @@ impl Client {
                     .iter()
                     .find(|a| a.is_ipv4())
                     .cloned()
-                    .context(format!(
-                        "No IPv4 address found for host '{}' (local socket is IPv4: {})",
-                        host, local_addr
-                    ))?
+                    .context("No IPv4 address found for an IPv4 socket")?
             }
             AddressFamily::Ipv6DualStack => {
                 // Dual-stack socket: any address family works, use first result
-                tracing::debug!("Using first DNS result (IPv6 dual-stack): {}", addrs[0]);
+                tracing::debug!("Using first DNS result (IPv6 dual-stack)");
                 addrs[0]
             }
             AddressFamily::Ipv6 => {
@@ -755,19 +844,11 @@ impl Client {
                     .iter()
                     .find(|a| a.is_ipv6())
                     .cloned()
-                    .context(format!(
-                        "No IPv6 address found for host '{}' (local socket is IPv6: {})",
-                        host, local_addr
-                    ))?
+                    .context("No IPv6 address found for an IPv6 socket")?
             }
         };
 
-        tracing::debug!(
-            "Connecting from {} to {} (selected from {} DNS results)",
-            local_addr,
-            compatible_addr,
-            addrs.len()
-        );
+        tracing::debug!(results = addrs.len(), "selected compatible DNS result");
 
         Ok(compatible_addr)
     }

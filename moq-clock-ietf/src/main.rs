@@ -7,6 +7,9 @@ use anyhow::Context;
 
 mod cli;
 mod clock;
+mod history;
+#[cfg(test)]
+mod test;
 
 use clap::Parser;
 use cli::Cli;
@@ -14,7 +17,7 @@ use cli::Cli;
 use moq_transport::{
     coding::TrackNamespace,
     serve,
-    session::{Publisher, SessionId, Subscriber},
+    session::{Publisher, Subscriber},
     setup::AuthorizationToken,
 };
 
@@ -35,11 +38,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut config = Cli::parse();
-    let authorization_tokens = std::mem::take(&mut config.authorization_tokens)
-        .into_iter()
-        .map(|token| AuthorizationToken::new(token.token_type, token.value))
-        .collect::<Result<Vec<_>, _>>()
-        .context("authorization token type exceeds the QUIC varint range")?;
+    let authorization_tokens: Vec<AuthorizationToken> =
+        std::mem::take(&mut config.authorization_tokens)
+            .into_iter()
+            .map(|token| AuthorizationToken::new(token.token_type, token.value))
+            .collect();
     let tls = config.tls.load()?;
 
     // Create the QUIC endpoint
@@ -58,14 +61,10 @@ async fn main() -> anyhow::Result<()> {
     // Depending on whether we are publishing or subscribing, create the appropriate session
     if config.publish {
         // Create the publisher session
-        let (session, mut publisher) = Publisher::connect_with_session_id_and_tokens(
-            session,
-            SessionId::new(connection_id.clone()),
-            transport,
-            authorization_tokens,
-        )
-        .await
-        .context("failed to create MoQ Transport session")?;
+        let (session, mut publisher) =
+            Publisher::connect_with_tokens(session, transport, authorization_tokens)
+                .await
+                .context("failed to create MoQ Transport session")?;
 
         if config.datagrams {
             tracing::info!("publishing clock via datagrams");
@@ -92,24 +91,26 @@ async fn main() -> anyhow::Result<()> {
             .produce();
 
             let track_writer = tracks_writer.create(&config.track).unwrap();
-            let clock_publisher = clock::Publisher::new(track_writer.subgroups()?);
+            let history = history::History::new(config.history_groups as usize);
+            let clock_publisher = clock::Publisher::new(track_writer.subgroups()?, history.clone());
+            publisher.accept_fetch();
+            let fetch_publisher = publisher.clone();
+            let fetch_namespace = TrackNamespace::from_utf8_path(&config.namespace);
+            let fetch_track = config.track.clone().into();
 
             tokio::select! {
                 res = session.run() => res.context("session error")?,
                 res = clock_publisher.run() => res.context("clock error")?,
                 res = publisher.publish_namespace(tracks_reader) => res.context("failed to serve tracks")?,
+                res = history.run(fetch_publisher, fetch_namespace, fetch_track) => res.context("failed to serve FETCH")?,
             }
         }
     } else {
         // Create the subscriber session
-        let (session, mut subscriber) = Subscriber::connect_with_session_id_and_tokens(
-            session,
-            SessionId::new(connection_id.clone()),
-            transport,
-            authorization_tokens,
-        )
-        .await
-        .context("failed to create MoQ Transport session")?;
+        let (session, mut subscriber) =
+            Subscriber::connect_with_tokens(session, transport, authorization_tokens)
+                .await
+                .context("failed to create MoQ Transport session")?;
 
         let track_namespace = TrackNamespace::from_utf8_path(&config.namespace);
 
@@ -125,8 +126,16 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::select! {
             res = session.run() => res.context("session error")?,
-            res = clock_subscriber.run() => res.context("clock error")?,
-            res = subscriber.subscribe(track_writer) => res.context("failed to subscribe to track")?,
+            res = async {
+                if let Some(groups) = config.join_groups {
+                    clock_subscriber.run_joined(subscriber, track_writer, groups as u64).await
+                } else {
+                    tokio::select! {
+                        res = clock_subscriber.run() => res,
+                        res = subscriber.subscribe(track_writer) => res.context("failed to subscribe to track"),
+                    }
+                }
+            } => res.context("clock error")?,
         }
     }
 

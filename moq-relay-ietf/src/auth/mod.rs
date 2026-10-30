@@ -10,22 +10,21 @@
 //! to, [`Coordinator::get_scope_config`] supplies that scope's
 //! [`ScopeAuthConfig`], including the public keys used to verify tokens. A
 //! scope that returns no policy carries no token enforcement; AUTHORIZATION
-//! TOKEN parameters are still validated for wire-format conformance (§9.2.2.1)
-//! but do not gate admission.
+//! TOKEN options are still validated for wire-format conformance
+//! (draft-18 §10.2.2) but do not gate admission.
 //!
 //! Internal relay peers bypass token authorization, relying on the embedder
 //! to authenticate them before tagging them internal. For public sessions
 //! where a policy is present, enforcement happens at two points:
 //!
-//! * **Setup.** The AUTHORIZATION TOKEN parameters from CLIENT_SETUP are
-//!   decoded (see [`decode_setup_tokens`]) and handed to
-//!   [`AuthHook::on_setup`]. A denial terminates the session before either
-//!   half of it is constructed.
-//! * **Request.** Every SUBSCRIBE, SUBSCRIBE_NAMESPACE, TRACK_STATUS,
-//!   PUBLISH_NAMESPACE, PUBLISH and FETCH (standalone and joining) are checked
-//!   before the relay acts on them. The first five use [`AuthHook::on_request`];
-//!   FETCH is checked via `may_fetch_track` under the `Fetch(7)` grant. A
-//!   denial rejects that request and leaves the session running.
+//! * **Setup.** The AUTHORIZATION TOKEN options from the client's SETUP
+//!   (draft-18 §10.3.1.4) are decoded (see [`decode_setup_tokens`]) and handed
+//!   to [`AuthHook::on_setup`]. A denial terminates the session with
+//!   UNAUTHORIZED (§3.5) before either half of it is constructed.
+//! * **Request.** Authorization-relevant requests are checked against the
+//!   [`Principal`] established at setup, through [`AuthHook::on_request`],
+//!   before the relay acts on them. A denial rejects that request and leaves
+//!   the session running.
 //!
 //! Cryptography is confined to setup. The identity established there is
 //! carried in a [`Principal`], so per-request checks are pure claim
@@ -33,9 +32,33 @@
 //! authorized more than [`ScopeAuthConfig::clock_skew`] past the token's
 //! `exp`. That tolerance exists to absorb clock differences between issuer
 //! and relay, and it applies to the per-request check exactly as it does at
-//! setup — so "expired" in practice means `exp + clock_skew`, not `exp`. The
-//! CAT hook clamps the configured value so a scope cannot widen the window
-//! indefinitely.
+//! setup — so "expired" in practice means `exp + clock_skew`, not `exp`.
+//!
+//! # CAT action mapping (draft-ietf-moq-c4m)
+//!
+//! | Wire message (draft-18) | [`AuthzOperation`] | CAT `moqt` action |
+//! |---|---|---|
+//! | SETUP (§10.3) | *(inside `on_setup`)* | `ClientSetup` (0) |
+//! | PUBLISH_NAMESPACE (§10.15) | `PublishNamespace` | 2 |
+//! | SUBSCRIBE_NAMESPACE (§10.18) | `SubscribeNamespace` | 3 |
+//! | SUBSCRIBE (§10.7) | `Subscribe` | 4 |
+//! | PUBLISH (§10.10) | `Publish` | 6 |
+//! | FETCH (§10.12) | `Fetch` | 7 |
+//! | TRACK_STATUS (§10.14) | `TrackStatus` | 8 |
+//! | SUBSCRIBE_TRACKS (§10.19) | `SubscribeNamespace` *(interim)* | 3 |
+//!
+//! FETCH requires `Fetch(7)`; a token that grants only `Subscribe(4)` cannot
+//! fetch. This relay does not serve FETCH yet (the session layer answers it
+//! as not supported), so no FETCH gate exists; the mapping is in place for
+//! when relay FETCH serving lands.
+//!
+//! SUBSCRIBE_TRACKS is new in draft-18 and has no CAT action yet, so the
+//! request is gated as `SubscribeNamespace` on its prefix. That grants
+//! discovery only: every PUBLISH it generates is separately authorized as a
+//! `Subscribe` for that exact track, as is every NAMESPACE a
+//! SUBSCRIBE_NAMESPACE would disclose (as `SubscribeNamespace` on the exact
+//! namespace). Tracks and namespaces outside the grant are withheld rather
+//! than failing the request.
 //!
 //! # Revocation, and what it does not cover
 //!
@@ -74,20 +97,21 @@
 //! * a hook that returns an error,
 //! * a missing, malformed, expired or out-of-scope token.
 //!
-//! Scopes without a policy and authenticated internal relay peers bypass
-//! token authorization. Token wire-format validation applies to every session.
-//!
 //! By default, a failed refresh reuses a fetched policy within the cap, with
 //! token checks enforced. A cached configuration with no policy has no reuse
 //! limit because it does not require token authorization. A coordinator can
 //! turn this exception off with [`Coordinator::reuse_scope_config_on_error`],
-//! so every failed fetch denies admission of public sessions, even on scopes
-//! without a policy.
+//! so every failed fetch denies admission even on scopes without a policy.
+//!
+//! Scopes without a policy and authenticated internal relay peers bypass
+//! token authorization. Token wire-format validation applies to every session.
 //!
 //! [`Coordinator::resolve_scope`]: crate::Coordinator::resolve_scope
 //! [`Coordinator::get_scope_config`]: crate::Coordinator::get_scope_config
 //! [`Coordinator::reuse_scope_config_on_error`]: crate::Coordinator::reuse_scope_config_on_error
 //! [`ScopeAuthConfig`]: crate::ScopeAuthConfig
+//! [`ScopeAuthConfig::clock_skew`]: crate::ScopeAuthConfig::clock_skew
+//! [`ScopeAuthConfig::ttl`]: crate::ScopeAuthConfig::ttl
 
 mod hook;
 mod scope;
@@ -113,7 +137,6 @@ pub(crate) use session::{authorize, SessionAuth};
 
 use crate::DEFAULT_SCOPE_AUTH_TTL;
 
-const UNSCOPED: &str = "<unscoped>";
-
-/// Session termination code for UNAUTHORIZED (draft-16 §13.4.1).
+/// Session termination code for UNAUTHORIZED (draft-18 §3.5, §15.10.1;
+/// unchanged from draft-16).
 pub(crate) const SESSION_ERROR_UNAUTHORIZED: u32 = 0x2;

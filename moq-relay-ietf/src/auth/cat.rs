@@ -37,7 +37,7 @@ use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix};
 
 use super::{
     AuthDecision, AuthError, AuthHook, AuthRequest, AuthToken, AuthzOperation, DenyReason,
-    Principal, CAT_TOKEN_TYPE, UNSCOPED,
+    Principal, CAT_TOKEN_TYPE,
 };
 use crate::{
     AuthKeyAlgorithm, AuthPublicKey, ScopeAuthConfig, SessionContext, MAX_SCOPE_AUTH_KEYS,
@@ -54,7 +54,7 @@ const MAX_TOKEN_LIFETIME_SECS: i64 = 7 * 24 * 60 * 60;
 /// of the `exp + skew` arithmetic.
 const MAX_CLOCK_SKEW_SECS: i64 = 300;
 
-/// Signature verifications a single CLIENT_SETUP may cost.
+/// Signature verifications a single client SETUP may cost.
 ///
 /// Verification is the expensive part of admission and it runs inline on the
 /// accepting task, while both multipliers — how many tokens are presented and,
@@ -211,7 +211,7 @@ impl CatAuthHook {
         let moqt_validator = MoqtValidator::new().disable_revalidation_support();
 
         tracing::info!(
-            scope = scope.unwrap_or(UNSCOPED),
+            scope_present = scope.is_some(),
             keys = keys.len(),
             issuers = config.issuers.len(),
             audiences = config.audiences.len(),
@@ -261,7 +261,7 @@ impl CatAuthHook {
         for key in self.candidate_keys(kid.as_deref()) {
             if *budget == 0 {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
+                    scope_present = self.scope.is_some(),
                     "exhausted the signature verification budget for this session"
                 );
                 return Err(DenyReason::TokenInvalid);
@@ -282,9 +282,8 @@ impl CatAuthHook {
             None => {
                 let err = best_error.unwrap_or(CatError::SignatureVerificationFailed);
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                    kid = kid.as_deref(),
-                    error = %err,
+                    scope_present = self.scope.is_some(),
+                    deny_reason = map_cat_error(err.clone()).label(),
                     "CAT token failed to verify against every configured key"
                 );
                 return Err(map_cat_error(err));
@@ -297,8 +296,7 @@ impl CatAuthHook {
         // leaked token to its lifetime.
         let Some(expires_at) = verified.claims().core.exp else {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                subject = verified.claims().informational.sub.as_deref(),
+                scope_present = self.scope.is_some(),
                 "CAT token has no expiry"
             );
             return Err(DenyReason::TokenInvalid);
@@ -312,8 +310,7 @@ impl CatAuthHook {
 
         if expires_at > horizon {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                subject = verified.claims().informational.sub.as_deref(),
+                scope_present = self.scope.is_some(),
                 "CAT token expiry is implausibly distant"
             );
             return Err(DenyReason::TokenInvalid);
@@ -334,8 +331,7 @@ impl CatAuthHook {
         if let Some(not_before) = verified.claims().core.nbf {
             if !(now.saturating_sub(MAX_TOKEN_LIFETIME_SECS)..=horizon).contains(&not_before) {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                    subject = verified.claims().informational.sub.as_deref(),
+                    scope_present = self.scope.is_some(),
                     "CAT token not-before is implausibly distant"
                 );
                 return Err(DenyReason::TokenInvalid);
@@ -343,8 +339,7 @@ impl CatAuthHook {
 
             if expires_at.saturating_sub(not_before) > MAX_TOKEN_LIFETIME_SECS {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                    subject = verified.claims().informational.sub.as_deref(),
+                    scope_present = self.scope.is_some(),
                     "CAT token lifetime exceeds the supported maximum"
                 );
                 return Err(DenyReason::TokenInvalid);
@@ -355,8 +350,7 @@ impl CatAuthHook {
         // verified token into the validated trust state.
         if let Some(claim) = unenforceable_claim(token.expose_value()) {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                subject = verified.claims().informational.sub.as_deref(),
+                scope_present = self.scope.is_some(),
                 claim,
                 "CAT token carries a restriction this relay cannot enforce"
             );
@@ -368,8 +362,8 @@ impl CatAuthHook {
         // Standard CWT claims: exp, nbf, iss, aud, plus CAT extensions.
         let validated = verified.validate(&self.token_validator).map_err(|err| {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                error = %err,
+                scope_present = self.scope.is_some(),
+                deny_reason = map_cat_error(err.clone()).label(),
                 "CAT token claims rejected"
             );
             map_cat_error(err)
@@ -389,9 +383,8 @@ impl CatAuthHook {
             .validate_moqt_claims(validated.claims())
             .map_err(|err| {
                 tracing::debug!(
-                    scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                    subject = validated.claims().informational.sub.as_deref(),
-                    error = %err,
+                    scope_present = self.scope.is_some(),
+                    deny_reason = map_cat_error(err.clone()).label(),
                     "CAT token MOQT claims rejected"
                 );
                 map_cat_error(err)
@@ -441,7 +434,7 @@ impl CatAuthHook {
         // setup, so this check always applies.
         let Some(now) = try_now_unix() else {
             tracing::error!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
+                scope_present = self.scope.is_some(),
                 "system clock is before the UNIX epoch; cannot evaluate token expiry"
             );
             return AuthDecision::deny(DenyReason::HookFault {
@@ -451,8 +444,7 @@ impl CatAuthHook {
 
         if now > principal.expires_at.saturating_add(principal.clock_skew) {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                subject = principal.token.informational.sub.as_deref(),
+                scope_present = self.scope.is_some(),
                 operation = operation.label(),
                 "CAT token expired mid-session"
             );
@@ -464,8 +456,7 @@ impl CatAuthHook {
             AuthDecision::allow(established.clone())
         } else {
             tracing::debug!(
-                scope = self.scope.as_deref().unwrap_or(UNSCOPED),
-                subject = principal.token.informational.sub.as_deref(),
+                scope_present = self.scope.is_some(),
                 operation = operation.label(),
                 deny_reason = DenyReason::ScopeMismatch.label(),
                 "CAT authorization denied"
@@ -479,7 +470,7 @@ impl std::fmt::Debug for CatAuthHook {
     /// Reports the shape of the configuration without its key material.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CatAuthHook")
-            .field("scope", &self.scope)
+            .field("scope_present", &self.scope.is_some())
             .field("keys", &self.keys.len())
             .field(
                 "kids",
@@ -524,8 +515,8 @@ impl AuthHook for CatAuthHook {
         session: &SessionContext,
         tokens: &[AuthToken],
     ) -> Result<AuthDecision, AuthError> {
-        // §9.3.1.5 lets a peer present more than one token, and §9.2.2.1 lets
-        // the parameter repeat. Accept the first that satisfies this scope
+        // Draft-18 §10.3.1.4 lets a peer present one or more tokens in SETUP,
+        // each as its own option. Accept the first that satisfies this scope
         // rather than only the first that is CAT-typed: a client mid-rotation,
         // or one holding tokens for several relays, legitimately sends
         // several, and only some will be usable here.
@@ -536,7 +527,7 @@ impl AuthHook for CatAuthHook {
 
         if candidates.peek().is_none() {
             tracing::debug!(
-                scope = session.scope().unwrap_or(UNSCOPED),
+                scope_present = session.scope().is_some(),
                 presented = tokens.len(),
                 "no CAT token in CLIENT_SETUP"
             );
@@ -572,16 +563,14 @@ impl AuthHook for CatAuthHook {
         // predicate, as the namespace-level actions are.
         if !scope_authorizes(&decoded, MoqtAction::ClientSetup, None, None) {
             tracing::debug!(
-                scope = session.scope().unwrap_or(UNSCOPED),
-                subject = decoded.informational.sub.as_deref(),
+                scope_present = session.scope().is_some(),
                 "CAT token does not authorize CLIENT_SETUP"
             );
             return Ok(AuthDecision::deny(DenyReason::ScopeMismatch));
         }
 
         tracing::debug!(
-            scope = session.scope().unwrap_or(UNSCOPED),
-            subject = decoded.informational.sub.as_deref(),
+            scope_present = session.scope().is_some(),
             "CAT token accepted"
         );
 
@@ -2540,7 +2529,7 @@ mod tests {
         );
     }
 
-    /// §9.3.1.5 permits more than one token. A token that does not satisfy
+    /// Draft-18 §10.3.1.4 permits more than one token. A token that does not satisfy
     /// this scope must not mask a later one that does.
     #[tokio::test]
     async fn a_later_token_is_tried_when_an_earlier_one_fails() {
@@ -3138,6 +3127,109 @@ mod tests {
         assert!(
             !decision.is_allowed(),
             "Subscribe(4)-only token must be denied for FETCH"
+        );
+    }
+
+    /// Mint a token whose only non-setup grant is `actions` under `sports`.
+    fn token_with_actions(signer: &Es256Algorithm, actions: &[MoqtAction]) -> Bytes {
+        let mut scope = MoqtScopeBuilder::new();
+        for action in actions {
+            scope = scope.action(*action);
+        }
+        let scope = scope.namespace_prefix(b"sports").track_prefix(b"").build();
+        let setup_scope = MoqtScopeBuilder::new()
+            .action(MoqtAction::ClientSetup)
+            .build();
+        let token = CatToken::new()
+            .with_issuer("test-issuer")
+            .with_single_audience("test-relay")
+            .with_subject("test-subject")
+            .with_expires_in(3600)
+            .with_moqt_scope(scope)
+            .with_moqt_scope(setup_scope);
+        Bytes::from(encode_token(&token, signer).expect("encode"))
+    }
+
+    async fn fetch_decision(hook: &CatAuthHook, token: Bytes) -> AuthDecision {
+        let principal = principal_for(hook, token).await;
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+        let track = TrackName::from("video");
+        decide(
+            hook,
+            &principal,
+            AuthzOperation::Fetch {
+                namespace: &namespace,
+                track: &track,
+            },
+        )
+        .await
+    }
+
+    /// A token granting only Fetch(7) may FETCH: no Subscribe(4) is needed.
+    #[tokio::test]
+    async fn fetch_only_token_is_allowed_for_fetch() {
+        let key = generate_key();
+        let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
+        let token = token_with_actions(&key.signer, &[MoqtAction::Fetch]);
+
+        assert!(
+            fetch_decision(&hook, token.clone()).await.is_allowed(),
+            "Fetch(7)-only token must allow FETCH"
+        );
+
+        // ...and it grants FETCH alone, not SUBSCRIBE.
+        let principal = principal_for(&hook, token).await;
+        let namespace = TrackNamespace::from_utf8_path("sports/football");
+        let track = TrackName::from("video");
+        let subscribe = decide(
+            &hook,
+            &principal,
+            AuthzOperation::Subscribe {
+                namespace: &namespace,
+                track: &track,
+            },
+        )
+        .await;
+        assert!(
+            !subscribe.is_allowed(),
+            "Fetch(7) must not imply Subscribe(4)"
+        );
+    }
+
+    /// `.subscriber()` grants [SubscribeNamespace(3), Subscribe(4), Fetch(7)].
+    /// Pinning the set guards the FETCH test below against a cat-token change
+    /// that would make it pass vacuously.
+    #[test]
+    fn subscriber_builder_grants_3_4_7_and_publisher_grants_2_6() {
+        use cat_token::MoqtScope;
+        let actions = |scope: MoqtScope| {
+            let mut a: Vec<i32> = scope.actions().iter().map(|x| *x as i32).collect();
+            a.sort();
+            a
+        };
+        assert_eq!(
+            actions(MoqtScopeBuilder::new().subscriber().build()),
+            vec![3, 4, 7]
+        );
+        assert_eq!(
+            actions(MoqtScopeBuilder::new().publisher().build()),
+            vec![2, 6]
+        );
+    }
+
+    /// A `.publisher()` token [PublishNamespace(2), Publish(6)] cannot FETCH.
+    #[tokio::test]
+    async fn publisher_token_is_denied_for_fetch() {
+        let key = generate_key();
+        let hook = hook(vec![AuthPublicKey::es256(key.pem)]);
+        let token = publisher_token(&key.signer, &[b"sports"]);
+
+        let decision = fetch_decision(&hook, token).await;
+        assert!(!decision.is_allowed(), "publisher token must not FETCH");
+        assert!(
+            matches!(decision.deny_reason(), Some(DenyReason::ScopeMismatch)),
+            "got {:?}",
+            decision.deny_reason()
         );
     }
 }

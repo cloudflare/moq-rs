@@ -6,33 +6,45 @@ use std::{cmp, io};
 
 use bytes::{Buf, Bytes, BytesMut};
 
-use crate::{
-    coding::{Decode, DecodeError},
-    data::{FetchRecord, FetchRecordDecoder, MAX_FETCH_RECORD_HEADER_SIZE},
-};
+use crate::coding::{Decode, DecodeError};
+use crate::data::{FetchRecord, FetchRecordDecoder, MAX_FETCH_RECORD_HEADER_SIZE};
 
+use super::transport as web_transport;
 use super::{SessionError, SessionId};
+use tracing::Instrument;
 
 pub struct Reader {
     session_id: SessionId,
+    span: tracing::Span,
     stream: web_transport::RecvStream,
     buffer: BytesMut,
 }
 
 impl Reader {
-    pub fn new(session_id: SessionId, stream: web_transport::RecvStream) -> Self {
+    #[cfg(test)]
+    pub fn new(stream: web_transport::RecvStream) -> Self {
+        Self::with_session_id(stream, SessionId::generate())
+    }
+
+    pub fn with_session_id(stream: web_transport::RecvStream, session_id: SessionId) -> Self {
         Self {
+            span: session_id.span(),
             session_id,
             stream,
             buffer: Default::default(),
         }
     }
 
+    pub async fn decode<T: Decode>(&mut self) -> Result<T, SessionError> {
+        let span = self.span.clone();
+        self.decode_inner().instrument(span).await
+    }
+
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
     }
 
-    pub async fn decode<T: Decode>(&mut self) -> Result<T, SessionError> {
+    async fn decode_inner<T: Decode>(&mut self) -> Result<T, SessionError> {
         tracing::trace!(
             "[READER] decode: attempting to decode {} (buffer_len={})",
             std::any::type_name::<T>(),
@@ -68,7 +80,6 @@ impl Reader {
                 }
                 Err(err) => {
                     tracing::error!(
-                        session_id = %self.session_id,
                         "[READER] decode: ERROR decoding {} - {:?} (buffer_len={})",
                         std::any::type_name::<T>(),
                         err,
@@ -84,7 +95,6 @@ impl Reader {
                 let before_read = self.buffer.len();
                 if self.stream.read_buf(&mut self.buffer).await?.is_none() {
                     tracing::warn!(
-                        session_id = %self.session_id,
                         "[READER] decode: stream ended while waiting for data (have={} bytes, need={})",
                         self.buffer.len(),
                         required
@@ -111,6 +121,11 @@ impl Reader {
     }
 
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, SessionError> {
+        let span = self.span.clone();
+        self.read_chunk_inner(max).instrument(span).await
+    }
+
+    async fn read_chunk_inner(&mut self, max: usize) -> Result<Option<Bytes>, SessionError> {
         tracing::trace!(
             "[READER] read_chunk: requested max={} bytes (buffer_len={})",
             max,
@@ -137,7 +152,21 @@ impl Reader {
         Ok(chunk)
     }
 
+    /// Decode the next record from a FETCH data stream.
+    ///
+    /// Returns `Ok(None)` on a clean FIN between records. A FIN in the middle
+    /// of a record, or a record header larger than
+    /// [`MAX_FETCH_RECORD_HEADER_SIZE`], is [`SessionError::WrongSize`]. The
+    /// decoder state only advances on success.
     pub(super) async fn decode_fetch(
+        &mut self,
+        decoder: &mut FetchRecordDecoder,
+    ) -> Result<Option<FetchRecord>, SessionError> {
+        let span = self.span.clone();
+        self.decode_fetch_inner(decoder).instrument(span).await
+    }
+
+    async fn decode_fetch_inner(
         &mut self,
         decoder: &mut FetchRecordDecoder,
     ) -> Result<Option<FetchRecord>, SessionError> {
@@ -148,9 +177,6 @@ impl Reader {
             match candidate.decode(&mut cursor) {
                 Ok(record) => {
                     let consumed = cursor.position() as usize;
-                    if consumed > MAX_FETCH_RECORD_HEADER_SIZE {
-                        return Err(SessionError::WrongSize);
-                    }
                     self.buffer.advance(consumed);
                     *decoder = candidate;
                     return Ok(Some(record));

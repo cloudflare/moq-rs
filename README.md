@@ -2,44 +2,45 @@
 
 An implementation of the Media over QUIC Transport (MoQT) protocol for live media delivery over QUIC, as specified by the IETF MoQ working group.
 
-This codebase was originally created by [Luke Curley (@kixelated)](https://github.com/kixelated). [Mike English (@englishm)](https://github.com/englishm) contributed to early design and has maintained this IETF-aligned fork. The project is now maintained by Cloudflare. The implementation targets [draft-ietf-moq-transport-16](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/16/).
-
-> **Note:** This repository includes example client and server applications (moq-pub, moq-sub, moq-clock-ietf, moq-relay-ietf) intended to demonstrate usage of the moq-transport library. These are meant for testing and development purposes and have not been optimized for production use.
+This codebase was originally created by [Luke Curley (@kixelated)](https://github.com/kixelated). [Mike English (@englishm)](https://github.com/englishm) contributed to early design and has maintained this IETF-aligned fork. The project is now maintained by Cloudflare. The implementation targets [draft-ietf-moq-transport-18](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/18/).
 
 ## Protocol Support
 
-The `main` branch targets **draft-16** of the MoQT specification and is the basis for Cloudflare's production deployment. Cloudflare currently runs draft-14 and draft-16 relays globally. See the [Cloudflare MoQ developer docs](https://developers.cloudflare.com/moq/) for endpoint URLs, provisioning, and a full feature matrix.
+This checkout targets **draft-18** of the MoQT specification. Raw QUIC uses the `moqt-18` ALPN; WebTransport uses HTTP/3 with `moqt-18` application-protocol negotiation. Both peers must support the same draft. The `DraftVersion` enum also names later drafts, but this implementation enables only draft-18.
 
-Other branches:
-- [`draft-ietf-moq-transport-14`](https://github.com/cloudflare/moq-rs/tree/draft-ietf-moq-transport-14) — draft-14 maintenance branch
-- [`draft-18-dev`](https://github.com/cloudflare/moq-rs/tree/draft-18-dev) — early draft-18 development
+Until `draft-18-dev` merges into `main`, build draft-18 clients and relays from the same `draft-18-dev` revision. Package versions and crates.io documentation still reflect the published release baseline; they do not identify the wire draft of this checkout. For draft-07 compatibility, see the [`draft-ietf-moq-transport-07`](https://github.com/cloudflare/moq-rs/tree/draft-ietf-moq-transport-07) branch.
 
 ### What's Included
 
 This repository provides:
-- **moq-transport**: A complete MoQT protocol library implementation
-- **moq-relay-ietf**: A production-ready relay server
+- **moq-transport**: A MoQT protocol library
+- **moq-relay-ietf**: A relay server with subscription deduplication and fan-out
 - **Sample clients**: An fMP4 publisher (moq-pub) and a demonstration clock application (moq-clock-ietf)
 
 ### Protocol Feature Support
 
 **Supported:**
-- CLIENT_SETUP / SERVER_SETUP
+- SETUP
 - PUBLISH_NAMESPACE
-- PUBLISH / PUBLISH_OK / PUBLISH_DONE
 - SUBSCRIBE
 - SUBSCRIBE_NAMESPACE
-- Standalone and Joining FETCH passthrough for local and remote PUBLISH_NAMESPACE origins. Joining FETCH is resolved at the receiving relay and forwarded upstream as a fresh Standalone FETCH.
+- SUBSCRIBE_TRACKS and TRACK_STATUS
+- PUBLISH / REQUEST_OK / PUBLISH_DONE (publisher-initiated tracks)
+- Dynamic groups: DYNAMIC_GROUPS advertisement and NEW_GROUP_REQUEST feedback,
+  including subscription REQUEST_UPDATE for that parameter
+- FETCH, standalone and joining (the relay forwards it to the track's origin)
 - WebTransport and raw QUIC transport layers
 - Both stream ("subgroup") and datagram delivery modes
 
 **Not Supported:**
-- Native hop-by-hop Joining FETCH forwarding, exact-PUBLISH-origin FETCH expansion, and cached FETCH responses
-- GOAWAY
+- REQUEST_UPDATE parameters other than NEW_GROUP_REQUEST, including FORWARD (so a Joining FETCH can only join a subscription whose Forward State was set by SUBSCRIBE)
+- Joining FETCH for a subscription created by PUBLISH (answered with NOT_SUPPORTED)
 
 ## Interoperability
 
-This codebase is compatible with other MoQT implementations targeting the same draft version. See the [moq-wg/moq-transport wiki](https://github.com/moq-wg/moq-transport/wiki/Interop) for a list of implementations, and the [moq-interop-runner](https://github.com/englishm/moq-interop-runner) for interop test tooling and a registry of public relay endpoints across draft versions.
+Check the draft supported by an interop endpoint before connecting. For a local draft-18 relay, use `https://localhost:4443` after starting `./dev/relay`. Hosts under `relay.example` in the crate READMEs are placeholders, not deployed endpoints.
+
+As an implementation targeting the IETF specification, this codebase should be compatible with other implementations targeting the same draft version. See the [moq-wg/moq-transport wiki](https://github.com/moq-wg/moq-transport/wiki/Interop) for a list of other implementations.
 
 For streaming format compatibility:
 - **[video-dev/moq-js](https://github.com/video-dev/moq-js)**: A TypeScript player implementation compatible with moq-pub's fMP4 output. Check draft version compatibility when selecting branches.
@@ -57,6 +58,7 @@ This repository contains several crates:
   - **moq-catalog**: Catalog format handling.
   - **moq-sub**: A subscriber client for consuming MoQT streams.
 - **moq-clock-ietf**: A simple time publisher/subscriber demonstrating non-media use cases.
+- **moq-cat-mint**: A CLI that mints Common Access Tokens (CAT) for testing relays that require them.
 
 ## Development
 
@@ -73,7 +75,13 @@ Typical development workflow:
    ```
    Add `--tls-disable-verify` if you prefer not to install local certificates.
 
-3. For playback, clone and run [moq-js](https://github.com/video-dev/moq-js) locally, then open it in a browser pointed at your local relay.
+3. Play the published broadcast in another terminal (requires `ffplay`):
+   ```bash
+   ./dev/sub
+   ```
+   Use the same `NAME` and `URL` environment variables for `./dev/pub` and `./dev/sub` when overriding the defaults. Browser players also need a branch compatible with draft-18; matching the media format alone is insufficient.
+
+For a smoke test without a media player or ffmpeg, start `./dev/clock --publish` and `./dev/clock` in separate terminals. Add `--tls-disable-verify` to native clients only when testing with an untrusted local certificate.
 
 See the [dev helper scripts](dev/README.md) for more options and workflows.
 
@@ -84,7 +92,7 @@ For detailed usage information, see the README in each crate directory:
 - [moq-relay-ietf](moq-relay-ietf/README.md) - Relay server configuration
 - [moq-pub](moq-pub/README.md) - Publisher client usage
 
-The moq-transport crate is also published on [crates.io](https://crates.io/crates/moq-transport) with [API documentation](https://docs.rs/moq-transport/latest/moq_transport/).
+The moq-transport crate is also published on [crates.io](https://crates.io/crates/moq-transport) with [API documentation](https://docs.rs/moq-transport/latest/moq_transport/). To read the API for this checkout, run `cargo doc -p moq-transport --no-deps --open`.
 
 ## License
 

@@ -109,7 +109,7 @@ impl Decode for Fetch {
             }
         };
 
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode_message_params(r)?;
 
         Ok(Self {
             id,
@@ -145,7 +145,7 @@ impl Encode for Fetch {
             }
         };
 
-        self.params.encode(w)?;
+        self.params.encode_message_params(w)?;
 
         Ok(())
     }

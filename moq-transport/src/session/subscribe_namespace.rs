@@ -12,8 +12,8 @@ use std::{
 use futures::channel::oneshot;
 
 use crate::{
-    coding::{KeyValuePairs, TrackNamespace, TrackNamespacePrefix},
-    message::{self, Message, SubscribeOptions},
+    coding::{TrackNamespace, TrackNamespacePrefix},
+    message::{self, Message},
     mlog,
     serve::ServeError,
     watch::State,
@@ -28,11 +28,31 @@ use super::{Reader, Session, SessionError, Subscriber, Writer};
 /// broad-prefix discovery.
 const MAX_KNOWN_NAMESPACE_SUFFIXES: usize = 1 << 20;
 
+/// Cap on events queued for the application but not yet read. Bounds the memory a
+/// peer can make this endpoint hold by churning NAMESPACE and NAMESPACE_DONE for
+/// the same namespaces faster than the application drains them.
+const MAX_PENDING_NAMESPACE_EVENTS: usize = 1 << 16;
+
+/// Whether the response stream carries on after a message.
+///
+/// Named rather than a bool because two different questions were being answered
+/// by the same `false`: whether a message changed anything worth reporting to the
+/// application, and whether the subscription is over. Only the second may end the
+/// loop, and draft-18 §14.4 gives that meaning to a FIN or reset of the response
+/// stream, not to a message we chose to ignore.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ResponseFlow {
+    /// Keep reading the response stream.
+    Continue,
+    /// The subscription is over: the request was refused, or nothing is left
+    /// listening for its events.
+    Ended,
+}
+
 #[derive(Debug, Clone)]
 pub struct SubscribeNamespaceInfo {
     pub request_id: u64,
     pub namespace_prefix: TrackNamespacePrefix,
-    pub subscribe_options: SubscribeOptions,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -57,15 +77,33 @@ impl Default for SubscribeNamespaceState {
     }
 }
 
-/// Outbound SUBSCRIBE_NAMESPACE request.
+impl SubscribeNamespaceState {
+    /// Queue an event for the application, refusing to grow without bound.
+    ///
+    /// Suppressing duplicate additions bounds this by the active namespace count,
+    /// but a peer can still churn add/remove pairs faster than an application
+    /// drains them, so the queue needs its own limit.
+    fn queue_event(&mut self, event: NamespaceEvent) -> Result<(), SessionError> {
+        if self.events.len() >= MAX_PENDING_NAMESPACE_EVENTS {
+            return Err(SessionError::ProtocolViolation(format!(
+                "SUBSCRIBE_NAMESPACE response exceeded {} pending namespace events",
+                MAX_PENDING_NAMESPACE_EVENTS
+            )));
+        }
+        self.events.push_back(event);
+        Ok(())
+    }
+}
+
+/// Outbound SUBSCRIBE_NAMESPACE request (draft-18 §10.18).
 ///
-/// This handle only exposes `NAMESPACE` / `NAMESPACE_DONE` updates from the
-/// request's dedicated response stream. If the request used
-/// `SubscribeOptions::Publish` or `SubscribeOptions::Both`, matching `PUBLISH`
-/// messages arrive on the session control stream (§9.25) and are surfaced via
-/// [`Subscriber::publish_received`].
+/// This handle exposes `NAMESPACE` / `NAMESPACE_DONE` updates from the
+/// request's dedicated bidirectional stream. SUBSCRIBE_NAMESPACE covers
+/// namespace discovery only; PUBLISH messages for tracks arrive on their own
+/// request streams and are surfaced via [`Subscriber::publish_received`].
 #[must_use = "cancels SUBSCRIBE_NAMESPACE on drop"]
 pub struct SubscribeNamespace {
+    session_id: super::SessionId,
     state: State<SubscribeNamespaceState>,
     // Keep the request half after FIN so a cancellation timeout can still reset it (§6.1).
     writer: Option<Writer>,
@@ -82,6 +120,7 @@ impl SubscribeNamespace {
         writer: Writer,
     ) -> (Self, SubscribeNamespaceRecv) {
         let (send_state, recv_state) = State::default().split();
+        let session_id = subscriber.session_id().clone();
         let (force_reset, recv_force_reset) = oneshot::channel();
         let recv = SubscribeNamespaceRecv {
             state: recv_state,
@@ -94,6 +133,7 @@ impl SubscribeNamespace {
             force_reset: Some(recv_force_reset),
         };
         let send = Self {
+            session_id,
             state: send_state,
             writer: Some(writer),
             request_finished: false,
@@ -102,6 +142,11 @@ impl SubscribeNamespace {
         };
 
         (send, recv)
+    }
+
+    /// The upstream session that owns this namespace subscription.
+    pub fn session_id(&self) -> &super::SessionId {
+        &self.session_id
     }
 
     pub async fn ok(&self) -> Result<(), ServeError> {
@@ -235,10 +280,12 @@ impl SubscribeNamespaceRecv {
                 return Ok(());
             }
 
-            let msg = reader.decode::<Message>().await?;
-            Session::log_control_message(reader.session_id(), &msg, "recv");
+            // Draft-18: responses on a request's own bidi stream omit the
+            // Request ID, so the stream's known request ID is injected here
+            // rather than read off the wire.
+            let msg = Session::decode_bidi_response(reader, self.request_id).await?;
             self.emit_mlog(mlog, &msg);
-            if !self.recv_message(msg)? {
+            if self.recv_message(msg)? == ResponseFlow::Ended {
                 return Ok(());
             }
         }
@@ -274,19 +321,17 @@ impl SubscribeNamespaceRecv {
         }
     }
 
-    fn recv_message(&mut self, msg: Message) -> Result<bool, SessionError> {
+    fn recv_message(&mut self, msg: Message) -> Result<ResponseFlow, SessionError> {
         match msg {
-            Message::RequestOk(msg) if !self.responded => {
-                self.check_response_id(msg.id)?;
+            Message::RequestOk(_) if !self.responded => {
                 self.responded = true;
                 self.recv_ok();
-                Ok(true)
+                Ok(ResponseFlow::Continue)
             }
             Message::RequestError(msg) if !self.responded => {
-                self.check_response_id(msg.id)?;
                 self.responded = true;
                 self.recv_error(ServeError::Closed(msg.error_code));
-                Ok(false)
+                Ok(ResponseFlow::Ended)
             }
             Message::Namespace(msg) if self.responded => self.recv_namespace(msg),
             Message::NamespaceDone(msg) if self.responded => self.recv_namespace_done(msg),
@@ -303,16 +348,6 @@ impl SubscribeNamespaceRecv {
         }
     }
 
-    fn check_response_id(&self, id: u64) -> Result<(), SessionError> {
-        if id == self.request_id {
-            return Ok(());
-        }
-
-        Err(SessionError::ProtocolViolation(
-            "SUBSCRIBE_NAMESPACE response request ID mismatch".to_string(),
-        ))
-    }
-
     fn recv_ok(&mut self) {
         if let Some(mut state) = self.state.lock_mut() {
             state.ok = true;
@@ -325,7 +360,7 @@ impl SubscribeNamespaceRecv {
         }
     }
 
-    fn recv_namespace(&mut self, msg: message::Namespace) -> Result<bool, SessionError> {
+    fn recv_namespace(&mut self, msg: message::Namespace) -> Result<ResponseFlow, SessionError> {
         let namespace = self
             .namespace_prefix
             .join_suffix(&msg.track_namespace_suffix)
@@ -345,15 +380,26 @@ impl SubscribeNamespaceRecv {
             )));
         }
 
-        self.known_suffixes.insert(msg.track_namespace_suffix);
+        if !self.known_suffixes.insert(msg.track_namespace_suffix) {
+            // Already active, so nothing changed and there is nothing to report.
+            // Queuing an event per duplicate is how the active-set cap gets
+            // bypassed: the set does not grow, so the cap above never trips while
+            // `events` grows without bound. Repeating a NAMESPACE is not a
+            // violation, so the subscription carries on.
+            return Ok(ResponseFlow::Continue);
+        }
+
         let Some(mut state) = self.state.lock_mut() else {
-            return Ok(false);
+            return Ok(ResponseFlow::Ended);
         };
-        state.events.push_back(NamespaceEvent::Added(namespace));
-        Ok(true)
+        state.queue_event(NamespaceEvent::Added(namespace))?;
+        Ok(ResponseFlow::Continue)
     }
 
-    fn recv_namespace_done(&mut self, msg: message::NamespaceDone) -> Result<bool, SessionError> {
+    fn recv_namespace_done(
+        &mut self,
+        msg: message::NamespaceDone,
+    ) -> Result<ResponseFlow, SessionError> {
         if !self.known_suffixes.remove(&msg.track_namespace_suffix) {
             return Err(SessionError::ProtocolViolation(
                 "NAMESPACE_DONE received before corresponding NAMESPACE".to_string(),
@@ -371,10 +417,10 @@ impl SubscribeNamespaceRecv {
             })?;
 
         let Some(mut state) = self.state.lock_mut() else {
-            return Ok(false);
+            return Ok(ResponseFlow::Ended);
         };
-        state.events.push_back(NamespaceEvent::Removed(namespace));
-        Ok(true)
+        state.queue_event(NamespaceEvent::Removed(namespace))?;
+        Ok(ResponseFlow::Continue)
     }
 }
 
@@ -384,69 +430,33 @@ impl Drop for SubscribeNamespaceRecv {
     }
 }
 
-pub(super) struct OpenSubscribeNamespace {
-    pub subscriber: Subscriber,
-    pub info: SubscribeNamespaceInfo,
-    pub message: message::SubscribeNamespace,
-    pub reply: oneshot::Sender<Result<SubscribeNamespace, SessionError>>,
-}
-
-impl OpenSubscribeNamespace {
-    pub fn new(
-        subscriber: Subscriber,
-        request_id: u64,
-        namespace_prefix: TrackNamespacePrefix,
-        subscribe_options: SubscribeOptions,
-        params: KeyValuePairs,
-        reply: oneshot::Sender<Result<SubscribeNamespace, SessionError>>,
-    ) -> Self {
-        let info = SubscribeNamespaceInfo {
-            request_id,
-            namespace_prefix: namespace_prefix.clone(),
-            subscribe_options,
-        };
-        let message = message::SubscribeNamespace {
-            id: request_id,
-            track_namespace_prefix: namespace_prefix,
-            subscribe_options,
-            params,
-        };
-
-        Self {
-            subscriber,
-            info,
-            message,
-            reply,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{
-        message::RequestOk, session::PendingRequests, session::RequestId, session::SessionId,
+        message::RequestOk,
+        session::{test_support::loopback_session, RequestId},
         watch::Queue,
     };
 
     use super::*;
 
-    fn subscriber() -> Subscriber {
-        let request_id = RequestId::new(0, 100, 100, 0);
+    async fn subscriber() -> Subscriber {
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
         Subscriber::new(
             Queue::default(),
-            Queue::default(),
+            loopback_session().await,
+            crate::session::Transport::WebTransport,
             None,
-            request_id,
-            PendingRequests::default(),
-            SessionId::generate(),
+            RequestId::new(0, 1),
+            bidi_task_tx,
+            Default::default(),
         )
     }
 
-    fn recv(prefix: &str) -> SubscribeNamespaceRecv {
+    async fn recv(prefix: &str) -> SubscribeNamespaceRecv {
         let info = SubscribeNamespaceInfo {
             request_id: 0,
             namespace_prefix: TrackNamespacePrefix::from_utf8_path(prefix),
-            subscribe_options: SubscribeOptions::Namespace,
         };
         SubscribeNamespaceRecv {
             state: State::<SubscribeNamespaceState>::default(),
@@ -455,23 +465,23 @@ mod tests {
             responded: false,
             known_suffixes: HashSet::default(),
             max_known_suffixes: MAX_KNOWN_NAMESPACE_SUFFIXES,
-            subscriber: subscriber(),
+            subscriber: subscriber().await,
             force_reset: None,
         }
     }
 
-    fn pair(prefix: &str) -> (SubscribeNamespace, SubscribeNamespaceRecv) {
+    async fn pair(prefix: &str) -> (SubscribeNamespace, SubscribeNamespaceRecv) {
         let info = SubscribeNamespaceInfo {
             request_id: 0,
             namespace_prefix: TrackNamespacePrefix::from_utf8_path(prefix),
-            subscribe_options: SubscribeOptions::Namespace,
         };
-        let subscriber = subscriber();
+        let subscriber = subscriber().await;
         let (send_state, recv_state) = State::default().split();
         let (force_reset, recv_force_reset) = oneshot::channel();
 
         (
             SubscribeNamespace {
+                session_id: super::super::SessionId::generate(),
                 state: send_state,
                 writer: None,
                 request_finished: false,
@@ -491,14 +501,17 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn queued_event_is_drained_after_response_fin() {
-        let (subscribe, mut recv) = pair("example.com");
-        recv.recv_message(Message::RequestOk(RequestOk {
+    fn request_ok() -> Message {
+        Message::RequestOk(RequestOk {
             id: 0,
             params: Default::default(),
-        }))
-        .unwrap();
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_event_is_drained_after_response_fin() {
+        let (subscribe, mut recv) = pair("example.com").await;
+        recv.recv_message(request_ok()).unwrap();
         recv.recv_message(Message::Namespace(message::Namespace {
             track_namespace_suffix: TrackNamespacePrefix::from_utf8_path("meeting=123"),
         }))
@@ -515,9 +528,9 @@ mod tests {
         assert_eq!(subscribe.next().await.unwrap(), None);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn graceful_finish_keeps_response_half_open() {
-        let (mut subscribe, mut recv) = pair("example.com");
+        let (mut subscribe, mut recv) = pair("example.com").await;
 
         subscribe.finish_request().unwrap();
         subscribe.finish_request().unwrap();
@@ -526,9 +539,9 @@ mod tests {
         assert_eq!(recv.force_reset.as_mut().unwrap().try_recv().unwrap(), None);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forced_reset_signals_response_half() {
-        let (mut subscribe, mut recv) = pair("example.com");
+        let (mut subscribe, mut recv) = pair("example.com").await;
         let force_reset = recv.force_reset.take().unwrap();
 
         subscribe.reset_request(42);
@@ -536,28 +549,22 @@ mod tests {
         assert_eq!(force_reset.await.unwrap(), 42);
     }
 
-    #[test]
-    fn request_ok_marks_subscription_ok() {
-        let mut recv = recv("example.com");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_ok_marks_subscription_ok() {
+        let mut recv = recv("example.com").await;
 
-        assert!(recv
-            .recv_message(Message::RequestOk(RequestOk {
-                id: 0,
-                params: Default::default(),
-            }))
-            .unwrap());
+        assert_eq!(
+            recv.recv_message(request_ok()).unwrap(),
+            ResponseFlow::Continue
+        );
 
         assert!(recv.state.lock().ok);
     }
 
-    #[test]
-    fn namespace_event_reconstructs_full_namespace() {
-        let mut recv = recv("example.com/meeting=123");
-        recv.recv_message(Message::RequestOk(RequestOk {
-            id: 0,
-            params: Default::default(),
-        }))
-        .unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespace_event_reconstructs_full_namespace() {
+        let mut recv = recv("example.com/meeting=123").await;
+        recv.recv_message(request_ok()).unwrap();
 
         recv.recv_message(Message::Namespace(message::Namespace {
             track_namespace_suffix: TrackNamespacePrefix::from_utf8_path("participant=100"),
@@ -573,14 +580,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn namespace_done_before_namespace_is_protocol_violation() {
-        let mut recv = recv("example.com");
-        recv.recv_message(Message::RequestOk(RequestOk {
-            id: 0,
-            params: Default::default(),
-        }))
-        .unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespace_done_before_namespace_is_protocol_violation() {
+        let mut recv = recv("example.com").await;
+        recv.recv_message(request_ok()).unwrap();
 
         let err = recv
             .recv_message(Message::NamespaceDone(message::NamespaceDone {
@@ -591,34 +594,21 @@ mod tests {
         assert!(matches!(err, SessionError::ProtocolViolation(_)));
     }
 
-    #[test]
-    fn second_request_response_is_protocol_violation() {
-        let mut recv = recv("example.com");
-        recv.recv_message(Message::RequestOk(RequestOk {
-            id: 0,
-            params: Default::default(),
-        }))
-        .unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_request_response_is_protocol_violation() {
+        let mut recv = recv("example.com").await;
+        recv.recv_message(request_ok()).unwrap();
 
-        let err = recv
-            .recv_message(Message::RequestOk(RequestOk {
-                id: 0,
-                params: Default::default(),
-            }))
-            .unwrap_err();
+        let err = recv.recv_message(request_ok()).unwrap_err();
 
         assert!(matches!(err, SessionError::ProtocolViolation(_)));
     }
 
-    #[test]
-    fn namespace_additions_are_capped() {
-        let mut recv = recv("example.com");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespace_additions_are_capped() {
+        let mut recv = recv("example.com").await;
         recv.max_known_suffixes = 2;
-        recv.recv_message(Message::RequestOk(RequestOk {
-            id: 0,
-            params: Default::default(),
-        }))
-        .unwrap();
+        recv.recv_message(request_ok()).unwrap();
 
         for i in 0..recv.max_known_suffixes {
             recv.recv_message(Message::Namespace(message::Namespace {
@@ -642,5 +632,45 @@ mod tests {
             track_namespace_suffix: TrackNamespacePrefix::from_utf8_path("meeting=0"),
         }))
         .expect("re-adding a tracked suffix stays within the cap");
+    }
+
+    /// A duplicate NAMESPACE does not change the active set, so it must not queue
+    /// another event. Otherwise a peer repeating one NAMESPACE forever grows the
+    /// event queue without ever tripping the active-set cap.
+    ///
+    /// It must also leave the subscription running. Suppressing the event by
+    /// reporting "nothing happened" as the same value that means "the response is
+    /// over" ended the stream instead, so the relay saw discovery finish and
+    /// dropped its upstream registration, on a message the peer was entitled to
+    /// send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_namespace_additions_queue_one_event_and_keep_the_stream() {
+        let mut recv = recv("example.com").await;
+        recv.recv_message(request_ok()).unwrap();
+
+        let namespace = || {
+            Message::Namespace(message::Namespace {
+                track_namespace_suffix: TrackNamespacePrefix::from_utf8_path("meeting=0"),
+            })
+        };
+
+        for _ in 0..50 {
+            assert_eq!(
+                recv.recv_message(namespace()).unwrap(),
+                ResponseFlow::Continue
+            );
+        }
+
+        assert_eq!(recv.state.lock().events.len(), 1);
+
+        // Still live afterwards: a subsequent distinct namespace is reported.
+        assert_eq!(
+            recv.recv_message(Message::Namespace(message::Namespace {
+                track_namespace_suffix: TrackNamespacePrefix::from_utf8_path("meeting=1"),
+            }))
+            .unwrap(),
+            ResponseFlow::Continue
+        );
+        assert_eq!(recv.state.lock().events.len(), 2);
     }
 }

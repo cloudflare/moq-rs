@@ -2,34 +2,47 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::io;
+use std::{io, ops};
 
 use crate::coding::{Encode, EncodeError};
 
+use super::transport as web_transport;
 use super::{SessionError, SessionId};
 use bytes::Buf;
+use tracing::Instrument;
 
 pub struct Writer {
     session_id: SessionId,
+    span: tracing::Span,
     stream: web_transport::SendStream,
     buffer: bytes::BytesMut,
 }
 
 impl Writer {
-    pub fn new(session_id: SessionId, stream: web_transport::SendStream) -> Self {
+    #[cfg(test)]
+    pub fn new(stream: web_transport::SendStream) -> Self {
+        Self::with_session_id(stream, SessionId::generate())
+    }
+
+    pub fn with_session_id(stream: web_transport::SendStream, session_id: SessionId) -> Self {
         Self {
+            span: session_id.span(),
             session_id,
             stream,
             buffer: Default::default(),
         }
     }
 
-    /// The id of the session that owns this stream.
+    pub async fn encode<T: Encode>(&mut self, msg: &T) -> Result<(), SessionError> {
+        let span = self.span.clone();
+        self.encode_inner(msg).instrument(span).await
+    }
+
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
     }
 
-    pub async fn encode<T: Encode>(&mut self, msg: &T) -> Result<(), SessionError> {
+    async fn encode_inner<T: Encode>(&mut self, msg: &T) -> Result<(), SessionError> {
         self.buffer.clear();
         tracing::trace!(
             "[WRITER] encode: encoding {} to buffer",
@@ -67,6 +80,11 @@ impl Writer {
     }
 
     pub async fn write(&mut self, buf: &[u8]) -> Result<(), SessionError> {
+        let span = self.span.clone();
+        self.write_inner(buf).instrument(span).await
+    }
+
+    async fn write_inner(&mut self, buf: &[u8]) -> Result<(), SessionError> {
         tracing::trace!("[WRITER] write: writing {} bytes to stream", buf.len());
 
         let mut cursor = io::Cursor::new(buf);
@@ -77,7 +95,6 @@ impl Writer {
             let size = self.stream.write_buf(&mut cursor).await?;
             if size == 0 {
                 tracing::error!(
-                    session_id = %self.session_id,
                     "[WRITER] write: ERROR - wrote 0 bytes with {} bytes remaining",
                     cursor.remaining()
                 );
@@ -98,12 +115,68 @@ impl Writer {
         Ok(())
     }
 
-    pub(super) fn finish(&mut self) -> Result<(), SessionError> {
+    /// Signal that no more data will be written (sends QUIC FIN).
+    pub fn finish(&mut self) -> Result<(), SessionError> {
         self.stream.finish()?;
         Ok(())
     }
 
-    pub(super) fn reset(&mut self, code: u32) {
+    /// Abort the send half with RESET_STREAM, discarding unsent data.
+    ///
+    /// Used to tear down a single request stream without closing the session.
+    pub fn reset(&mut self, code: u32) {
         self.stream.reset(code);
+    }
+
+    /// Wait until the peer stops receiving this stream or it is closed.
+    pub async fn closed(&mut self) -> Result<Option<u8>, SessionError> {
+        Ok(self.stream.closed().await?)
+    }
+}
+
+pub(super) struct ResetOnDropWriter {
+    writer: Writer,
+    closed: bool,
+}
+
+impl ResetOnDropWriter {
+    pub fn new(writer: Writer) -> Self {
+        Self {
+            writer,
+            closed: false,
+        }
+    }
+
+    pub fn finish(&mut self) -> Result<(), SessionError> {
+        self.writer.finish()?;
+        self.closed = true;
+        Ok(())
+    }
+
+    pub fn reset(&mut self, code: u32) {
+        self.writer.reset(code);
+        self.closed = true;
+    }
+}
+
+impl ops::Deref for ResetOnDropWriter {
+    type Target = Writer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.writer
+    }
+}
+
+impl ops::DerefMut for ResetOnDropWriter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.writer
+    }
+}
+
+impl Drop for ResetOnDropWriter {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.writer.reset(0);
+        }
     }
 }

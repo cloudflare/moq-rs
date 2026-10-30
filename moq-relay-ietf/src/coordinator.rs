@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use moq_native_ietf::quic;
+use moq_native_ietf::Client;
 use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix};
 use url::Url;
 
@@ -215,7 +215,7 @@ pub struct ScopeConfig {
     /// whose coordinator does not populate this field.
     ///
     /// `Some`: enforced for public sessions. They must present a valid
-    /// AUTHORIZATION TOKEN in CLIENT_SETUP, and every subsequent request is
+    /// AUTHORIZATION TOKEN in SETUP, and every subsequent request is
     /// checked against the token's claims. The relay fails closed on anything
     /// it cannot positively authorize, including a configuration it cannot
     /// parse and a relay binary built without the corresponding feature.
@@ -624,18 +624,8 @@ impl TrackSubscription {
 ///
 /// [`resolve_scope()`]: Coordinator::resolve_scope
 #[async_trait]
-// `clippy::double_must_use` fires when a function carries an explicit
-// `#[must_use]` annotation AND its return type is also `#[must_use]`.
-// Both conditions hold for every async method here:
-//   1. `async_trait` injects `#[must_use]` on each generated method signature
-//      so that callers must `.await` the returned future (see async-trait
-//      expand.rs, `Item::Trait` branch; impl blocks are not annotated).
-//   2. `std::future::Future` is `#[must_use]`, so the generated return type
-//      `Pin<Box<dyn Future<...>>>` is also `#[must_use]`.
-// This became a hard error in CI under Rust 1.99 stable with
-// `RUSTFLAGS=-D warnings` (injected by `actions-rust-lang/setup-rust-toolchain`).
-// Remove this allow when async-trait drops its `#[must_use]` injection or
-// when rustc/clippy gains an exemption for proc-macro-generated annotations.
+// `async_trait` adds #[must_use] to methods returning an already-must-use
+// Future. Keep the same targeted allowance as main for current Clippy.
 #[allow(clippy::double_must_use)]
 pub trait Coordinator: Send + Sync {
     /// Resolve a connection path to scope information.
@@ -742,13 +732,13 @@ pub trait Coordinator: Send + Sync {
     ///
     /// # Returns
     ///
-    /// - `Ok(NamespaceOrigin, Option<quic::Client>)` - Namespace origin and optional client if available
+    /// - `Ok(NamespaceOrigin, Option<Client>)` - Namespace origin and optional client if available
     /// - `Err` - Namespace not found anywhere
     async fn lookup(
         &self,
         scope: Option<&str>,
         namespace: &TrackNamespace,
-    ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)>;
+    ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)>;
 
     /// Lookup where a specific track is served from.
     ///
@@ -767,7 +757,7 @@ pub trait Coordinator: Send + Sync {
         scope: Option<&str>,
         namespace: &TrackNamespace,
         _track: &str,
-    ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+    ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
         self.lookup(scope, namespace).await
     }
 
@@ -805,7 +795,10 @@ pub trait Coordinator: Send + Sync {
     /// on anything it cannot positively authorize.
     ///
     /// The relay caches the returned configuration per scope for
-    /// [`ScopeAuthConfig::ttl`], so this method is not called per connection.
+    /// [`ScopeAuthConfig::ttl`], so this method is not normally called per
+    /// connection. The cache holds at most 1024 scopes; while it is full of
+    /// unexpired entries, a scope that does not fit is fetched on every
+    /// connection and has no cached policy to reuse during an outage.
     /// Key rotation takes effect for new sessions within one TTL while the
     /// coordinator is reachable. By default, failed refreshes reuse an enforced
     /// policy for at most 12 effective TTLs from the last successful fetch, then
@@ -1426,7 +1419,7 @@ mod tests {
             &self,
             scope: Option<&str>,
             namespace: &TrackNamespace,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
             let scope_key = MockState::scope_key(scope);
             let state = self.state.lock().unwrap();
 
@@ -1471,7 +1464,7 @@ mod tests {
             scope: Option<&str>,
             namespace: &TrackNamespace,
             track: &str,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
             let scope_key = MockState::scope_key(scope);
             let track_key = MockState::track_key(namespace, track);
 
@@ -1770,7 +1763,7 @@ mod tests {
         let config = ScopeConfig {
             origin_fallback: Some(Url::parse("https://origin.example.com").unwrap()),
             lingering_subscribe: true,
-            ..Default::default()
+            auth: None,
         };
         assert_eq!(
             config.origin_fallback.unwrap().as_str(),
@@ -1897,7 +1890,7 @@ mod tests {
             ScopeConfig {
                 origin_fallback: Some(Url::parse("https://ingest.example.com/origin").unwrap()),
                 lingering_subscribe: true,
-                ..Default::default()
+                auth: None,
             },
         );
 
@@ -2824,7 +2817,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
             Err(CoordinatorError::NamespaceNotFound)
         }
     }

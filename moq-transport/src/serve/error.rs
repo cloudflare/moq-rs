@@ -17,6 +17,10 @@ pub enum ServeError {
     #[error("not found")]
     NotFound,
 
+    /// A request ended with draft-18 REQUEST_ERROR TIMEOUT.
+    #[error("request timed out")]
+    Timeout,
+
     #[error("not found: {0} [error:{1}]")]
     NotFoundWithId(String, uuid::Uuid),
 
@@ -43,9 +47,25 @@ pub enum ServeError {
 }
 
 impl ServeError {
-    /// Returns error codes for per-request/per-track errors.
-    /// These codes are used in SUBSCRIBE_ERROR, PUBLISH_DONE, FETCH_ERROR, etc.
-    /// Error codes are based on draft-ietf-moq-transport-14 Section 13.1.x
+    /// Legacy per-request/per-track error codes.
+    ///
+    /// These predate draft-18 and do **not** match its registries: `NotFound`
+    /// answers 0x4 where §15.10.2 assigns DOES_NOT_EXIST 0x10, and `Done`
+    /// answers 0x0 where the PUBLISH_DONE path in `session::subscribed` uses
+    /// TRACK_ENDED 0x2.
+    ///
+    /// The only direct in-workspace wire user is PUBLISH_NAMESPACE_CANCEL. Note
+    /// also that the public
+    /// [`SessionError::code`](crate::session::SessionError::code) delegates here
+    /// for its `Serve` variant: nothing in this workspace calls it, but an
+    /// embedder can, and its result is measured against the §15.10.1
+    /// session-termination registry — a third registry these values were never
+    /// designed for. Both callers need addressing to retire this.
+    ///
+    /// New code should map to [`RequestErrorCode`](crate::message::RequestErrorCode)
+    /// or [`PublishDoneCode`](crate::message::PublishDoneCode) directly.
+    ///
+    /// TODO: retire this in favour of the registry enums.
     pub fn code(&self) -> u64 {
         match self {
             // Special case: 0 typically means successful completion or internal error depending on context
@@ -56,6 +76,8 @@ impl ServeError {
             Self::Closed(code) => *code,
             // TRACK_DOES_NOT_EXIST (0x4) from SUBSCRIBE_ERROR codes
             Self::NotFound | Self::NotFoundWithId(_, _) => 0x4,
+            // TIMEOUT (0x2) in the REQUEST_ERROR registry
+            Self::Timeout => 0x2,
             // This is more of a session-level error, but keeping a reasonable code
             Self::Duplicate => 0x5,
             // NOT_SUPPORTED (0x3) - appears in multiple error code registries
@@ -90,8 +112,8 @@ impl ServeError {
         let loc = std::panic::Location::caller();
         tracing::warn!(
             error_id = %id,
-            "Not found: {} at {}:{}",
-            context,
+            context = %crate::session::LogSafe(context.as_bytes()),
+            "Not found at {}:{}",
             loc.file(),
             loc.line()
         );
@@ -113,8 +135,8 @@ impl ServeError {
         let loc = std::panic::Location::caller();
         tracing::warn!(
             error_id = %id,
-            "Not found: {} at {}:{}",
-            context,
+            context = %crate::session::LogSafe(context.as_bytes()),
+            "Not found at {}:{}",
             loc.file(),
             loc.line()
         );
@@ -132,8 +154,8 @@ impl ServeError {
         let loc = std::panic::Location::caller();
         tracing::error!(
             error_id = %id,
-            "Internal error: {} at {}:{}",
-            context,
+            context = %crate::session::LogSafe(context.as_bytes()),
+            "Internal error at {}:{}",
             loc.file(),
             loc.line()
         );
@@ -151,8 +173,8 @@ impl ServeError {
         let loc = std::panic::Location::caller();
         tracing::warn!(
             error_id = %id,
-            "Not implemented: {} at {}:{}",
-            feature,
+            feature = %crate::session::LogSafe(feature.as_bytes()),
+            "Not implemented at {}:{}",
             loc.file(),
             loc.line()
         );
@@ -163,7 +185,9 @@ impl ServeError {
     ///
     /// The same id is embedded in [`Display`](std::fmt::Display), which is what
     /// goes on the wire as the reason phrase, so a client can quote it back and
-    /// an operator can find the session that produced it.
+    /// an operator can find matching error records. Session lookup additionally
+    /// requires a session-correlated record when the reason is sent; the UUID
+    /// itself is an error identity, not a session identity.
     pub fn error_id(&self) -> Option<uuid::Uuid> {
         match self {
             Self::NotFoundWithId(_, id)

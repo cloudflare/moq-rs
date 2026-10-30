@@ -33,7 +33,7 @@ impl Decode for Publish {
         let track_name = TrackName::decode(r)?;
         validate_full_track_name(&track_namespace, track_name.as_bytes())?;
         let track_alias = u64::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode_message_params(r)?;
         let track_extensions = TrackExtensions::decode(r)?;
 
         Ok(Self {
@@ -54,7 +54,7 @@ impl Encode for Publish {
         self.track_namespace.encode(w)?;
         self.track_name.encode(w)?;
         self.track_alias.encode(w)?;
-        self.params.encode(w)?;
+        self.params.encode_message_params(w)?;
         self.track_extensions.encode(w)?;
 
         Ok(())

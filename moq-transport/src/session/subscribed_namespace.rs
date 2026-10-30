@@ -11,13 +11,13 @@ use std::{
 
 use crate::{
     coding::{ReasonPhrase, TrackNamespace, TrackNamespacePrefix},
-    message::{self, Message, RequestErrorCode, SubscribeOptions},
+    message::{self, Message, RequestErrorCode},
     mlog,
     serve::ServeError,
     watch::State,
 };
 
-use super::{Reader, SessionError, Writer};
+use super::{Reader, Session, SessionError, Writer};
 
 /// Capacity of the per-subscription outbound message queue. Bounds memory when a
 /// downstream reader is slow: rather than buffering namespace updates without
@@ -29,7 +29,6 @@ const OUTGOING_QUEUE_CAPACITY: usize = 8192;
 pub struct SubscribedNamespaceInfo {
     pub request_id: u64,
     pub namespace_prefix: TrackNamespacePrefix,
-    pub subscribe_options: SubscribeOptions,
     pub forward: bool,
 }
 
@@ -266,7 +265,6 @@ impl SubscribedNamespaceRecv {
                         }
                         Err(err) => {
                             tracing::debug!(
-                                session_id = %writer.session_id(),
                                 request_id = self.request_id,
                                 error = %err,
                                 "SUBSCRIBE_NAMESPACE request stream closed with error"
@@ -283,6 +281,11 @@ impl SubscribedNamespaceRecv {
         }
     }
 
+    /// Write one response message on the request stream.
+    ///
+    /// Draft-18: responses travel on the request's own bidi stream with the
+    /// Request ID omitted, so this goes through the shared bidi response
+    /// encoder rather than the full-message encoder.
     async fn send_message(
         &self,
         writer: &mut Writer,
@@ -290,26 +293,7 @@ impl SubscribedNamespaceRecv {
         msg: Message,
     ) -> Result<bool, SessionError> {
         self.emit_mlog(mlog, &msg);
-        // This stream bypasses Session::log_control_message, so without this
-        // a REQUEST_ERROR sent here would reach the peer with no log record at
-        // all — nothing to correlate against the id the client is quoting.
-        if let Message::RequestError(ref m) = msg {
-            tracing::debug!(
-                target: "moq_transport::control",
-                session_id = %writer.session_id(),
-                direction = "sent",
-                msg_type = "REQUEST_ERROR",
-                request_id = m.id,
-                error_code = m.error_code,
-                // The reason is peer-supplied (up to 1024 bytes, arbitrary UTF-8).
-                // Log a sanitized form (control chars → '?') and the raw hex so
-                // analysts can reconstruct the exact bytes without log-injection risk.
-                reason_lossy = ?super::SanitizedDisplay(&m.reason.0).to_string(),
-                reason_hex = %super::HexDisplay(&m.reason.0),
-                "MoQT control message"
-            );
-        }
-        match writer.encode(&msg).await {
+        match Session::encode_bidi_response(writer, &msg).await {
             Ok(()) => Ok(true),
             Err(err) if err.is_stream_error() => Ok(false),
             Err(err) => Err(err),
@@ -392,7 +376,6 @@ mod tests {
         SubscribedNamespaceInfo {
             request_id: 0,
             namespace_prefix: TrackNamespacePrefix::from_utf8_path("example.com/meeting=123"),
-            subscribe_options: SubscribeOptions::Namespace,
             forward: true,
         }
     }
@@ -409,6 +392,24 @@ mod tests {
             .insert(0, info().namespace_prefix.clone());
         let (send, recv) = SubscribedNamespace::new(info(), active.clone());
         (send, recv, active)
+    }
+
+    #[tokio::test]
+    async fn oversized_rejection_reason_encodes_on_the_request_stream() {
+        let (send, mut recv, _active) = make();
+        let reason = format!("denied: {}", "界🦀".repeat(300));
+        send.reject(RequestErrorCode::Unauthorized as u64, &reason)
+            .unwrap();
+        let message = recv.outgoing.recv().await.unwrap();
+        Session::encode_bidi_response_frame(&message).unwrap();
+        let Message::RequestError(error) = message else {
+            panic!("expected REQUEST_ERROR");
+        };
+        assert_eq!(error.id, 0);
+        assert_eq!(error.error_code, RequestErrorCode::Unauthorized as u64);
+        assert!(error.reason.0.len() <= ReasonPhrase::MAX_LEN);
+        assert!(error.reason.0.len() + 4 > ReasonPhrase::MAX_LEN);
+        assert!(reason.starts_with(&error.reason.0));
     }
 
     #[tokio::test]

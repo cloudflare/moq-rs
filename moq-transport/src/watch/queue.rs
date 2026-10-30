@@ -10,14 +10,6 @@ pub struct Queue<T> {
     state: State<VecDeque<(T, Option<oneshot::Sender<()>>)>>, // store optional notifier per item
 }
 
-/// The queue was closed before the operation could complete.
-///
-/// A named type rather than `()` so a caller can tell from the signature what
-/// went wrong, and so the reason is not lost when the error is propagated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("queue closed")]
-pub struct QueueClosed;
-
 impl<T> Queue<T> {
     /// Push an item onto the queue. Returns Err(item) if the queue has been closed.
     pub fn push(&mut self, item: T) -> Result<(), T> {
@@ -84,23 +76,23 @@ impl<T> Queue<T> {
     }
 
     /// Push an item and wait until it is popped.
-    ///
-    /// Returns [`QueueClosed`] if the queue was closed either before the push
-    /// or while waiting for the item to be taken.
-    pub async fn push_and_wait_until_popped(&mut self, item: T) -> Result<(), QueueClosed> {
+    /// Returns `Ok(())` if the item was successfully popped.
+    /// Returns `Err(())` if the queue was closed before the item could be confirmed popped.
+    #[allow(clippy::result_unit_err)]
+    pub async fn push_and_wait_until_popped(&mut self, item: T) -> Result<(), ()> {
         // Create a oneshot channel
         let (tx, rx) = oneshot::channel();
 
         // Push the item along with the sender
         match self.state.lock_mut() {
             Some(mut state) => state.push_back((item, Some(tx))),
-            None => return Err(QueueClosed), // Queue already closed before push
+            None => return Err(()), // Queue already closed before push
         }
 
         // Wait until the item is popped.
         // If we receive Canceled, it means the sender was dropped without sending,
         // which indicates the queue was closed while we were waiting.
-        rx.await.map_err(|_| QueueClosed)
+        rx.await.map_err(|_| ())
     }
 
     /// Split the queue into two handles that share the same underlying state.
@@ -123,5 +115,50 @@ impl<T> Default for Queue<T> {
         Self {
             state: State::new(Default::default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::poll;
+
+    #[tokio::test]
+    async fn receipt_is_confirmed_only_when_its_item_is_popped() {
+        let (mut producer, mut consumer) = Queue::default().split();
+        producer.push("first").unwrap();
+        let receipt = producer.push_and_wait_until_popped("second");
+        tokio::pin!(receipt);
+        assert!(poll!(&mut receipt).is_pending());
+        assert_eq!(consumer.pop().await, Some("first"));
+        assert!(poll!(&mut receipt).is_pending());
+        assert_eq!(consumer.pop().await, Some("second"));
+        assert_eq!(receipt.await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn close_returns_pending_items_and_fails_their_receipts() {
+        let (mut producer, consumer) = Queue::default().split();
+        producer.push("first").unwrap();
+        let receipt = producer.push_and_wait_until_popped("second");
+        tokio::pin!(receipt);
+        assert!(poll!(&mut receipt).is_pending());
+        assert_eq!(consumer.close(), vec!["first", "second"]);
+        assert_eq!(receipt.await, Err(()));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_receipt_keeps_fifo_delivery_intact() {
+        let (mut producer, mut consumer) = Queue::default().split();
+        {
+            let receipt = producer.push_and_wait_until_popped("first");
+            tokio::pin!(receipt);
+            assert!(poll!(&mut receipt).is_pending());
+        }
+        producer.push("second").unwrap();
+        assert_eq!(consumer.pop().await, Some("first"));
+        assert_eq!(consumer.pop().await, Some("second"));
+        drop(producer);
+        assert_eq!(consumer.pop().await, None);
     }
 }

@@ -13,11 +13,12 @@ members = [
 	"moq-native-ietf",
 	"moq-catalog",
 	"moq-test-client",
+	"moq-cat-mint",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-web-transport = "0.10.4"
+web-transport-trait = "0.3.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

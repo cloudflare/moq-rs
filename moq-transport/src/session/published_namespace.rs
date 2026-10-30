@@ -2,16 +2,38 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::ops;
+use std::{
+    ops,
+    sync::{Arc, Mutex},
+};
+
+use tokio::sync::mpsc;
 
 use crate::coding::{ReasonPhrase, TrackNamespace};
-use crate::message::RequestErrorCode;
+use crate::message::{Message, RequestErrorCode};
+use crate::mlog;
 use crate::watch::State;
 use crate::{message, serve::ServeError};
 
-use super::{PublishNamespaceInfo, Subscriber};
+use super::{
+    PublishNamespaceInfo, Reader, Session, SessionError, Subscriber, Writer, CANCELLED_STREAM_CODE,
+};
 
-// Tracks whether the publisher has cleanly completed this namespace publish.
+// Immediate cancellation can queue after REQUEST_OK before the stream task runs.
+const RESPONSE_QUEUE_CAPACITY: usize = 2;
+pub(super) const ACTIVE_NAMESPACE_REASON: &str = "namespace already has an active publisher";
+
+enum StreamAction {
+    Response(Message),
+    Cancel(u32),
+}
+
+enum StreamEvent {
+    Action(Option<StreamAction>),
+    RequestFinished(Result<bool, SessionError>),
+    ResponseStopped(Result<Option<u8>, SessionError>),
+}
+
 #[derive(Default)]
 struct PublishedNamespaceState {
     done: bool,
@@ -19,34 +41,21 @@ struct PublishedNamespaceState {
 
 /// Represents an inbound PUBLISH_NAMESPACE received by a subscriber.
 ///
-/// On drop, revokes an accepted namespace with PUBLISH_NAMESPACE_CANCEL, or
-/// rejects an unaccepted namespace with REQUEST_ERROR.
+/// Dropping an accepted namespace cancels its request stream. Dropping an
+/// unaccepted namespace rejects it with REQUEST_ERROR.
 pub struct PublishedNamespace {
-    session: Subscriber,
     state: State<PublishedNamespaceState>,
+    outgoing: mpsc::Sender<StreamAction>,
 
     pub info: PublishNamespaceInfo,
 
     ok: bool,
-    error: Option<ServeError>,
-
-    /// REQUEST_ERROR code to send on drop when the publish was never accepted.
-    /// `None` falls back to UNINTERESTED, the default for a relay that simply
-    /// declined the namespace. Set by [`reject`](Self::reject) so callers can
-    /// state a specific reason such as UNAUTHORIZED.
-    error_code: Option<u64>,
-
-    /// Reason phrase to send on drop, when the caller supplied one.
-    ///
-    /// Without this the peer receives the `Display` of the internal
-    /// [`ServeError`] — for a coded rejection that renders as
-    /// `"closed, code=N"`, which restates the code and tells the peer nothing.
-    reason: Option<String>,
+    error: Option<message::RequestError>,
 }
 
 impl PublishedNamespace {
     pub(super) fn new(
-        session: Subscriber,
+        subscriber: Subscriber,
         request_id: u64,
         namespace: TrackNamespace,
     ) -> (PublishedNamespace, PublishedNamespaceRecv) {
@@ -54,47 +63,62 @@ impl PublishedNamespace {
             request_id,
             namespace,
         };
-
-        let (send, recv) = State::default().split();
+        let (send_state, recv_state) = State::default().split();
+        let (send_queue, recv_queue) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
         let send = Self {
-            session,
+            state: send_state,
+            outgoing: send_queue,
             info,
             ok: false,
             error: None,
-            error_code: None,
-            reason: None,
-            state: send,
         };
         let recv = PublishedNamespaceRecv {
-            state: recv,
+            state: recv_state,
+            outgoing: recv_queue,
+            subscriber,
             request_id,
         };
 
         (send, recv)
     }
 
-    /// Accept the PUBLISH_NAMESPACE by sending REQUEST_OK (draft-16 §9.7).
+    pub(super) fn reject_active_namespace(
+        subscriber: Subscriber,
+        request_id: u64,
+        namespace: TrackNamespace,
+    ) -> PublishedNamespaceRecv {
+        let (mut published, recv) = Self::new(subscriber, request_id, namespace);
+        published.error = Some(message::RequestError {
+            id: request_id,
+            error_code: RequestErrorCode::ExcessiveLoad as u64,
+            retry_interval: 0,
+            reason: ReasonPhrase(ACTIVE_NAMESPACE_REASON.to_string()),
+        });
+        drop(published);
+        recv
+    }
+
+    /// Accept the PUBLISH_NAMESPACE by sending REQUEST_OK.
     pub fn ok(&mut self) -> Result<(), ServeError> {
         if self.ok {
             return Err(ServeError::Duplicate);
         }
 
-        // Draft-16 §6.2: acceptance is signalled with REQUEST_OK, not the
-        // legacy PUBLISH_NAMESPACE_OK.
-        self.session.send_request_ok(
-            "publish_namespace",
-            message::RequestOk {
-                id: self.info.request_id,
-                params: Default::default(),
-            },
-        );
-
+        self.outgoing
+            .try_send(StreamAction::Response(
+                message::RequestOk {
+                    id: self.info.request_id,
+                    params: Default::default(),
+                }
+                .into(),
+            ))
+            .map_err(|_| ServeError::Cancel)?;
         self.ok = true;
 
         Ok(())
     }
 
-    /// Wait until the peer closes the namespace publish (PUBLISH_NAMESPACE_DONE).
+    /// Wait until the peer closes the namespace request stream.
     pub async fn closed(&self) -> Result<(), ServeError> {
         loop {
             let Some(modified) = self.state.lock().modified() else {
@@ -106,46 +130,44 @@ impl PublishedNamespace {
     }
 
     /// Reject the PUBLISH_NAMESPACE; the error is sent on drop.
-    ///
-    /// Before [`ok`](Self::ok), the peer receives REQUEST_ERROR with
-    /// UNINTERESTED. After `ok`, it receives PUBLISH_NAMESPACE_CANCEL with the
-    /// same code. Use [`reject`](Self::reject) to send a specific error code
-    /// such as UNAUTHORIZED.
     pub fn close(mut self, err: ServeError) -> Result<(), ServeError> {
-        self.error = Some(err);
+        self.error = Some(message::RequestError {
+            id: self.info.request_id,
+            error_code: RequestErrorCode::Uninterested as u64,
+            retry_interval: 0,
+            reason: ReasonPhrase::new(err.to_string()),
+        });
         Ok(())
     }
 
     /// Reject the PUBLISH_NAMESPACE with an explicit REQUEST_ERROR code
-    /// (draft-16 §9.8); the error is sent on drop.
+    /// (draft-18 §10.6); the error is sent on drop.
     ///
     /// Mirrors [`SubscribedNamespace::reject`], letting a caller distinguish
-    /// "not interested" from "not permitted".
+    /// "not interested" from "not permitted" (e.g. UNAUTHORIZED).
     ///
     /// `reason` is sent to the peer in the Reason Phrase, so it must describe
     /// the rejection without disclosing anything the peer is not entitled to
-    /// know. It is truncated to [`ReasonPhrase::MAX_LEN`], since a longer
-    /// phrase fails to encode and would take the whole message with it.
+    /// learn.
     ///
-    /// Calling this after [`ok`](Self::ok) is permitted and revokes the
-    /// acceptance: the peer receives PUBLISH_NAMESPACE_CANCEL (§9.24) instead
-    /// of REQUEST_ERROR, carrying this same code and reason. §9.24 draws its
-    /// codes from the same registry as REQUEST_ERROR, and expiry of
-    /// authorization is one of the reasons the draft names for a cancel, so
-    /// UNAUTHORIZED is meaningful there.
+    /// Only meaningful before [`ok`](Self::ok): once accepted, dropping the
+    /// namespace cancels its request stream and no REQUEST_ERROR is sent.
     ///
     /// [`SubscribedNamespace::reject`]: super::SubscribedNamespace::reject
     pub fn reject(mut self, error_code: u64, reason: &str) -> Result<(), ServeError> {
-        self.error = Some(ServeError::Closed(error_code));
-        self.error_code = Some(error_code);
-        self.reason = Some(reason.to_string());
         tracing::debug!(
             namespace = %self.info.namespace,
             request_id = self.info.request_id,
             error_code,
-            reason,
+            reason = %super::LogSafe(reason.as_bytes()),
             "rejecting PUBLISH_NAMESPACE"
         );
+        self.error = Some(message::RequestError {
+            id: self.info.request_id,
+            error_code,
+            retry_interval: 0,
+            reason: ReasonPhrase::new(reason),
+        });
         Ok(())
     }
 }
@@ -160,341 +182,474 @@ impl ops::Deref for PublishedNamespace {
 
 impl Drop for PublishedNamespace {
     fn drop(&mut self) {
-        let err = self.error.clone().unwrap_or(ServeError::Done);
-
-        // A caller-supplied reason wins over the error's own `Display`, which
-        // for a coded rejection is only `"closed, code=N"` and so tells the
-        // peer nothing the code did not already.
-        let reason = self.reason.clone().unwrap_or_else(|| err.to_string());
-
-        // An explicit `reject` code wins; otherwise the namespace is simply no
-        // longer wanted. Deriving the default from `err` would make a clean
-        // teardown report INTERNAL_ERROR, since that is code 0 and what
-        // `ServeError::Done` renders as.
-        let error_code = self
-            .error_code
-            .unwrap_or(RequestErrorCode::Uninterested as u64);
+        if self.state.lock().done {
+            return;
+        }
 
         if self.ok {
-            // Already answered with REQUEST_OK, so what is owed now is a
-            // revocation of that acceptance — and only if there is still
-            // something to revoke. A peer that has sent PUBLISH_NAMESPACE_DONE
-            // has withdrawn already.
-            if self.state.lock().done {
-                return;
-            }
-
-            // Accepted: send PUBLISH_NAMESPACE_CANCEL to revoke acceptance
-            // (draft-16 §9.24).  Carries Request ID, not the namespace.
-            self.session.send_message(message::PublishNamespaceCancel {
-                id: self.info.request_id,
-                error_code,
-                reason_phrase: ReasonPhrase::new(reason),
-            });
-        } else {
-            // Never answered. Draft-16 §6.2: "A subscriber MUST send exactly
-            // one REQUEST_OK or REQUEST_ERROR in response to a
-            // PUBLISH_NAMESPACE." A peer withdrawing does not discharge that,
-            // so this is sent even once PUBLISH_NAMESPACE_DONE has arrived —
-            // otherwise a publisher that pipelines DONE behind its
-            // PUBLISH_NAMESPACE, which it may do while the relay is still
-            // awaiting authorization, gets no response at all.
-            self.session.send_request_error(
-                "publish_namespace",
-                message::RequestError {
-                    id: self.info.request_id,
-                    error_code,
-                    retry_interval: 0,
-                    reason: ReasonPhrase::new(reason),
-                },
-            );
+            let _ = self
+                .outgoing
+                .try_send(StreamAction::Cancel(CANCELLED_STREAM_CODE));
+            return;
         }
+
+        let error = self.error.clone().unwrap_or_else(|| message::RequestError {
+            id: self.info.request_id,
+            error_code: RequestErrorCode::Uninterested as u64,
+            retry_interval: 0,
+            reason: ReasonPhrase::new(ServeError::Done.to_string()),
+        });
+        let _ = self.outgoing.try_send(StreamAction::Response(error.into()));
     }
 }
 
 pub(super) struct PublishedNamespaceRecv {
     state: State<PublishedNamespaceState>,
-    /// Request ID of the corresponding PUBLISH_NAMESPACE, used for O(1) lookup
-    /// when PUBLISH_NAMESPACE_DONE or PUBLISH_NAMESPACE_CANCEL arrives.
-    pub request_id: u64,
+    outgoing: mpsc::Receiver<StreamAction>,
+    subscriber: Subscriber,
+    request_id: u64,
 }
 
 impl PublishedNamespaceRecv {
-    pub fn recv_done(self) -> Result<(), ServeError> {
+    pub(super) async fn run(
+        mut self,
+        mut writer: Writer,
+        mut reader: Reader,
+        mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+    ) -> Result<(), SessionError> {
+        let mut reading = true;
+
+        loop {
+            let event = tokio::select! {
+                biased;
+                done = reader.done(), if reading => StreamEvent::RequestFinished(done),
+                action = self.outgoing.recv() => StreamEvent::Action(action),
+                stopped = writer.closed() => StreamEvent::ResponseStopped(stopped),
+            };
+
+            match event {
+                StreamEvent::Action(action) => {
+                    let Some(action) = action else {
+                        if reading {
+                            let _ = writer.finish();
+                        } else {
+                            writer.reset(CANCELLED_STREAM_CODE);
+                        }
+                        reader.stop(CANCELLED_STREAM_CODE);
+                        return Ok(());
+                    };
+                    let response = match action {
+                        StreamAction::Response(response) => response,
+                        StreamAction::Cancel(code) => {
+                            if reading {
+                                let _ = writer.finish();
+                            } else {
+                                writer.reset(code);
+                            }
+                            reader.stop(code);
+                            return Ok(());
+                        }
+                    };
+                    self.emit_mlog(&mlog, &response);
+                    let terminal = matches!(response, Message::RequestError(_));
+                    let encoded = if terminal {
+                        match tokio::time::timeout(
+                            Session::BIDI_REQUEST_TIMEOUT,
+                            Session::encode_bidi_response(&mut writer, &response),
+                        )
+                        .await
+                        {
+                            Ok(encoded) => encoded,
+                            Err(_) => {
+                                writer.reset(CANCELLED_STREAM_CODE);
+                                reader.stop(CANCELLED_STREAM_CODE);
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        Session::encode_bidi_response(&mut writer, &response).await
+                    };
+                    match encoded {
+                        Ok(()) => {}
+                        Err(err) if err.is_stream_error() => return Ok(()),
+                        Err(err) => return Err(err),
+                    }
+                    if terminal {
+                        reader.stop(CANCELLED_STREAM_CODE);
+                        return match writer.finish() {
+                            Ok(()) => Ok(()),
+                            Err(err) if err.is_stream_error() => Ok(()),
+                            Err(err) => Err(err),
+                        };
+                    }
+                }
+                StreamEvent::RequestFinished(done) => match done {
+                    Ok(true) => {
+                        reading = false;
+                    }
+                    Ok(false) => {
+                        return Err(SessionError::ProtocolViolation(
+                            "unexpected data after PUBLISH_NAMESPACE request".to_string(),
+                        ));
+                    }
+                    Err(err) if err.is_stream_error() => {
+                        writer.reset(CANCELLED_STREAM_CODE);
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                },
+                StreamEvent::ResponseStopped(stopped) => {
+                    let _ = stopped?;
+                    reader.stop(CANCELLED_STREAM_CODE);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn emit_mlog(&self, mlog: &Option<Arc<Mutex<mlog::MlogWriter>>>, msg: &Message) {
+        if let Some(mlog) = mlog {
+            if let Ok(mut mlog) = mlog.lock() {
+                let time = mlog.elapsed_ms();
+                let event = match msg {
+                    Message::RequestOk(msg) => Some(mlog::events::request_ok_created(
+                        time,
+                        0,
+                        "publish_namespace",
+                        msg,
+                    )),
+                    Message::RequestError(msg) => Some(mlog::events::request_error_created(
+                        time,
+                        0,
+                        "publish_namespace",
+                        msg,
+                    )),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    let _ = mlog.add_event(event);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PublishedNamespaceRecv {
+    fn drop(&mut self) {
+        self.subscriber.remove_published_namespace(self.request_id);
         if let Some(mut state) = self.state.lock_mut() {
             state.done = true;
         }
-
-        // Dropping the state signals the PublishedNamespace that the peer is done.
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        session::{
+            test_support::{loopback_session, loopback_session_pair},
+            RequestId, Transport,
+        },
+        watch::Queue,
+    };
+
     use super::*;
 
-    use crate::coding::{Decode, Encode, TrackNamespace};
-    use crate::session::{PendingRequests, RequestId, SessionId, Subscriber};
-    use crate::watch::Queue;
-
-    /// Build a `PublishedNamespace` wired to a queue the test can drain, so
-    /// the bytes destined for the peer are observable.
-    ///
-    /// The returned handle is a *clone* of the sending half rather than the
-    /// receiving half: `Queue::close` needs `lock_mut`, which stops working
-    /// once every drop guard is gone, and the guard the `Subscriber` holds
-    /// dies with the `PublishedNamespace` whose `Drop` we are trying to
-    /// observe. Cloning shares the guard, so the queue stays readable
-    /// afterwards.
-    fn published() -> (PublishedNamespace, Queue<message::Message>) {
-        let (send, _recv, observer) = published_with_recv();
-        (send, observer)
-    }
-
-    /// As [`published`], but also yields the receive half so a test can
-    /// simulate the peer sending PUBLISH_NAMESPACE_DONE.
-    fn published_with_recv() -> (
-        PublishedNamespace,
-        PublishedNamespaceRecv,
-        Queue<message::Message>,
-    ) {
-        let outgoing = Queue::<message::Message>::default();
-        let observer = outgoing.clone();
-        let namespace_open = Queue::default().split();
-
+    async fn pair() -> (PublishedNamespace, PublishedNamespaceRecv) {
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
         let subscriber = Subscriber::new(
-            outgoing,
-            namespace_open.0,
+            Queue::default(),
+            loopback_session().await,
+            Transport::WebTransport,
             None,
-            RequestId::new(0, 100, 100, 1),
-            PendingRequests::default(),
-            SessionId::generate(),
+            RequestId::new(0, 1),
+            bidi_task_tx,
+            Default::default(),
+        );
+        PublishedNamespace::new(subscriber, 6, TrackNamespace::from_utf8_path("test"))
+    }
+
+    #[tokio::test]
+    async fn dropping_accepted_namespace_cancels_request_stream() {
+        let (mut published, mut recv) = pair().await;
+        published.ok().unwrap();
+        assert!(matches!(
+            recv.outgoing.recv().await,
+            Some(StreamAction::Response(Message::RequestOk(_)))
+        ));
+        drop(published);
+
+        assert!(matches!(
+            recv.outgoing.recv().await,
+            Some(StreamAction::Cancel(CANCELLED_STREAM_CODE))
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_rejection_reason_reaches_the_request_stream() {
+        for explicit_code in [false, true] {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let (client, server) = loopback_session_pair().await;
+                let (published, recv) = pair().await;
+                let (mut request_send, response_recv) = client.open_bi().await.unwrap();
+                request_send.write(b"request").await.unwrap();
+                let (response_send, mut request_recv) = server.accept_bi().await.unwrap();
+                assert_eq!(
+                    request_recv.read(7).await.unwrap().unwrap().as_ref(),
+                    b"request"
+                );
+
+                let reason = format!("denied: {}", "界🦀".repeat(300));
+                let (error_code, original_reason) = if explicit_code {
+                    published
+                        .reject(RequestErrorCode::Unauthorized as u64, &reason)
+                        .unwrap();
+                    (RequestErrorCode::Unauthorized as u64, reason)
+                } else {
+                    let error = ServeError::Internal(reason);
+                    let original = error.to_string();
+                    published.close(error).unwrap();
+                    (RequestErrorCode::Uninterested as u64, original)
+                };
+
+                let run = recv.run(Writer::new(response_send), Reader::new(request_recv), None);
+                let read = async {
+                    let mut reader = Reader::new(response_recv);
+                    let Message::RequestError(error) =
+                        Session::decode_bidi_response(&mut reader, 6).await.unwrap()
+                    else {
+                        panic!("expected REQUEST_ERROR");
+                    };
+                    assert_eq!(error.id, 6);
+                    assert_eq!(error.error_code, error_code);
+                    assert_eq!(error.retry_interval, 0);
+                    assert!(error.reason.0.len() <= ReasonPhrase::MAX_LEN);
+                    assert!(error.reason.0.len() + 4 > ReasonPhrase::MAX_LEN);
+                    assert!(original_reason.starts_with(&error.reason.0));
+                    assert!(reader.done().await.unwrap());
+                };
+                let (result, ()) = tokio::join!(run, read);
+                result.unwrap();
+            })
+            .await
+            .expect("namespace rejection did not finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_sends_the_given_code_and_reason() {
+        let (published, mut recv) = pair().await;
+        published
+            .reject(RequestErrorCode::Unauthorized as u64, "unauthorized")
+            .unwrap();
+
+        match recv.outgoing.recv().await {
+            Some(StreamAction::Response(Message::RequestError(err))) => {
+                assert_eq!(err.id, 6);
+                assert_eq!(err.error_code, RequestErrorCode::Unauthorized as u64);
+                assert_eq!(err.reason.0, "unauthorized");
+            }
+            _ => panic!("expected REQUEST_ERROR"),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_still_sends_uninterested() {
+        let (published, mut recv) = pair().await;
+        published.close(ServeError::Done).unwrap();
+
+        match recv.outgoing.recv().await {
+            Some(StreamAction::Response(Message::RequestError(err))) => {
+                assert_eq!(err.error_code, RequestErrorCode::Uninterested as u64);
+            }
+            _ => panic!("expected REQUEST_ERROR"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_receiver_closes_namespace() {
+        let (published, recv) = pair().await;
+
+        drop(recv);
+
+        published.closed().await.unwrap();
+        assert!(published.state.lock().done);
+    }
+
+    #[tokio::test]
+    async fn accepted_namespace_survives_request_fin_until_local_cancel() {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = Subscriber::new(
+            Queue::default(),
+            server.clone(),
+            Transport::WebTransport,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+            Default::default(),
+        );
+        let (mut published, recv) =
+            PublishedNamespace::new(subscriber, 0, TrackNamespace::from_utf8_path("test"));
+
+        let (mut request_send, response_recv) = client.open_bi().await.unwrap();
+        request_send.write(b"request").await.unwrap();
+        let (response_send, mut request_recv) = server.accept_bi().await.unwrap();
+        assert_eq!(
+            request_recv.read(7).await.unwrap().unwrap().as_ref(),
+            b"request"
         );
 
-        let (send, recv) =
-            PublishedNamespace::new(subscriber, 42, TrackNamespace::from_utf8_path("sports"));
-
-        (send, recv, observer)
-    }
-
-    /// The rejection the peer receives, as (error_code, reason_phrase).
-    fn sent_request_error(outgoing: Queue<message::Message>) -> (u64, String) {
-        let sent = outgoing.close();
-        let error = sent
-            .into_iter()
-            .find_map(|msg| match msg {
-                message::Message::RequestError(err) => Some(err),
-                _ => None,
-            })
-            .expect("a REQUEST_ERROR should have been sent");
-
-        (error.error_code, error.reason.0)
-    }
-
-    /// The revocation the peer receives, as (error_code, reason_phrase).
-    ///
-    /// A separate matcher because PUBLISH_NAMESPACE_CANCEL is a different
-    /// message type; `sent_request_error` is structurally unable to see it,
-    /// which is how the accepted-then-revoked branch went untested.
-    fn sent_cancel(outgoing: Queue<message::Message>) -> (u64, String) {
-        let sent = outgoing.close();
-        let cancel = sent
-            .into_iter()
-            .find_map(|msg| match msg {
-                message::Message::PublishNamespaceCancel(cancel) => Some(cancel),
-                _ => None,
-            })
-            .expect("a PUBLISH_NAMESPACE_CANCEL should have been sent");
-
-        (cancel.error_code, cancel.reason_phrase.0)
-    }
-
-    /// Whatever was sent, decoded from its encoded bytes.
-    ///
-    /// The queue assertions stop at the in-memory message; this confirms the
-    /// reason survives encoding, which is what actually reaches the peer.
-    fn round_trip(outgoing: Queue<message::Message>) -> message::RequestError {
-        let sent = outgoing.close();
-        let error = sent
-            .into_iter()
-            .find_map(|msg| match msg {
-                message::Message::RequestError(err) => Some(err),
-                _ => None,
-            })
-            .expect("a REQUEST_ERROR should have been sent");
-
-        let mut buf = Vec::new();
-        error.encode(&mut buf).expect("must encode");
-
-        let mut cursor = &buf[..];
-        message::RequestError::decode(&mut cursor).expect("must decode")
-    }
-
-    /// The reason has to reach the peer, not just the local log. Without this
-    /// the phrase is the `Display` of `ServeError::Closed`, i.e.
-    /// `"closed, code=1"`, which merely restates the code.
-    #[test]
-    fn reject_sends_the_reason_to_the_peer() {
-        let (published, outgoing) = published();
-        published.reject(0x1, "unauthorized").unwrap();
-
-        let (code, reason) = sent_request_error(outgoing);
-        assert_eq!(code, 0x1);
-        assert_eq!(reason, "unauthorized");
-    }
-
-    /// The queue holds a struct; the peer receives bytes. Confirm the reason
-    /// survives the encode/decode round trip.
-    #[test]
-    fn the_reason_survives_encoding() {
-        let (published, outgoing) = published();
-        published.reject(0x1, "unauthorized").unwrap();
-
-        let decoded = round_trip(outgoing);
-        assert_eq!(decoded.id, 42);
-        assert_eq!(decoded.error_code, 0x1);
-        assert_eq!(decoded.reason.0, "unauthorized");
-    }
-
-    /// Rejecting an already-accepted namespace revokes it with
-    /// PUBLISH_NAMESPACE_CANCEL, carrying the same code and reason. §9.24
-    /// draws its codes from the REQUEST_ERROR registry, so UNAUTHORIZED is
-    /// meaningful here.
-    #[test]
-    fn rejecting_after_accepting_revokes_with_the_same_code_and_reason() {
-        let (mut published, outgoing) = published();
         published.ok().unwrap();
-        published.reject(0x1, "unauthorized").unwrap();
+        let run =
+            tokio::spawn(recv.run(Writer::new(response_send), Reader::new(request_recv), None));
+        request_send.finish().unwrap();
 
-        let (code, reason) = sent_cancel(outgoing);
-        assert_eq!(code, 0x1);
-        assert_eq!(reason, "unauthorized");
-    }
-
-    /// A clean teardown of an accepted namespace is not an internal error.
-    /// Deriving the code from `ServeError::Done` would send 0x0, which
-    /// §13.4.2 defines as INTERNAL_ERROR.
-    #[test]
-    fn a_clean_teardown_does_not_report_an_internal_error() {
-        let (mut published, outgoing) = published();
-        published.ok().unwrap();
-        drop(published);
-
-        let (code, _) = sent_cancel(outgoing);
-        assert_ne!(code, 0x0, "0x0 is INTERNAL_ERROR");
-        assert_eq!(code, RequestErrorCode::Uninterested as u64);
-    }
-
-    /// Draft-16 §6.2: "A subscriber MUST send exactly one REQUEST_OK or
-    /// REQUEST_ERROR in response to a PUBLISH_NAMESPACE."
-    ///
-    /// A publisher may pipeline PUBLISH_NAMESPACE_DONE behind its
-    /// PUBLISH_NAMESPACE, and the relay awaits authorization before
-    /// answering — so the withdrawal can land first. It does not discharge
-    /// the obligation to answer.
-    #[test]
-    fn a_withdrawal_before_the_response_does_not_suppress_it() {
-        let (published, recv, outgoing) = published_with_recv();
-
-        // The peer withdraws before we have answered.
-        recv.recv_done().unwrap();
-        published.reject(0x1, "unauthorized").unwrap();
-
-        let (code, reason) = sent_request_error(outgoing);
-        assert_eq!(code, 0x1);
-        assert_eq!(reason, "unauthorized");
-    }
-
-    /// Once accepted, a withdrawal *does* settle it: the response was already
-    /// sent, and there is nothing left to revoke.
-    #[test]
-    fn a_withdrawal_after_accepting_suppresses_the_cancel() {
-        let (mut published, recv, outgoing) = published_with_recv();
-        published.ok().unwrap();
-        recv.recv_done().unwrap();
-        drop(published);
-
-        let sent = outgoing.close();
+        let mut response_reader = Reader::new(response_recv);
+        assert!(matches!(
+            Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap(),
+            Message::RequestOk(_)
+        ));
         assert!(
-            !sent
-                .iter()
-                .any(|msg| matches!(msg, message::Message::PublishNamespaceCancel(_))),
-            "nothing to revoke once the peer has withdrawn"
+            tokio::time::timeout(std::time::Duration::from_millis(20), published.closed())
+                .await
+                .is_err()
         );
-    }
 
-    /// `close` has no reason of its own, so it keeps falling back to the
-    /// error's own rendering and to UNINTERESTED.
-    #[test]
-    fn close_falls_back_to_the_error_rendering() {
-        let (published, outgoing) = published();
-        published.close(ServeError::NotFound).unwrap();
-
-        let (code, reason) = sent_request_error(outgoing);
-        assert_eq!(code, RequestErrorCode::Uninterested as u64);
-        assert_eq!(reason, ServeError::NotFound.to_string());
-    }
-
-    /// Dropping without a verdict still tells the peer something.
-    #[test]
-    fn plain_drop_still_sends_an_error() {
-        let (published, outgoing) = published();
         drop(published);
 
-        let (code, _) = sent_request_error(outgoing);
-        assert_eq!(code, RequestErrorCode::Uninterested as u64);
+        run.await.unwrap().unwrap();
+        let reset = response_reader.done().await.unwrap_err();
+        assert!(reset.is_stream_error());
     }
 
-    /// A phrase longer than `ReasonPhrase::MAX_LEN` fails to encode, which
-    /// would drop the whole REQUEST_ERROR and leave the peer with nothing.
-    #[test]
-    fn an_oversized_reason_is_truncated_rather_than_dropped() {
-        let (published, outgoing) = published();
-        published
-            .reject(0x1, &"x".repeat(ReasonPhrase::MAX_LEN * 2))
-            .unwrap();
+    #[tokio::test]
+    async fn publisher_reset_closes_namespace_and_resets_response_direction() {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = Subscriber::new(
+            Queue::default(),
+            server.clone(),
+            Transport::WebTransport,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+            Default::default(),
+        );
+        let (mut published, recv) =
+            PublishedNamespace::new(subscriber, 0, TrackNamespace::from_utf8_path("test"));
 
-        let (_, reason) = sent_request_error(outgoing);
-        assert_eq!(reason.len(), ReasonPhrase::MAX_LEN);
+        let (mut request_send, response_recv) = client.open_bi().await.unwrap();
+        request_send.write(b"request").await.unwrap();
+        let (response_send, mut request_recv) = server.accept_bi().await.unwrap();
+        assert_eq!(
+            request_recv.read(7).await.unwrap().unwrap().as_ref(),
+            b"request"
+        );
 
-        // And it still encodes, which is the point of the bound.
-        let mut buf = Vec::new();
-        ReasonPhrase(reason).encode(&mut buf).expect("must encode");
+        published.ok().unwrap();
+        let run =
+            tokio::spawn(recv.run(Writer::new(response_send), Reader::new(request_recv), None));
+        let mut response_reader = Reader::new(response_recv);
+        assert!(matches!(
+            Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap(),
+            Message::RequestOk(_)
+        ));
+
+        request_send.reset(CANCELLED_STREAM_CODE);
+
+        published.closed().await.unwrap();
+        run.await.unwrap().unwrap();
+        assert!(response_reader.done().await.unwrap_err().is_stream_error());
     }
 
-    /// An over-long *fallback* reason must be bounded too. `close` takes a
-    /// `ServeError`, whose `Internal`/`NotImplemented` variants carry an
-    /// arbitrary `String`, and an unencodable phrase on the control stream
-    /// tears down the session rather than merely losing the message.
-    #[test]
-    fn an_oversized_fallback_reason_is_also_bounded() {
-        let (published, outgoing) = published();
-        published
-            .close(ServeError::Internal("y".repeat(ReasonPhrase::MAX_LEN * 4)))
-            .unwrap();
+    #[tokio::test]
+    async fn immediate_cancel_preserves_namespace_acceptance() {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = Subscriber::new(
+            Queue::default(),
+            server.clone(),
+            Transport::WebTransport,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+            Default::default(),
+        );
+        let (mut published, recv) =
+            PublishedNamespace::new(subscriber, 0, TrackNamespace::from_utf8_path("test"));
 
-        let (_, reason) = sent_request_error(outgoing);
-        assert!(reason.len() <= ReasonPhrase::MAX_LEN);
+        let (mut request_send, response_recv) = client.open_bi().await.unwrap();
+        request_send.write(b"request").await.unwrap();
+        let (response_send, mut request_recv) = server.accept_bi().await.unwrap();
+        assert_eq!(
+            request_recv.read(7).await.unwrap().unwrap().as_ref(),
+            b"request"
+        );
 
-        let mut buf = Vec::new();
-        ReasonPhrase(reason).encode(&mut buf).expect("must encode");
+        published.ok().unwrap();
+        drop(published);
+        let run =
+            tokio::spawn(recv.run(Writer::new(response_send), Reader::new(request_recv), None));
+
+        let mut response_reader = Reader::new(response_recv);
+        assert!(matches!(
+            Session::decode_bidi_response(&mut response_reader, 0)
+                .await
+                .unwrap(),
+            Message::RequestOk(_)
+        ));
+        assert!(response_reader.done().await.unwrap());
+        assert_eq!(
+            request_send.closed().await.unwrap(),
+            Some(u8::try_from(CANCELLED_STREAM_CODE).unwrap())
+        );
+        run.await.unwrap().unwrap();
     }
 
-    #[test]
-    fn recv_done_marks_namespace_done_before_drop() {
-        let state = State::<PublishedNamespaceState>::default();
-        let (send_state, recv_state) = state.split();
-        let recv = PublishedNamespaceRecv {
-            state: recv_state,
-            request_id: 0,
-        };
+    #[tokio::test]
+    async fn cancel_resets_response_when_request_fin_precedes_dispatch() {
+        let (client, server) = loopback_session_pair().await;
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = Subscriber::new(
+            Queue::default(),
+            server.clone(),
+            Transport::WebTransport,
+            None,
+            RequestId::new(0, 1),
+            bidi_task_tx,
+            Default::default(),
+        );
+        let (mut published, recv) =
+            PublishedNamespace::new(subscriber, 0, TrackNamespace::from_utf8_path("test"));
 
-        assert!(!send_state.lock().done);
+        let (mut request_send, response_recv) = client.open_bi().await.unwrap();
+        request_send.write(b"request").await.unwrap();
+        request_send.finish().unwrap();
+        let (response_send, mut request_recv) = server.accept_bi().await.unwrap();
+        assert_eq!(
+            request_recv.read(7).await.unwrap().unwrap().as_ref(),
+            b"request"
+        );
 
-        recv.recv_done().unwrap();
+        published.ok().unwrap();
+        drop(published);
+        let run =
+            tokio::spawn(recv.run(Writer::new(response_send), Reader::new(request_recv), None));
 
-        assert!(send_state.lock().done);
-        assert!(send_state.lock().modified().is_none());
+        let mut response_reader = Reader::new(response_recv);
+        match Session::decode_bidi_response(&mut response_reader, 0).await {
+            Ok(Message::RequestOk(_)) => {
+                let reset = response_reader.done().await.unwrap_err();
+                assert!(reset.is_stream_error());
+            }
+            Err(err) => assert!(err.is_stream_error()),
+            Ok(msg) => panic!("unexpected response: {}", msg.name()),
+        }
+        run.await.unwrap().unwrap();
     }
 }

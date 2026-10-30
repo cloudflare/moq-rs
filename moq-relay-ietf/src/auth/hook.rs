@@ -48,7 +48,7 @@ use crate::SessionContext;
 pub trait AuthHook: Send + Sync {
     /// Authorize session establishment and establish the peer's identity.
     ///
-    /// `tokens` holds every AUTHORIZATION TOKEN decoded from CLIENT_SETUP, in
+    /// `tokens` holds every AUTHORIZATION TOKEN decoded from the client's SETUP, in
     /// the order sent, with aliases already resolved. It may be empty; a hook
     /// that requires a token must deny in that case.
     async fn on_setup(

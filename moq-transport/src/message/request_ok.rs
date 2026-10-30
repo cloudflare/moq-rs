@@ -22,7 +22,7 @@ pub struct RequestOk {
 impl Decode for RequestOk {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
         let id = u64::decode(r)?;
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode_message_params(r)?;
         Ok(Self { id, params })
     }
 }
@@ -30,7 +30,7 @@ impl Decode for RequestOk {
 impl Encode for RequestOk {
     fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
         self.id.encode(w)?;
-        self.params.encode(w)?;
+        self.params.encode_message_params(w)?;
         Ok(())
     }
 }

@@ -3,11 +3,12 @@
 
 //! Resolves a scope's authorization policy into a hook, and caches it.
 
+use moq_transport::session::LogSafe;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use super::{AuthError, AuthHook, DenyAllAuthHook, UNSCOPED};
+use super::{AuthError, AuthHook, DenyAllAuthHook};
 use crate::{Coordinator, ScopeAuthConfig};
 
 /// Retry interval for an unusable configuration, or for a failed refresh that
@@ -26,6 +27,18 @@ const BROKEN_CONFIG_TTL: Duration = Duration::from_secs(30);
 /// until the coordinator came back. Token expiry does not bound that case,
 /// because whoever holds the key can sign fresh tokens.
 const MAX_STALE_TTLS: u32 = 12;
+
+/// Upper bound on cached scopes.
+///
+/// The cache key is the resolved scope ID, and with the default
+/// [`Coordinator::resolve_scope`] that is the client-chosen connection path, so
+/// without a bound a peer could grow the cache by connecting with fresh paths.
+/// When the cache is full, expired entries are pruned; if it is still full the
+/// policy is resolved normally but not cached. That costs a coordinator call
+/// for that connection but never changes the decision. An expired entry pruned
+/// under cache pressure loses its fallback, so that scope fails closed if the
+/// coordinator cannot be reached.
+const MAX_CACHED_SCOPES: usize = 1024;
 
 /// Builds and caches the authorization hook for each scope.
 ///
@@ -121,8 +134,8 @@ impl ScopeAuthorizer {
                             "scope authorization policy is too old",
                         )));
                         tracing::error!(
-                            scope = scope.unwrap_or(UNSCOPED),
-                            error = %err,
+                            scope_present = scope.is_some(),
+                            error = %LogSafe(err.to_string().as_bytes()),
                             "could not refresh the scope's authorization policy; reuse cap reached, \
                              refusing new sessions in this scope"
                         );
@@ -134,8 +147,8 @@ impl ScopeAuthorizer {
                             _ => retry_at,
                         };
                         tracing::warn!(
-                            scope = scope.unwrap_or(UNSCOPED),
-                            error = %err,
+                            scope_present = scope.is_some(),
+                            error = %LogSafe(err.to_string().as_bytes()),
                             "could not refresh the scope's authorization policy; retaining the cached state"
                         );
                     }
@@ -158,7 +171,7 @@ impl ScopeAuthorizer {
                 // `get_scope_config`, so it should be visible in logs rather
                 // than inferred from the absence of anything.
                 tracing::info!(
-                    scope = scope.unwrap_or(UNSCOPED),
+                    scope_present = scope.is_some(),
                     "scope has no token authorization policy; admitting sessions on \
                      scope permissions alone"
                 );
@@ -171,8 +184,8 @@ impl ScopeAuthorizer {
                     // must refuse every session, not run unauthenticated.
                     Err(err) => {
                         tracing::error!(
-                            scope = scope.unwrap_or(UNSCOPED),
-                            error = %err,
+                            scope_present = scope.is_some(),
+                            error = %LogSafe(err.to_string().as_bytes()),
                             "scope requires token authorization but its configuration is unusable; \
                              refusing all sessions in this scope"
                         );
@@ -197,22 +210,30 @@ impl ScopeAuthorizer {
 
     fn cached(&self, scope: Option<&str>) -> Option<CacheEntry> {
         let cache = self.cache.read().unwrap_or_else(|err| err.into_inner());
-        // `Option<&str>` cannot look up an `Option<String>` key directly, and
-        // the map is small (one entry per active scope), so an equality scan
-        // avoids allocating a key on every cache hit.
+        // `Option<&str>` cannot look up an `Option<String>` key directly, so
+        // the key is allocated. A hashed lookup keeps this O(1) however many
+        // scopes are cached, which a linear scan would not.
         cache
-            .iter()
-            .find(|(key, _)| key.as_deref() == scope)
-            .map(|(_, entry)| entry)
+            .get(&scope.map(str::to_string))
             .filter(|entry| entry.expires_at > Instant::now())
             .cloned()
     }
 
     fn store(&self, scope: Option<&str>, state: CacheState, ttl: Duration, policy_ttl: Duration) {
         let mut cache = self.cache.write().unwrap_or_else(|err| err.into_inner());
+        let key = scope.map(str::to_string);
+        if cache.len() >= MAX_CACHED_SCOPES && !cache.contains_key(&key) {
+            let now = Instant::now();
+            cache.retain(|_, entry| entry.expires_at > now);
+            if cache.len() >= MAX_CACHED_SCOPES {
+                // Still full of live entries: resolve without caching rather
+                // than evict a scope that is in use.
+                return;
+            }
+        }
         let now = Instant::now();
         cache.insert(
-            scope.map(str::to_string),
+            key,
             CacheEntry {
                 state,
                 expires_at: now + ttl,
@@ -220,6 +241,14 @@ impl ScopeAuthorizer {
                 policy_ttl,
             },
         );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.cache
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .len()
     }
 
     /// Drop a scope's cached policy, forcing the next session to re-fetch it.
@@ -271,7 +300,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use moq_native_ietf::quic;
+    use moq_native_ietf::Client;
     use moq_transport::coding::TrackNamespace;
 
     use crate::{
@@ -332,7 +361,7 @@ mod tests {
             &self,
             _scope: Option<&str>,
             _namespace: &TrackNamespace,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
             Err(CoordinatorError::NamespaceNotFound)
         }
 
@@ -372,7 +401,7 @@ mod tests {
             &self,
             scope: Option<&str>,
             namespace: &TrackNamespace,
-        ) -> CoordinatorResult<(NamespaceOrigin, Option<quic::Client>)> {
+        ) -> CoordinatorResult<(NamespaceOrigin, Option<Client>)> {
             self.0.lookup(scope, namespace).await
         }
 
@@ -479,29 +508,6 @@ mod tests {
         assert_eq!(coordinator.calls(), 3);
         authorizer.resolve(None).await.unwrap();
         assert_eq!(coordinator.calls(), 3);
-    }
-
-    /// A usable policy is cached for the TTL the coordinator asked for, so an
-    /// already-elapsed TTL forces a refetch. Needs the feature, since without
-    /// it the policy is unbuildable and takes the broken-config path below.
-    #[cfg(feature = "auth-cat")]
-    #[tokio::test]
-    async fn an_expired_entry_is_refetched() {
-        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig {
-            auth: Some(
-                ScopeAuthConfig::new(vec![AuthPublicKey::es256(valid_pem())])
-                    // Already elapsed by the time the next resolve runs.
-                    .with_ttl(Duration::from_nanos(1)),
-            ),
-            ..Default::default()
-        }));
-        let authorizer = ScopeAuthorizer::new(coordinator.clone());
-
-        authorizer.resolve(Some("tenant")).await.ok();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        authorizer.resolve(Some("tenant")).await.ok();
-
-        assert_eq!(coordinator.calls(), 2, "an expired entry must be refetched");
     }
 
     /// An unusable policy is cached too, on its own shorter TTL, so a broken
@@ -1039,6 +1045,173 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn concurrent_resolves_are_consistent() {
+        // The cache is shared across connection tasks; this exercises the lock
+        // discipline under contention rather than asserting a call count, since
+        // concurrent misses may legitimately each fetch.
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = Arc::new(ScopeAuthorizer::new(coordinator.clone()));
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let authorizer = authorizer.clone();
+            tasks.push(tokio::spawn(async move {
+                authorizer.resolve(Some("tenant")).await.unwrap().is_none()
+            }));
+        }
+
+        for task in tasks {
+            assert!(task.await.unwrap(), "every resolve must agree");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidate_forces_a_refetch() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        authorizer.resolve(Some("tenant")).await.unwrap();
+        authorizer.resolve(Some("tenant")).await.unwrap();
+        assert_eq!(coordinator.calls(), 1);
+
+        authorizer.invalidate(Some("tenant"));
+        authorizer.resolve(Some("tenant")).await.unwrap();
+        assert_eq!(coordinator.calls(), 2);
+    }
+
+    /// The key is peer-influenced, so the cache must not grow without bound,
+    /// and a full cache must still produce correct decisions.
+    #[tokio::test]
+    async fn the_cache_is_bounded_and_still_decides_when_full() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        for i in 0..MAX_CACHED_SCOPES + 10 {
+            let scope = format!("/path-{i}");
+            assert!(authorizer.resolve(Some(&scope)).await.unwrap().is_none());
+        }
+        assert_eq!(authorizer.len(), MAX_CACHED_SCOPES);
+
+        // An uncached scope is resolved on every call, not wrongly answered.
+        let calls = coordinator.calls();
+        authorizer.resolve(Some("/overflow")).await.unwrap();
+        authorizer.resolve(Some("/overflow")).await.unwrap();
+        assert_eq!(coordinator.calls(), calls + 2);
+
+        // A cached scope still hits.
+        let calls = coordinator.calls();
+        authorizer.resolve(Some("/path-0")).await.unwrap();
+        assert_eq!(coordinator.calls(), calls);
+    }
+
+    #[tokio::test]
+    async fn failed_refreshes_respect_the_cache_cap_and_pruned_scopes_fail_closed() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+        for i in 0..MAX_CACHED_SCOPES {
+            let scope = format!("/path-{i}");
+            assert!(authorizer.resolve(Some(&scope)).await.unwrap().is_none());
+        }
+        advance_cache_age(&authorizer, Some("/path-0"), crate::DEFAULT_SCOPE_AUTH_TTL);
+        advance_cache_age(&authorizer, Some("/path-1"), crate::DEFAULT_SCOPE_AUTH_TTL);
+        coordinator.set_failing(true);
+
+        // Reuse an entry that is present even when the cache is full.
+        let calls = coordinator.calls();
+        for _ in 0..2 {
+            assert!(authorizer.resolve(Some("/path-0")).await.unwrap().is_none());
+        }
+        assert_eq!(coordinator.calls(), calls + 1, "cache the retry interval");
+        assert_eq!(authorizer.len(), MAX_CACHED_SCOPES);
+
+        // A failed fetch for an uncached scope cannot insert or prune entries.
+        let calls = coordinator.calls();
+        for _ in 0..2 {
+            assert!(matches!(
+                authorizer.resolve(Some("/overflow")).await,
+                Err(AuthError::Backend(_))
+            ));
+            assert_eq!(authorizer.len(), MAX_CACHED_SCOPES);
+        }
+        assert_eq!(coordinator.calls(), calls + 2);
+
+        // A successful fetch under pressure prunes the other expired entry.
+        coordinator.set_failing(false);
+        assert!(authorizer
+            .resolve(Some("/overflow"))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(authorizer.len(), MAX_CACHED_SCOPES);
+        coordinator.set_failing(true);
+        let calls = coordinator.calls();
+        assert!(matches!(
+            authorizer.resolve(Some("/path-1")).await,
+            Err(AuthError::Backend(_))
+        ));
+        assert_eq!(
+            coordinator.calls(),
+            calls + 1,
+            "pruning removes the fallback"
+        );
+        assert_eq!(authorizer.len(), MAX_CACHED_SCOPES);
+        assert!(authorizer.resolve(Some("/path-0")).await.unwrap().is_none());
+        assert_eq!(
+            coordinator.calls(),
+            calls + 1,
+            "the reused entry was retained"
+        );
+    }
+
+    /// A full cache whose entries have expired makes room instead of refusing
+    /// to cache.
+    #[tokio::test]
+    async fn expired_entries_are_pruned_when_the_cache_is_full() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        for i in 0..MAX_CACHED_SCOPES {
+            authorizer.store(
+                Some(&format!("/stale-{i}")),
+                CacheState::Disabled,
+                Duration::from_nanos(1),
+                crate::DEFAULT_SCOPE_AUTH_TTL,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        authorizer.resolve(Some("/fresh")).await.unwrap();
+        assert_eq!(authorizer.len(), 1, "expired entries must be pruned");
+
+        let calls = coordinator.calls();
+        authorizer.resolve(Some("/fresh")).await.unwrap();
+        assert_eq!(coordinator.calls(), calls, "the new entry must be cached");
+    }
+
+    /// A usable policy is cached for the TTL the coordinator asked for, so an
+    /// already-elapsed TTL forces a refetch. Needs the feature, since without
+    /// it the policy is unbuildable and takes the broken-config path below.
+    #[cfg(feature = "auth-cat")]
+    #[tokio::test]
+    async fn an_expired_entry_is_refetched() {
+        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig {
+            auth: Some(
+                ScopeAuthConfig::new(vec![AuthPublicKey::es256(valid_pem())])
+                    // Already elapsed by the time the next resolve runs.
+                    .with_ttl(Duration::from_nanos(1)),
+            ),
+            ..Default::default()
+        }));
+        let authorizer = ScopeAuthorizer::new(coordinator.clone());
+
+        authorizer.resolve(Some("tenant")).await.ok();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        authorizer.resolve(Some("tenant")).await.ok();
+
+        assert_eq!(coordinator.calls(), 2, "an expired entry must be refetched");
+    }
+
     #[cfg(feature = "auth-cat")]
     #[tokio::test]
     async fn a_well_formed_scope_gets_a_working_hook() {
@@ -1081,41 +1254,6 @@ mod tests {
         let hook = authorizer.resolve(Some("tenant")).await.unwrap().unwrap();
         let session = crate::SessionContext::public(Some("tenant".to_string()));
         assert!(!hook.on_setup(&session, &[]).await.unwrap().is_allowed());
-        assert_eq!(coordinator.calls(), 2);
-    }
-
-    #[tokio::test]
-    async fn concurrent_resolves_are_consistent() {
-        // The cache is shared across connection tasks; this exercises the lock
-        // discipline under contention rather than asserting a call count, since
-        // concurrent misses may legitimately each fetch.
-        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
-        let authorizer = Arc::new(ScopeAuthorizer::new(coordinator.clone()));
-
-        let mut tasks = Vec::new();
-        for _ in 0..32 {
-            let authorizer = authorizer.clone();
-            tasks.push(tokio::spawn(async move {
-                authorizer.resolve(Some("tenant")).await.unwrap().is_none()
-            }));
-        }
-
-        for task in tasks {
-            assert!(task.await.unwrap(), "every resolve must agree");
-        }
-    }
-
-    #[tokio::test]
-    async fn invalidate_forces_a_refetch() {
-        let coordinator = Arc::new(ScriptedCoordinator::new(ScopeConfig::default()));
-        let authorizer = ScopeAuthorizer::new(coordinator.clone());
-
-        authorizer.resolve(Some("tenant")).await.unwrap();
-        authorizer.resolve(Some("tenant")).await.unwrap();
-        assert_eq!(coordinator.calls(), 1);
-
-        authorizer.invalidate(Some("tenant"));
-        authorizer.resolve(Some("tenant")).await.unwrap();
         assert_eq!(coordinator.calls(), 2);
     }
 }
