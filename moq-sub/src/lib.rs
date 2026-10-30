@@ -4,3 +4,8 @@
 
 mod fetch;
 pub mod media;
+
+/// Dependencies exposed by the public API.
+pub mod reexports {
+    pub use moq_transport;
+}
