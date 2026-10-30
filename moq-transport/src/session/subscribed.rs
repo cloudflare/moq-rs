@@ -23,6 +23,15 @@ use super::{
 
 // This file defines Publisher handling of inbound Subscriptions
 
+const MAX_CONCURRENT_SUBGROUPS: usize = 128;
+// FIN waiters use a separate budget so a short subgroup releases its writing
+// slot without waiting an RTT. Allow eight active-set-sized bursts in flight.
+const MAX_PENDING_SUBGROUP_ACKS: usize = 1024;
+
+#[cfg(test)]
+#[path = "subgroup_lifecycle.rs"]
+mod subgroup_lifecycle;
+
 #[derive(Debug)]
 struct ObjectForwarderState {
     largest_location: Option<Location>,
@@ -164,7 +173,7 @@ impl ObjectForwarder {
     }
 }
 
-/// A subgroup data stream that is reset unless it is explicitly finished.
+/// A subgroup data stream that is reset unless its FIN is acknowledged.
 ///
 /// Draft-16 §10.4.3: a FIN means "every object in this subgroup was delivered".
 /// Any earlier termination MUST be a `RESET_STREAM`, and the listed causes
@@ -177,11 +186,11 @@ impl ObjectForwarder {
 /// happened to stop. If that is mid-object the receiver has already been
 /// promised a payload length it will never get, and treats the truncated
 /// subgroup as a malformed track. This wrapper inverts that default: the stream
-/// is reset on drop unless [`SubgroupStream::finish`] ran, so the safe outcome
-/// is the automatic one.
+/// is reset on drop until FIN acknowledgement, so cancellation also discards
+/// buffered payload after a local [`SubgroupStream::finish`].
 struct SubgroupStream {
     writer: Writer,
-    /// Set once the stream has been explicitly finished or reset, after which
+    /// Set once the stream has been acknowledged or reset, after which
     /// `Drop` must not touch it again.
     terminated: bool,
 }
@@ -198,8 +207,17 @@ impl SubgroupStream {
         if self.terminated {
             return Ok(());
         }
-        self.terminated = true;
         self.writer.finish()
+    }
+
+    async fn acknowledged(&mut self) -> Result<(), SessionError> {
+        // FIN only queues the end of the stream. STOP_SENDING does not discard
+        // Quinn's buffered data, so retain the handle until ACK or cancellation.
+        if let Some(code) = self.writer.closed().await? {
+            self.writer.reset(u32::from(code));
+        }
+        self.terminated = true;
+        Ok(())
     }
 
     fn reset(&mut self, code: DataStreamResetCode) {
@@ -337,6 +355,14 @@ impl SubgroupOutput {
             SubgroupSink::Buffer { termination, .. } => {
                 termination.get_or_insert(SubgroupTermination::Reset(code));
             }
+        }
+    }
+
+    async fn acknowledged(&mut self) -> Result<(), SessionError> {
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.acknowledged().await,
+            #[cfg(test)]
+            SubgroupSink::Buffer { .. } => Ok(()),
         }
     }
 
@@ -514,11 +540,23 @@ impl ObjectForwarder {
         delivery_filter: DeliveryFilter,
     ) -> Result<(), SessionError> {
         let mut tasks = FuturesUnordered::new();
+        let mut acknowledgements = FuturesUnordered::new();
         let mut done: Option<Result<(), ServeError>> = None;
 
         loop {
             tokio::select! {
-                res = subgroups.next(), if done.is_none() => match res {
+                biased;
+                res = self.closed(), if done.is_none() || !tasks.is_empty() || !acknowledgements.is_empty() => {
+                    // Both sets own reset guards, including streams with FIN queued.
+                    return res.map_err(SessionError::from);
+                },
+                // Reap ready waiters before checking the ACK budget on handoff.
+                res = acknowledgements.next(), if !acknowledgements.is_empty() => {
+                    if let Some(Err(err)) = res {
+                        tracing::debug!(error = %err, "subgroup stream closed before FIN acknowledgement");
+                    }
+                },
+                res = subgroups.next(), if done.is_none() && tasks.len() < MAX_CONCURRENT_SUBGROUPS => match res {
                     Ok(Some(subgroup)) => {
                         let header = data::SubgroupHeader {
                             header_type: data::StreamHeaderType::SubgroupIdExt,  // SubGroupId = Yes, Extensions = Yes, ContainsEndOfGroup = No
@@ -535,20 +573,33 @@ impl ObjectForwarder {
                         let session_id = self.publisher.session_id().clone();
 
                         tasks.push(async move {
-                            if let Err(err) = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await {
-                                if Subscribed::is_expected_serve_shutdown(&err) {
+                            let res = Self::serve_subgroup(header, subgroup, publisher, state, mlog, delivery_filter).await;
+                            if let Err(err) = &res {
+                                if Subscribed::is_expected_serve_shutdown(err) {
                                     tracing::debug!(session_id = %session_id, subgroup_info = ?info, error = %err, "stopped serving subgroup");
                                 } else {
                                     tracing::warn!(session_id = %session_id, subgroup_info = ?info, error = %err, "failed to serve subgroup");
                                 }
                             }
+                            res
                         });
                     },
                     Ok(None) => done = Some(Ok(())),
                     Err(err) => done = Some(Err(err)),
                 },
-                res = self.closed(), if done.is_none() => done = Some(res),
-                _ = tasks.next(), if !tasks.is_empty() => {},
+                res = tasks.next(), if !tasks.is_empty() => {
+                    if let Some(Ok(Some(mut output))) = res {
+                        if acknowledgements.len() == MAX_PENDING_SUBGROUP_ACKS {
+                            // Do not silently forget a FIN handle: it would no
+                            // longer respond to STOP or subscription cancellation.
+                            // End this subscription instead. Dropping both sets
+                            // resets all retained streams with Cancelled, trading
+                            // continued delivery for a hard resource bound.
+                            return Err(ServeError::Closed(message::PublishDoneCode::TooFarBehind as u64).into());
+                        }
+                        acknowledgements.push(async move { output.acknowledged().await });
+                    }
+                },
                 else => return Ok(done.unwrap()?),
             }
         }
@@ -561,7 +612,7 @@ impl ObjectForwarder {
         state: State<ObjectForwarderState>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
         delivery_filter: DeliveryFilter,
-    ) -> Result<(), SessionError> {
+    ) -> Result<Option<SubgroupOutput>, SessionError> {
         tracing::trace!(
             "[PUBLISHER] serve_subgroup: starting - group_id={}, subgroup_id={:?}, priority={}",
             subgroup_reader.group_id,
@@ -572,7 +623,7 @@ impl ObjectForwarder {
         let Some(first_object) =
             Self::next_allowed_object(&mut subgroup_reader, delivery_filter).await?
         else {
-            return Ok(());
+            return Ok(None);
         };
 
         let mut send_stream = publisher.open_uni().await?;
@@ -604,7 +655,12 @@ impl ObjectForwarder {
         // quinn would implicitly FIN wherever we stopped, which silently
         // truncates the in-flight object.
         match res {
-            Ok(()) => output.finish(),
+            Ok(()) => {
+                output.finish()?;
+                // Transfer ownership to the separately bounded FIN-ACK set.
+                // The writing task releases its active slot immediately.
+                Ok(Some(output))
+            }
             Err(err) => {
                 output.reset(Self::reset_code_for(&err));
                 Err(err)

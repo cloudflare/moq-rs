@@ -16,6 +16,11 @@ pub struct Writer {
 }
 
 impl Writer {
+    /// Wait for FIN acknowledgement, peer STOP_SENDING or session closure.
+    pub async fn closed(&mut self) -> Result<Option<u8>, SessionError> {
+        Ok(self.stream.closed().await?)
+    }
+
     pub fn new(session_id: SessionId, stream: web_transport::SendStream) -> Self {
         Self {
             session_id,
