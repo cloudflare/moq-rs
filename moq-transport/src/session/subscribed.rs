@@ -23,6 +23,10 @@ use super::{DeliveryError, DeliveryFilter, Publisher, SessionError, SubscribeInf
 
 const MAX_CONCURRENT_SUBGROUPS: usize = 128;
 
+#[cfg(test)]
+#[path = "subgroup_lifecycle.rs"]
+mod subgroup_lifecycle;
+
 struct ObjectForwarderState {
     track: Option<serve::TrackReader>,
     largest_location: Option<Location>,
@@ -257,7 +261,7 @@ impl ObjectForwarder {
     }
 }
 
-/// A subgroup data stream that is reset unless it is explicitly finished.
+/// A subgroup data stream that is reset unless its FIN is acknowledged.
 ///
 /// Draft-18 Section 11.4.3 allows FIN only after all subgroup objects required
 /// by the subscription have been delivered. Dropping a QUIC send stream
@@ -279,8 +283,19 @@ impl SubgroupStream {
         if self.terminated {
             return Ok(());
         }
-        self.terminated = true;
         self.writer.finish()
+    }
+
+    async fn acknowledged(&mut self) -> Result<(), SessionError> {
+        // finish() only queues FIN. Quinn still owns buffered data until ACK,
+        // and STOP_SENDING alone does not discard that data. Keep the handle
+        // alive so a stop can reset it, or subscription cancellation can drop
+        // this guard and reset even an already-finished stream.
+        if let Some(code) = self.writer.closed().await? {
+            self.writer.reset(u32::from(code));
+        }
+        self.terminated = true;
+        Ok(())
     }
 
     fn reset(&mut self, code: DataStreamResetCode) {
@@ -398,6 +413,14 @@ impl SubgroupOutput {
             SubgroupSink::Buffer { termination, .. } => {
                 termination.get_or_insert(SubgroupTermination::Reset(code));
             }
+        }
+    }
+
+    async fn acknowledged(&mut self) -> Result<(), SessionError> {
+        match &mut self.sink {
+            SubgroupSink::Stream(stream) => stream.acknowledged().await,
+            #[cfg(test)]
+            SubgroupSink::Buffer { .. } => Ok(()),
         }
     }
 
@@ -750,8 +773,8 @@ impl ObjectForwarder {
                 },
                 res = self.closed(), if done.is_none() || !tasks.is_empty() => {
                     // Returning drops active subgroup futures. Their
-                    // SubgroupStream guards reset any stream that has not
-                    // reached FIN, including one blocked on a partial object.
+                    // SubgroupStream guards reset any stream whose FIN has not
+                    // been acknowledged, including locally finished streams.
                     return res.map_err(SessionError::from);
                 },
                 res = tasks.next(), if !tasks.is_empty() => {
@@ -855,7 +878,13 @@ impl ObjectForwarder {
         // Draft-18 Section 11.4.3 requires a reset when forwarding stops before
         // all subgroup objects required by the subscription have been delivered.
         match res {
-            Ok(()) => output.finish(),
+            Ok(()) => {
+                output.finish()?;
+                // The existing concurrency limit also bounds finished streams
+                // awaiting ACK. These are futures owned by this subscription,
+                // not detached tasks, so cancellation reclaims all of them.
+                output.acknowledged().await
+            }
             Err(err) => {
                 output.reset(Self::reset_code_for(&err));
                 Err(err)
@@ -2414,6 +2443,8 @@ mod tests {
             [(None, true), (Some(Location::new(0, 5)), false)]
         {
             let (publisher_session, peer_session) = loopback_session_pair().await;
+            // Keep the connection alive until the sender observes the FIN ACK.
+            let _peer_keepalive = peer_session.clone();
             let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
             let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
             let publisher = Publisher::new(
