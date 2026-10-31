@@ -36,3 +36,10 @@ mp4 = "0.14"
 anyhow = { version = "1", features = ["backtrace"] }
 serde_json = "1"
 rfc6381-codec = "0.2"
+
+[dev-dependencies]
+moq-sub = { path = "../moq-sub", version = "0.4" }
+moq-relay-ietf = { path = "../moq-relay-ietf", version = "0.7" }
+async-trait = "0.1"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }

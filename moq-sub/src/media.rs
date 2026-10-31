@@ -18,12 +18,15 @@ use tokio::{
 };
 use tracing::{debug, info, trace, warn};
 
+pub use crate::fetch::{FetchMode, JoiningStart};
+
 pub struct Media<O> {
     subscriber: Subscriber,
     broadcast: TracksReader,
     tracks_writer: TracksWriter,
     output: Arc<Mutex<O>>,
     request_catalog: bool,
+    fetch: Option<FetchMode>,
 }
 
 impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
@@ -33,6 +36,17 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         output: O,
         request_catalog: bool,
     ) -> anyhow::Result<Self> {
+        Self::new_with_fetch(subscriber, tracks, output, request_catalog, None).await
+    }
+
+    /// Play a finite FETCH or replay a Joining FETCH before continuing live.
+    pub async fn new_with_fetch(
+        subscriber: Subscriber,
+        tracks: Tracks,
+        output: O,
+        request_catalog: bool,
+        fetch: Option<FetchMode>,
+    ) -> anyhow::Result<Self> {
         let (tracks_writer, _tracks_request, tracks_reader) = tracks.produce();
         let broadcast = tracks_reader; // breadcrumb for navigating API name changes
         Ok(Self {
@@ -41,6 +55,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             tracks_writer,
             output: Arc::new(Mutex::new(output)),
             request_catalog,
+            fetch,
         })
     }
 
@@ -59,7 +74,13 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         };
         let moov = {
             let init_track_name: &str = match catalog {
-                Some(ref c) => &c.tracks[0].init_track.clone().unwrap(),
+                Some(ref c) => c
+                    .tracks
+                    .first()
+                    .context("catalog contains no tracks")?
+                    .init_track
+                    .as_deref()
+                    .context("catalog track has no init track")?,
                 None => "0.mp4",
             };
             let buf = self.download_first_object(init_track_name, "init").await?;
@@ -80,10 +101,16 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         let mut has_video = false;
         let mut has_audio = false;
         let mut tracks = vec![];
+        let mut fetch_tracks = Vec::new();
         for (idx, trak) in moov.traks.into_iter().enumerate() {
             let id = trak.tkhd.track_id;
             let name: String = match catalog {
-                Some(ref c) => c.tracks[idx].name.clone(),
+                Some(ref c) => c
+                    .tracks
+                    .get(idx)
+                    .context("catalog has fewer tracks than init segment")?
+                    .name
+                    .clone(),
                 None => format!("{id}.m4s"),
             };
             info!("found track {name}");
@@ -99,6 +126,10 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                 info!("using {name} for audio");
             }
             if active {
+                if self.fetch.is_some() {
+                    fetch_tracks.push(name);
+                    continue;
+                }
                 let track = self
                     .tracks_writer
                     .create(&name)
@@ -119,18 +150,57 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             }
         }
 
-        info!("playing {} tracks", tracks.len());
+        info!("playing {} tracks", tracks.len() + fetch_tracks.len());
         let mut tasks = JoinSet::new();
+        let history_complete = Arc::new(tokio::sync::Barrier::new(fetch_tracks.len().max(1)));
+        for name in fetch_tracks {
+            let subscriber = self.subscriber.clone();
+            let namespace = self.broadcast.namespace.clone();
+            let out = self.output.clone();
+            let mode = self.fetch.context("missing FETCH mode")?;
+            let history_complete = history_complete.clone();
+            tasks.spawn(async move {
+                crate::fetch::play(
+                    subscriber,
+                    namespace,
+                    name.into(),
+                    out,
+                    mode,
+                    history_complete,
+                )
+                .await
+            });
+        }
         for track in tracks {
             let out = self.output.clone();
             tasks.spawn(async move {
                 let name = track.name.clone();
-                if let Err(err) = Self::recv_track(track, out).await {
-                    warn!("failed to play track {name}: {err:?}");
-                }
+                Self::recv_track(track, out)
+                    .await
+                    .with_context(|| format!("failed to play track {name}"))
             });
         }
-        while tasks.join_next().await.is_some() {}
+        Self::wait_for_tracks(&mut tasks, self.fetch.is_some()).await?;
+        if self.fetch.is_some() {
+            self.output.lock().await.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn wait_for_tracks(
+        tasks: &mut JoinSet<anyhow::Result<()>>,
+        strict: bool,
+    ) -> anyhow::Result<()> {
+        while let Some(result) = tasks.join_next().await {
+            let result = result
+                .context("media task panicked")
+                .and_then(|result| result);
+            if strict {
+                result?;
+            } else if let Err(err) = result {
+                warn!("failed to play media track: {err:#}");
+            }
+        }
         Ok(())
     }
 
@@ -144,12 +214,23 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             .create(track_name)
             .context(format!("failed to create {alias} track"))?;
 
-        let mut subscriber = self.subscriber.clone();
-        tokio::task::spawn(async move {
-            subscriber.subscribe(track).await.unwrap_or_else(|err| {
-                warn!("failed to subscribe to {alias} track: {err:?}");
+        let _subscription = if self.fetch.is_some() {
+            Some(
+                self.subscriber
+                    .subscribe_open(track)
+                    .await
+                    .with_context(|| format!("failed to subscribe to {alias} track"))?,
+            )
+        } else {
+            // Preserve live-only playback's detached, warning-only SUBSCRIBE.
+            let mut subscriber = self.subscriber.clone();
+            tokio::task::spawn(async move {
+                if let Err(err) = subscriber.subscribe(track).await {
+                    warn!("failed to subscribe to {alias} track: {err:?}");
+                }
             });
-        });
+            None
+        };
 
         let track = self
             .broadcast
@@ -250,4 +331,62 @@ async fn read_atom<R: AsyncReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Ve
     let _read_bytes = limit.read_to_end(&mut raw).await?;
 
     Ok(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moq_transport::{coding::TrackNamespace, serve::Track};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn live_only_playback_keeps_healthy_track_after_sibling_failure() {
+        let namespace = TrackNamespace::from_utf8_path("test/live");
+        let (failed, failed_reader) = Track::new(namespace.clone(), "failed").produce();
+        // A track that closes before choosing a mode makes recv_track fail.
+        drop(failed);
+        let (healthy, healthy_reader) = Track::new(namespace, "healthy").produce();
+        let mut groups = healthy.subgroups().unwrap();
+        let mut group = groups.append(127).unwrap();
+        let (out, mut received) = tokio::io::duplex(64);
+        let out = Arc::new(Mutex::new(out));
+        let mut tasks = JoinSet::new();
+        let (failure_sent, failure_seen) = tokio::sync::oneshot::channel();
+        let failed_out = out.clone();
+        tasks.spawn(async move {
+            let result = Media::recv_track(failed_reader, failed_out).await;
+            assert!(result.is_err());
+            failure_sent.send(()).unwrap();
+            result
+        });
+        tasks.spawn(Media::recv_track(healthy_reader, out));
+        let verify = async {
+            failure_seen.await.unwrap();
+            group.write(vec![1, 2, 3].into()).unwrap();
+            let mut payload = [0; 3];
+            received.read_exact(&mut payload).await.unwrap();
+            assert_eq!(payload, [1, 2, 3]);
+            drop(group);
+            drop(groups);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                Media::<tokio::io::DuplexStream>::wait_for_tracks(&mut tasks, false),
+                verify
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_playback_propagates_track_failure() {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { anyhow::bail!("missing media Object") });
+        let err = Media::<tokio::io::Sink>::wait_for_tracks(&mut tasks, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "missing media Object");
+    }
 }

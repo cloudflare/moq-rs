@@ -15,6 +15,8 @@ use std::io::Cursor;
 use std::time;
 use tokio::sync::mpsc;
 
+use crate::FetchHistory;
+
 pub struct Media {
     // Tracks based on their track ID.
     tracks: HashMap<u32, Track>,
@@ -35,12 +37,23 @@ pub struct Media {
 
     // Optional notification for tracks as they become available.
     track_tx: Option<mpsc::UnboundedSender<TrackName>>,
+    fetch_history: Option<FetchHistory>,
 }
 
 impl Media {
     pub fn new(
+        broadcast: TracksWriter,
+        track_tx: Option<mpsc::UnboundedSender<TrackName>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_fetch(broadcast, track_tx, None)
+    }
+
+    /// Publish live media and retain the same complete CMAF Objects for FETCH.
+    /// Run [`crate::serve_fetches`] with a clone of this history concurrently.
+    pub fn new_with_fetch(
         mut broadcast: TracksWriter,
         track_tx: Option<mpsc::UnboundedSender<TrackName>>,
+        fetch_history: Option<FetchHistory>,
     ) -> anyhow::Result<Self> {
         let catalog = broadcast
             .create(".catalog")
@@ -65,6 +78,7 @@ impl Media {
             moov: None,
             current: None,
             track_tx,
+            fetch_history,
         })
     }
 
@@ -175,7 +189,7 @@ impl Media {
         init.extend_from_slice(&raw);
 
         // Create the catalog track with a single segment.
-        self.init.append(0)?.write(init.into())?;
+        write_object(&self.fetch_history, &mut self.init.append(0)?, init.into())?;
 
         let mut tracks = Vec::new();
 
@@ -270,7 +284,7 @@ impl Media {
             if let Some(tx) = &self.track_tx {
                 let _ = tx.send(TrackName::from(name.clone()));
             }
-            let track = Track::new(track, handler, timescale);
+            let track = Track::new(track, handler, timescale, self.fetch_history.clone())?;
             self.tracks.insert(id, track);
         }
 
@@ -288,7 +302,11 @@ impl Media {
         tracing::info!("catalog: {}", catalog_str);
 
         // Create a single fragment for the segment.
-        self.catalog.append(0)?.write(catalog_str.into())?;
+        write_object(
+            &self.fetch_history,
+            &mut self.catalog.append(0)?,
+            catalog_str.into(),
+        )?;
 
         Ok(())
     }
@@ -356,17 +374,24 @@ struct Track {
 
     // The type of track, ex. "vide" or "soun"
     handler: TrackType,
+    fetch_history: Option<FetchHistory>,
 }
 
 impl Track {
-    fn new(track: TrackWriter, handler: TrackType, timescale: u64) -> Self {
-        Self {
-            track: track.subgroups().unwrap(),
+    fn new(
+        track: TrackWriter,
+        handler: TrackType,
+        timescale: u64,
+        fetch_history: Option<FetchHistory>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            track: track.subgroups()?,
             current: None,
             pending_moof: None,
             timescale,
             handler,
-        }
+            fetch_history,
+        })
     }
 
     pub fn header(&mut self, raw: Bytes, fragment: Fragment) -> anyhow::Result<()> {
@@ -413,7 +438,7 @@ impl Track {
         let mut combined = BytesMut::with_capacity(moof.len() + raw.len());
         combined.put_slice(&moof);
         combined.put_slice(&raw);
-        segment.write(combined.freeze())?;
+        write_object(&self.fetch_history, segment, combined.freeze())?;
 
         Ok(())
     }
@@ -421,6 +446,18 @@ impl Track {
     pub fn end_group(&mut self) {
         self.current = None;
         self.pending_moof = None;
+    }
+}
+
+fn write_object(
+    history: &Option<FetchHistory>,
+    segment: &mut SubgroupWriter,
+    payload: Bytes,
+) -> anyhow::Result<()> {
+    if let Some(history) = history {
+        history.write(segment, payload)
+    } else {
+        segment.write(payload).map_err(Into::into)
     }
 }
 
