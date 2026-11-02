@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.16...moq-test-client-v0.2.0) - 2026-11-02
+
+### Added
+
+- *(moq-transport)* [**breaking**] add native transport backend injection
+- *(moq-test-client)* add data-subgroup-basic data-plane scenario
+- *(moq-test-client)* add moq-test generator and scoreboard verifier
+
+### Fixed
+
+- *(moq-test-client)* verify relay-transparent metadata in the scoreboard
+- *(moq-test-client)* halve the moq-test rendezvous window below TEST_TIMEOUT
+- *(moq-test-client)* reject misaligned EOG tuples and unbounded generation
+- *(moq-test-client)* tighten scoreboard status and bound object sizes
+- *(moq-test-client)* stop publish-track-subscribe failing on a clean end
+- restore the relay crates from main onto the draft-18 base
+- fix publish namespace clean close
+
+### Other
+
+- Merge pull request #176 from cloudflare/draft-18-dev
+- docs, ci: address final draft-18 review findings
+- reconcile main into draft-18 development
+- *(moq-test-client)* enumerate the scoreboard verification contract
+- *(moq-test-client)* correct TwoSubgroupsPerGroup parity comment
+- *(moq-test-client)* validate built-in scenarios without panic!
+- *(moq-test-client)* add rendezvous timeout interop scenario
+- Integrate draft-18 (PR#178 bidi core) onto current main via 3-way merge
+- Accept bidi request streams and encode responses without Request ID (draft-18 relay)
+- harden setup and request-id flow control
+- harden draft-16 control and data paths
+- rename announce flow to publish_namespace for draft-16 alignment
+
 ## [0.1.16](https://github.com/cloudflare/moq-rs/compare/moq-test-client-v0.1.15...moq-test-client-v0.1.16) - 2026-10-31
 
 ### Other

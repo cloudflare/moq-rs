@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/cloudflare/moq-rs/compare/moq-sub-v0.4.18...moq-sub-v0.5.0) - 2026-11-02
+
+### Added
+
+- *(moq-sub)* [**breaking**] restore draft-18 standalone and joining playback
+
+### Fixed
+
+- *(moq-sub)* backpressure live Objects during history playback
+- *(moq-sub)* preserve live-only track failure handling
+- *(moq-sub)* reexport public transport dependency
+- restore the relay crates from main onto the draft-18 base
+
+### Other
+
+- Merge pull request #176 from cloudflare/draft-18-dev
+- reconcile main into draft-18 development
+- Integrate draft-18 (PR#178 bidi core) onto current main via 3-way merge
+
 ## [0.4.18](https://github.com/cloudflare/moq-rs/compare/moq-sub-v0.4.17...moq-sub-v0.4.18) - 2026-10-31
 
 ### Other

@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.25](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.24...moq-clock-ietf-v0.6.25) - 2026-11-02
+
+### Added
+
+- *(moq-clock)* demonstrate joining FETCH with bounded history
+- *(moq-transport)* present authorization tokens in SETUP
+
+### Fixed
+
+- *(moq-transport)* preserve draft-18 datagram semantics
+- restore the relay crates from main onto the draft-18 base
+
+### Other
+
+- Merge pull request #176 from cloudflare/draft-18-dev
+- *(moq-clock)* follow opaque coordinator client API
+- reconcile main into draft-18 development
+- add datagram-collapse reproduction example
+- Integrate draft-18 (PR#178 bidi core) onto current main via 3-way merge
+- rename announce flow to publish_namespace for draft-16 alignment
+
 ## [0.6.24](https://github.com/cloudflare/moq-rs/compare/moq-clock-ietf-v0.6.23...moq-clock-ietf-v0.6.24) - 2026-10-31
 
 ### Other
