@@ -9,7 +9,7 @@ authors = ["moq-rs contributors"]
 repository = "https://github.com/cloudflare/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.9.7"
+version = "0.10.0"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -18,8 +18,8 @@ categories = ["multimedia", "network-programming", "web-programming"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
-moq-transport = { path = "../moq-transport", version = "0.16" }
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.11" }
+moq-transport = { path = "../moq-transport", version = "0.17" }
 moq-catalog = { path = "../moq-catalog", version = "0.2" }
 
 url = "2"
@@ -38,8 +38,8 @@ serde_json = "1"
 rfc6381-codec = "0.2"
 
 [dev-dependencies]
-moq-sub = { path = "../moq-sub", version = "0.4" }
-moq-relay-ietf = { path = "../moq-relay-ietf", version = "0.7" }
+moq-sub = { path = "../moq-sub", version = "0.5" }
+moq-relay-ietf = { path = "../moq-relay-ietf", version = "0.8" }
 async-trait = "0.1"
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }

@@ -6,6 +6,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.31...moq-relay-ietf-v0.8.0) - 2026-11-02
+
+### Added
+
+- *(moq-native-ietf)* [**breaking**] add opaque outbound clients
+- *(moq-transport)* [**breaking**] add native transport backend injection
+- *(moq)* correlate draft-18 sessions with credential-safe diagnostics
+- *(moq)* support draft-18 dynamic groups (RT-738)
+- serve Joining FETCH on draft-18
+- *(moq-relay-ietf)* forward standalone FETCH to the track's origin
+- *(moq-transport)* present authorization tokens in SETUP
+- *(moq-relay-ietf)* load CAT scope policy from a --scope-config file
+- *(auth)* enforce the session's token on every draft-18 request
+- *(auth)* verify Common Access Tokens with CatAuthHook (auth-cat)
+- *(auth)* [**breaking**] admit draft-18 sessions through the scope's auth policy
+- *(fuzz)* add coverage-guided fuzz harness for decode_setup_tokens
+- *(auth)* C1 auth foundations for draft-18 CAT
+- *(moq-relay-ietf)* fan out subscribed tracks
+- *(moq-relay-ietf)* wait for rendezvous publishers
+
+### Fixed
+
+- *(auth)* retain sanitized actor and scope in audit logs
+- *(moq)* retain sanitized session failure diagnostics
+- *(moq)* re-export tracing used by session span APIs
+- *(moq-transport)* bound Joining FETCH responses and refuse joining a PUBLISH
+- *(moq-transport)* recheck a Joining FETCH's SUBSCRIBE between receipt and registration
+- *(moq-transport)* wait for a Joining FETCH's SUBSCRIBE if it is not read yet
+- *(moq-transport)* relay FETCH_OK early and validate proxied FETCH bodies
+- *(moq-transport)* keep refusing FETCH unless the publisher accepts it
+- *(moq-relay-ietf)* treat a denied FETCH as an answered request
+- *(moq-relay-ietf)* do not reuse cached scope policy when --scope-config is set
+- *(moq-relay-ietf)* warn on multi-relay scope configs and wide policies
+- *(auth)* reuse the cached scope policy when the coordinator is down
+- *(auth)* admit internal relay peers on scopes with a token policy
+- *(auth)* bound the scope authorization cache
+- *(moq-transport)* [**breaking**] use draft-18 AUTHORIZATION TOKEN alias codes
+- cancel unbounded remote lookups
+- close cache teardown ordering gaps
+- preserve ordered rendezvous teardown
+- serve a peer-forwarded PUBLISH_NAMESPACE for discovery only
+- resolve the upstream readiness gate when its sender is dropped
+- *(moq-transport)* preserve draft-18 datagram semantics
+- *(moq-transport)* address review feedback
+- restore the relay crates from main onto the draft-18 base
+- clean up unsubscribe state
+- fix small nits
+- opencode suggestions
+
+### Other
+
+- docs, ci: address final draft-18 review findings
+- Merge main into draft-18-dev
+- Merge draft-18-dev into me/d18-session-id
+- Merge pull request #294 from englishm-cloudflare/me/d18-opaque-client
+- Merge pull request #293 from englishm-cloudflare/me/d18-session-seam
+- refresh draft-18 development and relay usage
+- reconcile main into draft-18 development
+- *(moq-relay-ietf)* say FETCH is authorized before any routing lookup
+- *(moq-relay-ietf)* list FETCH among the token-checked requests
+- *(moq-relay-ietf)* use a plain placeholder in the auth-token example
+- *(moq-relay-ietf)* drop the unreachable unusable-policy reload row
+- *(moq-relay-ietf)* qualify the --scope-config help for cached policies
+- *(moq-relay-ietf)* describe scope config failures with the cached-policy rules
+- *(moq-relay-ietf)* tie scope config failure wording to the library cache
+- *(moq-relay-ietf)* correct scope config caching and lock notes
+- *(auth)* say the FETCH grant applies once relay FETCH serving lands
+- SUBSCRIBE_NAMESPACE serves namespace announcements only (draft-18 §10.18/§10.19)
+- satisfy relay clippy
+- Integrate draft-18 (PR#178 bidi core) onto current main via 3-way merge
+- Implement draft-16 subscription parameters and TrackName type
+- harden draft-16 control and data paths
+- update relay and transport descriptions for draft-16
+- update TRACK_STATUS flow for draft-16
+- rename announce flow to publish_namespace for draft-16 alignment
+
 ## [0.7.31](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.30...moq-relay-ietf-v0.7.31) - 2026-10-30
 
 ### Other

@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.10.0...moq-native-ietf-v0.11.0) - 2026-11-02
+
+### Added
+
+- *(moq-native-ietf)* [**breaking**] add opaque outbound clients
+- *(moq-transport)* [**breaking**] add native transport backend injection
+- *(moq)* correlate draft-18 sessions with credential-safe diagnostics
+
+### Fixed
+
+- *(moq-native-ietf)* reexport outbound connector dependencies
+- *(moq-transport)* address MR !73 review findings
+- *(moq-native-ietf)* address review feedback
+- *(moq-native-ietf)* explain WebTransport CONNECT rejections
+- restore the relay crates from main onto the draft-18 base
+- implement proper ALPN version negotiation
+
+### Other
+
+- Merge draft-18-dev into me/d18-session-id
+- Merge pull request #259 from englishm-cloudflare/feat/d18-draft-version-enum
+- Integrate draft-18 (PR#178 bidi core) onto current main via 3-way merge
+- Remove MAX_REQUEST_ID/REQUESTS_BLOCKED (draft-18 §A.1)
+- Implement draft-16 subscription parameters and TrackName type
+
 ## [0.10.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.9.3...moq-native-ietf-v0.10.0) - 2026-07-20
 
 ### Added

@@ -6,6 +6,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.5...moq-transport-v0.17.0) - 2026-11-02
+
+### Added
+
+- *(moq-transport)* [**breaking**] add native transport backend injection
+- *(moq)* correlate draft-18 sessions with credential-safe diagnostics
+- *(moq-clock)* demonstrate joining FETCH with bounded history
+- *(moq)* support draft-18 dynamic groups (RT-738)
+- serve Joining FETCH on draft-18
+- *(moq-relay-ietf)* forward standalone FETCH to the track's origin
+- *(moq-transport)* serve and issue standalone FETCH on draft-18
+- *(moq-transport)* present authorization tokens in SETUP
+- *(moq-transport)* allow explicit PUBLISH_NAMESPACE rejection codes
+- *(moq-transport)* add Publisher::publish_namespace_start
+- *(moq-transport)* retain peer SETUP options and redact tokens in mlog
+- *(moq-transport)* add DraftVersion enum for multi-version ALPN model
+- *(auth)* C1 auth foundations for draft-18 CAT
+- *(moq-transport)* make SubgroupWriter::create_with_id_and_status public
+- *(moq-transport)* surface SUBSCRIBE_OK params, PUBLISH_DONE details, and clean subgroup close
+- *(moq-transport)* accept subscribe tracks requests
+- *(moq-transport)* support rendezvous timeout subscriptions
+- *(moq-transport)* port SUBSCRIBE_NAMESPACE and direct PUBLISH to draft-18
+- switch control stream from bidirectional to unidirectional (draft-18)
+- unified SETUP message with length-bounded KVP (draft-18)
+- replace QUIC-style varint with draft-18 leading-1-bits encoding
+
+### Fixed
+
+- *(moq-transport)* separate FIN acknowledgement and writing budgets
+- *(moq-transport)* reset stopped subgroups until FIN acknowledgement
+- *(moq-transport)* reexport backend injection dependencies
+- *(moq)* retain sanitized session failure diagnostics
+- *(moq-transport)* preserve PUBLISH rejection after request stop
+- *(moq)* re-export tracing used by session span APIs
+- *(moq)* isolate dynamic-group feedback failures (RT-738)
+- *(moq-transport)* bound draft-18 response reason phrases
+- *(moq-transport)* re-export uuid for public error types
+- *(moq-transport)* bound Joining FETCH responses and refuse joining a PUBLISH
+- *(moq-transport)* recheck a Joining FETCH's SUBSCRIBE between receipt and registration
+- *(moq-transport)* wait for a Joining FETCH's SUBSCRIBE if it is not read yet
+- *(moq-transport)* relay FETCH_OK early and validate proxied FETCH bodies
+- *(moq-transport)* keep a served FETCH's request stream open past FETCH_OK
+- *(moq-transport)* keep refusing FETCH unless the publisher accepts it
+- *(moq-relay-ietf)* treat a denied FETCH as an answered request
+- *(moq-transport)* stop decoding FETCH_CANCEL on request streams
+- *(moq-transport)* make FETCH session plumbing functional on draft-18
+- *(moq-transport)* [**breaking**] use draft-18 AUTHORIZATION TOKEN alias codes
+- *(moq-transport)* address MR !73 review findings
+- *(moq-transport)* reject duplicate namespace requests locally
+- *(moq-transport)* preserve subgroup object status
+- *(moq-transport)* isolate subgroup readers
+- *(moq-transport)* preserve subgroup fanout
+- close cache teardown ordering gaps
+- preserve ordered rendezvous teardown
+- *(moq-transport)* reset subgroup streams mid-object
+- *(moq-transport)* cancel published namespaces on request streams
+- *(moq-transport)* await publish terminal delivery
+- *(moq-transport)* preserve draft-18 datagram semantics
+- *(moq-transport)* support draft-18 subgroup modifiers
+- *(moq-transport)* preserve subgroup object IDs
+- *(moq-transport)* correct the draft-18 error code registries
+- *(moq-transport)* address review feedback
+- *(moq-transport)* honour PUBLISH_DONE Stream Count before teardown
+- *(moq-transport)* recover a watch state after a panic under its lock
+- *(draft-18)* correct SUBSCRIBE_NAMESPACE message type 0x11 -> 0x50
+- *(draft-18)* encode byte-valued message parameters as raw uint8
+- implement proper ALPN version negotiation
+- correct subscriber test helper to use RequestId API
+- clean up unsubscribe state
+- add missing subscribe option in subscribe namespace message
+- fix small nits
+- fix publish namespace clean close
+
+### Other
+
+- Merge main into draft-18-dev
+- *(moq-transport)* observe subgroup resets through the carrier
+- Merge remote-tracking branch 'gh/draft-18-dev' into me/d18-reset-stopped-streams
+- Merge draft-18-dev into me/d18-session-id
+- Merge pull request #293 from englishm-cloudflare/me/d18-session-seam
+- Merge pull request #291 from englishm-cloudflare/me/d18-fetch-parity
+- Merge pull request #289 from englishm-cloudflare/me/d18-integrity-tests
+- *(moq-transport)* retain loopback peers until FIN acknowledgement
+- *(moq-transport)* map subgroup integrity coverage to draft-18
+- Merge pull request #287 from englishm-cloudflare/me/d18-dynamic-groups
+- *(moq)* clarify that Forward updates remain unsupported (RT-738)
+- reconcile main into draft-18 development
+- *(moq-transport)* cover the inbound FETCH cap
+- *(moq-transport)* say why FETCH_OK still ends the request stream
+- *(moq-transport)* do not describe the legacy FETCH object as draft-18
+- Merge pull request #256 from englishm-cloudflare/fix/d18-subgroup-template-bound
+- Merge pull request #259 from englishm-cloudflare/feat/d18-draft-version-enum
+- Merge pull request #261 from englishm-cloudflare/me/d18-data-subgroup-basic
+- bound the history an unclaimed subgroups template keeps
+- never block the datagram receive loop on an alias lookup
+- remove SUBSCRIBE_NAMESPACE Subscribe Options field (draft-18 §10.18)
+- address final review comments
+- *(moq-transport)* keep overflow peer session alive
+- *(moq-transport)* address review feedback
+- Integrate draft-18 (PR#178 bidi core) onto current main via 3-way merge
+- Finish subscribe stream on happy path; bound bidi request slots
+- Fail fast on loopback handshake in cleanup tests
+- Drop dead code in loopback test helper
+- Test subscribe cleanup paths; finish bidi stream on lock poison
+- Correct bidi reader doc comments after spawn removal
+- Use structured concurrency for bidi readers; build SUBSCRIBE once
+- Accept bidi request streams and encode responses without Request ID (draft-18 relay)
+- Send requests on bidi streams, decode responses without Request ID (draft-18)
+- Remove MAX_REQUEST_ID/REQUESTS_BLOCKED (draft-18 §A.1)
+- use correct loglevel for logs for subgroups
+- Implement draft-16 subscription parameters and TrackName type
+- set default max request id to 0 if not provided in client setup
+- harden setup and request-id flow control
+- remove legacy draft message stubs
+- harden draft-16 control and data paths
+- update relay and transport descriptions for draft-16
+- return REQUEST_ERROR NOT_SUPPORTED for unimplemented requests
+- remove ObjectDoesNotExist (0x1) from ObjectStatus for draft-16
+- update TRACK_STATUS flow for draft-16
+- update subscription termination flow for draft-16
+- update SUBSCRIBE flow for draft-16
+- update PUBLISH_NAMESPACE flow for draft-16
+- enforce draft-16 request ID flow control
+- add REQUEST_OK/REQUEST_ERROR/REQUEST_UPDATE and enforce control message length
+- update setup and ALPN for draft-16
+- implement draft-16 KVP delta encoding and namespace validation
+- rename announce flow to publish_namespace for draft-16 alignment
+
 ## [0.16.5](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.4...moq-transport-v0.16.5) - 2026-10-30
 
 ### Fixed

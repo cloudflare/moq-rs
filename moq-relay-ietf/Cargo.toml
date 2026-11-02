@@ -8,7 +8,7 @@ authors = ["moq-rs contributors"]
 repository = "https://github.com/cloudflare/moq-rs"
 license = "MIT OR Apache-2.0"
 
-version = "0.7.31"
+version = "0.8.0"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -23,8 +23,8 @@ name = "moq-relay-ietf"
 path = "src/bin/moq-relay-ietf/main.rs"
 
 [dependencies]
-moq-transport = { path = "../moq-transport", version = "0.16" }
-moq-native-ietf = { path = "../moq-native-ietf", version = "0.10" }
+moq-transport = { path = "../moq-transport", version = "0.17" }
+moq-native-ietf = { path = "../moq-native-ietf", version = "0.11" }
 moq-api = { path = "../moq-api", version = "0.2" }
 
 # Bearer tokens are held in a type that zeroizes on drop and redacts under
