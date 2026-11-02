@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "moq-clock-ietf"
-version = "0.6.23"
+version = "0.6.24"
 dependencies = [
  "anyhow",
  "base64",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "moq-pub"
-version = "0.9.6"
+version = "0.9.7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "moq-sub"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "anyhow",
  "clap",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "moq-test-client"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "bytes",
