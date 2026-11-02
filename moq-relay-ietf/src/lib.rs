@@ -33,57 +33,6 @@
 //! relay.run().await?;
 //! ```
 
-// Build an explicit root span at the most verbose level enabled for a target.
-macro_rules! enabled_root_span {
-    (target: $target:expr, $name:literal, $($fields:tt)*) => {{
-        if tracing::enabled!(target: $target, tracing::Level::TRACE) {
-            tracing::span!(
-                target: $target,
-                parent: None,
-                tracing::Level::TRACE,
-                $name,
-                $($fields)*
-            )
-        } else if tracing::enabled!(target: $target, tracing::Level::DEBUG) {
-            tracing::span!(
-                target: $target,
-                parent: None,
-                tracing::Level::DEBUG,
-                $name,
-                $($fields)*
-            )
-        } else if tracing::enabled!(target: $target, tracing::Level::INFO) {
-            tracing::span!(
-                target: $target,
-                parent: None,
-                tracing::Level::INFO,
-                $name,
-                $($fields)*
-            )
-        } else if tracing::enabled!(target: $target, tracing::Level::WARN) {
-            tracing::span!(
-                target: $target,
-                parent: None,
-                tracing::Level::WARN,
-                $name,
-                $($fields)*
-            )
-        } else if tracing::enabled!(target: $target, tracing::Level::ERROR) {
-            tracing::span!(
-                target: $target,
-                parent: None,
-                tracing::Level::ERROR,
-                $name,
-                $($fields)*
-            )
-        } else {
-            tracing::Span::none()
-        }
-    }};
-}
-
-pub(crate) use enabled_root_span;
-
 mod api;
 mod auth;
 mod consumer;
@@ -106,9 +55,15 @@ pub use auth::*;
 pub use consumer::*;
 pub use coordinator::*;
 pub use local::*;
+// Re-export moq_transport so callers of the auth API (AuthHook, AuthzOperation,
+// decode_setup_tokens) can use TrackNamespace, KeyValuePairs etc. without
+// adding moq_transport as a direct dependency. Per RFC-047 §6.
+pub use moq_transport;
 pub use moq_transport::session::SessionConfig;
 pub use producer::*;
 pub use relay::*;
 pub use remote::RemoteManager;
 pub use session::*;
+// SessionContext::span exposes tracing::Span in the public API.
+pub use tracing;
 pub use web::*;

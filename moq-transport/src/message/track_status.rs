@@ -29,7 +29,7 @@ impl Decode for TrackStatus {
         let track_name = TrackName::decode(r)?;
         validate_full_track_name(&track_namespace, track_name.as_bytes())?;
 
-        let params = KeyValuePairs::decode(r)?;
+        let params = KeyValuePairs::decode_message_params(r)?;
 
         Ok(Self {
             id,
@@ -47,7 +47,7 @@ impl Encode for TrackStatus {
         self.track_namespace.encode(w)?;
         self.track_name.encode(w)?;
 
-        self.params.encode(w)?;
+        self.params.encode_message_params(w)?;
 
         Ok(())
     }

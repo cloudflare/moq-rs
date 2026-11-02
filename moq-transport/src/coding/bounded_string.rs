@@ -13,12 +13,10 @@ macro_rules! bounded_string {
 
             /// Build from a string, truncating to [`MAX_LEN`](Self::MAX_LEN).
             ///
-            /// [`Encode`] rejects anything longer, and an encode failure on
-            /// the control stream tears down the whole session — so for a
-            /// string the local application did not choose (an error's
-            /// `Display`, a caller-supplied reason phrase) a shortened value
-            /// is strictly better than the alternative. Prefer this over the
-            /// tuple constructor anywhere the length is not known statically.
+            /// [`Encode`] rejects anything longer, so truncate application
+            /// error text and caller-supplied reasons before writing a response.
+            /// Prefer this over the tuple constructor anywhere the length is
+            /// not known statically.
             ///
             /// Truncation lands on a UTF-8 character boundary, so the result
             /// is always a valid prefix of the input.
@@ -114,7 +112,7 @@ mod tests {
     fn decode_too_large() {
         let mut data: Vec<u8> = vec![0x00; 1025]; // Create a vector with 1025 bytes
                                                   // Set first 2 bytes as length of 1025 as a VarInt
-        data[0] = 0x44;
+        data[0] = 0x84;
         data[1] = 0x01;
         let mut buf: Bytes = data.into();
         let decoded = ReasonPhrase::decode(&mut buf);
@@ -168,7 +166,7 @@ mod tests {
     }
 
     /// The bound is in bytes, matching what `Encode` checks and what
-    /// draft-16 §1.4.3 specifies.
+    /// the wire format specifies.
     #[test]
     fn new_bounds_bytes_not_characters() {
         let wide = "\u{10FFFF}".repeat(ReasonPhrase::MAX_LEN);

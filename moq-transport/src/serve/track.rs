@@ -23,8 +23,112 @@ use super::{
     StreamWriter, Subgroups, SubgroupsReader, SubgroupsWriter,
 };
 use crate::coding::{Location, TrackName, TrackNamespace};
+use crate::message::TrackExtensions;
+use futures::future::BoxFuture;
 use paste::paste;
-use std::{ops::Deref, sync::Arc};
+use std::{
+    future::Future,
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
+
+pub(crate) type NewGroupHandler =
+    Arc<dyn Fn(u64) -> BoxFuture<'static, Result<(), ServeError>> + Send + Sync>;
+
+#[derive(Default)]
+pub(crate) struct TrackControl {
+    properties: Mutex<(TrackExtensions, Option<NewGroupHandler>)>,
+    new_group: tokio::sync::Mutex<(Option<u64>, Option<u64>)>,
+    largest_group: Mutex<Option<u64>>,
+}
+
+impl TrackControl {
+    pub(crate) fn properties(&self) -> Result<TrackExtensions, ServeError> {
+        Ok(self
+            .properties
+            .lock()
+            .map_err(|_| ServeError::internal_ctx("track properties lock poisoned"))?
+            .0
+            .clone())
+    }
+
+    pub(crate) fn configure(
+        &self,
+        properties: TrackExtensions,
+        handler: Option<NewGroupHandler>,
+    ) -> Result<(), ServeError> {
+        *self
+            .properties
+            .lock()
+            .map_err(|_| ServeError::internal_ctx("track properties lock poisoned"))? =
+            (properties, handler);
+        Ok(())
+    }
+
+    pub(crate) fn observe_largest(
+        &self,
+        largest: Option<Location>,
+    ) -> Result<Option<u64>, ServeError> {
+        let mut group = self
+            .largest_group
+            .lock()
+            .map_err(|_| ServeError::internal_ctx("track group lock poisoned"))?;
+        *group = (*group).max(largest.map(|location| location.group_id));
+        Ok(*group)
+    }
+
+    pub(crate) fn initial_request(
+        &self,
+        value: Option<u64>,
+        largest: Option<Location>,
+    ) -> Result<(), ServeError> {
+        let largest = self.observe_largest(largest)?;
+        let mut outstanding = self.new_group.try_lock().map_err(|_| {
+            ServeError::internal_ctx("initial new group request raced establishment")
+        })?;
+        *outstanding = (largest, value);
+        Ok(())
+    }
+
+    async fn request_new_group(&self, value: u64, track: &TrackReader) -> Result<(), ServeError> {
+        let handler = {
+            let properties = self
+                .properties
+                .lock()
+                .map_err(|_| ServeError::internal_ctx("track properties lock poisoned"))?;
+            if properties
+                .0
+                .dynamic_groups()
+                .map_err(|_| ServeError::internal_ctx("invalid dynamic groups property"))?
+                != Some(true)
+            {
+                return Err(ServeError::not_implemented_ctx("dynamic groups"));
+            }
+            properties.1.clone()
+        };
+        let Some(handler) = handler else {
+            return Err(ServeError::not_implemented_ctx("dynamic groups"));
+        };
+        let mut outstanding = self.new_group.lock().await;
+        // Snapshot after acquiring the gate: Groups may have advanced while
+        // another downstream request was being forwarded.
+        let largest = self.observe_largest(track.largest_location())?;
+        // §10.2.13: a request stays outstanding until the Largest Group increases.
+        if outstanding.0 < largest {
+            outstanding.1 = None;
+        }
+        outstanding.0 = largest;
+        if value != 0 && largest.is_some_and(|group| value <= group) {
+            return Ok(());
+        }
+        if outstanding.1.is_some_and(|previous| previous >= value) {
+            return Ok(());
+        }
+        handler(value).await?;
+        outstanding.1 = Some(value);
+        Ok(())
+    }
+}
 
 /// Static information about a track.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,8 +151,9 @@ impl Track {
         let info = Arc::new(self);
 
         // Create TrackReader and TrackWriter with shared state and info
-        let writer = TrackWriter::new(writer_track_state, info.clone());
-        let reader = TrackReader::new(reader_track_state, info);
+        let control = Arc::new(TrackControl::default());
+        let writer = TrackWriter::new(writer_track_state, info.clone(), control.clone());
+        let reader = TrackReader::new(reader_track_state, info, control);
 
         (writer, reader)
     }
@@ -74,12 +179,34 @@ impl Default for TrackState {
 pub struct TrackWriter {
     state: State<TrackState>,
     pub info: Arc<Track>,
+    pub(crate) control: Arc<TrackControl>,
 }
 
 impl TrackWriter {
     /// Create a track with the given name (info/Track)
-    fn new(state: State<TrackState>, info: Arc<Track>) -> Self {
-        Self { state, info }
+    fn new(state: State<TrackState>, info: Arc<Track>, control: Arc<TrackControl>) -> Self {
+        Self {
+            state,
+            info,
+            control,
+        }
+    }
+
+    /// Advertise dynamic groups and deliver requests to the original publisher.
+    /// Configure this before publishing the track or answering a SUBSCRIBE.
+    /// The callback decides when to end the current Group (§10.2.13); it must
+    /// return without waiting for downstream delivery of the new Group.
+    pub fn enable_dynamic_groups<F, Fut>(&self, handler: F) -> Result<(), ServeError>
+    where
+        F: Fn(u64) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), ServeError>> + Send + 'static,
+    {
+        let mut properties = self.control.properties()?;
+        properties.set_dynamic_groups(true);
+        self.control.configure(
+            properties,
+            Some(Arc::new(move |value| Box::pin(handler(value)))),
+        )
     }
 
     /// Create a new stream with the given priority, inserting it into the track.
@@ -187,11 +314,28 @@ impl Deref for TrackWriter {
 pub struct TrackReader {
     state: State<TrackState>,
     pub info: Arc<Track>,
+    pub(crate) control: Arc<TrackControl>,
 }
 
 impl TrackReader {
-    fn new(state: State<TrackState>, info: Arc<Track>) -> Self {
-        Self { state, info }
+    fn new(state: State<TrackState>, info: Arc<Track>, control: Arc<TrackControl>) -> Self {
+        Self {
+            state,
+            info,
+            control,
+        }
+    }
+
+    /// Track properties retained across relay cache and fanout handles.
+    pub fn track_extensions(&self) -> Result<TrackExtensions, ServeError> {
+        self.control.properties()
+    }
+
+    /// Request a new Group, suppressing satisfied and outstanding requests.
+    /// `value` is the largest Group known to the subscriber plus one, or zero
+    /// when it has no Group information. Clones share suppression state.
+    pub async fn request_new_group(&self, value: u64) -> Result<(), ServeError> {
+        self.control.request_new_group(value, self).await
     }
 
     /// Get the current mode of the track, waiting if necessary.

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fs2::FileExt;
-use moq_native_ietf::quic::Client;
+use moq_native_ietf::Client;
 use moq_transport::coding::{TrackNamespace, TrackNamespacePrefix, TupleField};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -94,7 +94,7 @@ impl Drop for NamespaceSubscriptionHandle {
             &self.prefix_key,
             &self.relay_url,
         ) {
-            tracing::warn!(prefix = %self.prefix_key, relay_url = %self.relay_url, error = %err, "failed to unregister namespace subscription on drop: {}", err);
+            tracing::warn!(prefix = %self.prefix_key, error = %moq_transport::session::LogSafe(err.to_string().as_bytes()), "failed to unregister namespace subscription on drop");
         }
     }
 }
@@ -129,7 +129,7 @@ fn unregister_namespace_sync(file_path: &Path, scope_key: &str, namespace_key: &
     file.lock_exclusive()?;
 
     let mut data = read_data(&file)?;
-    tracing::debug!(namespace = %namespace_key, scope = %scope_key, "unregistering namespace: {}", namespace_key);
+    tracing::debug!(namespace = %namespace_key, "unregistering namespace");
     if let Some(bucket) = data.namespaces.get_mut(scope_key) {
         bucket.remove(namespace_key);
         if bucket.is_empty() {
@@ -154,7 +154,7 @@ fn unregister_track_sync(file_path: &Path, scope_key: &str, track_key: &str) -> 
     file.lock_exclusive()?;
 
     let mut data = read_data(&file)?;
-    tracing::debug!(track = %track_key, scope = %scope_key, "unregistering track: {}", track_key);
+    tracing::debug!(track = %track_key, "unregistering track");
     if let Some(bucket) = data.tracks.get_mut(scope_key) {
         bucket.remove(track_key);
         if bucket.is_empty() {
@@ -344,9 +344,8 @@ impl Coordinator for FileCoordinator {
             file.lock_exclusive()?;
 
             let mut data = read_data(&file)?;
-            tracing::info!(namespace = %key_clone, scope = %scope_clone, relay_url = %relay_url, "registering namespace: {} -> {}", key_clone, relay_url);
-            data
-                .namespaces
+            tracing::info!(namespace = %key_clone, "registering namespace");
+            data.namespaces
                 .entry(scope_clone)
                 .or_default()
                 .insert(key_clone, relay_url);
@@ -408,7 +407,7 @@ impl Coordinator for FileCoordinator {
                 file.lock_shared()?;
 
                 let data = read_data(&file)?;
-                tracing::debug!(namespace = %namespace_key, scope = %scope_key, "looking up namespace: {}", namespace_key);
+                tracing::debug!(namespace = %namespace_key, "looking up namespace");
 
                 let Some(bucket) = data.namespaces.get(&scope_key) else {
                     file.unlock()?;
@@ -428,7 +427,8 @@ impl Coordinator for FileCoordinator {
                     let is_prefix = namespace_key_has_prefix(&namespace_key, registered_key);
                     match best_match {
                         Some((ns, _))
-                            if is_prefix && key_field_count(&ns) < key_field_count(registered_key) =>
+                            if is_prefix
+                                && key_field_count(&ns) < key_field_count(registered_key) =>
                         {
                             best_match = Some((registered_key.clone(), url.clone()));
                         }
@@ -626,7 +626,7 @@ impl Coordinator for FileCoordinator {
             file.lock_exclusive()?;
 
             let mut data = read_data(&file)?;
-            tracing::info!(track = %key_clone, scope = %scope_clone, relay_url = %relay_url, "registering track: {} -> {}", key_clone, relay_url);
+            tracing::info!(track = %key_clone, "registering track");
             data.tracks
                 .entry(scope_clone)
                 .or_default()
@@ -690,7 +690,7 @@ impl Coordinator for FileCoordinator {
                 file.lock_shared()?;
 
                 let data = read_data(&file)?;
-                tracing::debug!(track = %track_key, scope = %scope_key, "looking up track: {}", track_key);
+                tracing::debug!(track = %track_key, "looking up track");
 
                 if let Some(relay_url) = data
                     .tracks
@@ -699,7 +699,10 @@ impl Coordinator for FileCoordinator {
                 {
                     let url = Url::parse(relay_url)?;
                     file.unlock()?;
-                    return Ok(Some((NamespaceOrigin::new(namespace.clone(), url, None), None)));
+                    return Ok(Some((
+                        NamespaceOrigin::new(namespace.clone(), url, None),
+                        None,
+                    )));
                 }
 
                 let Some(bucket) = data.namespaces.get(&scope_key) else {
@@ -710,7 +713,10 @@ impl Coordinator for FileCoordinator {
                 if let Some(relay_url) = bucket.get(&namespace_key) {
                     let url = Url::parse(relay_url)?;
                     file.unlock()?;
-                    return Ok(Some((NamespaceOrigin::new(namespace.clone(), url, None), None)));
+                    return Ok(Some((
+                        NamespaceOrigin::new(namespace.clone(), url, None),
+                        None,
+                    )));
                 }
 
                 let mut best_match: Option<(String, String)> = None;
@@ -718,7 +724,8 @@ impl Coordinator for FileCoordinator {
                     let is_prefix = namespace_key_has_prefix(&namespace_key, registered_key);
                     match best_match {
                         Some((ns, _))
-                            if is_prefix && key_field_count(&ns) < key_field_count(registered_key) =>
+                            if is_prefix
+                                && key_field_count(&ns) < key_field_count(registered_key) =>
                         {
                             best_match = Some((registered_key.clone(), url.clone()));
                         }

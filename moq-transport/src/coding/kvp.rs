@@ -20,6 +20,7 @@
 //! A sequence of KVPs is prefixed by a varint count of the number of pairs.
 
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
+use bytes::Buf as _;
 use std::fmt;
 
 /// Maximum byte-value length for a bytes-typed KVP (2^16 − 1).
@@ -91,6 +92,22 @@ impl KeyValuePair {
         r: &mut R,
         prev: u64,
     ) -> Result<(Self, u64), DecodeError> {
+        Self::decode_with_prev_typed(r, prev, &[], &[])
+    }
+
+    /// Like [`decode_with_prev`](KeyValuePair::decode_with_prev), but the
+    /// absolute types listed in `u8_value_types` carry a single raw `uint8`
+    /// value instead of the default varint. Draft-17 (§10.2) replaced the
+    /// generic even=varint rule for certain message parameters (e.g.
+    /// SUBSCRIBER_PRIORITY, whose implicit default 128 does not fit in one
+    /// varint byte) with a fixed one-byte value; see
+    /// [`crate::message::U8_VALUE_PARAMETER_TYPES`].
+    pub(crate) fn decode_with_prev_typed<R: bytes::Buf>(
+        r: &mut R,
+        prev: u64,
+        u8_value_types: &[u64],
+        two_varint_value_types: &[u64],
+    ) -> Result<(Self, u64), DecodeError> {
         let delta = u64::decode(r)?;
 
         // Draft-16 §1.4.2: prev + delta MUST NOT overflow u64.
@@ -98,7 +115,22 @@ impl KeyValuePair {
             .checked_add(delta)
             .ok_or(DecodeError::KvpTypeOverflow)?;
 
-        let pair = if abs_type % 2 == 0 {
+        let pair = if u8_value_types.contains(&abs_type) {
+            // Draft-17+ typed parameter → single raw uint8 value.
+            let value = u8::decode(r)?;
+            KeyValuePair::new_int(abs_type, value.into())
+        } else if two_varint_value_types.contains(&abs_type) {
+            let first = u64::decode(r)?;
+            let second = u64::decode(r)?;
+            let mut value = Vec::new();
+            first
+                .encode(&mut value)
+                .map_err(|_| DecodeError::InvalidParameter)?;
+            second
+                .encode(&mut value)
+                .map_err(|_| DecodeError::InvalidParameter)?;
+            KeyValuePair::new_bytes(abs_type, value)
+        } else if abs_type % 2 == 0 {
             // Even type → varint value.
             let value = u64::decode(r)?;
             KeyValuePair::new_int(abs_type, value)
@@ -125,6 +157,22 @@ impl KeyValuePair {
         w: &mut W,
         prev: u64,
     ) -> Result<u64, EncodeError> {
+        self.encode_with_prev_typed(w, prev, &[], &[])
+    }
+
+    /// Like [`encode_with_prev`](KeyValuePair::encode_with_prev), but the keys
+    /// listed in `u8_value_types` are written as a single raw `uint8` value
+    /// instead of the default varint. Values exceeding 255 for such a key are
+    /// rejected. See
+    /// [`decode_with_prev_typed`](KeyValuePair::decode_with_prev_typed) and
+    /// [`crate::message::U8_VALUE_PARAMETER_TYPES`].
+    pub(crate) fn encode_with_prev_typed<W: bytes::BufMut>(
+        &self,
+        w: &mut W,
+        prev: u64,
+        u8_value_types: &[u64],
+        two_varint_value_types: &[u64],
+    ) -> Result<u64, EncodeError> {
         // Keys must be consistent with their value parity.
         match &self.value {
             Value::IntValue(_) if !self.key.is_multiple_of(2) => {
@@ -142,9 +190,26 @@ impl KeyValuePair {
 
         match &self.value {
             Value::IntValue(v) => {
-                (*v).encode(w)?;
+                if u8_value_types.contains(&self.key) {
+                    // Draft-17+ typed parameter → single raw uint8 value.
+                    let byte = u8::try_from(*v).map_err(|_| EncodeError::InvalidValue)?;
+                    byte.encode(w)?;
+                } else {
+                    (*v).encode(w)?;
+                }
             }
             Value::BytesValue(v) => {
+                if two_varint_value_types.contains(&self.key) {
+                    let mut value = bytes::Bytes::copy_from_slice(v);
+                    let first = u64::decode(&mut value).map_err(|_| EncodeError::InvalidValue)?;
+                    let second = u64::decode(&mut value).map_err(|_| EncodeError::InvalidValue)?;
+                    if value.has_remaining() {
+                        return Err(EncodeError::InvalidValue);
+                    }
+                    first.encode(w)?;
+                    second.encode(w)?;
+                    return Ok(self.key);
+                }
                 if v.len() > MAX_BYTES_VALUE_LEN {
                     return Err(EncodeError::KeyValuePairLengthExceeded);
                 }
@@ -215,8 +280,23 @@ impl KeyValuePairs {
     }
 }
 
-impl Decode for KeyValuePairs {
-    fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+impl KeyValuePairs {
+    /// Decode a count-prefixed KVP sequence, treating the absolute types listed
+    /// in `u8_value_types` as single raw `uint8` values (draft-17+ typed message
+    /// parameters). Pass `&[]` for the generic draft-16 even=varint behaviour;
+    /// the [`Decode`] impl does exactly that.
+    pub fn decode_with_u8_types<R: bytes::Buf>(
+        r: &mut R,
+        u8_value_types: &[u64],
+    ) -> Result<Self, DecodeError> {
+        Self::decode_with_value_types(r, u8_value_types, &[])
+    }
+
+    pub(crate) fn decode_with_value_types<R: bytes::Buf>(
+        r: &mut R,
+        u8_value_types: &[u64],
+        two_varint_value_types: &[u64],
+    ) -> Result<Self, DecodeError> {
         let count = u64::decode(r)?;
 
         // `count` is peer-controlled, so do not allocate directly from it.
@@ -229,17 +309,37 @@ impl Decode for KeyValuePairs {
         let mut prev = 0u64;
 
         for _ in 0..count {
-            let (pair, new_prev) = KeyValuePair::decode_with_prev(r, prev)?;
+            let (pair, new_prev) = KeyValuePair::decode_with_prev_typed(
+                r,
+                prev,
+                u8_value_types,
+                two_varint_value_types,
+            )?;
             prev = new_prev;
             kvps.push(pair);
         }
 
         Ok(KeyValuePairs(kvps))
     }
-}
 
-impl Encode for KeyValuePairs {
-    fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+    /// Encode a count-prefixed KVP sequence, writing the keys listed in
+    /// `u8_value_types` as single raw `uint8` values (draft-17+ typed message
+    /// parameters). Pass `&[]` for the generic draft-16 even=varint behaviour;
+    /// the [`Encode`] impl does exactly that.
+    pub fn encode_with_u8_types<W: bytes::BufMut>(
+        &self,
+        w: &mut W,
+        u8_value_types: &[u64],
+    ) -> Result<(), EncodeError> {
+        self.encode_with_value_types(w, u8_value_types, &[])
+    }
+
+    pub(crate) fn encode_with_value_types<W: bytes::BufMut>(
+        &self,
+        w: &mut W,
+        u8_value_types: &[u64],
+        two_varint_value_types: &[u64],
+    ) -> Result<(), EncodeError> {
         // Sort a working copy by ascending key before encoding so the delta is
         // always non-negative.  The internal Vec is not required to be sorted.
         let mut sorted: Vec<&KeyValuePair> = self.0.iter().collect();
@@ -249,10 +349,22 @@ impl Encode for KeyValuePairs {
 
         let mut prev = 0u64;
         for kvp in &sorted {
-            prev = kvp.encode_with_prev(w, prev)?;
+            prev = kvp.encode_with_prev_typed(w, prev, u8_value_types, two_varint_value_types)?;
         }
 
         Ok(())
+    }
+}
+
+impl Decode for KeyValuePairs {
+    fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+        Self::decode_with_u8_types(r, &[])
+    }
+}
+
+impl Encode for KeyValuePairs {
+    fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        self.encode_with_u8_types(w, &[])
     }
 }
 
@@ -266,6 +378,47 @@ impl fmt::Debug for KeyValuePairs {
             write!(f, "{:?}", kv)?;
         }
         write!(f, " }}")
+    }
+}
+
+impl KeyValuePairs {
+    /// Decode KVPs from a length-bounded byte slice (draft-18+).
+    ///
+    /// Unlike the count-prefixed [`Decode`] impl, this reads KVPs until
+    /// exactly `byte_len` bytes have been consumed. No leading count varint.
+    pub fn decode_bounded(r: &mut impl bytes::Buf, byte_len: usize) -> Result<Self, DecodeError> {
+        if byte_len == 0 {
+            return Ok(Self::default());
+        }
+
+        <u64 as Decode>::decode_remaining(r, byte_len)?;
+        let mut payload = r.copy_to_bytes(byte_len);
+
+        let mut kvps = Vec::new();
+        let mut prev = 0u64;
+
+        while payload.has_remaining() {
+            let (pair, new_prev) = KeyValuePair::decode_with_prev(&mut payload, prev)?;
+            prev = new_prev;
+            kvps.push(pair);
+        }
+
+        Ok(KeyValuePairs(kvps))
+    }
+
+    /// Encode KVPs without a leading count prefix (draft-18+ length-bounded).
+    ///
+    /// Returns the encoded bytes. The caller writes the length separately.
+    pub fn encode_bounded(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut buf = Vec::new();
+        let mut sorted = self.0.clone();
+        sorted.sort_by_key(|k| k.key);
+
+        let mut prev = 0u64;
+        for kvp in &sorted {
+            prev = kvp.encode_with_prev(&mut buf, prev)?;
+        }
+        Ok(buf)
     }
 }
 
@@ -536,5 +689,63 @@ mod tests {
             decoded.get(1).unwrap().value,
             Value::BytesValue(vec![0x01, 0x02, 0x03, 0x04, 0x05])
         );
+    }
+
+    // ── draft-17+ typed uint8 values ──────────────────────────────────────────
+
+    #[test]
+    fn u8_typed_value_encodes_as_single_byte() {
+        // Even type 0x20 with value 200 (≥ 64): the generic even=varint rule
+        // needs two bytes, but the u8-typed override must emit exactly one.
+        let u8_types: &[u64] = &[0x20];
+        let kvps = KeyValuePairs(vec![KeyValuePair::new_int(0x20, 200)]);
+
+        let mut typed = BytesMut::new();
+        kvps.encode_with_u8_types(&mut typed, u8_types).unwrap();
+        // count=1, delta=0x20, value=0xC8 (single byte)
+        assert_eq!(typed.to_vec(), vec![0x01, 0x20, 0xC8]);
+
+        let decoded = KeyValuePairs::decode_with_u8_types(&mut typed, u8_types).unwrap();
+        assert_eq!(decoded, kvps);
+    }
+
+    #[test]
+    fn u8_typed_value_rejects_out_of_range() {
+        let u8_types: &[u64] = &[0x20];
+        let kvps = KeyValuePairs(vec![KeyValuePair::new_int(0x20, 256)]);
+        let mut buf = BytesMut::new();
+        assert!(matches!(
+            kvps.encode_with_u8_types(&mut buf, u8_types).unwrap_err(),
+            EncodeError::InvalidValue
+        ));
+    }
+
+    #[test]
+    fn generic_kvp_still_varint_for_even_types() {
+        // Without a u8-type override, even type 0x20 = 200 must use the two-byte
+        // varint form (unchanged draft-16 behaviour, e.g. SETUP parameters).
+        let kvps = KeyValuePairs(vec![KeyValuePair::new_int(0x20, 200)]);
+        let mut buf = BytesMut::new();
+        kvps.encode(&mut buf).unwrap();
+        // count=1, delta=0x20, draft-17 leading-1-bits varint(200)=0x80 0xC8
+        assert_eq!(buf.to_vec(), vec![0x01, 0x20, 0x80, 0xC8]);
+        let decoded = KeyValuePairs::decode(&mut buf).unwrap();
+        assert_eq!(decoded, kvps);
+    }
+
+    #[test]
+    fn empty_u8_types_matches_generic_for_mixed_content() {
+        let kvps = KeyValuePairs(vec![
+            KeyValuePair::new_int(0, 5),
+            KeyValuePair::new_bytes(1, vec![0xAA]),
+            KeyValuePair::new_int(2, 300),
+        ]);
+        let mut buf = BytesMut::new();
+        kvps.encode(&mut buf).unwrap();
+
+        let via_typed = KeyValuePairs::decode_with_u8_types(&mut buf.clone(), &[]).unwrap();
+        let via_generic = KeyValuePairs::decode(&mut buf).unwrap();
+        assert_eq!(via_typed, via_generic);
+        assert_eq!(via_typed, kvps);
     }
 }

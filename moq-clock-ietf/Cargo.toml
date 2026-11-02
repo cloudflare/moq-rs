@@ -35,3 +35,9 @@ anyhow = { version = "1", features = ["backtrace"] }
 
 # CLOCK STUFF
 chrono = "0.4"
+
+[dev-dependencies]
+moq-relay-ietf = { path = "../moq-relay-ietf", version = "0.7" }
+async-trait = "0.1"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }

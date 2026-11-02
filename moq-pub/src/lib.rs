@@ -7,14 +7,7 @@ mod media;
 pub use fetch::*;
 pub use media::*;
 
-/// Dependencies exposed by this crate's public API.
-///
-/// ```
-/// use moq_pub::reexports::moq_transport;
-///
-/// let location = moq_transport::coding::Location::new(0, 0);
-/// assert_eq!(location.group_id, 0);
-/// ```
+/// Dependencies used in this crate's public API.
 pub mod reexports {
     pub use moq_transport;
 }

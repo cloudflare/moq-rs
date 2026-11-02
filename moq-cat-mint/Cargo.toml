@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Cloudflare Inc.
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "moq-cat-mint"
+description = "Mint Common Access Tokens (draft-ietf-moq-c4m) for testing MoQ relays"
+authors = ["moq-rs contributors"]
+repository = "https://github.com/cloudflare/moq-rs"
+license = "MIT OR Apache-2.0"
+
+version = "0.1.0"
+edition = "2021"
+# A test utility, not a library or a supported issuer.
+publish = false
+
+keywords = ["moqt", "cat", "c4m", "testing"]
+categories = ["development-tools::testing", "command-line-utilities"]
+
+[dependencies]
+# Pinned to the version moq-relay-ietf verifies with.
+cat-token = "=0.3.0-alpha.2"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

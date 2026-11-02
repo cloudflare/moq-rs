@@ -18,15 +18,31 @@
 //!
 //! # List available tests
 //! moq-test-client --list
+//!
+//! # Run an ad-hoc moq-test scenario from a 16-field tuple
+//! moq-test-client --relay https://localhost:4443 \
+//!   --moq-test-tuple "moq-test-00/0/0/0/2/4/5/64/32/2/1/1/0/-1/-1/0"
 //! ```
+//!
+//! The `moq-test-*` tests implement the moq-test protocol
+//! (draft-afrind-moq-test) as a self-publishing scoreboard test: the client
+//! generates a deterministic object set from the tuple, publishes it through
+//! the relay, subscribes, and verifies the exact set plus terminal signals.
+//!
+//! The `data-*` tests implement the moq-interop-runner data-plane
+//! specifications with the same generator and scoreboard: the publisher
+//! publishes a `("moq-test", <test-id>, <run-id>)` routing prefix and serves
+//! moq-test tuples below it, and the subscriber subscribes to the prefix
+//! followed by the scenario's canonical tuple.
 
 use std::net;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use url::Url;
 
+mod moqtest;
 mod scenarios;
 
 /// MoQT Interop Test Client
@@ -46,6 +62,12 @@ pub struct Args {
     /// Specific test to run (runs all if not specified)
     #[arg(short, long, env = "TESTCASE")]
     pub test: Option<TestCase>,
+
+    /// Run an ad-hoc moq-test scenario from a tuple: 16 '/'-separated
+    /// namespace fields (e.g. "moq-test-00/0/0/0/2/4/5/64/32/2/1/1/0///"),
+    /// subscribe-first choreography. Blank fields select defaults.
+    #[arg(long, value_name = "TUPLE", conflicts_with_all = ["test", "list"])]
+    pub moq_test_tuple: Option<String>,
 
     /// List available test cases and exit
     #[arg(short, long)]
@@ -83,6 +105,27 @@ pub enum TestCase {
     PublishTrackOnly,
     /// T0.8: Publisher sends PUBLISH for one track, subscriber receives it through relay routing
     PublishTrackSubscribe,
+    /// T0.9: SUBSCRIBE with RENDEZVOUS_TIMEOUT expires with TIMEOUT
+    RendezvousTimeout,
+    /// Data plane: publisher-first moq-test tuple below a routing prefix,
+    /// one subgroup per group (interop-runner `data-subgroup-basic`)
+    DataSubgroupBasic,
+    /// moq-test: one subgroup per group with End of Group markers
+    MoqTestSubgroupPerGroupEog,
+    /// moq-test: one subgroup per object
+    MoqTestSubgroupPerObject,
+    /// moq-test: two subgroups per group (parity) with End of Group markers
+    MoqTestTwoSubgroupsEog,
+    /// moq-test: datagram forwarding
+    MoqTestDatagram,
+    /// moq-test: datagram forwarding with End of Group markers
+    MoqTestDatagramEog,
+    /// moq-test: integer and variable extensions on every object
+    MoqTestExtensions,
+    /// moq-test: non-default start/increment arithmetic
+    MoqTestIncrements,
+    /// moq-test: SUBSCRIBE with FORWARD=0 (setup and PUBLISH_DONE, no data)
+    MoqTestForwardZero,
 }
 
 impl TestCase {
@@ -96,6 +139,16 @@ impl TestCase {
             TestCase::PublishNamespaceDone,
             TestCase::PublishTrackOnly,
             TestCase::PublishTrackSubscribe,
+            TestCase::RendezvousTimeout,
+            TestCase::DataSubgroupBasic,
+            TestCase::MoqTestSubgroupPerGroupEog,
+            TestCase::MoqTestSubgroupPerObject,
+            TestCase::MoqTestTwoSubgroupsEog,
+            TestCase::MoqTestDatagram,
+            TestCase::MoqTestDatagramEog,
+            TestCase::MoqTestExtensions,
+            TestCase::MoqTestIncrements,
+            TestCase::MoqTestForwardZero,
         ]
     }
 
@@ -109,6 +162,16 @@ impl TestCase {
             TestCase::PublishNamespaceDone => "publish-namespace-done",
             TestCase::PublishTrackOnly => "publish-track-only",
             TestCase::PublishTrackSubscribe => "publish-track-subscribe",
+            TestCase::RendezvousTimeout => "rendezvous-timeout",
+            TestCase::DataSubgroupBasic => "data-subgroup-basic",
+            TestCase::MoqTestSubgroupPerGroupEog => "moq-test-subgroup-per-group-eog",
+            TestCase::MoqTestSubgroupPerObject => "moq-test-subgroup-per-object",
+            TestCase::MoqTestTwoSubgroupsEog => "moq-test-two-subgroups-eog",
+            TestCase::MoqTestDatagram => "moq-test-datagram",
+            TestCase::MoqTestDatagramEog => "moq-test-datagram-eog",
+            TestCase::MoqTestExtensions => "moq-test-extensions",
+            TestCase::MoqTestIncrements => "moq-test-increments",
+            TestCase::MoqTestForwardZero => "moq-test-forward-zero",
         }
     }
 }
@@ -116,32 +179,98 @@ impl TestCase {
 /// Result of running a test case
 #[derive(Debug)]
 pub struct TestResult {
-    pub test_case: TestCase,
+    pub name: String,
     pub passed: bool,
     pub duration: Duration,
     pub message: Option<String>,
     pub cids: Vec<String>,
+    /// Multi-connection tests where the subscriber connected first (affects
+    /// CID labeling only).
+    subscriber_first: bool,
+    /// Revision of the interop-runner prose specification implemented, for
+    /// tests that have one.
+    spec_revision: Option<u32>,
 }
 
 impl TestResult {
-    fn success(test_case: TestCase, duration: Duration, cids: Vec<String>) -> Self {
+    fn success(
+        name: String,
+        duration: Duration,
+        cids: Vec<String>,
+        subscriber_first: bool,
+    ) -> Self {
         Self {
-            test_case,
+            name,
             passed: true,
             duration,
             message: None,
             cids,
+            subscriber_first,
+            spec_revision: None,
         }
     }
 
-    fn failure(test_case: TestCase, duration: Duration, message: String) -> Self {
+    fn failure(name: String, duration: Duration, message: String) -> Self {
         Self {
-            test_case,
+            name,
             passed: false,
             duration,
             message: Some(message),
             cids: Vec::new(),
+            subscriber_first: false,
+            spec_revision: None,
         }
+    }
+}
+
+/// Run a moq-test scenario under the shared timeout and translate the
+/// verification report into connection IDs or an error.
+async fn run_moqtest_scenario(
+    args: &Args,
+    scenario: &moqtest::Scenario,
+) -> Result<scenarios::TestConnectionIds> {
+    let (cids, report) =
+        tokio::time::timeout(scenarios::TEST_TIMEOUT, moqtest::run(args, scenario))
+            .await
+            .context("test timed out")??;
+
+    if report.passed() {
+        tracing::info!("moq-test passed: {}", report.summary());
+        Ok(cids)
+    } else {
+        bail!(
+            "moq-test verification failed: {}",
+            report.failures.join("; ")
+        )
+    }
+}
+
+/// Run a named moq-test scenario.
+async fn run_moqtest(args: &Args, test_case: TestCase) -> Result<scenarios::TestConnectionIds> {
+    let scenario = moqtest::scenario(test_case.name())?
+        .ok_or_else(|| anyhow::anyhow!("unregistered moq-test scenario"))?;
+    run_moqtest_scenario(args, scenario).await
+}
+
+/// Run a named interop-runner data-plane scenario.
+async fn run_data_plane(args: &Args, test_case: TestCase) -> Result<scenarios::TestConnectionIds> {
+    let scenario = moqtest::data_plane_scenario(test_case.name())?
+        .ok_or_else(|| anyhow::anyhow!("unregistered data-plane scenario"))?;
+    let (cids, report) = tokio::time::timeout(
+        scenarios::TEST_TIMEOUT,
+        moqtest::run_data_plane(args, scenario),
+    )
+    .await
+    .context("test timed out")??;
+
+    if report.passed() {
+        tracing::info!("data-plane test passed: {}", report.summary());
+        Ok(cids)
+    } else {
+        bail!(
+            "data-plane verification failed: {}",
+            report.failures.join("; ")
+        )
     }
 }
 
@@ -162,24 +291,50 @@ async fn run_test(args: &Args, test_case: TestCase) -> TestResult {
         TestCase::PublishNamespaceDone => scenarios::test_publish_namespace_done(args).await,
         TestCase::PublishTrackOnly => scenarios::test_publish_track_only(args).await,
         TestCase::PublishTrackSubscribe => scenarios::test_publish_track_subscribe(args).await,
+        TestCase::RendezvousTimeout => scenarios::test_rendezvous_timeout(args).await,
+        TestCase::DataSubgroupBasic => run_data_plane(args, test_case).await,
+        TestCase::MoqTestSubgroupPerGroupEog
+        | TestCase::MoqTestSubgroupPerObject
+        | TestCase::MoqTestTwoSubgroupsEog
+        | TestCase::MoqTestDatagram
+        | TestCase::MoqTestDatagramEog
+        | TestCase::MoqTestExtensions
+        | TestCase::MoqTestIncrements
+        | TestCase::MoqTestForwardZero => run_moqtest(args, test_case).await,
     };
 
     let duration = start.elapsed();
+    let spec_revision = moqtest::data_plane_scenario(test_case.name())
+        .ok()
+        .flatten()
+        .map(|scenario| scenario.spec_revision);
 
-    match result {
-        Ok(cids) => TestResult::success(test_case, duration, cids.cids),
-        Err(e) => TestResult::failure(test_case, duration, format!("{:#}", e)),
-    }
+    // T0.5 and every moq-test scenario connect the subscriber first.
+    let subscriber_first = test_case == TestCase::SubscribeBeforePublishNamespace
+        || test_case.name().starts_with("moq-test-");
+    let mut result = match result {
+        Ok(cids) => TestResult::success(
+            test_case.name().to_string(),
+            duration,
+            cids.cids,
+            subscriber_first,
+        ),
+        Err(e) => TestResult::failure(test_case.name().to_string(), duration, format!("{:#}", e)),
+    };
+    result.spec_revision = spec_revision;
+    result
 }
 
 fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
     let status = if result.passed { "ok" } else { "not ok" };
-    let name = result.test_case.name();
-    println!("{} {} - {}", status, test_number, name);
+    println!("{} {} - {}", status, test_number, result.name);
 
     // YAML diagnostic block
     println!("  ---");
     println!("  duration_ms: {}", result.duration.as_millis());
+    if let Some(revision) = result.spec_revision {
+        println!("  test_spec_revision: {revision}");
+    }
 
     // Connection IDs for mlog correlation
     match result.cids.len() {
@@ -187,8 +342,8 @@ fn print_tap_result(test_number: usize, result: &TestResult, verbose: bool) {
         1 => println!("  connection_id: {}", result.cids[0]),
         2 => {
             // Multi-connection tests: first is publisher, second is subscriber
-            // (except subscribe-before-announce where subscriber connects first)
-            if result.test_case == TestCase::SubscribeBeforePublishNamespace {
+            // (except subscribe-first choreographies)
+            if result.subscriber_first {
                 println!("  subscriber_connection_id: {}", result.cids[0]);
                 println!("  publisher_connection_id: {}", result.cids[1]);
             } else {
@@ -249,6 +404,41 @@ async fn main() -> Result<()> {
             println!("{}", tc.name());
         }
         return Ok(());
+    }
+
+    // Ad-hoc moq-test tuple: parse, run, report as a single TAP line.
+    if let Some(tuple) = &args.moq_test_tuple {
+        let fields: Vec<String> = tuple.split('/').map(str::to_string).collect();
+        let start = Instant::now();
+        let result = async {
+            let params = moqtest::MoqTestParams::from_namespace_fields(&fields)
+                .context("invalid moq-test tuple")?;
+            let scenario = moqtest::Scenario {
+                params,
+                forward_zero: false,
+            };
+            run_moqtest_scenario(&args, &scenario).await
+        }
+        .await;
+        let duration = start.elapsed();
+        let result = match result {
+            Ok(cids) => {
+                TestResult::success("moq-test-adhoc".to_string(), duration, cids.cids, true)
+            }
+            Err(e) => {
+                TestResult::failure("moq-test-adhoc".to_string(), duration, format!("{:#}", e))
+            }
+        };
+        println!("TAP version 14");
+        println!("# moq-test-client v{}", env!("CARGO_PKG_VERSION"));
+        println!("# Relay: {}", args.relay);
+        println!("1..1");
+        print_tap_result(1, &result, args.verbose);
+        return if result.passed {
+            Ok(())
+        } else {
+            std::process::exit(1);
+        };
     }
 
     let tests_to_run = match args.test {

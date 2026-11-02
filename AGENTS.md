@@ -3,148 +3,64 @@ SPDX-FileCopyrightText: 2026 Cloudflare Inc.
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# Working in this repository
+# Repository Guidance
 
-Media over QUIC Transport (MoQT) in Rust. Targets
-[draft-ietf-moq-transport-16](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/16/).
+## Scope And Constraints
 
-## CI must pass
+- This repository targets MoQT `draft-ietf-moq-transport-18`.
+- Core protocol code lives in `moq-transport`; relay behavior lives in `moq-relay-ietf`.
+- `moq-test-client` is the interop test harness: it runs TAP-emitting scenarios against a relay. The `moq-test-*` scenarios implement the moq-test protocol (draft-afrind-moq-test) as self-publishing scoreboard tests that need no relay-side moq-test support. The `data-*` scenarios implement moq-interop-runner data-plane specs with the same generator: publisher-first, PUBLISH_NAMESPACE of a `("moq-test", <test-id>, <run-id>)` routing prefix, and a SUBSCRIBE for that prefix plus the scenario's moq-test tuple.
+- `moq-relay-ietf` is production critical, so prefer small, tested changes over broad refactors.
+- Avoid breaking public APIs, wire behavior, CLI flags, and operator workflows unless explicitly requested.
+- Do not add `unsafe` code unless there is a clear performance or FFI need and the safety invariant is documented at the call site.
+- Do not commit or directly edit draft spec text files (`docs/draft-*.txt`) unless explicitly requested; they are local protocol reference material.
+- Avoid `unwrap()`, `expect()`, `panic!`, `todo!`, `unimplemented!`, and `dbg!` in production paths. Propagate errors or convert lock poisoning to an internal error instead.
 
-CI (`.github/workflows/pr.yml`) runs these at the **workspace root**. Run them
-before pushing; they are the whole gate.
+## Commands
 
-```sh
-cargo test --verbose      # every crate, default features
-cargo clippy --no-deps    # warnings are not denied, but keep it clean
-cargo fmt --check
-cargo machete             # unused dependencies
-```
+- Run `cargo fmt --all` after Rust changes.
+- Run `cargo test -p moq-transport` for protocol changes.
+- Run `cargo test -p moq-relay-ietf` or `cargo build -p moq-relay-ietf` for relay-only changes.
+- Run `cargo build --workspace` when shared APIs, relay behavior, or test-client behavior changes.
+- Consider `cargo clippy --workspace --all-targets` before larger changes or when review asks for lint coverage.
+- List interop scenarios with `cargo run -p moq-test-client -- --list`.
+- Run a scenario against a local relay with `cargo run -p moq-test-client -- --relay https://localhost:4443 --tls-disable-verify --test data-subgroup-basic` (any `--list` name works; omit `--test` to run them all).
+- Run an ad-hoc moq-test tuple with `cargo run -p moq-test-client -- --relay https://localhost:4443 --tls-disable-verify --moq-test-tuple "moq-test-00/0/0/0/2/4/5/64/32/2/1/1/0/-1/-1/0"` (16 `/`-separated fields; blanks select defaults).
+- When tests fail, diagnose from compiler/test output first and keep fixes scoped to the failing behavior.
+- Run the fuzz harness from `moq-relay-ietf/` with nightly:
+  `cargo +nightly fuzz run decode_setup_tokens fuzz/seeds/decode_setup_tokens -- -max_total_time=300`
 
-REUSE compliance is also checked: every new file needs an
-`SPDX-FileCopyrightText` and `SPDX-License-Identifier` header. Match the header
-on a neighbouring file in the same crate.
+## Draft-18 Terminology
 
-Optional features are **not** covered by the default CI run. If you touch code
-behind one, test it explicitly:
+- Use `PUBLISH_NAMESPACE` terminology in protocol code and docs; older docs and comments may call this Announce.
+- `PublishedNamespace` represents an inbound `PUBLISH_NAMESPACE` received by a subscriber.
+- `TrackNamespacePrefix` is for `SUBSCRIBE_NAMESPACE` prefixes and may be empty; `TrackNamespace` is full and non-empty.
+- `REQUEST_OK`, `REQUEST_ERROR`, and `REQUEST_UPDATE` are shared request response/update messages.
+- Requests (SUBSCRIBE, PUBLISH_NAMESPACE, etc.) are sent on individual bidirectional streams; responses on the same stream omit the Request ID field.
+- `MAX_REQUEST_ID` and `REQUESTS_BLOCKED` do not exist in draft-18.
 
-```sh
-cargo test -p moq-relay-ietf --features auth-cat
-cargo clippy --no-deps --all-targets -p moq-relay-ietf --features auth-cat
-```
+## Token Authorization
 
-A feature-gated module still has to compile and behave correctly with the
-feature *off* — that is usually where the bugs are.
-
-## Workspace layout
-
-| Crate | Responsibility |
-|---|---|
-| `moq-transport` | The protocol. Wire encoding, control messages, session state machine, `serve` model. No policy, no I/O beyond the QUIC/WebTransport handle. |
-| `moq-relay-ietf` | The relay. Routing, caching, namespace/track registration, authorization. Both a library and the `moq-relay-ietf` binary. |
-| `moq-native-ietf` | QUIC/TLS setup shared by the native binaries (endpoints, certificates, ALPN). |
-| `moq-api` | HTTP API server for cluster-wide origin registration. |
-| `moq-pub` / `moq-sub` | Reference publisher and subscriber CLIs. |
-| `moq-clock-ietf` | Minimal publisher/subscriber used as a smoke test. |
-| `moq-catalog` | Catalog format types. |
-| `moq-test-client` | Interop test client. |
-
-Dependencies point one way: `moq-transport` knows nothing about the relay.
-Keep it that way — if the relay needs something from the transport, add an
-accessor rather than moving policy down.
-
-## Protocol references
-
-Cite the section, not just the document, when a decision follows from the spec.
-
-- **[draft-ietf-moq-transport-16](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/16/)** —
-  the transport. Frequently needed: §9.2.2.1 (AUTHORIZATION TOKEN), §9.3.1
-  (setup parameters), §13.1 (auth token alias types), §13.4.1 (session
-  termination codes), §13.4.2 (REQUEST_ERROR codes).
-- **[draft-ietf-moq-c4m-01](https://datatracker.ietf.org/doc/draft-ietf-moq-c4m/)** —
-  Common Access Token authorization. §2 (the `moqt` claim and its matching
-  rules), §3.1.1 (DPoP), §7.1 (token type registry).
-- **RFC 9052 / 8392 / 8747** — COSE, CWT, and CWT proof-of-possession, for
-  anything touching token encoding.
-
-The drafts are the authority. Where this implementation knowingly diverges, the
-divergence is documented at the site — search for "Known gap".
-
-## Conventions
-
-**Comments explain why.** The what is in the code. A comment earns its place by
-recording a constraint, a spec requirement, or a decision someone would
-otherwise undo. Prefer citing a draft section over restating the line below.
-
-**Fail closed.** Anything on an authorization or admission path treats an error
-as a denial, never as a pass. `Result` in that code is not an escape hatch:
-`unwrap_or_default`, `.ok()` and a permissive `_ =>` arm are how these bugs get
-written. The scope-policy cache is the one exception: by default, to admit new
-sessions during a coordinator outage, it reuses the last fetched policy after
-a failed refresh. A coordinator can turn this exception off with
-`Coordinator::reuse_scope_config_on_error`. Reuse is limited to 12 effective
-TTLs from the last successful fetch on scopes that enforce tokens. Scopes
-without a policy have no reuse limit. A scope whose configuration has never
-been fetched denies new sessions if the fetch fails.
-
-**Tests should fail when the behaviour breaks.** For a security control, check
-that: remove the control, confirm a test goes red, put it back. A test that
-still passes without the thing it is testing is worse than no test, because it
-implies coverage that does not exist.
-
-**Errors sent to a peer carry a code and a fixed phrase.** Diagnostic detail
-goes to logs. Never put validation internals, claim contents, or token bytes in
-a wire message — or in a `Debug` impl that might reach one.
-
-## Authorization
-
-Lives in `moq-relay-ietf/src/auth/`. Read `auth/mod.rs` first; it states the
-model and the fail-closed contract.
-
-Keys and policy come from the coordinator per scope
-(`Coordinator::get_scope_config`), never from per-key CLI flags — a relay
-serves multiple tenants and rotates keys without restarting. The standalone
-binary's coordinators can serve that policy from a JSON file given by
-`--scope-config` (`MOQ_RELAY_SCOPE_CONFIG`), which is re-read without a
-restart. A scope that returns no policy is unauthenticated by design and must
-keep working exactly as before.
 Sessions tagged `SessionInterface::Internal` are relay peers and skip token
-authorization; their setup tokens are still decoded and malformed ones
-rejected. Only an embedder that has authenticated the peer may tag it internal;
-a source subnet or listener address does not authenticate a peer on its own.
+authorization at setup and on every request. Their SETUP tokens must still be
+decoded, with malformed tokens and forbidden alias directives rejected
+(draft-18 section 10.2.2). Only an embedder that has authenticated the peer may
+tag it internal; a source subnet or listener address does not authenticate a
+peer on its own.
 
-Enforcement points are `AuthHook::on_setup` (once, before either session half
-exists) and `AuthHook::on_request` (before SUBSCRIBE, SUBSCRIBE_NAMESPACE,
-TRACK_STATUS, PUBLISH_NAMESPACE, PUBLISH). Standalone and joining FETCH are also gated:
-`serve_fetch` calls `may_fetch_track` which checks `AuthzOperation::Fetch`
-(CAT action 7) before any local or remote lookup. Each enforcement point runs
-*before* the corresponding lookup or registration; for SUBSCRIBE, TRACK_STATUS
-and FETCH that ordering is a correctness property, since deciding afterwards
-turns them into existence oracles.
+## Session Transport Seam
 
-**FETCH authorization.** `may_fetch_track` calls `authorize` with
-`AuthzOperation::Fetch`, which maps to `MoqtAction::Fetch` (CAT action 7,
-draft-16 §9.16). Any outcome other than an explicit allow is a denial —
-no fallback to `Subscribe(4)` or any other action.
+- Native sessions adapt `web_transport_trait::Session` through `session::transport::Session::new(backend, original_url)`. The embedder owns connection establishment and supplies truthful original URL metadata.
+- Browser wasm builds retain the separate `session/transport_wasm.rs` adapter; native backend injection does not replace that path.
+- External backends can name the transport trait and URL types through `moq_transport::reexports`.
 
-Adding an enforcement point means adding an `AuthzOperation` variant, which is
-deliberately a compile error everywhere it must be handled. FETCH uses
-`AuthzOperation::Fetch`; see `may_fetch_track` in `producer.rs`.
+## Outbound Connector Seam
 
-## Gotchas
+- `moq_native_ietf::client::Connector` establishes a transport before MoQT SETUP.
+- Preserve the original URL and its verification name, credentials and path; a direct destination address must not replace that name. Retain the original TLS/trust and bind policy rather than rebuilding it.
+- Keep the borrowed connect future cancellation-safe: dropping it must release in-flight resources. Do not add detached drivers, retries or fallback inside the client wrapper.
 
-- `moq-transport`'s `Publisher`/`Subscriber` cannot be constructed outside that
-  crate, so relay code holding one is not unit-testable. Extract the decision
-  into a free function and test that.
-- `KeyValuePairs::get` returns only the first match. Parameters that may
-  legitimately repeat (AUTHORIZATION TOKEN, §9.2.2.1) must be read by iterating
-  `.0`.
-- `ReasonPhrase` is capped at 1024 bytes and *fails to encode* above it. An
-  encode failure on the control stream propagates out of `Session::run` and
-  ends the session, so it is not merely a lost message. Build one with
-  `ReasonPhrase::new`, which truncates on a character boundary; the tuple
-  constructor is only safe for string literals.
-- Dropping a request handle (`Subscribed`, `PublishedNamespace`,
-  `PublishReceived`) sends a rejection to the peer. Check the `Drop` impl
-  before assuming a code or reason reaches the wire.
-- `cargo fmt` reformats the whole workspace. Check `git diff --stat` and revert
-  unrelated churn before committing.
+## External Contributions
+
+- Treat public GitHub mirror and community PRs with heightened scrutiny for protocol correctness, resource bounds, panic-free production paths, and safe peer-facing errors.
+- Be careful with compatibility: do not rename public CLI flags or remove behavior solely for terminology cleanup without an explicit migration decision.

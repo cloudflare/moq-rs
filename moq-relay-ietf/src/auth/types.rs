@@ -11,7 +11,7 @@ use secrecy::{ExposeSecret, SecretSlice};
 
 use crate::SessionContext;
 
-/// A resolved AUTHORIZATION TOKEN (draft-16 §9.2.2.1).
+/// A resolved AUTHORIZATION TOKEN (draft-18 §10.2.2, §10.3.1.4).
 ///
 /// Alias bookkeeping is resolved before a hook sees this, so implementations
 /// always get a Token Type and Token Value pair, never a raw alias directive.
@@ -26,12 +26,12 @@ use crate::SessionContext;
 /// # What this does and does not protect
 ///
 /// It bounds the lifetime of this one copy, and this is the only copy the
-/// relay's own decoding creates — [`decode_setup_tokens`] borrows the
-/// parameter rather than duplicating it. It does **not** make the process
+/// relay's own decoding creates — the transport parser borrows the option
+/// value, and [`decode_setup_tokens`] copies it straight into this buffer. It does **not** make the process
 /// secret-free. Others exist and none are zeroized:
 ///
 /// * the QUIC receive path, and the transport's `Reader` buffer, which
-///   retains the raw CLIENT_SETUP for the life of the session;
+///   retains the raw SETUP for the life of the session;
 /// * [`Session::setup_params`], likewise for the life of the session;
 /// * with the `auth-cat` feature, the allocations `cat-token` makes per
 ///   verification attempt while base64-decoding the token and re-encoding the
@@ -146,45 +146,46 @@ impl fmt::Debug for Principal {
 
 /// The operation being authorized.
 ///
-/// Each variant corresponds to a live authorization point in the relay.
-/// Standalone and joining FETCH are not separate variants: `serve_fetch`
-/// calls `fetch.resolve()` which converts both forms to a `StandaloneFetch`
-/// range, then authorises via `AuthzOperation::Fetch` with the resolved
-/// namespace and track. FETCH requires `Fetch(7)` from the CAT `moqt` claim.
+/// Each variant corresponds to an authorization point in the relay. FETCH
+/// requires `Fetch(7)` from the CAT `moqt` claim; `Subscribe(4)` is not
+/// accepted in its place.
+///
+/// SUBSCRIBE_TRACKS (draft-18 §10.19) has no variant of its own because the
+/// CAT `moqt` action registry has no code point for it yet; the relay gates it
+/// as [`SubscribeNamespace`](Self::SubscribeNamespace) in the interim.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AuthzOperation<'a> {
-    /// Inbound PUBLISH_NAMESPACE (draft-16 §9.20).
+    /// Inbound PUBLISH_NAMESPACE (draft-18 §10.15).
     PublishNamespace { namespace: &'a TrackNamespace },
 
-    /// Inbound PUBLISH for a single track (§9.13).
+    /// Inbound PUBLISH for a single track (§10.10).
     Publish {
         namespace: &'a TrackNamespace,
         track: &'a TrackName,
     },
 
-    /// Inbound SUBSCRIBE (§9.9).
+    /// Inbound SUBSCRIBE (§10.7).
     Subscribe {
         namespace: &'a TrackNamespace,
         track: &'a TrackName,
     },
 
-    /// Inbound SUBSCRIBE_NAMESPACE (§9.25).
+    /// Inbound SUBSCRIBE_NAMESPACE (§10.18).
     SubscribeNamespace { prefix: &'a TrackNamespacePrefix },
 
-    /// Inbound TRACK_STATUS (§9.19).
+    /// Inbound TRACK_STATUS (§10.14).
     TrackStatus {
         namespace: &'a TrackNamespace,
         track: &'a TrackName,
     },
 
-    /// Inbound FETCH — standalone or joining (draft-16 §9.16).
+    /// Inbound FETCH — standalone or joining (draft-18 §10.12).
     ///
-    /// `serve_fetch` resolves joining FETCH to a standalone request before
-    /// calling `may_fetch_track`, so both forms are authorized through this
-    /// variant. FETCH retrieves a bounded range of archived track content and
-    /// requires `Fetch = 7` in the CAT `moqt` claim (`Subscribe = 4` is not
-    /// accepted).
+    /// FETCH retrieves a bounded range of archived track content and requires
+    /// `Fetch = 7` in the CAT `moqt` claim (`Subscribe = 4` is not accepted).
+    /// Both forms are authorized through this variant once a joining FETCH has
+    /// been resolved to its track.
     Fetch {
         namespace: &'a TrackNamespace,
         track: &'a TrackName,
@@ -281,8 +282,8 @@ pub enum Verdict {
 /// Why an operation was denied.
 ///
 /// Abstract on purpose: the relay maps these onto wire codes, and the mapping
-/// differs between session termination (§13.4.1) and per-request rejection
-/// (§13.4.2).
+/// differs between session termination (draft-18 §15.10.1) and per-request
+/// rejection (§15.10.2).
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum DenyReason {
@@ -362,7 +363,8 @@ impl DenyReason {
         }
     }
 
-    /// The REQUEST_ERROR code for rejecting a single request (§13.4.2).
+    /// The REQUEST_ERROR code for rejecting a single request (draft-18 §10.6,
+    /// §15.10.2; unchanged from draft-16).
     ///
     /// Malformed and expired tokens have dedicated codes; everything else is
     /// UNAUTHORIZED. The reason phrase sent alongside is fixed text, so no
@@ -491,8 +493,8 @@ mod tests {
     }
 
     #[test]
-    fn deny_reasons_map_to_draft16_request_error_codes() {
-        // §13.4.2: MALFORMED_AUTH_TOKEN 0x4, EXPIRED_AUTH_TOKEN 0x5,
+    fn deny_reasons_map_to_draft18_request_error_codes() {
+        // draft-18 §15.10.2: MALFORMED_AUTH_TOKEN 0x4, EXPIRED_AUTH_TOKEN 0x5,
         // UNAUTHORIZED 0x1.
         assert_eq!(DenyReason::TokenMalformed.request_error_code(), 0x4);
         assert_eq!(DenyReason::TokenExpired.request_error_code(), 0x5);

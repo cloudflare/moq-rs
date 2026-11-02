@@ -25,11 +25,12 @@ mod fetch_type;
 mod filter_type;
 mod go_away;
 mod group_order;
-mod max_request_id;
+
 mod namespace;
 mod params;
 mod pubilsh_namespace_done;
 mod publish;
+mod publish_blocked;
 mod publish_done;
 mod publish_namespace;
 mod publish_namespace_cancel;
@@ -38,10 +39,11 @@ mod publisher;
 mod request_error;
 mod request_ok;
 mod request_update;
-mod requests_blocked;
+
 mod subscribe;
 mod subscribe_namespace;
 mod subscribe_ok;
+mod subscribe_tracks;
 mod subscriber;
 mod track_status;
 mod unsubscribe;
@@ -53,11 +55,12 @@ pub use fetch_type::*;
 pub use filter_type::*;
 pub use go_away::*;
 pub use group_order::*;
-pub use max_request_id::*;
+
 pub use namespace::*;
 pub use params::*;
 pub use pubilsh_namespace_done::*;
 pub use publish::*;
+pub use publish_blocked::*;
 pub use publish_done::*;
 pub use publish_namespace::*;
 pub use publish_namespace_cancel::*;
@@ -66,10 +69,11 @@ pub use publisher::*;
 pub use request_error::*;
 pub use request_ok::*;
 pub use request_update::*;
-pub use requests_blocked::*;
+
 pub use subscribe::*;
 pub use subscribe_namespace::*;
 pub use subscribe_ok::*;
+pub use subscribe_tracks::*;
 pub use subscriber::*;
 pub use track_status::*;
 pub use unsubscribe::*;
@@ -81,6 +85,16 @@ use std::fmt;
 // Use a macro to generate the Message enum and its encode/decode impls.
 macro_rules! message_types {
     {$($name:ident = $val:expr,)*} => {
+        /// Wire type IDs for control messages (draft-18 Table 5).
+        ///
+        /// These are the `u64` values used in the `Message Type` field on
+        /// the wire. Use these constants instead of hardcoded hex literals
+        /// when matching or constructing message frames.
+        #[allow(non_upper_case_globals)]
+        pub mod wire_id {
+            $(pub const $name: u64 = $val;)*
+        }
+
         /// All supported control message types.
         #[derive(Clone)]
         pub enum Message {
@@ -112,12 +126,20 @@ macro_rules! message_types {
                     return Err(DecodeError::InvalidMessage(t));
                 }
 
+                if !msg.parameter_scopes_valid() {
+                    return Err(DecodeError::InvalidParameter);
+                }
+
                 Ok(msg)
             }
         }
 
         impl Encode for Message {
             fn encode<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+                if !self.parameter_scopes_valid() {
+                    return Err(EncodeError::InvalidValue);
+                }
+
                 match self {
                     $(Self::$name(ref m) => {
                         self.id().encode(w)?;
@@ -150,6 +172,26 @@ macro_rules! message_types {
                 }
             }
 
+            pub(crate) fn parameter_scopes_valid(&self) -> bool {
+                let params = match self {
+                    Self::RequestUpdate(m) => &m.params,
+                    Self::RequestOk(m) => &m.params,
+                    Self::Subscribe(m) => &m.params,
+                    Self::SubscribeOk(m) => &m.params,
+                    Self::PublishNamespace(m) => &m.params,
+                    Self::TrackStatus(m) => &m.params,
+                    Self::Publish(m) => &m.params,
+                    Self::PublishOk(m) => &m.params,
+                    Self::Fetch(m) => &m.params,
+                    Self::FetchOk(m) => &m.params,
+                    Self::SubscribeNamespace(m) => &m.params,
+                    Self::SubscribeTracks(m) => &m.params,
+                    _ => return true,
+                };
+
+                params.parameters_allowed_on(self.id())
+            }
+
             /// Return the request ID if this message participates in request ID sequencing.
             ///
             /// Responses and cancellation messages reference existing request IDs
@@ -162,8 +204,27 @@ macro_rules! message_types {
                     Self::Fetch(m) => Some(m.id),
                     Self::TrackStatus(m) => Some(m.id),
                     Self::SubscribeNamespace(m) => Some(m.id),
+                    Self::SubscribeTracks(m) => Some(m.id),
                     Self::Publish(m) => Some(m.id),
                     Self::PublishNamespace(m) => Some(m.id),
+                    _ => None,
+                }
+            }
+
+            /// Return the target request ID for response/follow-up messages sent
+            /// back on a bidi stream (draft-18). Returns `None` for request-initiating
+            /// messages and session-level messages.
+            pub fn response_target_id(&self) -> Option<u64> {
+                match self {
+                    Self::RequestUpdate(m) => Some(m.existing_request_id),
+                    Self::RequestOk(m) => Some(m.id),
+                    Self::RequestError(m) => Some(m.id),
+                    Self::SubscribeOk(m) => Some(m.id),
+                    Self::PublishDone(m) => Some(m.id),
+                    Self::PublishNamespaceDone(m) => Some(m.id),
+                    Self::Unsubscribe(m) => Some(m.id),
+                    Self::PublishOk(m) => Some(m.id),
+                    Self::FetchOk(m) => Some(m.id),
                     _ => None,
                 }
             }
@@ -213,19 +274,19 @@ message_types! {
     Publish         = 0x1d,
     PublishDone     = 0xb,
     PublishOk       = 0x1e,
+    PublishBlocked  = 0x0f,
 
     // ── FETCH family ─────────────────────────────────────────────────────────
     Fetch           = 0x16,
     FetchCancel     = 0x17,
     FetchOk         = 0x18,
 
-    // ── SUBSCRIBE_NAMESPACE (bidi stream; §9.25) ──────────────────────────────
-    SubscribeNamespace = 0x11,
+    // ── SUBSCRIBE_NAMESPACE (bidi stream; §10.18) ────────────────────────────
+    SubscribeNamespace = 0x50,
+    SubscribeTracks = 0x51,
 
     // ── Session management ────────────────────────────────────────────────────
     GoAway          = 0x10,
-    MaxRequestId    = 0x15,
-    RequestsBlocked = 0x1a,
 }
 
 #[cfg(test)]
@@ -298,31 +359,39 @@ mod tests {
             Message::SubscribeNamespace(SubscribeNamespace {
                 id: 8,
                 track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("test/ns"),
-                subscribe_options: SubscribeOptions::Both,
                 params: KeyValuePairs::default(),
             }),
             8,
         );
 
         assert_sequenced(
-            Message::Publish(Publish {
+            Message::SubscribeTracks(SubscribeTracks {
                 id: 10,
+                track_namespace_prefix: TrackNamespacePrefix::from_utf8_path("test/ns"),
+                params: KeyValuePairs::default(),
+            }),
+            10,
+        );
+
+        assert_sequenced(
+            Message::Publish(Publish {
+                id: 12,
                 track_namespace: namespace(),
                 track_name: "track".into(),
                 track_alias: 1,
                 params: KeyValuePairs::default(),
                 track_extensions: TrackExtensions::default(),
             }),
-            10,
+            12,
         );
 
         assert_sequenced(
             Message::PublishNamespace(PublishNamespace {
-                id: 12,
+                id: 14,
                 track_namespace: namespace(),
                 params: KeyValuePairs::default(),
             }),
-            12,
+            14,
         );
     }
 
@@ -383,7 +452,76 @@ mod tests {
     }
 
     #[test]
-    fn draft16_wire_layouts_for_changed_control_messages() {
+    fn message_boundary_enforces_parameter_scope() {
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(1_000);
+        let request_ok = RequestOk { id: 1, params };
+
+        let mut encoded = bytes::BytesMut::new();
+        let err = Message::RequestOk(request_ok.clone())
+            .encode(&mut encoded)
+            .unwrap_err();
+        assert!(matches!(err, EncodeError::InvalidValue));
+
+        encoded.clear();
+        let mut payload = bytes::BytesMut::new();
+        request_ok.encode(&mut payload).unwrap();
+        wire_id::RequestOk.encode(&mut encoded).unwrap();
+        (payload.len() as u16).encode(&mut encoded).unwrap();
+        encoded.extend_from_slice(&payload);
+
+        let err = Message::decode(&mut encoded).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidParameter));
+
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(1_000);
+        params.set_bytesvalue(123, vec![1, 2, 3]);
+        let subscribe = Message::Subscribe(Subscribe {
+            id: 2,
+            track_namespace: namespace(),
+            track_name: "track".into(),
+            params,
+        });
+
+        encoded.clear();
+        subscribe.encode(&mut encoded).unwrap();
+        let Message::Subscribe(decoded) = Message::decode(&mut encoded).unwrap() else {
+            panic!("expected SUBSCRIBE");
+        };
+        assert_eq!(decoded.params.rendezvous_timeout().unwrap(), Some(1_000));
+        assert!(decoded.params.get(123).is_some());
+
+        let mut params = KeyValuePairs::default();
+        params.set_subscriber_priority(128);
+        let subscribe_tracks = Message::SubscribeTracks(SubscribeTracks {
+            id: 4,
+            track_namespace_prefix: TrackNamespacePrefix::new(),
+            params,
+        });
+        encoded.clear();
+        assert!(matches!(
+            subscribe_tracks.encode(&mut encoded),
+            Err(EncodeError::InvalidValue)
+        ));
+
+        let mut params = KeyValuePairs::default();
+        params.set_forward(false);
+        params.set_bytesvalue(parameter_type::AUTHORIZATION_TOKEN, vec![1, 2, 3]);
+        let subscribe_tracks = Message::SubscribeTracks(SubscribeTracks {
+            id: 4,
+            track_namespace_prefix: TrackNamespacePrefix::new(),
+            params,
+        });
+        encoded.clear();
+        subscribe_tracks.encode(&mut encoded).unwrap();
+        assert!(matches!(
+            Message::decode(&mut encoded).unwrap(),
+            Message::SubscribeTracks(_)
+        ));
+    }
+
+    #[test]
+    fn draft18_wire_layouts_for_control_messages() {
         fn encoded(msg: Message) -> Vec<u8> {
             let mut buf = bytes::BytesMut::new();
             msg.encode(&mut buf).unwrap();
@@ -473,14 +611,32 @@ mod tests {
             vec![0x18, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00]
         );
 
+        // Draft-18 §10.18: Request ID, Track Namespace Prefix, Parameters.
+        // Type=0x50, Length=3, id=0x00, pfc=0x00 (empty prefix), params_count=0x00.
         assert_eq!(
             encoded(Message::SubscribeNamespace(SubscribeNamespace {
                 id: 0,
                 track_namespace_prefix: prefix,
-                subscribe_options: SubscribeOptions::Both,
                 params: KeyValuePairs::default(),
             })),
-            vec![0x11, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00]
+            vec![0x50, 0x00, 0x03, 0x00, 0x00, 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::SubscribeTracks(SubscribeTracks {
+                id: 0,
+                track_namespace_prefix: TrackNamespacePrefix::new(),
+                params: KeyValuePairs::default(),
+            })),
+            vec![0x51, 0x00, 0x03, 0x00, 0x00, 0x00]
+        );
+
+        assert_eq!(
+            encoded(Message::PublishBlocked(PublishBlocked {
+                track_namespace_suffix: TrackNamespacePrefix::new(),
+                track_name: "t".into(),
+            })),
+            vec![0x0f, 0x00, 0x03, 0x00, 0x01, b't']
         );
     }
 }

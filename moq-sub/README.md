@@ -5,23 +5,60 @@ A command line tool for subscribing to media via Media over QUIC (MoQ).
 Takes a URL to a MoQ relay and a broadcast name via `--name`. It will connect to the relay, subscribe to the broadcast,
 and dump the media segments of the first video and first audio track to STDOUT.
 
-```sh
+```
 moq-sub --name dev https://localhost:4443 | ffplay -
 ```
 
-With no subcommand, `moq-sub` preserves the live subscription behavior above. The init segment is always written first.
+## FETCH playback (draft-18)
 
-Saved media can be requested with one of the nested `fetch` modes:
+The publisher must retain history, for example with `moq-pub --fetch-groups 8`.
+The existing FETCH commands are supported:
 
 ```sh
-# Fetch groups 10 through 20, then exit. END object 0 includes the whole group.
-moq-sub --name dev https://localhost:4443 fetch standalone 10:0 20:0 > media.mp4
-
-# Fetch the last five groups (the boundary group counts as one), then continue live.
-moq-sub --name dev https://localhost:4443 fetch relative 5 | ffplay -
-
-# Fetch from absolute group 100 through the live boundary, then continue live.
-moq-sub --name dev https://localhost:4443 fetch absolute 100 | ffplay -
+# Replay three groups including the subscription's boundary group, then live.
+moq-sub --name dev https://localhost:4443 fetch relative 3 | ffplay -
+# Equivalent: two previous groups plus the boundary group.
+moq-sub --name dev --join-groups 2 https://localhost:4443 | ffplay -
+# Replay from group 4 to the live boundary, then live.
+moq-sub --name dev https://localhost:4443 fetch absolute 4 | ffplay -
+# Fetch a finite range and exit. End Object 0 includes the whole end group.
+moq-sub --name dev https://localhost:4443 fetch standalone 4:0 6:0 > clip.mp4
 ```
 
-Locations use decimal `GROUP:OBJECT` syntax. A nonzero END object is exclusive, while END object `0` includes the entire end group; equal nonzero locations request an empty range. Group and object values are limited to QUIC variable-length integers, and relative `GROUPS` must be non-zero. Joining modes buffer complete live objects while all selected-track FETCH requests finish, then release the live stream without interleaving it with fetched output. FETCH processing and buffered live media each account for at most 16 MiB and 32 complete-object payloads, excluding transport, QUIC, output-writer, allocator, and publisher-history memory. Producers wait for application budget capacity instead of failing during contention; an individual object larger than 16 MiB is rejected.
+Locations are unsigned decimal `GROUP:OBJECT` values using draft-18's full
+64-bit ID range. A nonzero end Object is exclusive. Catalog/init tracks are
+downloaded with SUBSCRIBE in every mode. Standalone playback fetches media
+tracks only and flushes output before returning.
+
+Joining playback uses a Largest Object SUBSCRIBE and a relative or absolute
+Joining FETCH. A cold relay is primed and re-subscribed to obtain an actual
+Joining Location. FETCH must cover the requested first Object and end exactly
+at that location. The subscriber outputs history before buffered live Objects,
+discards overlap through the boundary and checks consecutive media IDs across
+the handoff. All selected tracks finish history before any releases live data.
+
+This media profile uses one subgroup (ID 0) per group and consecutive group
+and Object IDs, as produced by `moq-pub`. Unavailable history, gaps, unsupported
+subgroups and oversized Objects are errors. Per track, live buffering uses a
+32-slot queue and a 16 MiB payload budget. When either fills, collection waits
+for playback to drain it; a slow history FETCH does not cause queue-exhaustion
+errors. Each fetched Object is limited to 16 MiB. Warm-up and FETCH have
+ten-second deadlines.
+
+FETCH modes propagate metadata SUBSCRIBE and playback failures, because a
+missing track or history prefix would invalidate the requested replay. Live-only
+playback retains warning-only SUBSCRIBE/track failure handling so other tracks
+can continue.
+
+Library callers use
+`Media::new_with_fetch(subscriber, tracks, output, request_catalog, Some(mode))`.
+`media::FetchMode` retains its `Standalone { start, end }` and `Joining(...)`
+variants. **Migration from draft-16:** import `JoiningStart` from
+`moq_sub::media` rather than `moq_transport::session`; draft-18 transport uses
+`Subscriber::joining_fetch(FetchType, request_id, start, params)` instead.
+`JoiningStart::Relative(0)` still means the boundary group, while the CLI's
+`fetch relative 1` expresses the same choice as a group count. `Media::new`
+continues to select live playback.
+
+The `moq_sub::reexports::moq_transport` module exposes the transport types used
+by these public APIs, including `Location`, `Subscriber` and `Tracks`.

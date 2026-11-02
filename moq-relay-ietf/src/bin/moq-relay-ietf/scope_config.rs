@@ -29,7 +29,7 @@
 //! ```
 //!
 //! A scope ID is the session's normalized connection path (the WebTransport
-//! URL path, or the CLIENT_SETUP PATH parameter over raw QUIC), for example `/demo`. A
+//! URL path, or the SETUP PATH option over raw QUIC), for example `/demo`. A
 //! session's policy is the `scopes` entry for its scope ID if there is one,
 //! otherwise `default`. A session with no path is unscoped and always uses
 //! `default`. With neither, the scope has no token policy.
@@ -312,7 +312,6 @@ fn convert_scope(
     if let Some(secs) = auth.ttl_secs {
         if secs > WARN_TTL_SECS {
             tracing::warn!(
-                scope = label,
                 ttl_secs = secs,
                 "ttl_secs is above {WARN_TTL_SECS}; a removed key keeps admitting new sessions \
                  for up to this long"
@@ -324,7 +323,6 @@ fn convert_scope(
     for (field, values) in [("issuers", &auth.issuers), ("audiences", &auth.audiences)] {
         if values.is_empty() {
             tracing::warn!(
-                scope = label,
                 "auth.{field} is empty, so tokens with any {} are accepted",
                 if field == "issuers" { "iss" } else { "aud" }
             );

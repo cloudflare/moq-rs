@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::*;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use web_transport::quinn::{self as wt, quinn};
 
@@ -43,7 +42,7 @@ async fn pair_with_ack_control(
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let alpn = if raw {
-        b"moqt-16".to_vec()
+        b"moqt-18".to_vec()
     } else {
         wt::ALPN.as_bytes().to_vec()
     };
@@ -149,15 +148,14 @@ async fn pair_with_ack_control(
 
 fn forwarder(session: web_transport::Session) -> (ObjectForwarder, ObjectForwarderRecv) {
     let (outgoing, _outgoing_recv) = crate::watch::Queue::default().split();
+    let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
     ObjectForwarder::new(
         Publisher::new(
             outgoing,
             session,
             None,
-            crate::session::RequestId::new(0, u64::MAX, u64::MAX, 1),
-            crate::session::PendingRequests::default(),
-            crate::session::SessionId::generate(),
-            tokio_util::sync::CancellationToken::new(),
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
         ),
         42,
         None,
@@ -178,7 +176,7 @@ async fn source() -> (serve::SubgroupsWriter, serve::SubgroupsReader) {
             priority: 128,
         })
         .unwrap();
-    let mut object = subgroup.create(PAYLOAD, None).unwrap();
+    let mut object = subgroup.create_with_id(0, PAYLOAD, None).unwrap();
     object.write(bytes::Bytes::from(vec![7; PAYLOAD])).unwrap();
     drop(object);
     drop(subgroup);
@@ -186,6 +184,21 @@ async fn source() -> (serve::SubgroupsWriter, serve::SubgroupsReader) {
         panic!("expected subgroups")
     };
     (writer, reader)
+}
+
+// Observe the reset through the backend-neutral receive API. Any payload already
+// delivered before cancellation may precede the terminal stream error.
+async fn expect_reset(stream: &mut web_transport::RecvStream, code: u32) {
+    loop {
+        match stream.read(65536).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected RESET_STREAM, received FIN"),
+            Err(err) => {
+                assert_eq!(err.stream_error(), Some(code));
+                return;
+            }
+        }
+    }
 }
 
 async fn cancelled_finished_stream(raw: bool, unsubscribe: bool) {
@@ -227,7 +240,7 @@ async fn cancelled_finished_stream(raw: bool, unsubscribe: bool) {
         // A locally stopped receive stream no longer exposes a reset code;
         // observe the actual incoming RESET_STREAM frame in that case.
         if unsubscribe {
-            assert_eq!(stream.closed().await.unwrap(), Some(code as u8));
+            expect_reset(&mut stream, code).await;
         }
         while observer.stats().frame_rx.reset_stream == before {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -295,10 +308,7 @@ async fn cancellation_is_scoped_and_ack_releases(raw: bool) {
     };
     let receive = async {
         cancel.recv_unsubscribe().unwrap();
-        assert_eq!(
-            stale.closed().await.unwrap(),
-            Some(u32::from(DataStreamResetCode::Cancelled) as u8)
-        );
+        expect_reset(&mut stale, u32::from(DataStreamResetCode::Cancelled)).await;
         let mut stream = receiver.accept_uni().await.unwrap();
         let mut bytes = 0;
         while let Some(chunk) = stream.read(65536).await.unwrap() {
@@ -338,7 +348,7 @@ async fn finished_subgroups_release_active_slots(raw: bool, overflow: bool) {
     // No data stream has been opened yet, so none can already have its FIN ACKed.
     proxy.1.store(true, Ordering::SeqCst);
     let (mut forwarder, mut cancel) = forwarder(sender);
-    let opened = forwarder.state.clone();
+    let opened = forwarder.stream_count.clone();
     let (writer, reader) = serve::Track::new(
         crate::coding::TrackNamespace::from_utf8_path("test"),
         "short-subgroups",
@@ -362,13 +372,13 @@ async fn finished_subgroups_release_active_slots(raw: bool, overflow: bool) {
                     priority: 128,
                 })
                 .unwrap();
-            let mut object = subgroup.create(1, None).unwrap();
+            let mut object = subgroup.create_with_id(0, 1, None).unwrap();
             object.write(bytes::Bytes::from_static(b"x")).unwrap();
             drop(object);
             drop(subgroup);
-            // Don't overwrite the latest subgroup before the forwarder has
-            // taken its reader.
-            while opened.lock().stream_count <= subgroup_id {
+            // Also works with the draft-16 latest-only reader: don't overwrite
+            // a subgroup before the forwarder has taken its reader.
+            while opened.get() <= subgroup_id {
                 tokio::task::yield_now().await;
             }
         }

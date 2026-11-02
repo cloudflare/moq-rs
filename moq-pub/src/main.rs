@@ -18,7 +18,7 @@ use moq_pub::{serve_fetches, FetchHistory, Media};
 use moq_transport::{
     coding::{KeyValuePairs, TrackName, TrackNamespace},
     serve,
-    session::{Publisher, SessionId},
+    session::Publisher,
 };
 
 #[derive(Parser, Clone)]
@@ -53,7 +53,7 @@ pub struct Cli {
     #[arg(long)]
     pub publish: bool,
 
-    /// Retain the newest N media groups per track for FETCH.
+    /// Retain the newest N groups per track for FETCH (also byte/Object bounded).
     #[arg(long)]
     pub fetch_groups: Option<NonZeroUsize>,
 }
@@ -102,15 +102,9 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    // TODO(itzmanish): When SessionId becomes mandatory in the next breaking API, make
-    // `connect` accept it and remove `connect_with_session_id`.
-    let (session, publisher) = Publisher::connect_with_session_id(
-        session,
-        SessionId::new(connection_id.clone()),
-        transport,
-    )
-    .await
-    .context("failed to create MoQ Transport publisher")?;
+    let (session, publisher) = Publisher::connect(session, transport)
+        .await
+        .context("failed to create MoQ Transport publisher")?;
 
     let mut namespace_publisher = publisher.clone();
     let publish_publisher = publisher.clone();
@@ -190,6 +184,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fetch_groups_preserves_opt_in_and_nonzero_limit() {
+        let args = ["moq-pub", "https://example.com/watch", "--name", "test"];
+        assert!(Cli::try_parse_from(args).unwrap().fetch_groups.is_none());
+        assert_eq!(
+            Cli::try_parse_from(args.into_iter().chain(["--fetch-groups", "3"]))
+                .unwrap()
+                .fetch_groups,
+            NonZeroUsize::new(3)
+        );
+        assert!(Cli::try_parse_from(args.into_iter().chain(["--fetch-groups", "0"])).is_err());
+    }
+
+    #[test]
     fn publish_flag_defaults_false() {
         let cli = Cli::try_parse_from(["moq-pub", "https://example.com/watch", "--name", "test"])
             .unwrap();
@@ -207,39 +214,5 @@ mod tests {
         ])
         .unwrap();
         assert!(cli.publish);
-    }
-
-    #[test]
-    fn fetch_groups_defaults_disabled() {
-        let cli = Cli::try_parse_from(["moq-pub", "https://example.com/watch", "--name", "test"])
-            .unwrap();
-        assert_eq!(cli.fetch_groups, None);
-    }
-
-    #[test]
-    fn fetch_groups_accepts_nonzero_capacity() {
-        let cli = Cli::try_parse_from([
-            "moq-pub",
-            "https://example.com/watch",
-            "--name",
-            "test",
-            "--fetch-groups",
-            "3",
-        ])
-        .unwrap();
-        assert_eq!(cli.fetch_groups, std::num::NonZeroUsize::new(3));
-    }
-
-    #[test]
-    fn fetch_groups_rejects_zero() {
-        assert!(Cli::try_parse_from([
-            "moq-pub",
-            "https://example.com/watch",
-            "--name",
-            "test",
-            "--fetch-groups",
-            "0",
-        ])
-        .is_err());
     }
 }

@@ -2,18 +2,23 @@
 // SPDX-FileCopyrightText: 2023-2024 Luke Curley and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::ops;
+use std::{ops, time::Duration};
 
 use crate::{
-    coding::{KeyValuePairs, Location, TrackName, TrackNamespace},
+    coding::{KeyValuePairs, Location, ReasonPhrase, TrackName, TrackNamespace},
     data,
-    message::{self, FilterType, GroupOrder, SubscriptionFilter},
+    message::{self, FilterType, GroupOrder, SubscriptionFilter, TrackExtensions},
     serve::{self, ServeError, TrackWriter, TrackWriterMode},
 };
 
 use crate::watch::State;
 
-use super::{joining_fetch_end_location, SessionError, Subscriber};
+use super::SessionError;
+use super::Subscriber;
+use super::{DoneOutcome, StreamDrain};
+
+const SUBSCRIBE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+type SubscribeRequestSink = tokio::sync::mpsc::Sender<super::BidiResponse>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeliveryFilter {
@@ -68,7 +73,7 @@ pub struct SubscribeInfo {
     pub end_group_id: Option<u64>,
 
     /// None means the SUBSCRIPTION_FILTER parameter was omitted and the
-    /// subscription is unfiltered per draft-16 §9.2.2.5.
+    /// subscription is unfiltered.
     pub filter: Option<SubscriptionFilter>,
 
     /// Optional parameters
@@ -76,15 +81,6 @@ pub struct SubscribeInfo {
 
     // Set to true if this is a track_status request only
     pub track_status: bool,
-}
-
-/// Start selection for a Joining FETCH associated with this subscription.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum JoiningStart {
-    /// Start at the beginning of the saved Largest Location's group minus this offset.
-    Relative(u64),
-    /// Start at the beginning of this absolute group.
-    Absolute(u64),
 }
 
 impl SubscribeInfo {
@@ -96,6 +92,7 @@ impl SubscribeInfo {
             .unwrap_or(FilterType::AbsoluteStart);
         let start_location = filter.as_ref().and_then(|filter| filter.start_location);
         let end_group_id = filter.as_ref().and_then(|filter| filter.end_group_id);
+        msg.params.rendezvous_timeout()?;
 
         Ok(Self {
             id: msg.id,
@@ -136,231 +133,45 @@ impl SubscribeInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) enum JoiningEligibility {
-    Pending,
-    Established,
-    InvalidRequestId,
-    WrongFilter,
+/// The SUBSCRIBE_OK acknowledgement received from the publisher (draft-18
+/// §9.10).
+///
+/// The transport consumes only the Track Alias (for stream routing) and
+/// `default_publisher_priority` (for Object decoding); everything else the
+/// publisher sent is kept here, losslessly, so an application can read
+/// LARGEST_OBJECT, EXPIRES, DELIVERY_TIMEOUT, NEW_GROUP_REQUEST, GROUP_ORDER,
+/// MAX_CACHE_DURATION, DYNAMIC_GROUPS, and any unrecognized parameters or
+/// extensions through the typed accessors on [`KeyValuePairs`] and
+/// [`TrackExtensions`].
+#[derive(Debug, Clone)]
+pub struct SubscribeOkInfo {
+    /// The Track Alias the publisher bound this subscription to (§10.1).
+    pub track_alias: u64,
+
+    /// Message parameters carried by SUBSCRIBE_OK (§10.2).
+    pub params: KeyValuePairs,
+
+    /// Track extensions carried by SUBSCRIBE_OK.
+    pub track_extensions: TrackExtensions,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(super) struct JoiningSnapshot {
-    pub track_namespace: TrackNamespace,
-    pub track_name: TrackName,
-    pub largest: Location,
-}
+/// The PUBLISH_DONE that terminated this subscription (draft-18 §10.11).
+///
+/// [`Subscribe::closed`] reports termination only as a [`ServeError`]; this
+/// keeps the full terminal record so an application can compare the announced
+/// Stream Count against the data streams it actually received and read the
+/// publisher's reason phrase.
+#[derive(Debug, Clone)]
+pub struct PublishDoneInfo {
+    /// Why the subscription ended (§15.10.3).
+    pub status_code: u64,
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) enum JoiningSnapshotError {
-    InvalidRequestId,
-}
+    /// The number of data streams the publisher opened for this subscription,
+    /// including streams that contained no Objects.
+    pub stream_count: u64,
 
-#[derive(Debug)]
-enum JoiningPhase {
-    PendingSubscriber {
-        filter: Option<FilterType>,
-    },
-    PendingPublisher {
-        saved_largest: Option<Location>,
-    },
-    Established {
-        filter: Option<FilterType>,
-        saved_largest: Option<Location>,
-    },
-    Terminated {
-        saved_largest: Option<Option<Location>>,
-    },
-}
-
-#[derive(Clone)]
-pub(super) struct JoiningAssociation {
-    track_namespace: TrackNamespace,
-    track_name: TrackName,
-    state: State<JoiningPhase>,
-}
-
-pub(super) struct JoiningAssociationEntry {
-    association: JoiningAssociation,
-    _owner: State<JoiningPhase>,
-}
-
-impl JoiningAssociationEntry {
-    pub fn pending_subscriber(
-        track_namespace: TrackNamespace,
-        track_name: TrackName,
-        filter: Option<FilterType>,
-    ) -> Self {
-        Self::new(
-            track_namespace,
-            track_name,
-            JoiningPhase::PendingSubscriber { filter },
-        )
-    }
-
-    pub fn pending_publisher(
-        track_namespace: TrackNamespace,
-        track_name: TrackName,
-        saved_largest: Option<Location>,
-    ) -> Self {
-        Self::new(
-            track_namespace,
-            track_name,
-            JoiningPhase::PendingPublisher { saved_largest },
-        )
-    }
-
-    fn new(track_namespace: TrackNamespace, track_name: TrackName, phase: JoiningPhase) -> Self {
-        let (state, owner) = State::new(phase).split();
-        Self {
-            association: JoiningAssociation {
-                track_namespace,
-                track_name,
-                state,
-            },
-            _owner: owner,
-        }
-    }
-
-    pub fn association(&self) -> JoiningAssociation {
-        self.association.clone()
-    }
-
-    pub fn establish_publisher(&self, filter: Option<FilterType>) -> Result<(), SessionError> {
-        self.association.establish_publisher(filter)
-    }
-
-    pub fn terminate(&self) -> Result<(), SessionError> {
-        self.association.terminate()
-    }
-
-    #[cfg(test)]
-    pub fn poison_state(&self) {
-        let state = self.association.state.clone();
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _state = state.try_lock_mut().unwrap();
-            panic!("poison joining association state");
-        }));
-    }
-}
-
-impl JoiningAssociation {
-    pub fn establish_subscriber(
-        &self,
-        saved_largest: Option<Location>,
-    ) -> Result<(), SessionError> {
-        let Some(mut state) = self
-            .state
-            .try_lock_mut()
-            .map_err(|_| SessionError::Internal)?
-        else {
-            return Ok(());
-        };
-        let JoiningPhase::PendingSubscriber { filter } = *state else {
-            return Err(SessionError::ProtocolViolation(
-                "subscription is not pending subscriber establishment".to_string(),
-            ));
-        };
-        *state = JoiningPhase::Established {
-            filter,
-            saved_largest,
-        };
-        Ok(())
-    }
-
-    pub fn establish_publisher(&self, filter: Option<FilterType>) -> Result<(), SessionError> {
-        let Some(mut state) = self
-            .state
-            .try_lock_mut()
-            .map_err(|_| SessionError::Internal)?
-        else {
-            return Ok(());
-        };
-        let JoiningPhase::PendingPublisher { saved_largest } = *state else {
-            return Err(SessionError::ProtocolViolation(
-                "subscription is not pending publisher establishment".to_string(),
-            ));
-        };
-        *state = JoiningPhase::Established {
-            filter,
-            saved_largest,
-        };
-        Ok(())
-    }
-
-    pub fn terminate(&self) -> Result<(), SessionError> {
-        let Some(mut state) = self
-            .state
-            .try_lock_mut()
-            .map_err(|_| SessionError::Internal)?
-        else {
-            return Ok(());
-        };
-        let saved_largest = match *state {
-            JoiningPhase::Established { saved_largest, .. } => Some(saved_largest),
-            _ => None,
-        };
-        *state = JoiningPhase::Terminated { saved_largest };
-        Ok(())
-    }
-
-    pub fn eligibility(&self) -> Result<JoiningEligibility, SessionError> {
-        let state = self.state.try_lock().map_err(|_| SessionError::Internal)?;
-        Ok(match &*state {
-            JoiningPhase::PendingSubscriber {
-                filter: Some(FilterType::LargestObject),
-            } => JoiningEligibility::Pending,
-            JoiningPhase::Established {
-                filter: Some(FilterType::LargestObject),
-                ..
-            } => JoiningEligibility::Established,
-            JoiningPhase::PendingSubscriber { .. } | JoiningPhase::Established { .. } => {
-                JoiningEligibility::WrongFilter
-            }
-            JoiningPhase::PendingPublisher { .. } | JoiningPhase::Terminated { .. } => {
-                JoiningEligibility::InvalidRequestId
-            }
-        })
-    }
-
-    pub async fn snapshot(&self) -> Result<Option<JoiningSnapshot>, JoiningSnapshotError> {
-        loop {
-            let notify = {
-                let state = self
-                    .state
-                    .try_lock()
-                    .map_err(|_| JoiningSnapshotError::InvalidRequestId)?;
-                match &*state {
-                    JoiningPhase::PendingSubscriber { .. } => state
-                        .modified()
-                        .ok_or(JoiningSnapshotError::InvalidRequestId)?,
-                    JoiningPhase::Established { saved_largest, .. } => {
-                        return Ok(saved_largest.map(|largest| JoiningSnapshot {
-                            track_namespace: self.track_namespace.clone(),
-                            track_name: self.track_name.clone(),
-                            largest,
-                        }));
-                    }
-                    JoiningPhase::Terminated {
-                        saved_largest: Some(saved_largest),
-                    } => {
-                        return Ok(saved_largest.map(|largest| JoiningSnapshot {
-                            track_namespace: self.track_namespace.clone(),
-                            track_name: self.track_name.clone(),
-                            largest,
-                        }));
-                    }
-                    JoiningPhase::PendingPublisher { .. }
-                    | JoiningPhase::Terminated {
-                        saved_largest: None,
-                    } => {
-                        return Err(JoiningSnapshotError::InvalidRequestId);
-                    }
-                }
-            };
-            notify.await;
-        }
-    }
+    /// The publisher's human-readable reason for ending the subscription.
+    pub reason: ReasonPhrase,
 }
 
 fn next_object_location(largest_location: Option<Location>) -> Location {
@@ -385,18 +196,26 @@ fn next_group_location(largest_location: Option<Location>) -> Location {
 
 struct SubscribeState {
     ok: bool,
+    peer_rejected: bool,
     track_alias: Option<u64>,
-    largest_location: Option<Location>,
+    /// The SUBSCRIBE_OK received from the publisher, once it arrives.
+    subscribe_ok: Option<SubscribeOkInfo>,
+    /// The PUBLISH_DONE received from the publisher, if one arrives.
+    publish_done: Option<PublishDoneInfo>,
     closed: Result<(), ServeError>,
+    new_group_sender: Option<serve::NewGroupHandler>,
 }
 
 impl Default for SubscribeState {
     fn default() -> Self {
         Self {
             ok: Default::default(),
+            peer_rejected: false,
             track_alias: None,
-            largest_location: None,
+            subscribe_ok: None,
+            publish_done: None,
             closed: Ok(()),
+            new_group_sender: None,
         }
     }
 }
@@ -406,17 +225,24 @@ impl Default for SubscribeState {
 pub struct Subscribe {
     state: State<SubscribeState>,
     subscriber: Subscriber,
+    stream: Option<SubscribeRequestSink>,
+    request_done: Option<tokio::sync::oneshot::Receiver<()>>,
+    request_cancel: Option<tokio::sync::oneshot::Sender<u32>>,
 
     pub info: SubscribeInfo,
 }
 
 impl Subscribe {
-    pub(super) fn new_with_params(
-        subscriber: Subscriber,
+    /// The identity of the upstream session that owns this subscription.
+    pub fn session_id(&self) -> &super::SessionId {
+        self.subscriber.session_id()
+    }
+
+    fn build_info(
         request_id: u64,
-        track: TrackWriter,
+        track: &TrackWriter,
         params: KeyValuePairs,
-    ) -> Result<(Subscribe, SubscribeRecv), SessionError> {
+    ) -> Result<(message::Subscribe, SubscribeInfo), SessionError> {
         let subscribe_message = message::Subscribe {
             id: request_id,
             track_namespace: track.namespace.clone(),
@@ -424,41 +250,155 @@ impl Subscribe {
             params,
         };
         let info = SubscribeInfo::new_from_subscribe(&subscribe_message)?;
+        Ok((subscribe_message, info))
+    }
 
+    /// Create a Subscribe without sending on the control stream, returning the
+    /// wire message to send on the bidi request stream (draft-18) alongside it.
+    /// The message is the one already built by `build_info`, so it is never
+    /// constructed twice.
+    pub(super) fn new(
+        subscriber: Subscriber,
+        request_id: u64,
+        track: TrackWriter,
+        params: KeyValuePairs,
+    ) -> Result<(Subscribe, SubscribeRecv, message::Subscribe), SessionError> {
+        let (msg, info) = Self::build_info(request_id, &track, params)?;
+        let (send, recv) = Self::from_parts(subscriber, info, track);
+        Ok((send, recv, msg))
+    }
+
+    fn from_parts(
+        subscriber: Subscriber,
+        info: SubscribeInfo,
+        track: TrackWriter,
+    ) -> (Subscribe, SubscribeRecv) {
         let (send, recv) = State::default().split();
 
         let send = Subscribe {
             state: send,
             subscriber,
+            stream: None,
+            request_done: None,
+            request_cancel: None,
             info,
         };
 
         let recv = SubscribeRecv {
             state: recv,
+            control: track.control.clone(),
+            initial_new_group: send.info.params.new_group_request().ok().flatten(),
             writer: Some(track.into()),
+            default_publisher_priority: data::DEFAULT_PUBLISHER_PRIORITY,
+            drain: StreamDrain::default(),
         };
 
-        Ok((send, recv))
+        (send, recv)
     }
 
-    pub(super) fn send_request(&mut self) {
-        self.subscriber.send_message(message::Subscribe {
-            id: self.info.id,
-            track_namespace: self.info.track_namespace.clone(),
-            track_name: self.info.track_name.clone(),
-            params: self.info.params.clone(),
-        });
+    pub(super) fn set_stream(
+        &mut self,
+        stream: SubscribeRequestSink,
+        request_done: tokio::sync::oneshot::Receiver<()>,
+        request_cancel: tokio::sync::oneshot::Sender<u32>,
+    ) {
+        let request_ids = self.subscriber.request_ids();
+        let parent_id = self.info.id;
+        let sink = stream.clone();
+        // Avoid retaining Subscriber here: its map owns the same track.
+        if let Some(mut state) = self.state.lock_mut() {
+            state.new_group_sender = Some(std::sync::Arc::new(move |value| {
+                let sink = sink.clone();
+                let request_ids = request_ids.clone();
+                Box::pin(async move {
+                    let mut params = KeyValuePairs::default();
+                    params.set_new_group_request(value);
+                    let id = request_ids.allocate().map_err(ServeError::from)?;
+                    let (update, receipt) = super::BidiResponse::with_completion(
+                        message::RequestUpdate {
+                            id,
+                            existing_request_id: parent_id,
+                            params,
+                        }
+                        .into(),
+                    );
+                    sink.send(update).await.map_err(|_| ServeError::Cancel)?;
+                    receipt
+                        .await
+                        .map_err(|_| ServeError::Cancel)?
+                        .map_err(|err| ServeError::from(err.into_session_error()))
+                })
+            }));
+        }
+        self.stream = Some(stream);
+        self.request_done = Some(request_done);
+        self.request_cancel = Some(request_cancel);
+    }
+
+    /// End the subscription and wait until the peer terminates its request
+    /// stream. This provides an ordering barrier before opening another
+    /// SUBSCRIBE for the same track.
+    pub async fn unsubscribe(mut self) {
+        self.unsubscribe_before(SUBSCRIBE_TEARDOWN_TIMEOUT).await;
+    }
+
+    pub(super) async fn unsubscribe_before(&mut self, timeout: Duration) {
+        self.send_unsubscribe();
+        if let Some(mut request_done) = self.request_done.take() {
+            if tokio::time::timeout(timeout, &mut request_done)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    request_id = self.info.id,
+                    "peer did not finish SUBSCRIBE request stream after UNSUBSCRIBE; resetting it"
+                );
+                if let Some(cancel) = self.request_cancel.take() {
+                    let _ = cancel.send(super::CANCELLED_STREAM_CODE);
+                }
+                // RESET_STREAM is not ordered against a new QUIC stream. Retire
+                // this session before releasing a cache generation so a retry
+                // cannot overtake teardown on the same connection. This also
+                // interrupts every other subscription multiplexed on the peer;
+                // they reconnect through normal upstream routing.
+                tracing::warn!(
+                    request_id = self.info.id,
+                    "retiring upstream session after stuck SUBSCRIBE teardown; all multiplexed subscriptions will reconnect"
+                );
+                self.subscriber.close_session(
+                    super::CANCELLED_STREAM_CODE,
+                    "SUBSCRIBE request stream teardown timed out",
+                );
+                if tokio::time::timeout(timeout, &mut request_done)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        request_id = self.info.id,
+                        "SUBSCRIBE request stream did not stop after reset"
+                    );
+                }
+            }
+        }
+        self.subscriber.remove_subscribe(self.info.id);
+    }
+
+    fn send_unsubscribe(&mut self) {
+        let stream = self.stream.take();
+        if self.state.lock().closed.is_ok() {
+            if let Some(stream) = &stream {
+                let _ = stream.try_send(super::BidiResponse::new(
+                    message::Unsubscribe { id: self.info.id }.into(),
+                ));
+            }
+        }
     }
 
     pub async fn closed(&self) -> Result<(), ServeError> {
         loop {
             {
                 let state = self.state.lock();
-                match state.closed.clone() {
-                    Ok(()) => {}
-                    Err(ServeError::Done) => return Ok(()),
-                    Err(err) => return Err(err),
-                }
+                state.closed.clone()?;
 
                 match state.modified() {
                     Some(notify) => notify,
@@ -488,41 +428,35 @@ impl Subscribe {
         }
     }
 
-    /// Issue a Relative or Absolute Joining FETCH associated with this
-    /// subscription. The subscription must use the Largest Object filter.
-    pub fn fetch_joining(
-        &self,
-        start: JoiningStart,
-        params: KeyValuePairs,
-    ) -> Result<super::Fetch, ServeError> {
-        self.state.lock().closed.clone()?;
-        if self.info.filter_type != FilterType::LargestObject {
-            return Err(ServeError::Mode);
-        }
-        let mut subscriber = self.subscriber.clone();
-        let largest = self.state.lock().largest_location.ok_or(ServeError::Size)?;
-        let start_location = match start {
-            JoiningStart::Relative(offset) => Location::new(
-                largest
-                    .group_id
-                    .checked_sub(offset)
-                    .ok_or(ServeError::Size)?,
-                0,
-            ),
-            JoiningStart::Absolute(group) => Location::new(group, 0),
-        };
-        if start_location > largest {
-            return Err(ServeError::Size);
-        }
-        let end_location = joining_fetch_end_location(largest).ok_or(ServeError::Size)?;
-        subscriber.fetch_joining_id(self.info.id, start, (start_location, end_location), params)
+    /// Whether the request ended with REQUEST_ERROR from the peer.
+    pub fn peer_rejected(&self) -> bool {
+        self.state.lock().peer_rejected
+    }
+
+    /// The SUBSCRIBE_OK the publisher acknowledged this subscription with, if
+    /// it has arrived.
+    ///
+    /// The transport retains these properties in the shared track and forwards
+    /// dynamic-group feedback. Await [`ok`](Self::ok) before inspecting them.
+    pub fn subscribe_ok(&self) -> Option<SubscribeOkInfo> {
+        self.state.lock().subscribe_ok.clone()
+    }
+
+    /// The PUBLISH_DONE the publisher terminated this subscription with, if it
+    /// sent one.
+    ///
+    /// Recorded when PUBLISH_DONE arrives, ahead of the §10.11 drain, so it is
+    /// available as soon as [`closed`](Self::closed) resolves. `None` means the
+    /// subscription ended some other way (UNSUBSCRIBE, a dead request stream,
+    /// or session teardown).
+    pub fn publish_done(&self) -> Option<PublishDoneInfo> {
+        self.state.lock().publish_done.clone()
     }
 }
 
 impl Drop for Subscribe {
     fn drop(&mut self) {
-        self.subscriber
-            .send_message(message::Unsubscribe { id: self.info.id });
+        self.send_unsubscribe();
         self.subscriber.remove_subscribe(self.info.id);
     }
 }
@@ -537,23 +471,157 @@ impl ops::Deref for Subscribe {
 
 pub(super) struct SubscribeRecv {
     state: State<SubscribeState>,
+    control: std::sync::Arc<serve::TrackControl>,
+    initial_new_group: Option<u64>,
     writer: Option<TrackWriterMode>,
+    pub(super) default_publisher_priority: u8,
+    /// PUBLISH_DONE Stream Count accounting (draft-18 §10.11).
+    drain: StreamDrain<ServeError>,
 }
 
 impl SubscribeRecv {
-    pub fn ok(&mut self, alias: u64, largest_location: Option<Location>) -> Result<(), ServeError> {
+    pub(super) fn is_established(&self) -> bool {
+        self.state.lock().ok
+    }
+
+    pub(super) fn observe_largest(&self, largest: Option<Location>) -> Result<(), ServeError> {
+        self.control.observe_largest(largest).map(|_| ())
+    }
+
+    pub fn ok(
+        &mut self,
+        msg: &message::SubscribeOk,
+        default_publisher_priority: u8,
+    ) -> Result<(), ServeError> {
         let state = self.state.lock();
         if state.ok {
             return Err(ServeError::Duplicate);
         }
 
+        self.control.initial_request(
+            self.initial_new_group,
+            msg.params
+                .largest_object()
+                .map_err(|_| ServeError::internal_ctx("invalid largest object"))?,
+        )?;
+        self.control
+            .configure(msg.track_extensions.clone(), state.new_group_sender.clone())?;
+
         if let Some(mut state) = state.into_mut() {
             state.ok = true;
-            state.track_alias = Some(alias);
-            state.largest_location = largest_location;
+            state.track_alias = Some(msg.track_alias);
+            state.subscribe_ok = Some(SubscribeOkInfo {
+                track_alias: msg.track_alias,
+                params: msg.params.clone(),
+                track_extensions: msg.track_extensions.clone(),
+            });
         }
+        self.default_publisher_priority = default_publisher_priority;
 
         Ok(())
+    }
+
+    /// Record a data stream arriving for this subscription (§10.11 Stream
+    /// Count). Must be paired with
+    /// [`note_stream_finished`](Self::note_stream_finished).
+    pub fn note_stream_received(&mut self) {
+        self.drain.note_stream_received();
+    }
+
+    /// Record a data stream finishing.
+    ///
+    /// Returns `true` if this completed a deferred teardown, in which case the
+    /// caller must release the subscription's session-level state.
+    #[must_use]
+    pub fn note_stream_finished(&mut self) -> bool {
+        match self.drain.note_stream_finished() {
+            Some(err) => {
+                self.finish(err);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record PUBLISH_DONE (§10.11).
+    ///
+    /// The subscription is kept alive until the announced Stream Count has been
+    /// received and every stream has closed, so Objects the publisher already
+    /// sent are still delivered. See [`DoneOutcome`].
+    pub fn recv_done(&mut self, done: PublishDoneInfo) -> DoneOutcome {
+        // Keep only the first PUBLISH_DONE: a duplicate while draining (or
+        // after teardown) must not replace the record the drain is completing
+        // against.
+        let first = !self.drain.is_draining() && !self.drain.is_finished();
+        let (outcome, terminal) = self
+            .drain
+            .arm(ServeError::Closed(done.status_code), done.stream_count);
+        if first {
+            if let Some(mut state) = self.state.lock().into_mut() {
+                state.publish_done = Some(done);
+            }
+        }
+        if let Some(err) = terminal {
+            self.finish(err);
+        }
+        outcome
+    }
+
+    /// True while waiting for streams announced by PUBLISH_DONE.
+    pub fn is_draining(&self) -> bool {
+        self.drain.is_draining()
+    }
+
+    /// End the subscription because its request stream died.
+    ///
+    /// No further Stream Count can be announced, but a data stream already
+    /// being read still has to finish, so this can defer exactly like
+    /// PUBLISH_DONE does.
+    pub fn abort(&mut self, err: ServeError) -> DoneOutcome {
+        if self.drain.is_finished() {
+            return DoneOutcome::Finished;
+        }
+        if self.drain.is_draining() {
+            return DoneOutcome::AlreadyDraining;
+        }
+
+        let (outcome, terminal) = self.drain.arm(err, 0);
+        if let Some(err) = terminal {
+            self.finish(err);
+        }
+        outcome
+    }
+
+    /// Give up waiting for announced streams (§10.11 requires this backstop).
+    ///
+    /// Returns `true` if this call ended the subscription.
+    pub fn drain_timeout(&mut self) -> bool {
+        match self.drain.timeout() {
+            Some(err) => {
+                self.finish(err);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Apply the terminal state, closing the writer so the reader sees the end
+    /// of the track.
+    pub(super) fn finish(&mut self, err: ServeError) {
+        self.drain.mark_finished();
+        if let Some(writer) = self.writer.take() {
+            if let Err(err) = writer.close(err.clone()) {
+                tracing::debug!(error = %super::LogSafe(err.to_string().as_bytes()), "failed to close subscribe writer");
+            }
+        }
+
+        let state = self.state.lock();
+        if state.closed.is_err() {
+            return;
+        }
+        if let Some(mut state) = state.into_mut() {
+            state.closed = Err(err);
+        }
     }
 
     pub fn error(mut self, err: ServeError) -> Result<(), ServeError> {
@@ -570,25 +638,56 @@ impl SubscribeRecv {
         Ok(())
     }
 
+    pub fn reject(self, err: ServeError) -> Result<(), ServeError> {
+        if let Some(mut state) = self.state.lock().into_mut() {
+            state.peer_rejected = true;
+        }
+        self.error(err)
+    }
+
     pub fn subgroup(
         &mut self,
         header: data::SubgroupHeader,
     ) -> Result<serve::SubgroupWriter, ServeError> {
         let writer = self.writer.take().ok_or(ServeError::Done)?;
 
+        // Every failure below restores the writer: one rejected subgroup must
+        // not strand the track in a state where nothing can be written, which
+        // would also lose the PUBLISH_DONE status code later.
         let mut subgroups = match writer {
             // TODO SLG - understand why both of these are needed, clock demo won't run if I comment out TrackWriteMode::Track
             TrackWriterMode::Track(track) => track.subgroups()?,
             TrackWriterMode::Subgroups(subgroups) => subgroups,
-            _ => return Err(ServeError::Mode),
+            other => {
+                self.writer = Some(other);
+                return Err(ServeError::Mode);
+            }
         };
 
-        let writer = subgroups.create(serve::Subgroup {
-            group_id: header.group_id,
-            // When subgroup_id is not present in the header type, it implicitly means subgroup 0
-            subgroup_id: header.subgroup_id.unwrap_or(0),
-            priority: header.publisher_priority,
-        })?;
+        let priority = if header.header_type.uses_default_priority() {
+            self.default_publisher_priority
+        } else {
+            header.publisher_priority
+        };
+        let writer = match subgroups.create_with_metadata(
+            serve::Subgroup {
+                group_id: header.group_id,
+                // When subgroup_id is not present in the header type, it implicitly means subgroup 0
+                subgroup_id: header.subgroup_id.unwrap_or(0),
+                priority,
+            },
+            serve::SubgroupStreamMetadata {
+                has_properties: header.header_type.has_properties(),
+                end_of_group: header.header_type.end_of_group(),
+                first_object: header.header_type.begins_with_first_object(),
+            },
+        ) {
+            Ok(writer) => writer,
+            Err(err) => {
+                self.writer = Some(subgroups.into());
+                return Err(err);
+            }
+        };
 
         self.writer = Some(subgroups.into());
 
@@ -596,30 +695,19 @@ impl SubscribeRecv {
     }
 
     pub fn datagram(&mut self, datagram: data::Datagram) -> Result<(), ServeError> {
+        let datagram = serve::Datagram::from_data(datagram, self.default_publisher_priority);
         let writer = self.writer.take().ok_or(ServeError::Done)?;
 
         match writer {
             TrackWriterMode::Track(track) => {
                 // convert Track -> Datagrams writer, write, then put Datagrams back
                 let mut datagrams = track.datagrams()?;
-                datagrams.write(serve::Datagram {
-                    group_id: datagram.group_id,
-                    object_id: datagram.object_id.unwrap_or(0),
-                    priority: datagram.publisher_priority,
-                    payload: datagram.payload.unwrap_or_default(),
-                    extension_headers: datagram.extension_headers.unwrap_or_default(),
-                })?;
+                datagrams.write(datagram)?;
                 self.writer = Some(TrackWriterMode::Datagrams(datagrams));
                 Ok(())
             }
             TrackWriterMode::Datagrams(mut datagrams) => {
-                datagrams.write(serve::Datagram {
-                    group_id: datagram.group_id,
-                    object_id: datagram.object_id.unwrap_or(0),
-                    priority: datagram.publisher_priority,
-                    payload: datagram.payload.unwrap_or_default(),
-                    extension_headers: datagram.extension_headers.unwrap_or_default(),
-                })?;
+                datagrams.write(datagram)?;
                 self.writer = Some(TrackWriterMode::Datagrams(datagrams));
                 Ok(())
             }
@@ -636,192 +724,6 @@ impl SubscribeRecv {
 mod tests {
     use super::*;
 
-    fn full_name() -> (TrackNamespace, TrackName) {
-        (
-            TrackNamespace::from_utf8_path("test/binary"),
-            vec![0, 0xff].into(),
-        )
-    }
-
-    #[tokio::test]
-    async fn joining_association_saves_initial_largest_immutably() {
-        let (namespace, name) = full_name();
-        let entry = JoiningAssociationEntry::pending_subscriber(
-            namespace.clone(),
-            name.clone(),
-            Some(FilterType::LargestObject),
-        );
-        let association = entry.association();
-
-        assert_eq!(
-            association.eligibility().unwrap(),
-            JoiningEligibility::Pending
-        );
-        association
-            .establish_subscriber(Some(Location::new(7, 11)))
-            .unwrap();
-
-        assert_eq!(
-            association.snapshot().await.unwrap(),
-            Some(JoiningSnapshot {
-                track_namespace: namespace,
-                track_name: name,
-                largest: Location::new(7, 11),
-            })
-        );
-        assert!(association
-            .establish_subscriber(Some(Location::new(9, 13)))
-            .is_err());
-        assert_eq!(
-            association.snapshot().await.unwrap().unwrap().largest,
-            Location::new(7, 11)
-        );
-    }
-
-    #[test]
-    fn pending_publisher_is_not_joinable() {
-        let (namespace, name) = full_name();
-        let entry =
-            JoiningAssociationEntry::pending_publisher(namespace, name, Some(Location::new(3, 4)));
-
-        assert_eq!(
-            entry.association().eligibility().unwrap(),
-            JoiningEligibility::InvalidRequestId
-        );
-
-        entry
-            .establish_publisher(Some(FilterType::LargestObject))
-            .unwrap();
-        assert_eq!(
-            entry.association().eligibility().unwrap(),
-            JoiningEligibility::Established
-        );
-    }
-
-    #[test]
-    fn omitted_and_non_largest_filters_are_protocol_violations() {
-        for filter in [
-            None,
-            Some(FilterType::NextGroupStart),
-            Some(FilterType::AbsoluteStart),
-            Some(FilterType::AbsoluteRange),
-        ] {
-            let (namespace, name) = full_name();
-            let entry = JoiningAssociationEntry::pending_subscriber(namespace, name, filter);
-            assert_eq!(
-                entry.association().eligibility().unwrap(),
-                JoiningEligibility::WrongFilter
-            );
-
-            let (namespace, name) = full_name();
-            let published = JoiningAssociationEntry::pending_publisher(
-                namespace,
-                name,
-                Some(Location::new(1, 2)),
-            );
-            published.establish_publisher(filter).unwrap();
-            assert_eq!(
-                published.association().eligibility().unwrap(),
-                JoiningEligibility::WrongFilter
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn terminating_pending_association_wakes_snapshot_waiter() {
-        let (namespace, name) = full_name();
-        let entry = JoiningAssociationEntry::pending_subscriber(
-            namespace,
-            name,
-            Some(FilterType::LargestObject),
-        );
-        let association = entry.association();
-        let waiter = tokio::spawn(async move { association.snapshot().await });
-
-        entry.terminate().unwrap();
-
-        assert_eq!(
-            waiter.await.unwrap().unwrap_err(),
-            JoiningSnapshotError::InvalidRequestId
-        );
-    }
-
-    #[tokio::test]
-    async fn established_snapshot_survives_subscription_termination() {
-        let (namespace, name) = full_name();
-        let entry = JoiningAssociationEntry::pending_subscriber(
-            namespace.clone(),
-            name.clone(),
-            Some(FilterType::LargestObject),
-        );
-        let association = entry.association();
-        association
-            .establish_subscriber(Some(Location::new(8, 12)))
-            .unwrap();
-        entry.terminate().unwrap();
-
-        assert_eq!(
-            association.snapshot().await.unwrap(),
-            Some(JoiningSnapshot {
-                track_namespace: namespace,
-                track_name: name,
-                largest: Location::new(8, 12),
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn pending_waiter_observes_snapshot_when_establishment_immediately_terminates() {
-        let (namespace, name) = full_name();
-        let entry = JoiningAssociationEntry::pending_subscriber(
-            namespace,
-            name,
-            Some(FilterType::LargestObject),
-        );
-        let association = entry.association();
-        let waiter_association = association.clone();
-        let waiter = tokio::spawn(async move { waiter_association.snapshot().await });
-
-        association
-            .establish_subscriber(Some(Location::new(9, 3)))
-            .unwrap();
-        entry.terminate().unwrap();
-
-        assert_eq!(
-            waiter.await.unwrap().unwrap().unwrap().largest,
-            Location::new(9, 3)
-        );
-    }
-
-    #[test]
-    fn subscriber_establishment_is_benign_after_association_owner_drops() {
-        let (namespace, name) = full_name();
-        let entry = JoiningAssociationEntry::pending_subscriber(
-            namespace,
-            name,
-            Some(FilterType::LargestObject),
-        );
-        let association = entry.association();
-        drop(entry);
-
-        assert!(association
-            .establish_subscriber(Some(Location::new(1, 2)))
-            .is_ok());
-    }
-
-    #[test]
-    fn publisher_establishment_is_benign_after_association_owner_drops() {
-        let (namespace, name) = full_name();
-        let entry =
-            JoiningAssociationEntry::pending_publisher(namespace, name, Some(Location::new(1, 2)));
-        let association = entry.association();
-        drop(entry);
-
-        assert!(association
-            .establish_publisher(Some(FilterType::LargestObject))
-            .is_ok());
-    }
-
     fn subscribe_info_with(params: KeyValuePairs) -> SubscribeInfo {
         SubscribeInfo::new_from_subscribe(&message::Subscribe {
             id: 0,
@@ -830,6 +732,333 @@ mod tests {
             params,
         })
         .unwrap()
+    }
+
+    fn subscribe_ok(track_alias: u64) -> message::SubscribeOk {
+        message::SubscribeOk {
+            id: 0,
+            track_alias,
+            params: KeyValuePairs::default(),
+            track_extensions: message::TrackExtensions::default(),
+        }
+    }
+
+    fn publish_done(status_code: u64, stream_count: u64) -> PublishDoneInfo {
+        PublishDoneInfo {
+            status_code,
+            stream_count,
+            reason: ReasonPhrase("test reason".into()),
+        }
+    }
+
+    async fn test_recv_with_reader() -> (Subscribe, SubscribeRecv, serve::TrackReader) {
+        let (bidi_task_tx, _bidi_task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriber = crate::session::Subscriber::new(
+            crate::watch::Queue::default(),
+            crate::session::test_support::loopback_session().await,
+            crate::session::Transport::WebTransport,
+            None,
+            crate::session::RequestId::new(0, 1),
+            bidi_task_tx,
+            Default::default(),
+        );
+        let (writer, reader) =
+            crate::serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let (send, recv, _msg) =
+            Subscribe::new(subscriber, 0, writer, KeyValuePairs::default()).unwrap();
+        (send, recv, reader)
+    }
+
+    async fn test_recv() -> (Subscribe, SubscribeRecv) {
+        let (send, recv, _reader) = test_recv_with_reader().await;
+        (send, recv)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn datagram_resolves_default_priority_and_preserves_semantics() {
+        let (_send, mut recv, reader) = test_recv_with_reader().await;
+        recv.ok(&subscribe_ok(42), 200).unwrap();
+
+        let mut properties = data::ExtensionHeaders::new();
+        properties.set_intvalue(2, 7);
+        recv.datagram(data::Datagram {
+            datagram_type: data::DatagramType::PayloadExtEndOfGroupDefaultPriority,
+            track_alias: 42,
+            group_id: 3,
+            object_id: None,
+            publisher_priority: None,
+            extension_headers: Some(properties),
+            status: None,
+            payload: Some(bytes::Bytes::from_static(b"payload")),
+        })
+        .unwrap();
+
+        let serve::TrackReaderMode::Datagrams(mut datagrams) = reader.mode().await.unwrap() else {
+            panic!("expected datagram mode");
+        };
+        let datagram = datagrams.read().await.unwrap().unwrap();
+        assert_eq!(datagram.group_id, 3);
+        assert_eq!(datagram.object_id, 0);
+        assert_eq!(datagram.priority, 200);
+        assert_eq!(datagram.status, data::ObjectStatus::NormalObject);
+        assert!(datagram.end_of_group);
+        assert_eq!(datagram.payload, bytes::Bytes::from_static(b"payload"));
+        assert!(datagram.extension_headers.has(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_done_drain_preserves_reverse_order_subgroups() {
+        let (_send, mut recv, reader) = test_recv_with_reader().await;
+        recv.ok(&subscribe_ok(42), 200).unwrap();
+        assert_eq!(
+            recv.recv_done(publish_done(message::PublishDoneCode::TrackEnded as u64, 2)),
+            DoneOutcome::DrainArmed
+        );
+
+        recv.note_stream_received();
+        let mut one = recv
+            .subgroup(data::SubgroupHeader {
+                header_type: data::StreamHeaderType::SubgroupIdDefaultPriorityFirstObject,
+                track_alias: 42,
+                group_id: 0,
+                subgroup_id: Some(1),
+                publisher_priority: 128,
+            })
+            .unwrap();
+        for object_id in [3, 5] {
+            let mut object = one.create_with_id(object_id, 1, None).unwrap();
+            object
+                .write(bytes::Bytes::from(vec![object_id as u8]))
+                .unwrap();
+        }
+        drop(one);
+        assert!(!recv.note_stream_finished());
+
+        let serve::TrackReaderMode::Subgroups(mut subgroups) = reader.mode().await.unwrap() else {
+            panic!("expected subgroup delivery");
+        };
+
+        recv.note_stream_received();
+        let mut zero = recv
+            .subgroup(data::SubgroupHeader {
+                header_type:
+                    data::StreamHeaderType::SubgroupZeroIdEndOfGroupDefaultPriorityFirstObject,
+                track_alias: 42,
+                group_id: 0,
+                subgroup_id: None,
+                publisher_priority: 128,
+            })
+            .unwrap();
+        for object_id in [4, 6] {
+            let mut object = zero.create_with_id(object_id, 1, None).unwrap();
+            object
+                .write(bytes::Bytes::from(vec![object_id as u8]))
+                .unwrap();
+        }
+        drop(zero);
+        assert!(recv.note_stream_finished());
+
+        for (subgroup_id, object_ids) in [(1, [3, 5]), (0, [4, 6])] {
+            let mut subgroup = subgroups.next().await.unwrap().unwrap();
+            assert_eq!(subgroup.subgroup_id, subgroup_id);
+            for object_id in object_ids {
+                let mut object = subgroup.next().await.unwrap().unwrap();
+                assert_eq!(object.object_id, object_id);
+                assert_eq!(
+                    object.read_all().await.unwrap().as_ref(),
+                    &[object_id as u8]
+                );
+            }
+        }
+    }
+
+    /// §10.11: the request stream can die while a data stream is still being
+    /// read. Tearing down here discards Objects already in flight — the same
+    /// loss the drain exists to prevent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_waits_for_a_stream_still_being_read() {
+        let (_send, mut recv) = test_recv().await;
+
+        recv.note_stream_received();
+        assert_eq!(
+            recv.abort(ServeError::Cancel),
+            DoneOutcome::DrainArmed,
+            "teardown defers while a stream is mid-transfer"
+        );
+        assert!(
+            recv.writer.is_some(),
+            "the writer must survive so the in-flight Object can be written"
+        );
+
+        assert!(recv.note_stream_finished(), "closing the stream ends it");
+        assert!(recv.writer.is_none());
+    }
+
+    /// With nothing in flight the subscription must fail immediately, so an
+    /// application awaiting `Subscribe::ok()` is not left waiting for the life
+    /// of the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_fails_an_idle_subscription_immediately() {
+        let (send, mut recv) = test_recv().await;
+
+        assert_eq!(recv.abort(ServeError::Cancel), DoneOutcome::Finished);
+        assert_eq!(send.ok().await, Err(ServeError::Cancel));
+    }
+
+    /// A drain already carries the publisher's own status code, so an abort
+    /// must not replace it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_leaves_an_armed_drain_alone() {
+        let (send, mut recv) = test_recv().await;
+
+        assert_eq!(
+            recv.recv_done(publish_done(0x6, 4)),
+            DoneOutcome::DrainArmed
+        );
+        assert_eq!(recv.abort(ServeError::Cancel), DoneOutcome::AlreadyDraining);
+
+        assert!(recv.drain_timeout());
+        assert_eq!(send.closed().await, Err(ServeError::Closed(0x6)));
+    }
+
+    /// SUBSCRIBE_OK parameters the transport does not consume — LARGEST_OBJECT
+    /// and the Track Extensions here — must still reach the application.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_ok_params_are_exposed_to_the_application() {
+        let (send, mut recv) = test_recv().await;
+
+        let mut msg = subscribe_ok(42);
+        msg.params.set_largest_object(Location::new(7, 3)).unwrap();
+        msg.params.set_expires(30_000);
+        msg.track_extensions.set_max_cache_duration(60_000);
+        msg.track_extensions.set_dynamic_groups(true);
+        recv.ok(&msg, 200).unwrap();
+
+        let ok = send
+            .subscribe_ok()
+            .expect("SUBSCRIBE_OK must be visible to the application");
+        assert_eq!(ok.track_alias, 42);
+        assert_eq!(
+            ok.params.largest_object().unwrap(),
+            Some(Location::new(7, 3))
+        );
+        assert_eq!(ok.params.expires().unwrap(), Some(30_000));
+        assert_eq!(
+            ok.track_extensions.max_cache_duration().unwrap(),
+            Some(60_000)
+        );
+        assert_eq!(ok.track_extensions.dynamic_groups().unwrap(), Some(true));
+    }
+
+    /// PUBLISH_DONE's Stream Count, status code, and reason phrase must reach
+    /// the application, not just the status code folded into `closed()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_done_details_are_exposed_to_the_application() {
+        let (send, mut recv) = test_recv().await;
+
+        assert!(send.publish_done().is_none(), "nothing received yet");
+        assert_eq!(
+            recv.recv_done(publish_done(message::PublishDoneCode::TrackEnded as u64, 0)),
+            DoneOutcome::Finished
+        );
+
+        let done = send
+            .publish_done()
+            .expect("PUBLISH_DONE must be visible to the application");
+        assert_eq!(
+            done.status_code,
+            message::PublishDoneCode::TrackEnded as u64
+        );
+        assert_eq!(done.stream_count, 0);
+        assert_eq!(done.reason.0, "test reason");
+    }
+
+    /// A duplicate PUBLISH_DONE while draining must not replace the record the
+    /// application will read after the drain completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_duplicate_publish_done_keeps_the_first_record() {
+        let (send, mut recv) = test_recv().await;
+
+        assert_eq!(
+            recv.recv_done(publish_done(0x2, 1)),
+            DoneOutcome::DrainArmed
+        );
+        assert_eq!(
+            recv.recv_done(publish_done(0x6, 9)),
+            DoneOutcome::AlreadyDraining
+        );
+
+        recv.note_stream_received();
+        assert!(recv.note_stream_finished());
+
+        let done = send
+            .publish_done()
+            .expect("the first PUBLISH_DONE survives");
+        assert_eq!(done.status_code, 0x2);
+        assert_eq!(done.stream_count, 1);
+    }
+
+    /// Ending without PUBLISH_DONE must not fabricate a record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ending_without_publish_done_exposes_no_record() {
+        let (send, mut recv) = test_recv().await;
+
+        assert_eq!(recv.abort(ServeError::Cancel), DoneOutcome::Finished);
+        assert!(send.publish_done().is_none());
+    }
+
+    #[test]
+    fn rendezvous_timeout_is_parsed_from_params() {
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(30_000);
+
+        assert_eq!(
+            subscribe_info_with(params)
+                .params
+                .rendezvous_timeout()
+                .unwrap(),
+            Some(30_000)
+        );
+    }
+
+    #[test]
+    fn invalid_outbound_params_are_rejected() {
+        let (writer, _reader) =
+            crate::serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(message::parameter_type::RENDEZVOUS_TIMEOUT, vec![1]);
+
+        assert!(Subscribe::build_info(0, &writer, params).is_err());
+    }
+
+    /// Absent carries draft-18's default of 0, so a relay must not hold the
+    /// subscription. Kept as None rather than defaulted to 0 so a relay can tell
+    /// "not requested" from "explicitly zero" if it ever wants to.
+    #[test]
+    fn omitted_rendezvous_timeout_is_none() {
+        assert_eq!(
+            subscribe_info_with(KeyValuePairs::default())
+                .params
+                .rendezvous_timeout()
+                .unwrap(),
+            None
+        );
+    }
+
+    /// Zero is meaningful and distinct from absent on the wire, even though both
+    /// mean "answer immediately".
+    #[test]
+    fn explicit_zero_rendezvous_timeout_is_preserved() {
+        let mut params = KeyValuePairs::default();
+        params.set_rendezvous_timeout(0);
+
+        assert_eq!(
+            subscribe_info_with(params)
+                .params
+                .rendezvous_timeout()
+                .unwrap(),
+            Some(0)
+        );
     }
 
     #[test]
@@ -885,51 +1114,5 @@ mod tests {
 
         assert!(!filter.allows(0, 0));
         assert!(!filter.allows(100, 100));
-    }
-
-    #[tokio::test]
-    async fn closed_returns_ok_for_track_ended() {
-        let rid = crate::session::RequestId::new(0, 100, 100, 0);
-        let subscriber = crate::session::Subscriber::new(
-            crate::session::Queue::default(),
-            crate::session::Queue::default(),
-            None,
-            rid,
-            crate::session::PendingRequests::default(),
-            crate::session::SessionId::generate(),
-        );
-        let (writer, _reader) =
-            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
-        let (subscribe, recv) =
-            Subscribe::new_with_params(subscriber, 1, writer, KeyValuePairs::default()).unwrap();
-
-        recv.error(ServeError::Done).unwrap();
-
-        assert_eq!(subscribe.closed().await, Ok(()));
-    }
-
-    #[tokio::test]
-    async fn closed_returns_error_for_non_track_ended() {
-        let rid = crate::session::RequestId::new(0, 100, 100, 0);
-        let subscriber = crate::session::Subscriber::new(
-            crate::session::Queue::default(),
-            crate::session::Queue::default(),
-            None,
-            rid,
-            crate::session::PendingRequests::default(),
-            crate::session::SessionId::generate(),
-        );
-        let (writer, _reader) =
-            serve::Track::new(TrackNamespace::from_utf8_path("test"), "track").produce();
-        let (subscribe, recv) =
-            Subscribe::new_with_params(subscriber, 1, writer, KeyValuePairs::default()).unwrap();
-
-        recv.error(ServeError::Closed(message::PublishDoneCode::Expired as u64))
-            .unwrap();
-
-        assert!(matches!(
-            subscribe.closed().await,
-            Err(ServeError::Closed(code)) if code == message::PublishDoneCode::Expired as u64
-        ));
     }
 }

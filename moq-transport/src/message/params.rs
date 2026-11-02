@@ -6,12 +6,15 @@ use bytes::Buf as _;
 use crate::coding::{
     Decode, DecodeError, Encode, EncodeError, KeyValuePair, KeyValuePairs, Location, Value,
 };
-use crate::message::{FilterType, GroupOrder};
+use crate::message::{wire_id, FilterType, GroupOrder};
 
 /// Draft-16 message-parameter type IDs.
 pub mod parameter_type {
     pub const DELIVERY_TIMEOUT: u64 = 0x02;
     pub const AUTHORIZATION_TOKEN: u64 = 0x03;
+    /// draft-18 §10.2.6. Milliseconds a subscriber will wait for a publisher to
+    /// appear. Valid on SUBSCRIBE only, unlike the delivery timeouts.
+    pub const RENDEZVOUS_TIMEOUT: u64 = 0x04;
     pub const EXPIRES: u64 = 0x08;
     pub const LARGEST_OBJECT: u64 = 0x09;
     pub const FORWARD: u64 = 0x10;
@@ -21,26 +24,29 @@ pub mod parameter_type {
     pub const NEW_GROUP_REQUEST: u64 = 0x32;
 }
 
-pub(crate) fn validate_message_parameter_types(params: &KeyValuePairs) -> Result<(), DecodeError> {
-    if params.0.iter().all(|param| {
-        matches!(
-            param.key,
-            parameter_type::DELIVERY_TIMEOUT
-                | parameter_type::AUTHORIZATION_TOKEN
-                | parameter_type::EXPIRES
-                | parameter_type::LARGEST_OBJECT
-                | parameter_type::FORWARD
-                | parameter_type::SUBSCRIBER_PRIORITY
-                | parameter_type::SUBSCRIPTION_FILTER
-                | parameter_type::GROUP_ORDER
-                | parameter_type::NEW_GROUP_REQUEST
-        )
-    }) {
-        Ok(())
-    } else {
-        Err(DecodeError::InvalidParameter)
-    }
-}
+/// Message-parameter type IDs whose value is a single raw `uint8` byte rather
+/// than a varint (draft-18 §10.2).
+///
+/// Draft-17 replaced the generic even=varint / odd=length-prefixed KVP rule for
+/// message parameters with per-parameter value kinds. These three are the
+/// byte-valued parameters carried by SUBSCRIBE / FETCH. Notably
+/// SUBSCRIBER_PRIORITY defaults to 128, which a varint encodes in two bytes —
+/// desynchronising the parameter block for peers (imquic, moq-go) that expect a
+/// single byte. SUBSCRIPTION_FILTER (0x21) stays length-prefixed bytes and the
+/// varint-valued parameters (timeouts, EXPIRES, NEW_GROUP_REQUEST) are
+/// unaffected, so they are intentionally absent here.
+pub const U8_VALUE_PARAMETER_TYPES: &[u64] = &[
+    parameter_type::FORWARD,             // 0x10
+    parameter_type::SUBSCRIBER_PRIORITY, // 0x20
+    parameter_type::GROUP_ORDER,         // 0x22
+];
+
+const TWO_VARINT_VALUE_PARAMETER_TYPES: &[u64] = &[parameter_type::LARGEST_OBJECT];
+
+/// Message scopes enforced for supported parameters with restricted use.
+/// Unknown parameter types remain available for negotiated extensions.
+const MESSAGE_PARAMETER_SCOPES: &[(u64, &[u64])] =
+    &[(parameter_type::RENDEZVOUS_TIMEOUT, &[wire_id::Subscribe])];
 
 /// Draft-16 extension-header type IDs.
 pub mod extension_type {
@@ -88,6 +94,12 @@ impl TrackExtensions {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    pub(crate) fn contains_only(&self, supported_types: &[u64]) -> bool {
+        self.0
+            .iter()
+            .all(|extension| supported_types.contains(&extension.key))
     }
 
     pub fn delivery_timeout(&self) -> Result<Option<u64>, DecodeError> {
@@ -150,17 +162,6 @@ impl TrackExtensions {
 
     pub fn set_dynamic_groups(&mut self, enabled: bool) {
         self.set_int_extension(extension_type::DYNAMIC_GROUPS, if enabled { 1 } else { 0 });
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), DecodeError> {
-        if self.delivery_timeout()? == Some(0) {
-            return Err(DecodeError::InvalidParameter);
-        }
-        self.max_cache_duration()?;
-        self.default_publisher_priority()?;
-        self.default_publisher_group_order()?;
-        self.dynamic_groups()?;
-        Ok(())
     }
 }
 
@@ -283,6 +284,49 @@ fn get_kvp_u8(pairs: &[KeyValuePair], key: u64) -> Result<Option<u8>, DecodeErro
 }
 
 impl KeyValuePairs {
+    /// Decode a draft-18 §10.2 message-parameter block (SUBSCRIBE, FETCH,
+    /// PUBLISH, PUBLISH_OK, REQUEST_OK, REQUEST_UPDATE, …).
+    ///
+    /// This is the count-prefixed KVP decode with the draft-17 byte-valued
+    /// parameter kinds applied uniformly (see [`U8_VALUE_PARAMETER_TYPES`]).
+    /// Every message carrying §10.2 parameters MUST use this rather than the
+    /// generic [`KeyValuePairs::decode`], otherwise a peer's single-byte
+    /// SUBSCRIBER_PRIORITY (default 128) desynchronises the whole block.
+    pub fn decode_message_params<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
+        Self::decode_with_value_types(
+            r,
+            U8_VALUE_PARAMETER_TYPES,
+            TWO_VARINT_VALUE_PARAMETER_TYPES,
+        )
+    }
+
+    /// Encode a draft-18 §10.2 message-parameter block. Counterpart to
+    /// [`decode_message_params`](KeyValuePairs::decode_message_params).
+    pub fn encode_message_params<W: bytes::BufMut>(&self, w: &mut W) -> Result<(), EncodeError> {
+        self.encode_with_value_types(
+            w,
+            U8_VALUE_PARAMETER_TYPES,
+            TWO_VARINT_VALUE_PARAMETER_TYPES,
+        )
+    }
+
+    pub(crate) fn parameters_allowed_on(&self, message_type: u64) -> bool {
+        if message_type == wire_id::SubscribeTracks {
+            return self.0.iter().all(|parameter| {
+                matches!(
+                    parameter.key,
+                    parameter_type::AUTHORIZATION_TOKEN | parameter_type::FORWARD
+                )
+            });
+        }
+        self.0.iter().all(|parameter| {
+            MESSAGE_PARAMETER_SCOPES
+                .iter()
+                .find(|(parameter_type, _)| *parameter_type == parameter.key)
+                .is_none_or(|(_, message_types)| message_types.contains(&message_type))
+        })
+    }
+
     fn int_parameter(&self, key: u64) -> Result<Option<u64>, DecodeError> {
         get_kvp_int(&self.0, key)
     }
@@ -381,6 +425,17 @@ impl KeyValuePairs {
         self.int_parameter(parameter_type::DELIVERY_TIMEOUT)
     }
 
+    pub fn set_rendezvous_timeout(&mut self, timeout_ms: u64) {
+        self.set_intvalue(parameter_type::RENDEZVOUS_TIMEOUT, timeout_ms);
+    }
+
+    /// Milliseconds the subscriber will wait for a publisher to become available
+    /// (draft-18 §10.2.6). `None` and `Some(0)` are equivalent in effect: the
+    /// spec's default is 0, meaning respond immediately rather than hold.
+    pub fn rendezvous_timeout(&self) -> Result<Option<u64>, DecodeError> {
+        self.int_parameter(parameter_type::RENDEZVOUS_TIMEOUT)
+    }
+
     pub fn set_new_group_request(&mut self, group_id: u64) {
         self.set_intvalue(parameter_type::NEW_GROUP_REQUEST, group_id);
     }
@@ -393,6 +448,7 @@ impl KeyValuePairs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
 
     #[test]
     fn key_value_pairs_message_parameter_methods_round_trip_typed_values() {
@@ -411,6 +467,7 @@ mod tests {
         params.set_expires(6);
         params.set_delivery_timeout(8);
         params.set_new_group_request(9);
+        params.set_rendezvous_timeout(30_000);
 
         assert_eq!(params.forward().unwrap(), Some(false));
         assert_eq!(params.subscriber_priority().unwrap(), Some(7));
@@ -420,6 +477,44 @@ mod tests {
         assert_eq!(params.expires().unwrap(), Some(6));
         assert_eq!(params.delivery_timeout().unwrap(), Some(8));
         assert_eq!(params.new_group_request().unwrap(), Some(9));
+        assert_eq!(params.rendezvous_timeout().unwrap(), Some(30_000));
+    }
+
+    /// 0x04 is even, so the KVP codec carries it as a varint. A peer sending a
+    /// byte string under that key is malformed rather than something to coerce.
+    #[test]
+    fn rendezvous_timeout_rejects_a_bytes_value() {
+        let mut params = KeyValuePairs::default();
+        params.set_bytesvalue(parameter_type::RENDEZVOUS_TIMEOUT, vec![1, 2, 3]);
+
+        assert!(params.rendezvous_timeout().is_err());
+    }
+
+    /// Absent means the spec default of 0: do not hold, answer immediately.
+    #[test]
+    fn rendezvous_timeout_absent_is_none() {
+        assert_eq!(KeyValuePairs::default().rendezvous_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn largest_object_uses_two_inline_varints() {
+        let mut params = KeyValuePairs::default();
+        params.set_largest_object(Location::new(4, 5)).unwrap();
+        let mut encoded = BytesMut::new();
+
+        params.encode_message_params(&mut encoded).unwrap();
+
+        assert_eq!(
+            encoded.as_ref(),
+            &[1, parameter_type::LARGEST_OBJECT as u8, 4, 5]
+        );
+        assert_eq!(
+            KeyValuePairs::decode_message_params(&mut encoded)
+                .unwrap()
+                .largest_object()
+                .unwrap(),
+            Some(Location::new(4, 5))
+        );
     }
 
     #[test]
@@ -452,5 +547,17 @@ mod tests {
             extensions.set_default_publisher_group_order(GroupOrder::Publisher),
             Err(EncodeError::InvalidValue)
         ));
+    }
+
+    #[test]
+    fn track_extensions_contains_only_supported_types() {
+        let mut extensions = TrackExtensions::default();
+        let supported = [extension_type::DEFAULT_PUBLISHER_PRIORITY];
+
+        assert!(extensions.contains_only(&supported));
+        extensions.set_default_publisher_priority(30);
+        assert!(extensions.contains_only(&supported));
+        extensions.set_delivery_timeout(10);
+        assert!(!extensions.contains_only(&supported));
     }
 }

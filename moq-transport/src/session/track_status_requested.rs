@@ -52,13 +52,13 @@ impl TrackStatusRequested {
                 .map_err(|_| SessionError::Internal)?;
         }
 
-        self.publisher.send_request_ok(
-            "track_status",
+        self.publisher.send_track_status_ok(
             RequestOk {
                 id: self.request_msg.id,
                 params,
             },
-        );
+            track.track_extensions()?,
+        )?;
 
         Ok(())
     }
