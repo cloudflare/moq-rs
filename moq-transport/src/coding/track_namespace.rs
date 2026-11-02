@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Cloudflare Inc., Luke Curley, Mike English and contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Track namespace and track name encoding per draft-ietf-moq-transport-16 §2.4.1.
+//! Track namespace and track name encoding per draft-ietf-moq-transport-18 §2.4.1.
 //!
 //! Rules enforced here:
 //!
-//! - A **full** `TrackNamespace` must have 1–32 fields; each field must be ≥ 1 byte.
+//! - A **full** `TrackNamespace` must have 0–32 fields; each field must be ≥ 1 byte.
 //! - A **prefix** `TrackNamespacePrefix` (used in `SUBSCRIBE_NAMESPACE`) may have
 //!   0–32 fields; each non-empty field must also be ≥ 1 byte.
 //! - The total length of a Full Track Name (sum of all namespace field lengths +
@@ -224,7 +224,8 @@ pub enum TrackNamespaceError {
     #[error("too many fields: {0} exceeds maximum of {1}")]
     TooManyFields(usize, usize),
 
-    #[error("too few fields: full track namespace requires at least 1 field")]
+    /// Retained for callers that used the pre-draft-18 validation error.
+    #[error("too few fields")]
     TooFewFields,
 
     #[error("namespace too large: {0} bytes exceeds maximum of {1}")]
@@ -237,9 +238,9 @@ pub enum TrackNamespaceError {
     EmptyField,
 }
 
-// ─── TrackNamespace (full, 1–32 non-empty fields) ─────────────────────────────
+// ─── TrackNamespace (full, 0–32 non-empty fields) ─────────────────────────────
 
-/// A full Track Namespace: 1–32 non-empty byte fields.
+/// A full Track Namespace: 0–32 non-empty byte fields.
 ///
 /// Used in `SUBSCRIBE`, `PUBLISH`, `PUBLISH_NAMESPACE`, `TRACK_STATUS`, etc.
 #[derive(Clone, Default, Eq, PartialEq)]
@@ -315,8 +316,8 @@ impl Hash for TrackNamespace {
 
 impl Decode for TrackNamespace {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        // Draft-16 §2.4.1: full namespaces have 1-32 non-empty fields.
-        let fields = decode_namespace_fields(r, 1, Self::MAX_FIELDS, "TrackNamespace")?;
+        // Draft-18 §2.4.1: full namespaces have 0-32 non-empty fields.
+        let fields = decode_namespace_fields(r, 0, Self::MAX_FIELDS, "TrackNamespace")?;
         let namespace = Self { fields };
         namespace.validate_namespace_byte_len()?;
         Ok(namespace)
@@ -330,7 +331,7 @@ impl Encode for TrackNamespace {
                 "TrackNamespace".to_string(),
             ));
         }
-        encode_namespace_fields(&self.fields, 1, Self::MAX_FIELDS, "TrackNamespace", w)
+        encode_namespace_fields(&self.fields, 0, Self::MAX_FIELDS, "TrackNamespace", w)
     }
 }
 
@@ -350,7 +351,7 @@ impl TryFrom<Vec<TupleField>> for TrackNamespace {
     type Error = TrackNamespaceError;
 
     fn try_from(fields: Vec<TupleField>) -> Result<Self, Self::Error> {
-        validate_track_namespace_fields(&fields, 1, Self::MAX_FIELDS)?;
+        validate_track_namespace_fields(&fields, 0, Self::MAX_FIELDS)?;
         let namespace_len = namespace_fields_byte_len(&fields);
         if namespace_len > MAX_FULL_TRACK_NAME_LEN {
             return Err(TrackNamespaceError::NamespaceTooLarge(
@@ -480,7 +481,7 @@ impl Hash for TrackNamespacePrefix {
 
 impl Decode for TrackNamespacePrefix {
     fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
-        // Draft-16 §9.25: prefixes have 0-32 non-empty fields.
+        // Draft-18 §2.4.1: prefixes have 0-32 non-empty fields.
         let fields = decode_namespace_fields(r, 0, Self::MAX_FIELDS, "TrackNamespacePrefix")?;
         let prefix = Self { fields };
         prefix.validate_namespace_byte_len()?;
@@ -522,7 +523,7 @@ pub fn full_track_name_len(namespace: &TrackNamespace, track_name: &[u8]) -> usi
     namespace.namespace_byte_len() + track_name.len()
 }
 
-/// Validate that a Full Track Name is within the draft-16 4096-byte limit.
+/// Validate that a Full Track Name is within the draft-18 4096-byte limit.
 pub fn validate_full_track_name(
     namespace: &TrackNamespace,
     track_name: &[u8],
@@ -590,28 +591,35 @@ mod tests {
         assert_eq!(decoded, t);
     }
 
-    // ── 0-field rejection ─────────────────────────────────────────────────────
+    // ── 0-field namespace ─────────────────────────────────────────────────────
 
     #[test]
-    fn decode_zero_fields_is_error() {
+    fn decode_zero_fields_is_valid() {
         // wire: count = 0
         let data: Vec<u8> = vec![0x00];
         let mut buf: Bytes = data.into();
-        let err = TrackNamespace::decode(&mut buf).unwrap_err();
-        assert!(
-            matches!(err, DecodeError::FieldBoundsExceeded(_)),
-            "expected FieldBoundsExceeded, got {:?}",
-            err
+        assert_eq!(
+            TrackNamespace::decode(&mut buf).unwrap(),
+            TrackNamespace::new()
         );
     }
 
     #[test]
-    fn encode_zero_fields_is_error() {
-        let t = TrackNamespace::new(); // empty
+    fn encode_zero_fields_is_valid() {
+        let t = TrackNamespace::new();
         let mut buf = BytesMut::new();
+        t.encode(&mut buf).unwrap();
+        assert_eq!(buf, BytesMut::from(&[0x00][..]));
+    }
+
+    #[test]
+    fn decode_truncated_field_is_error() {
+        // wire: count = 1, field length = 1, but no field byte
+        let data: Vec<u8> = vec![0x01, 0x01];
+        let mut buf: Bytes = data.into();
         assert!(matches!(
-            t.encode(&mut buf).unwrap_err(),
-            EncodeError::FieldBoundsExceeded(_)
+            TrackNamespace::decode(&mut buf).unwrap_err(),
+            DecodeError::More(1)
         ));
     }
 
@@ -707,13 +715,10 @@ mod tests {
     }
 
     #[test]
-    fn try_from_empty_vec_is_error() {
+    fn try_from_empty_vec_is_valid() {
         let fields: Vec<TupleField> = vec![];
         let result: Result<TrackNamespace, _> = fields.try_into();
-        assert!(matches!(
-            result.unwrap_err(),
-            TrackNamespaceError::TooFewFields
-        ));
+        assert_eq!(result.unwrap(), TrackNamespace::new());
     }
 
     #[test]
@@ -894,13 +899,12 @@ mod tests {
     }
 
     #[test]
-    fn join_suffix_rejects_empty_full_namespace() {
+    fn join_suffix_accepts_empty_full_namespace() {
         let prefix = TrackNamespacePrefix::new();
         let suffix = TrackNamespacePrefix::new();
 
-        let err = prefix.join_suffix(&suffix).unwrap_err();
-
-        assert!(matches!(err, TrackNamespaceError::TooFewFields));
+        let namespace = prefix.join_suffix(&suffix).unwrap();
+        assert_eq!(namespace, TrackNamespace::new());
     }
 
     #[test]
