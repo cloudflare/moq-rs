@@ -54,6 +54,14 @@ moq-test-client --relay https://localhost:4443 --tls-disable-verify
 | `publish-track-subscribe` | Publisher sends direct PUBLISH, subscriber subscribes to the exact track |
 | `rendezvous-timeout` | Subscribe with RENDEZVOUS_TIMEOUT and expect REQUEST_ERROR TIMEOUT |
 | `data-subgroup-basic` | Publish a `moq-test/data-subgroup-basic/<run-id>` prefix, subscribe to a moq-test tuple below it, verify 15 objects over 3 subgroup streams |
+| `moq-test-subgroup-per-group-eog` | moq-test tuple: 3 groups × 5 objects, one subgroup per group, End of Group markers |
+| `moq-test-subgroup-per-object` | moq-test tuple: 2 groups × 4 objects, one subgroup per object |
+| `moq-test-two-subgroups-eog` | moq-test tuple: 3 groups × 6 objects split across two subgroups per group, End of Group markers |
+| `moq-test-datagram` | moq-test tuple: 3 groups × 5 objects as datagrams |
+| `moq-test-datagram-eog` | moq-test tuple: datagrams with End of Group markers |
+| `moq-test-extensions` | moq-test tuple: integer and variable-length object extensions |
+| `moq-test-increments` | moq-test tuple: non-zero start location, group increment 7, object increment 2 |
+| `moq-test-forward-zero` | moq-test tuple: subscribe with Forward = 0 and verify no objects are delivered |
 
 The `data-*` tests implement the moq-interop-runner data-plane specifications.
 The publisher sends PUBLISH_NAMESPACE for a run-unique routing prefix
@@ -65,6 +73,18 @@ canonical tuple, so the relay must route by Namespace Prefix Matching.
 
 The `moq-test-*` tests use the same generator and scoreboard verifier with a
 subscribe-first, direct-PUBLISH choreography.
+
+### Ad-hoc moq-test tuples
+
+`--moq-test-tuple` runs a single moq-test (draft-afrind-moq-test) scenario from
+a 16-field `/`-separated tuple instead of a named test. Blank fields select
+defaults. It uses the same subscribe-first choreography and scoreboard, and
+can't be combined with `--test` or `--list`:
+
+```bash
+moq-test-client --relay https://localhost:4443 \
+  --moq-test-tuple "moq-test-00/0/0/0/2/4/5/64/32/2/1/1/0/-1/-1/0"
+```
 
 ## Running with moq-relay
 

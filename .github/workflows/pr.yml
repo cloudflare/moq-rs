@@ -39,3 +39,16 @@ jobs:
 
       # Check for unused dependencies
       - uses: bnjbvr/cargo-machete@main
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      # The fuzz crate is excluded from the workspace (cargo-fuzz manages its
+      # own), so the build job above never compiles it. Check that the
+      # harness still builds against the current parser; running the fuzzer
+      # needs nightly and cargo-fuzz and stays a manual step. Not --locked:
+      # release version bumps only update the workspace lockfile.
+      - run: cargo check --bins
+        working-directory: moq-relay-ietf/fuzz

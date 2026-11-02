@@ -48,9 +48,10 @@
 //! | SUBSCRIBE_TRACKS (§10.19) | `SubscribeNamespace` *(interim)* | 3 |
 //!
 //! FETCH requires `Fetch(7)`; a token that grants only `Subscribe(4)` cannot
-//! fetch. This relay does not serve FETCH yet (the session layer answers it
-//! as not supported), so no FETCH gate exists; the mapping is in place for
-//! when relay FETCH serving lands.
+//! fetch. The relay serves standalone and Joining FETCH (`accept_fetch` in
+//! `producer.rs`) and checks `Fetch(7)` on the requested track before serving
+//! or forwarding it upstream, so CAT policies that should allow FETCH must
+//! grant `Fetch` explicitly.
 //!
 //! SUBSCRIBE_TRACKS is new in draft-18 and has no CAT action yet, so the
 //! request is gated as `SubscribeNamespace` on its prefix. That grants

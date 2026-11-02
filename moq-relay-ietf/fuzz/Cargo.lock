@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "moq-transport"
-version = "0.16.0"
+version = "0.16.5"
 dependencies = [
  "bytes",
  "futures",
@@ -832,8 +832,11 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "url",
  "uuid",
  "web-transport",
+ "web-transport-quinn",
+ "web-transport-trait",
 ]
 
 [[package]]
