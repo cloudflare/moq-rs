@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.5](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.4...moq-transport-v0.16.5) - 2026-10-30
+
+### Fixed
+
+- *(moq-transport)* separate FIN acknowledgement and writing budgets
+- *(moq-transport)* bound request error reasons before encoding
+- *(moq-transport)* expose stream completion to draft-16 forwarding
+- *(moq-transport)* reset stopped subgroups until FIN acknowledgement
+
+### Other
+
+- Merge pull request #299 from englishm-cloudflare/me/d16-request-error-bound
+
 ## [0.16.4](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.3...moq-transport-v0.16.4) - 2026-10-06
 
 ### Added

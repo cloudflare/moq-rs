@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.31](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.30...moq-relay-ietf-v0.7.31) - 2026-10-30
+
+### Other
+
+- *(moq-relay)* name per-operation decision callback type
+
 ## [0.7.30](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.29...moq-relay-ietf-v0.7.30) - 2026-10-14
 
 ### Added
