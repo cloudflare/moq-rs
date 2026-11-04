@@ -24,7 +24,7 @@ use crate::{
     watch::State,
 };
 
-use super::{FetchStreamReg, FetchValidator, Reader, SessionError};
+use super::{FetchStreamReg, FetchValidator, Reader, SessionError, TrafficCounter};
 
 /// Stream reset / STOP_SENDING code used when the requester cancels.
 const CANCELLED: u32 = crate::data::DataStreamResetCode::Cancelled as u32;
@@ -57,6 +57,10 @@ pub struct Fetch {
     decoder: FetchRecordDecoder,
     payload_remaining: u64,
     stream_done: bool,
+    /// Objects and groups received from the peer.
+    traffic: Arc<TrafficCounter>,
+    /// Group of the last object read, so each group counts once.
+    last_group: Option<u64>,
 }
 
 /// The half of a [`Fetch`] the request-stream reader drives.
@@ -72,6 +76,7 @@ impl Fetch {
         webtransport: web_transport::Session,
         registration: FetchStreamReg,
         cancel: tokio::sync::oneshot::Sender<u32>,
+        traffic: Arc<TrafficCounter>,
     ) -> (Self, FetchRecv) {
         let order = request.params.group_order().ok().flatten();
         let (send, recv) = State::default().split();
@@ -99,6 +104,8 @@ impl Fetch {
                 decoder: FetchRecordDecoder::new(order),
                 payload_remaining: 0,
                 stream_done: false,
+                traffic,
+                last_group: None,
             },
             FetchRecv {
                 state: recv,
@@ -191,8 +198,14 @@ impl Fetch {
             self.stop(MALFORMED);
             return Err(err);
         }
-        if let FetchRecord::Object(FetchRecordObject { payload_length, .. }) = &record {
+        if let FetchRecord::Object(FetchRecordObject {
+            group_id,
+            payload_length,
+            ..
+        }) = &record
+        {
             self.payload_remaining = *payload_length;
+            self.traffic.fetch_object(&mut self.last_group, *group_id);
         }
         Ok(Some(record))
     }
@@ -1197,7 +1210,7 @@ mod tests {
             origin
         });
         downstream.proxy(upstream, T).await.unwrap();
-        let _origin = origin_task.await.unwrap();
+        let origin = origin_task.await.unwrap();
 
         let ok = tokio::time::timeout(T, fetch.ok()).await.unwrap().unwrap();
         assert_eq!(ok.end_location, Location::new(1, 2));
@@ -1207,6 +1220,25 @@ mod tests {
             records,
             vec![(obj(0, 0, 2), b"hi".to_vec()), (obj(1, 1, 0), vec![])]
         );
+
+        // Every hop counts the 2 objects in 2 groups: written by the origin,
+        // read and re-sent by the relay, read by the end subscriber.
+        let sent = |publisher: &Publisher| {
+            let traffic =
+                super::super::SessionTraffic::new(Default::default(), publisher.traffic_counter());
+            let snapshot = traffic.snapshot();
+            (snapshot.egress_objects, snapshot.egress_groups)
+        };
+        let received = |subscriber: &Subscriber| {
+            let traffic =
+                super::super::SessionTraffic::new(subscriber.traffic_counter(), Default::default());
+            let snapshot = traffic.snapshot();
+            (snapshot.ingress_objects, snapshot.ingress_groups)
+        };
+        assert_eq!(sent(&origin), (2, 2), "origin writes");
+        assert_eq!(received(&relay_up), (2, 2), "relay reads upstream");
+        assert_eq!(sent(&relay_down), (2, 2), "relay proxies downstream");
+        assert_eq!(received(&end), (2, 2), "end subscriber reads");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1427,7 +1459,14 @@ mod tests {
                 }),
                 params: KeyValuePairs::default(),
             };
-            Fetch::new(request, None, session, FetchStreamReg::detached(), cancel)
+            Fetch::new(
+                request,
+                None,
+                session,
+                FetchStreamReg::detached(),
+                cancel,
+                Default::default(),
+            )
         }
         let early = || FetchOk {
             id: 0,

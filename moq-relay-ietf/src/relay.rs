@@ -15,8 +15,10 @@ use url::Url;
 use crate::auth::{decode_setup_tokens, ScopeAuthorizer, SessionAuth, SESSION_ERROR_UNAUTHORIZED};
 use crate::upstream_namespaces::{UpstreamNamespaces, UpstreamNamespacesRunner};
 use crate::{
-    metrics::GaugeGuard, ConnectionMeta, ConnectionTagger, Consumer, Coordinator, Locals, Producer,
-    RelayInfo, RemoteManager, Session, SessionContext, SessionInterface,
+    connection_usage::{reported_scope, ConnectionUsage, ConnectionUsageGuard},
+    metrics::GaugeGuard,
+    ConnectionMeta, ConnectionTagger, ConnectionUsageObserver, Consumer, Coordinator, Locals,
+    Producer, RelayInfo, RemoteManager, Session, SessionContext, SessionInterface,
     DEFAULT_CACHE_IDLE_TIMEOUT,
 };
 
@@ -25,7 +27,11 @@ type ServerFuture = Pin<
     Box<
         dyn Future<
             Output = (
-                anyhow::Result<(web_transport::Session, quic::ConnInfo)>,
+                anyhow::Result<(
+                    web_transport::Session,
+                    quic::ConnInfo,
+                    quic::ConnectionStatistics,
+                )>,
                 quic::Server,
             ),
         >,
@@ -265,6 +271,8 @@ pub struct Relay {
     /// Per-scope authorization policy, resolved from the coordinator and
     /// cached. Shared by every accepted connection.
     authorizer: Arc<ScopeAuthorizer>,
+
+    connection_usage: Option<Arc<dyn ConnectionUsageObserver>>,
 }
 
 #[cfg(test)]
@@ -373,7 +381,16 @@ impl Relay {
             upstream_namespaces,
             upstream_namespaces_runner,
             authorizer,
+            connection_usage: None,
         })
+    }
+
+    /// Report each accepted connection's usage to `observer`.
+    ///
+    /// Off by default. See [`crate::ConnectionUsage`] for what is reported.
+    pub fn with_connection_usage(mut self, observer: Arc<dyn ConnectionUsageObserver>) -> Self {
+        self.connection_usage = Some(observer);
+        self
     }
 
     /// Run the relay server.
@@ -385,6 +402,7 @@ impl Relay {
             upstream_namespaces,
             upstream_namespaces_runner,
             authorizer,
+            connection_usage,
         } = self;
 
         let RelayConfig {
@@ -518,7 +536,7 @@ impl Relay {
                 // Create a future, box it, and push it to the collection.
                 accepts.push(
                     async move {
-                        let conn = server.accept().await.context("accept failed");
+                        let conn = server.accept_with_stats().await.context("accept failed");
                         (conn, server)
                     }
                     .boxed(),
@@ -533,13 +551,13 @@ impl Relay {
                         // First, immediately queue up the next accept() call for this server.
                         accepts.push(
                             async move {
-                                let conn = server.accept().await.context("accept failed");
+                                let conn = server.accept_with_stats().await.context("accept failed");
                                 (conn, server)
                             }
                             .boxed(),
                         );
 
-                        let (conn, info) = conn_result.context("failed to accept QUIC connection")?;
+                        let (conn, info, connection_statistics) = conn_result.context("failed to accept QUIC connection")?;
                         let quic::ConnInfo {
                             id: connection_id,
                             transport,
@@ -564,6 +582,8 @@ impl Relay {
                         let upstream_namespaces = upstream_namespaces.clone();
                         let connection_tagger = connection_tagger.clone();
                         let authorizer = authorizer.clone();
+                        let usage_observer = connection_usage.clone();
+                        let usage_connection_id = connection_id.clone();
                         let session_id = moq_transport::session::SessionId::new(connection_id);
                         let accept_span = session_id.span();
 
@@ -643,6 +663,21 @@ impl Relay {
                                 None => SessionContext::public(scope),
                             };
 
+                            // Created once the interface is known, which is after
+                            // scope resolution, and held until the connection task
+                            // ends, which closes it on every exit path.
+                            let connection_usage = usage_observer.map(|observer| {
+                                let usage = ConnectionUsage::new(
+                                    usage_connection_id,
+                                    context.interface,
+                                    transport,
+                                    connection_statistics,
+                                    moq_session.traffic(),
+                                );
+                                observer.connection_opened(usage.clone());
+                                ConnectionUsageGuard::new(usage)
+                            });
+
                             // The resolved interface controls whether an inbound
                             // PUBLISH_NAMESPACE is owned here or advertised only
                             // for peer discovery. Internal sessions are rare and
@@ -709,6 +744,16 @@ impl Relay {
                                     return Ok(());
                                 }
                             };
+
+                            // The tenant is reported only now that the session
+                            // is authorized.
+                            if let Some(guard) = &connection_usage {
+                                guard.usage().authorize(reported_scope(
+                                    coordinator.as_ref(),
+                                    scope_info.as_ref(),
+                                    true,
+                                ));
+                            }
 
                             // Gate Producer/Consumer creation on permissions.
                             // Note the intentional inversion:
