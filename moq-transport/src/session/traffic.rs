@@ -18,20 +18,100 @@ use std::{
     },
 };
 
-/// Tracks whose largest group ID is remembered per direction.
-///
-/// A session that has carried more tracks than this forgets them all and
-/// starts again, so a group in flight at that moment can be counted twice.
-/// Bounding the memory of a long-lived session matters more.
+/// Tracks whose recent groups are remembered per direction. Past this, the
+/// least recently used track is forgotten, so a group in flight on that track
+/// can be counted twice. Bounding a long-lived session's memory matters more.
 const MAX_TRACKED_TRACKS: usize = 4096;
+
+/// Groups below a track's newest that are still told apart. A group whose
+/// first object arrives more than this far behind the newest is not counted:
+/// counting it could count twice a group whose mark has left the window.
+const GROUP_WINDOW: u64 = u64::BITS as u64;
+
+/// Which recent groups of one track have been seen.
+#[derive(Debug)]
+struct TrackGroups {
+    newest: u64,
+    /// Bit `i` is set once group `newest - i` has been seen.
+    seen: u64,
+    /// When the track was last used, for least-recently-used eviction.
+    last_used: u64,
+}
+
+impl TrackGroups {
+    fn new(group_id: u64, now: u64) -> Self {
+        Self {
+            newest: group_id,
+            seen: 1,
+            last_used: now,
+        }
+    }
+
+    /// Mark `group_id` seen, returning whether it is new.
+    fn mark(&mut self, group_id: u64) -> bool {
+        if group_id > self.newest {
+            let shift = group_id - self.newest;
+            self.seen = if shift >= GROUP_WINDOW {
+                0
+            } else {
+                self.seen << shift
+            };
+            self.seen |= 1;
+            self.newest = group_id;
+            return true;
+        }
+        let age = self.newest - group_id;
+        if age >= GROUP_WINDOW {
+            return false;
+        }
+        let bit = 1 << age;
+        let new = self.seen & bit == 0;
+        self.seen |= bit;
+        new
+    }
+}
+
+/// Recent groups per track alias, bounded by [`MAX_TRACKED_TRACKS`].
+#[derive(Debug, Default)]
+struct GroupWindows {
+    tracks: HashMap<u64, TrackGroups>,
+    /// Logical clock for least-recently-used eviction.
+    clock: u64,
+}
+
+impl GroupWindows {
+    /// Mark `group_id` seen on `track_alias`, returning whether it is new.
+    fn first_sight(&mut self, track_alias: u64, group_id: u64) -> bool {
+        self.clock += 1;
+        let now = self.clock;
+        if let Some(track) = self.tracks.get_mut(&track_alias) {
+            track.last_used = now;
+            return track.mark(group_id);
+        }
+        if self.tracks.len() >= MAX_TRACKED_TRACKS {
+            // Runs only when a new track arrives at the cap.
+            if let Some(oldest) = self
+                .tracks
+                .iter()
+                .min_by_key(|(_, track)| track.last_used)
+                .map(|(alias, _)| *alias)
+            {
+                self.tracks.remove(&oldest);
+            }
+        }
+        self.tracks
+            .insert(track_alias, TrackGroups::new(group_id, now));
+        true
+    }
+}
 
 /// Counts the objects and groups crossing a session in one direction.
 #[derive(Debug, Default)]
 pub(crate) struct TrafficCounter {
     objects: AtomicU64,
     groups: AtomicU64,
-    /// Largest group ID seen per track alias.
-    largest_groups: Mutex<HashMap<u64, u64>>,
+    /// Recent groups seen per track alias.
+    group_windows: Mutex<GroupWindows>,
 }
 
 impl TrafficCounter {
@@ -46,34 +126,25 @@ impl TrafficCounter {
 
     /// Count `group_id` the first time an object of it crosses on `track_alias`.
     ///
-    /// Subgroup streams of one group arrive concurrently and in any order, so
-    /// a group is new only if it is larger than every group seen on the track.
-    /// A group whose first object arrives after a newer group's is therefore
-    /// not counted.
+    /// Subgroup streams arrive concurrently and in any order, including the
+    /// first streams of different groups, so each track remembers which of
+    /// its recent groups it has seen; see [`GROUP_WINDOW`].
     pub(crate) fn track_group(&self, track_alias: u64, group_id: u64) {
-        let mut largest_groups = self
-            .largest_groups
+        let new = self
+            .group_windows
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        match largest_groups.get_mut(&track_alias) {
-            Some(largest) if *largest >= group_id => return,
-            Some(largest) => *largest = group_id,
-            None => {
-                if largest_groups.len() >= MAX_TRACKED_TRACKS {
-                    largest_groups.clear();
-                }
-                largest_groups.insert(track_alias, group_id);
-            }
+            .unwrap_or_else(PoisonError::into_inner)
+            .first_sight(track_alias, group_id);
+        if new {
+            self.group();
         }
-        drop(largest_groups);
-        self.group();
     }
 
     /// [`Self::track_group`], skipped when `last` already holds this group.
     ///
-    /// Repeating the last group checked is always a no-op, because the
-    /// largest group per track only grows, so a datagram path can skip the
-    /// lock for consecutive datagrams of one group.
+    /// Repeating the last group checked never adds a count, because that
+    /// group is already marked seen (or too old to count), so a datagram path
+    /// can skip the lock for consecutive datagrams of one group.
     pub(crate) fn track_group_once(
         &self,
         last: &mut Option<(u64, u64)>,
@@ -171,7 +242,7 @@ mod tests {
 
         // With the track forgotten, a lookup would count (1, 5) again, so an
         // unchanged count shows the repeat skipped it.
-        counter.largest_groups.lock().unwrap().clear();
+        counter.group_windows.lock().unwrap().tracks.clear();
         counter.track_group_once(&mut last, 1, 5);
         assert_eq!(counter.groups(), 3);
     }
@@ -192,8 +263,56 @@ mod tests {
         for track in 0..MAX_TRACKED_TRACKS as u64 * 2 {
             counter.track_group(track, 0);
         }
-        assert!(counter.largest_groups.lock().unwrap().len() <= MAX_TRACKED_TRACKS);
+        assert_eq!(
+            counter.group_windows.lock().unwrap().tracks.len(),
+            MAX_TRACKED_TRACKS
+        );
         assert_eq!(counter.groups(), MAX_TRACKED_TRACKS as u64 * 2);
+    }
+
+    #[test]
+    fn a_late_group_inside_the_window_counts_once() {
+        let counter = TrafficCounter::default();
+        // Group 3's first stream arrives after group 5's, then repeats.
+        for group in [5, 3, 4, 3, 5, 4] {
+            counter.track_group(1, group);
+        }
+        assert_eq!(counter.groups(), 3);
+    }
+
+    #[test]
+    fn a_group_older_than_the_window_is_not_counted() {
+        let counter = TrafficCounter::default();
+        counter.track_group(1, 100);
+        counter.track_group(1, 100 - (GROUP_WINDOW - 1));
+        assert_eq!(counter.groups(), 2, "the oldest group the window holds");
+        counter.track_group(1, 100 - GROUP_WINDOW);
+        assert_eq!(counter.groups(), 2, "beyond the window");
+        // A jump past the window forgets every earlier mark.
+        counter.track_group(1, 100 + GROUP_WINDOW);
+        counter.track_group(1, 100 + 1);
+        assert_eq!(counter.groups(), 4);
+    }
+
+    #[test]
+    fn the_least_recently_used_track_is_forgotten_first() {
+        let counter = TrafficCounter::default();
+        for track in 0..MAX_TRACKED_TRACKS as u64 {
+            counter.track_group(track, 0);
+        }
+        // Track 0 stays in use, so track 1 is the least recently used.
+        counter.track_group(0, 0);
+        counter.track_group(MAX_TRACKED_TRACKS as u64, 0);
+        let counted = counter.groups();
+
+        counter.track_group(0, 0);
+        assert_eq!(counter.groups(), counted, "the active track is remembered");
+        counter.track_group(1, 0);
+        assert_eq!(
+            counter.groups(),
+            counted + 1,
+            "the evicted track starts over"
+        );
     }
 
     #[test]

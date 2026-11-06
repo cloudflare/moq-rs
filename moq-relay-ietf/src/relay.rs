@@ -611,6 +611,39 @@ impl Relay {
                             // Create our MoQ relay session
                             let moq_session = session;
 
+                            // Classify the connection interface (public client vs internal
+                            // relay peer) from the peer socket address, TLS SNI, and
+                            // connection path, before scope resolution, so a connection
+                            // refused there is still reported against its interface. With
+                            // no tagger configured every inbound connection is a public
+                            // client.
+                            let tags = connection_tagger.as_ref().map(|tagger| {
+                                let meta = ConnectionMeta::new(
+                                    Some(remote_addr),
+                                    server_name,
+                                    moq_session.connection_path().map(str::to_string),
+                                )
+                                .with_local_ip(local_ip);
+                                tagger.tag(&meta)
+                            });
+                            let interface = tags
+                                .as_ref()
+                                .map_or(SessionInterface::Public, |tags| tags.interface());
+
+                            // Held until the connection task ends, which closes it on
+                            // every exit path, including refusal below.
+                            let connection_usage = usage_observer.map(|observer| {
+                                let usage = ConnectionUsage::new(
+                                    usage_connection_id,
+                                    interface,
+                                    transport,
+                                    connection_statistics,
+                                    moq_session.traffic(),
+                                );
+                                observer.connection_opened(usage.clone());
+                                ConnectionUsageGuard::new(usage)
+                            });
+
                             // Resolve the connection path to a scope (identity + permissions).
                             // This translates the raw transport-level path into an application-level
                             // scope_id and determines what the connection is allowed to do.
@@ -639,44 +672,17 @@ impl Relay {
                             let can_publish = scope_info.as_ref().is_none_or(|s| s.permissions.can_publish());
                             let can_subscribe = scope_info.as_ref().is_none_or(|s| s.permissions.can_subscribe());
 
-                            // Classify the connection interface (public client vs internal
-                            // relay peer). This is deliberately separate from scope
-                            // resolution above: resolve_scope() returns identity +
-                            // permissions, while the embedder-supplied tagger decides the
-                            // transport interface from the peer socket address, TLS SNI, and
-                            // connection path. With no tagger configured every inbound
-                            // connection is treated as a public client. For connections
-                            // classified internal, the peer relay identity is derived from
-                            // the inbound socket address (see RelayInfo::from_socket_addr).
+                            // The interface was classified above, deliberately
+                            // separately from scope resolution: resolve_scope() returns
+                            // identity + permissions, while the embedder-supplied tagger
+                            // decides the transport interface. For connections classified
+                            // internal, the peer relay identity is derived from the
+                            // inbound socket address (see RelayInfo::from_socket_addr).
                             let scope = normalize_scope_id(scope_info.as_ref());
-                            let context = match connection_tagger.as_ref() {
-                                Some(tagger) => {
-                                    let meta = ConnectionMeta::new(
-                                        Some(remote_addr),
-                                        server_name,
-                                        moq_session.connection_path().map(str::to_string),
-                                    )
-                                    .with_local_ip(local_ip);
-                                    let tags = tagger.tag(&meta);
-                                    SessionContext::from_tags(scope, &tags, Some(remote_addr))
-                                }
+                            let context = match &tags {
+                                Some(tags) => SessionContext::from_tags(scope, tags, Some(remote_addr)),
                                 None => SessionContext::public(scope),
                             };
-
-                            // Created once the interface is known, which is after
-                            // scope resolution, and held until the connection task
-                            // ends, which closes it on every exit path.
-                            let connection_usage = usage_observer.map(|observer| {
-                                let usage = ConnectionUsage::new(
-                                    usage_connection_id,
-                                    context.interface,
-                                    transport,
-                                    connection_statistics,
-                                    moq_session.traffic(),
-                                );
-                                observer.connection_opened(usage.clone());
-                                ConnectionUsageGuard::new(usage)
-                            });
 
                             // The resolved interface controls whether an inbound
                             // PUBLISH_NAMESPACE is owned here or advertised only
@@ -820,6 +826,120 @@ mod tests {
     use super::*;
 
     use crate::{ScopeInfo, ScopePermissions};
+
+    /// Refuses every connection at scope resolution.
+    struct RefusingCoordinator;
+
+    #[async_trait::async_trait]
+    impl Coordinator for RefusingCoordinator {
+        async fn resolve_scope(
+            &self,
+            _connection_path: Option<&str>,
+        ) -> crate::CoordinatorResult<Option<ScopeInfo>> {
+            Err(crate::CoordinatorError::Other(anyhow::anyhow!("refused")))
+        }
+
+        async fn register_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &moq_transport::coding::TrackNamespace,
+            _context: &crate::CoordinatorContext,
+        ) -> crate::CoordinatorResult<crate::NamespaceRegistration> {
+            Ok(crate::NamespaceRegistration::new(()))
+        }
+
+        async fn unregister_namespace(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &moq_transport::coding::TrackNamespace,
+        ) -> crate::CoordinatorResult<()> {
+            Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            _scope: Option<&str>,
+            _namespace: &moq_transport::coding::TrackNamespace,
+        ) -> crate::CoordinatorResult<(crate::NamespaceOrigin, Option<moq_native_ietf::Client>)>
+        {
+            Err(crate::CoordinatorError::NamespaceNotFound)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(std::sync::Mutex<Vec<crate::ConnectionUsage>>);
+
+    impl crate::ConnectionUsageObserver for RecordingObserver {
+        fn connection_opened(&self, usage: crate::ConnectionUsage) {
+            self.0.lock().unwrap().push(usage);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_refused_at_scope_resolution_is_reported() {
+        let tls = crate::test::test_tls();
+        let endpoint = Endpoint::new(
+            quic::Config::new("127.0.0.1:0".parse().unwrap(), None, tls.clone()).unwrap(),
+        )
+        .unwrap();
+        let port = endpoint
+            .server
+            .as_ref()
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = moq_native_ietf::Client::from(endpoint.client.clone());
+        let observer = Arc::new(RecordingObserver::default());
+        let relay = Relay::new(RelayConfig {
+            bind: None,
+            endpoints: vec![endpoint],
+            tls,
+            qlog_dir: None,
+            mlog_dir: None,
+            announce: None,
+            node: None,
+            coordinator: Arc::new(RefusingCoordinator),
+            session: SessionConfig::default(),
+            connection_tagger: None,
+        })
+        .unwrap()
+        .with_connection_usage(observer.clone());
+
+        let url = Url::parse("moqt://localhost/refused").unwrap();
+        let addr = net::SocketAddr::from(([127, 0, 0, 1], port));
+        let reported = async {
+            let connection = client.connect(&url, Some(addr)).await.unwrap();
+            // Setup completes, then the relay refuses the scope and closes.
+            let _ = moq_transport::session::Session::connect(
+                connection.session,
+                None,
+                connection.transport,
+            )
+            .await;
+            loop {
+                let usage = observer.0.lock().unwrap().first().cloned();
+                if let Some(usage) = usage.filter(|usage| usage.snapshot().closed) {
+                    break usage;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        // `Relay::run` is not `Send`, so drive it alongside the client here.
+        let usage = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = relay.run() => panic!("relay stopped: {result:?}"),
+                usage = reported => usage,
+            }
+        })
+        .await
+        .expect("the refused connection is reported and closed");
+
+        assert_eq!(usage.scope(), None, "never reported under a tenant");
+        assert_eq!(usage.interface(), SessionInterface::Public);
+        assert!(usage.snapshot().ingress_bytes > 0);
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
+    }
 
     fn scope_info(scope_id: &str) -> ScopeInfo {
         ScopeInfo {

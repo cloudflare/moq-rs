@@ -46,7 +46,8 @@ pub(crate) struct TestEndpoint {
     pub addr: SocketAddr,
 }
 
-pub(crate) fn test_endpoint() -> TestEndpoint {
+/// TLS for a test endpoint whose client trusts its own self-signed server.
+pub(crate) fn test_tls() -> moq_native_ietf::tls::Config {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let certificate = certified.cert.der().clone();
@@ -67,14 +68,18 @@ pub(crate) fn test_endpoint() -> TestEndpoint {
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let tls = moq_native_ietf::tls::Config {
+    moq_native_ietf::tls::Config {
         client: client_tls,
         server: Some(server_tls),
         fingerprints: Vec::new(),
-    };
-    let endpoint =
-        quic::Endpoint::new(quic::Config::new("0.0.0.0:0".parse().unwrap(), None, tls).unwrap())
-            .unwrap();
+    }
+}
+
+pub(crate) fn test_endpoint() -> TestEndpoint {
+    let endpoint = quic::Endpoint::new(
+        quic::Config::new("0.0.0.0:0".parse().unwrap(), None, test_tls()).unwrap(),
+    )
+    .unwrap();
     let client = endpoint.client;
     let server = endpoint.server.unwrap();
     let addr = SocketAddr::from(([127, 0, 0, 1], server.local_addr().unwrap().port()));

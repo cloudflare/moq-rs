@@ -4,10 +4,9 @@
 //! Per-connection usage, for embedders that report it.
 //!
 //! With [`crate::Relay::with_connection_usage`], the relay hands the observer
-//! a [`ConnectionUsage`] for each accepted connection once its scope is
-//! resolved and its interface classified. A connection refused at scope
-//! resolution is not reported; one refused at authorization is reported
-//! without a tenant. The embedder reads it on its own schedule; the relay keeps no
+//! a [`ConnectionUsage`] for each accepted connection once MoQT setup
+//! completes and its interface is classified. A connection refused at scope
+//! resolution or authorization is reported without a tenant. The embedder reads it on its own schedule; the relay keeps no
 //! timer, registry or lock shared between connections. When the connection
 //! ends, the relay records the final totals and releases the connection, so a
 //! handle kept until its final totals are reported does not keep the
@@ -22,8 +21,8 @@ use crate::{Coordinator, ScopeInfo, SessionInterface};
 
 /// Receives the usage handle of every accepted connection.
 pub trait ConnectionUsageObserver: Send + Sync + 'static {
-    /// Called once per connection, after scope resolution and before
-    /// authorization, on the connection's task. It must not block.
+    /// Called once per connection, after MoQT setup and before scope
+    /// resolution, on the connection's task. It must not block.
     fn connection_opened(&self, usage: ConnectionUsage);
 }
 
