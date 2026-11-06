@@ -57,7 +57,7 @@ pub use connection_usage::{ConnectionUsage, ConnectionUsageObserver, UsageSnapsh
 pub use consumer::*;
 pub use coordinator::*;
 pub use local::*;
-// RelayConfig and Coordinator::lookup expose moq_native_ietf types. Per RFC-047 §6.
+// RelayConfig and Coordinator::lookup expose moq_native_ietf types.
 pub use moq_native_ietf;
 // Re-export moq_transport so callers of the auth API (AuthHook, AuthzOperation,
 // decode_setup_tokens) can use TrackNamespace, KeyValuePairs etc. without

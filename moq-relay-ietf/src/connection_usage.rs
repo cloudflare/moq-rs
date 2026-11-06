@@ -208,20 +208,16 @@ pub struct UsageSnapshot {
     pub closed: bool,
 }
 
-/// The scope a session is reported under once its admission is decided.
+/// The scope an authorized session is reported under.
 ///
-/// A refused session is never reported under a tenant. Only the
-/// coordinator's metrics scope ID is used: the routing scope's format is
-/// coordinator-defined and may carry credentials, so only its presence is
-/// consulted.
+/// Only the coordinator's metrics scope ID is used: the routing scope's
+/// format is coordinator-defined and may carry credentials, so only its
+/// presence is consulted. Call this only once the session is authorized; a
+/// refused session must never be reported under a tenant.
 pub(crate) fn reported_scope(
     coordinator: &dyn Coordinator,
     scope_info: Option<&ScopeInfo>,
-    authorized: bool,
 ) -> Option<String> {
-    if !authorized {
-        return None;
-    }
     scope_info
         .filter(|info| !info.scope_id.is_empty())
         .and_then(|info| coordinator.metrics_scope_id(info))
@@ -329,28 +325,16 @@ mod tests {
     fn only_the_metrics_scope_id_is_reported() {
         let scope = scope_with_credential();
         assert_eq!(
-            reported_scope(&ProjectingCoordinator(Some("uid")), Some(&scope), true),
+            reported_scope(&ProjectingCoordinator(Some("uid")), Some(&scope)),
             Some("uid".to_owned())
         );
         // Without a projection the routing scope must not be reported.
         assert_eq!(
-            reported_scope(&ProjectingCoordinator(None), Some(&scope), true),
+            reported_scope(&ProjectingCoordinator(None), Some(&scope)),
             None
         );
         assert_eq!(
-            reported_scope(&ProjectingCoordinator(Some("")), Some(&scope), true),
-            None
-        );
-    }
-
-    #[test]
-    fn a_refused_session_is_never_reported_under_the_tenant() {
-        assert_eq!(
-            reported_scope(
-                &ProjectingCoordinator(Some("uid")),
-                Some(&scope_with_credential()),
-                false
-            ),
+            reported_scope(&ProjectingCoordinator(Some("")), Some(&scope)),
             None
         );
     }
@@ -358,11 +342,11 @@ mod tests {
     #[test]
     fn a_session_without_a_routing_scope_is_unscoped() {
         let coordinator = ProjectingCoordinator(Some("uid"));
-        assert_eq!(reported_scope(&coordinator, None, true), None);
+        assert_eq!(reported_scope(&coordinator, None), None);
         let empty = ScopeInfo {
             scope_id: String::new(),
             permissions: ScopePermissions::ReadWrite,
         };
-        assert_eq!(reported_scope(&coordinator, Some(&empty), true), None);
+        assert_eq!(reported_scope(&coordinator, Some(&empty)), None);
     }
 }

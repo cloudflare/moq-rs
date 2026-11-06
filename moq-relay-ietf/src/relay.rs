@@ -640,8 +640,11 @@ impl Relay {
                                     connection_statistics,
                                     moq_session.traffic(),
                                 );
-                                observer.connection_opened(usage.clone());
-                                ConnectionUsageGuard::new(usage)
+                                // Guard first, so the usage is closed even if
+                                // the observer panics.
+                                let guard = ConnectionUsageGuard::new(usage);
+                                observer.connection_opened(guard.usage().clone());
+                                guard
                             });
 
                             // Resolve the connection path to a scope (identity + permissions).
@@ -757,7 +760,6 @@ impl Relay {
                                 guard.usage().authorize(reported_scope(
                                     coordinator.as_ref(),
                                     scope_info.as_ref(),
-                                    true,
                                 ));
                             }
 
@@ -827,8 +829,14 @@ mod tests {
 
     use crate::{ScopeInfo, ScopePermissions};
 
-    /// Refuses every connection at scope resolution.
-    struct RefusingCoordinator;
+    /// Refuses every connection, at scope resolution or at authorization.
+    ///
+    /// Either way it names a tenant, so a refused connection reported under
+    /// it would be caught.
+    enum RefusingCoordinator {
+        AtScope,
+        AtAuthorization,
+    }
 
     #[async_trait::async_trait]
     impl Coordinator for RefusingCoordinator {
@@ -836,7 +844,26 @@ mod tests {
             &self,
             _connection_path: Option<&str>,
         ) -> crate::CoordinatorResult<Option<ScopeInfo>> {
+            match self {
+                Self::AtScope => Err(crate::CoordinatorError::Other(anyhow::anyhow!("refused"))),
+                Self::AtAuthorization => Ok(Some(ScopeInfo {
+                    scope_id: "tenant".to_string(),
+                    permissions: ScopePermissions::ReadWrite,
+                })),
+            }
+        }
+
+        // A scope whose policy has never been fetched denies new sessions
+        // when the fetch fails.
+        async fn get_scope_config(
+            &self,
+            _scope: Option<&str>,
+        ) -> crate::CoordinatorResult<crate::ScopeConfig> {
             Err(crate::CoordinatorError::Other(anyhow::anyhow!("refused")))
+        }
+
+        fn metrics_scope_id(&self, _scope: &ScopeInfo) -> Option<String> {
+            Some("tenant".to_string())
         }
 
         async fn register_namespace(
@@ -875,8 +902,9 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_connection_refused_at_scope_resolution_is_reported() {
+    /// Connects once, lets `coordinator` refuse the connection, and returns
+    /// what the relay reported for it once closed.
+    async fn report_refused_connection(coordinator: RefusingCoordinator) -> crate::ConnectionUsage {
         let tls = crate::test::test_tls();
         let endpoint = Endpoint::new(
             quic::Config::new("127.0.0.1:0".parse().unwrap(), None, tls.clone()).unwrap(),
@@ -899,7 +927,7 @@ mod tests {
             mlog_dir: None,
             announce: None,
             node: None,
-            coordinator: Arc::new(RefusingCoordinator),
+            coordinator: Arc::new(coordinator),
             session: SessionConfig::default(),
             connection_tagger: None,
         })
@@ -910,7 +938,7 @@ mod tests {
         let addr = net::SocketAddr::from(([127, 0, 0, 1], port));
         let reported = async {
             let connection = client.connect(&url, Some(addr)).await.unwrap();
-            // Setup completes, then the relay refuses the scope and closes.
+            // Setup completes, then the relay refuses and closes.
             let _ = moq_transport::session::Session::connect(
                 connection.session,
                 None,
@@ -934,11 +962,23 @@ mod tests {
         })
         .await
         .expect("the refused connection is reported and closed");
+        assert_eq!(observer.0.lock().unwrap().len(), 1);
+        usage
+    }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_refused_at_scope_resolution_is_reported() {
+        let usage = report_refused_connection(RefusingCoordinator::AtScope).await;
         assert_eq!(usage.scope(), None, "never reported under a tenant");
         assert_eq!(usage.interface(), SessionInterface::Public);
         assert!(usage.snapshot().ingress_bytes > 0);
-        assert_eq!(observer.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_refused_at_authorization_is_reported_without_its_tenant() {
+        let usage = report_refused_connection(RefusingCoordinator::AtAuthorization).await;
+        assert_eq!(usage.scope(), None, "never reported under a tenant");
+        assert!(usage.snapshot().ingress_bytes > 0);
     }
 
     fn scope_info(scope_id: &str) -> ScopeInfo {
