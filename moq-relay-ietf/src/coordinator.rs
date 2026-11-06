@@ -665,6 +665,22 @@ pub trait Coordinator: Send + Sync {
         }))
     }
 
+    /// A stable scope identifier safe to report as a connection's tenant.
+    ///
+    /// [`ScopeInfo::scope_id`] is never reported directly: its format is
+    /// coordinator-defined and may contain credentials or be unbounded.
+    /// Return `None` to report the session without a scope identifier, which
+    /// is the default.
+    ///
+    /// The relay calls this only for an authorized session, and only when
+    /// [`crate::Relay::with_connection_usage`] is enabled; the value becomes
+    /// [`crate::ConnectionUsage::scope`]. Return a value drawn from a bounded
+    /// set, such as a tenant identifier, never anything a client chooses
+    /// freely.
+    fn metrics_scope_id(&self, _scope: &ScopeInfo) -> Option<String> {
+        None
+    }
+
     /// Register a namespace as locally available on this relay.
     ///
     /// Called when a publisher sends PUBLISH_NAMESPACE.
@@ -2840,6 +2856,16 @@ mod tests {
         let coord = MinimalCoordinator;
         let result = coord.resolve_scope(None).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn default_scope_projection_does_not_expose_routing_scope() {
+        let coord = MinimalCoordinator;
+        let scope = ScopeInfo {
+            scope_id: "/tenant/raw-credential".to_string(),
+            permissions: ScopePermissions::ReadWrite,
+        };
+        assert_eq!(coord.metrics_scope_id(&scope), None);
     }
 
     #[tokio::test]

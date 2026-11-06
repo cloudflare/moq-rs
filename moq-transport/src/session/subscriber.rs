@@ -31,7 +31,7 @@ use super::{
     fetch_range_is_valid, validate_fetch_params, BidiResponse, BidiResponseMap, DoneOutcome, Fetch,
     NameRegistry, PublishDoneInfo, PublishReceived, PublishReceivedRecv, PublishedNamespace,
     PublishedNamespaceRecv, Reader, RequestId, Session, SessionError, Subscribe,
-    SubscribeNamespace, SubscribeNamespaceInfo, SubscribeRecv, Writer,
+    SubscribeNamespace, SubscribeNamespaceInfo, SubscribeRecv, TrafficCounter, Writer,
 };
 
 // Default timeout for waiting for subscribe aliases to become available via SUBSCRIBE_OK (1 second)
@@ -526,6 +526,9 @@ pub struct Subscriber {
     /// Channel for sending bidi reader futures to `Session::run`, which polls
     /// them cooperatively under structured concurrency (no task is spawned).
     bidi_task_tx: super::BidiTaskSender,
+
+    /// Objects and groups received from the peer.
+    traffic: Arc<TrafficCounter>,
 }
 
 #[derive(Default)]
@@ -599,7 +602,12 @@ impl Subscriber {
             fetch_streams: Default::default(),
             bidi_task_tx,
             bidi_response_map,
+            traffic: Default::default(),
         }
+    }
+
+    pub(super) fn traffic_counter(&self) -> Arc<TrafficCounter> {
+        self.traffic.clone()
     }
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
@@ -1114,6 +1122,7 @@ impl Subscriber {
             self.webtransport.clone(),
             registration,
             cancel_tx,
+            self.traffic_counter(),
         );
 
         let response = async move {
@@ -2727,6 +2736,11 @@ impl Subscriber {
                 object_count + 1,
                 chunks_read
             );
+            if object_count == 0 {
+                self.traffic
+                    .track_group(subgroup_header.track_alias, subgroup_header.group_id);
+            }
+            self.traffic.object();
             object_count += 1;
         }
         subgroup.finish();
@@ -2743,6 +2757,17 @@ impl Subscriber {
 
     /// Handle reception of a datagram from the QUIC session.
     pub async fn recv_datagram(&mut self, datagram: bytes::Bytes) -> Result<(), SessionError> {
+        self.recv_datagram_tracked(datagram, &mut None).await
+    }
+
+    /// [`Self::recv_datagram`], remembering in `last_group` the track and
+    /// group of the datagram so the next one of the same group skips the
+    /// traffic lock.
+    pub(super) async fn recv_datagram_tracked(
+        &mut self,
+        datagram: bytes::Bytes,
+        last_group: &mut Option<(u64, u64)>,
+    ) -> Result<(), SessionError> {
         let mut cursor = io::Cursor::new(datagram);
         let datagram = data::Datagram::decode(&mut cursor).map_err(|err| match err {
             crate::coding::DecodeError::More(_) => {
@@ -2750,6 +2775,11 @@ impl Subscriber {
             }
             err => SessionError::Decode(err),
         })?;
+        // Counted on receipt, whether it is delivered, deferred until its
+        // alias is known, or dropped for an ended subscription.
+        self.traffic.object();
+        self.traffic
+            .track_group_once(last_group, datagram.track_alias, datagram.group_id);
 
         if let Some(ref mlog) = self.mlog {
             if let Ok(mut mlog_guard) = mlog.lock() {

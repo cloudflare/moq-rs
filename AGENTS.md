@@ -48,6 +48,13 @@ decoded, with malformed tokens and forbidden alias directives rejected
 tag it internal; a source subnet or listener address does not authenticate a
 peer on its own.
 
+## Connection Usage
+
+A connection's reported scope comes only from `Coordinator::metrics_scope_id()`,
+set only once the session is authorized. Raw connection paths and routing
+scopes can carry credentials and are never reported, and a refused session's
+traffic is never reported under a tenant.
+
 ## Session Transport Seam
 
 - Native sessions adapt `web_transport_trait::Session` through `session::transport::Session::new(backend, original_url)`. The embedder owns connection establishment and supplies truthful original URL metadata.

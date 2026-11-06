@@ -39,7 +39,7 @@ use crate::{
 
 use super::{
     joining_fetch_end_location, Fetch, FetchValidator, JoiningError, JoiningSnapshot,
-    JoiningTarget, SessionError, Writer,
+    JoiningTarget, SessionError, TrafficCounter, Writer,
 };
 
 /// Chunk size for relaying upstream FETCH payloads in [`FetchRequested::proxy`].
@@ -64,6 +64,8 @@ struct ProxyState {
     validator: FetchValidator,
     payload_remaining: u64,
     ok_sent: bool,
+    /// Group of the last object relayed, so each group counts once.
+    last_group: Option<u64>,
 }
 
 impl ProxyState {
@@ -74,6 +76,7 @@ impl ProxyState {
             validator: FetchValidator::new(Some(range), order),
             payload_remaining: 0,
             ok_sent: false,
+            last_group: None,
         }
     }
 }
@@ -139,6 +142,8 @@ pub struct FetchRequested {
     joining: Option<JoiningTarget>,
     /// The range [`Self::resolve`] settled on.
     resolved: OnceLock<message::StandaloneFetch>,
+    /// Objects and groups sent to the peer.
+    traffic: Arc<TrafficCounter>,
     /// The FETCH as received.
     pub request: message::Fetch,
 }
@@ -203,6 +208,7 @@ impl FetchRequested {
         request: message::Fetch,
         joining: Option<JoiningTarget>,
         session_id: super::SessionId,
+        traffic: Arc<TrafficCounter>,
     ) -> (Self, FetchRequestedRecv) {
         let (send, recv) = State::default().split();
         (
@@ -215,6 +221,7 @@ impl FetchRequested {
                 id: request.id,
                 joining,
                 resolved: OnceLock::new(),
+                traffic,
                 request,
             },
             FetchRequestedRecv { state: recv },
@@ -358,6 +365,7 @@ impl FetchRequested {
             encoder,
             validator,
             payload_remaining: 0,
+            last_group: None,
             request: self,
         })
     }
@@ -511,6 +519,8 @@ impl FetchRequested {
                     out.writer.write(&encoded).await?;
                     if let FetchRecord::Object(object) = &record {
                         relay.payload_remaining = object.payload_length;
+                        self.traffic
+                            .fetch_object(&mut relay.last_group, object.group_id);
                     }
                 }
                 ProxyStep::Record(None) => body_done = true,
@@ -690,6 +700,8 @@ pub struct FetchWriter {
     encoder: FetchRecordEncoder,
     validator: FetchValidator,
     payload_remaining: u64,
+    /// Group of the last object written, so each group counts once.
+    last_group: Option<u64>,
     request: FetchRequested,
 }
 
@@ -709,6 +721,9 @@ impl FetchWriter {
         self.write(&encoded).await?;
         if let FetchRecord::Object(object) = record {
             self.payload_remaining = object.payload_length;
+            self.request
+                .traffic
+                .fetch_object(&mut self.last_group, object.group_id);
         }
         Ok(())
     }
@@ -796,6 +811,7 @@ mod tests {
             standalone(id),
             None,
             super::super::SessionId::generate(),
+            Default::default(),
         );
         (request, recv, Sent(outgoing_rx, keepalive), active)
     }
