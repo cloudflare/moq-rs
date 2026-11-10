@@ -1702,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "moq-native-ietf"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1749,7 +1749,7 @@ dependencies = [
 
 [[package]]
 name = "moq-relay-ietf"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "moq-transport"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "bytes",
  "futures",

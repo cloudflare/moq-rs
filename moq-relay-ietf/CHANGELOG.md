@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.8.0...moq-relay-ietf-v0.8.1) - 2026-11-10
+
+### Added
+
+- report per-connection usage
+
+### Fixed
+
+- *(moq-relay-ietf)* test that a refused session is reported without its tenant
+- close known gaps in connection usage counting
+
 ## [0.8.0](https://github.com/cloudflare/moq-rs/compare/moq-relay-ietf-v0.7.31...moq-relay-ietf-v0.8.0) - 2026-11-02
 
 ### Added

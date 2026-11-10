@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.17.0...moq-transport-v0.17.1) - 2026-11-10
+
+### Added
+
+- report per-connection usage
+
+### Fixed
+
+- close known gaps in connection usage counting
+
 ## [0.17.0](https://github.com/cloudflare/moq-rs/compare/moq-transport-v0.16.5...moq-transport-v0.17.0) - 2026-11-02
 
 ### Added
