@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.11.0...moq-native-ietf-v0.11.1) - 2026-11-10
+
+### Added
+
+- report per-connection usage
+
 ## [0.11.0](https://github.com/cloudflare/moq-rs/compare/moq-native-ietf-v0.10.0...moq-native-ietf-v0.11.0) - 2026-11-02
 
 ### Added
