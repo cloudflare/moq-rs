@@ -35,6 +35,7 @@
 
 mod api;
 mod auth;
+mod connection_usage;
 mod consumer;
 mod coordinator;
 mod covering_prefix_set;
@@ -52,9 +53,12 @@ mod web;
 
 pub use api::*;
 pub use auth::*;
+pub use connection_usage::{ConnectionUsage, ConnectionUsageObserver, UsageSnapshot};
 pub use consumer::*;
 pub use coordinator::*;
 pub use local::*;
+// RelayConfig and Coordinator::lookup expose moq_native_ietf types.
+pub use moq_native_ietf;
 // Re-export moq_transport so callers of the auth API (AuthHook, AuthzOperation,
 // decode_setup_tokens) can use TrackNamespace, KeyValuePairs etc. without
 // adding moq_transport as a direct dependency. Per RFC-047 §6.

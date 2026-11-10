@@ -27,7 +27,7 @@ use super::{
     FetchRequestedRecv, NameRegistry, ObjectForwarderRecv, PublishNamespace, PublishNamespaceRecv,
     Published, PublishedInfo, PublishedRecv, Reader, RequestId, Session, SessionError, Subscribed,
     SubscribedNamespace, SubscribedNamespaceInfo, SubscribedNamespaceRecv, SubscribedTracks,
-    SubscribedTracksInfo, SubscribedTracksRecv, TrackStatusRequested, Writer,
+    SubscribedTracksInfo, SubscribedTracksRecv, TrackStatusRequested, TrafficCounter, Writer,
 };
 use crate::message::RequestErrorCode;
 
@@ -170,6 +170,9 @@ pub struct Publisher {
     /// Inbound request streams owned by `Session::run`. Normal serving waits
     /// for the owning writer to encode its terminal message and send FIN.
     pub(super) bidi_response_map: BidiResponseMap,
+
+    /// Objects and groups sent to the peer.
+    traffic: Arc<TrafficCounter>,
 }
 
 struct PublishNamespaceCleanup {
@@ -271,7 +274,16 @@ impl Publisher {
             subscribe_arrived: Default::default(),
             fetches: Default::default(),
             bidi_response_map: Default::default(),
+            traffic: Default::default(),
         }
+    }
+
+    pub(super) fn traffic_counter(&self) -> Arc<TrafficCounter> {
+        self.traffic.clone()
+    }
+
+    pub(super) fn traffic(&self) -> &TrafficCounter {
+        &self.traffic
     }
 
     pub async fn accept(
@@ -1464,6 +1476,7 @@ impl Publisher {
             msg,
             joining,
             self.session_id().clone(),
+            self.traffic_counter(),
         );
         self.fetches
             .lock()

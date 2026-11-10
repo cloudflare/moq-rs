@@ -27,6 +27,7 @@ mod subscribed_namespace;
 mod subscribed_tracks;
 mod subscriber;
 mod track_status_requested;
+mod traffic;
 #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
 pub mod transport;
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
@@ -57,6 +58,8 @@ pub use subscribed_namespace::*;
 pub use subscribed_tracks::*;
 pub use subscriber::*;
 pub use track_status_requested::*;
+pub(crate) use traffic::TrafficCounter;
+pub use traffic::{SessionTraffic, TrafficSnapshot};
 
 use self::transport as web_transport;
 use reader::*;
@@ -313,6 +316,9 @@ pub struct Session {
     /// The transport protocol negotiated for this connection.
     transport: Transport,
 
+    /// Objects and groups carried by the session's two halves.
+    traffic: SessionTraffic,
+
     /// The connection path, derived from the WebTransport URL path or SETUP PATH parameter.
     /// For incoming connections: extracted during accept() from the WebTransport CONNECT URL
     /// (takes precedence) or the SETUP PATH parameter (key 0x1).
@@ -427,6 +433,12 @@ impl Session {
     /// Returns the negotiated transport protocol for this connection.
     pub fn transport(&self) -> Transport {
         self.transport
+    }
+
+    /// Objects and groups this session carries. The handle stays readable
+    /// after the session ends.
+    pub fn traffic(&self) -> SessionTraffic {
+        self.traffic.clone()
     }
 
     /// Returns the connection path, if one was present on the incoming connection.
@@ -712,6 +724,17 @@ impl Session {
             bidi_response_map.clone(),
         ));
 
+        let traffic = SessionTraffic::new(
+            subscriber
+                .as_ref()
+                .map(Subscriber::traffic_counter)
+                .unwrap_or_default(),
+            publisher
+                .as_ref()
+                .map(Publisher::traffic_counter)
+                .unwrap_or_default(),
+        );
+
         let session = Self {
             webtransport,
             sender,
@@ -722,6 +745,7 @@ impl Session {
             request_id,
             mlog: mlog_shared,
             transport,
+            traffic,
             connection_path,
             bidi_task_rx,
             bidi_response_map,
@@ -2119,12 +2143,14 @@ impl Session {
         webtransport: web_transport::Session,
         mut subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
+        // Consecutive datagrams of one group skip the traffic lock.
+        let mut last_group = None;
         loop {
             let datagram = webtransport.recv_datagram().await?;
             subscriber
                 .as_mut()
                 .ok_or(SessionError::RoleViolation)?
-                .recv_datagram(datagram)
+                .recv_datagram_tracked(datagram, &mut last_group)
                 .await?;
         }
     }

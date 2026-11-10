@@ -19,7 +19,9 @@ use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::{State, StateWeak};
 use crate::{data, message, serve};
 
-use super::{DeliveryError, DeliveryFilter, Publisher, SessionError, SubscribeInfo, Writer};
+use super::{
+    DeliveryError, DeliveryFilter, Publisher, SessionError, SubscribeInfo, TrafficCounter, Writer,
+};
 
 // This file defines Publisher handling of inbound Subscriptions
 
@@ -340,13 +342,16 @@ enum SubgroupSink {
 struct SubgroupOutput {
     sink: SubgroupSink,
     owed: usize,
+    /// Objects and groups sent to the peer.
+    traffic: Arc<TrafficCounter>,
 }
 
 impl SubgroupOutput {
-    fn stream(writer: Writer) -> Self {
+    fn stream(writer: Writer, traffic: Arc<TrafficCounter>) -> Self {
         Self {
             sink: SubgroupSink::Stream(SubgroupStream::new(writer)),
             owed: 0,
+            traffic,
         }
     }
 
@@ -358,6 +363,7 @@ impl SubgroupOutput {
                 termination: None,
             },
             owed: 0,
+            traffic: Default::default(),
         }
     }
 
@@ -892,10 +898,10 @@ impl ObjectForwarder {
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         send_stream.set_priority(i32::from(subgroup_reader.priority));
 
-        let mut output = SubgroupOutput::stream(Writer::with_session_id(
-            send_stream,
-            publisher.session_id().clone(),
-        ));
+        let mut output = SubgroupOutput::stream(
+            Writer::with_session_id(send_stream, publisher.session_id().clone()),
+            publisher.traffic_counter(),
+        );
         stream_count.opened();
         let state_status = state.lock().closed.clone();
         let res = if let Err(err) = state_status {
@@ -1144,6 +1150,12 @@ impl ObjectForwarder {
                 return Err(ServeError::Size.into());
             }
 
+            if object_count == 0 {
+                output
+                    .traffic
+                    .track_group(header.track_alias, header.group_id);
+            }
+            output.traffic.object();
             object_count += 1;
         }
 
@@ -1214,6 +1226,8 @@ impl ObjectForwarder {
         tracing::debug!("[PUBLISHER] serve_datagrams: starting");
 
         let mut datagram_count = 0;
+        // Consecutive datagrams of one group skip the traffic lock.
+        let mut last_group = None;
         loop {
             let next = tokio::select! {
                 biased;
@@ -1298,6 +1312,12 @@ impl ObjectForwarder {
             }
 
             self.publisher.send_datagram(buffer.into()).await?;
+            self.publisher.traffic().object();
+            self.publisher.traffic().track_group_once(
+                &mut last_group,
+                encoded_datagram.track_alias,
+                encoded_datagram.group_id,
+            );
 
             if datagram.status == data::ObjectStatus::NormalObject {
                 self.state
