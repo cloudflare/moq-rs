@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::Event;
 
@@ -22,6 +22,22 @@ impl MlogWriter {
         let mut writer = BufWriter::new(file);
 
         let start_time = Instant::now();
+        // Wall-clock time at `start_time`, in Unix epoch milliseconds. Sampled
+        // once, next to `start_time`; event times stay monotonic. Rounded to
+        // whole microseconds: an f64 this large resolves only ~0.24 us, so
+        // finer digits would be noise.
+        let reference_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_micros() as f64 / 1000.0);
+
+        // Event times are milliseconds since `start_time`. qlog 0.3 reads a
+        // missing time_format as "absolute", so declare "relative" and anchor
+        // it with reference_time.
+        let mut common_fields = serde_json::json!({ "time_format": "relative" });
+        if let Some(reference_time) = reference_time {
+            common_fields["reference_time"] = reference_time.into();
+        }
 
         // Write qlog-compatible header as first record
         // This follows qlog JSON-SEQ format (RFC 7464)
@@ -31,6 +47,7 @@ impl MlogWriter {
             "title": "moq-relay",
             "description": "MoQ Transport events",
             "trace": {
+                "common_fields": common_fields,
                 "vantage_point": {
                     "type": "server"
                 },
@@ -66,5 +83,58 @@ impl MlogWriter {
     /// Flush and close the log
     pub fn finish(mut self) -> io::Result<()> {
         self.writer.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_declares_relative_times_anchored_to_wall_clock() {
+        let path = std::env::temp_dir().join(format!(
+            "mlog-header-test-{}-{}.mlog",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Same microsecond rounding as the writer, so the bounds can't be
+        // finer than the value they bracket.
+        let now_ms = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as f64
+                / 1000.0
+        };
+
+        let before = now_ms();
+        MlogWriter::new(&path).unwrap().finish().unwrap();
+        let after = now_ms();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let record = contents
+            .strip_prefix('\x1e')
+            .and_then(|s| s.lines().next())
+            .expect("header record");
+        let header: serde_json::Value = serde_json::from_str(record).unwrap();
+        let common = &header["trace"]["common_fields"];
+
+        assert_eq!(common["time_format"], "relative");
+        let reference_time = common["reference_time"].as_f64().expect("reference_time");
+        assert!(
+            (before..=after).contains(&reference_time),
+            "reference_time {reference_time} not within [{before}, {after}]"
+        );
+
+        // Whole microseconds: no more than three digits after the point.
+        let text = common["reference_time"].to_string();
+        let decimals = text.split_once('.').map_or(0, |(_, frac)| frac.len());
+        assert!(decimals <= 3, "reference_time {text} finer than 1 us");
     }
 }

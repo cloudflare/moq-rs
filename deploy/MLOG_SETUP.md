@@ -245,6 +245,10 @@ mlog uses [JSON-SEQ (RFC 7464)](https://www.rfc-editor.org/rfc/rfc7464): each re
   "title": "moq-relay",
   "description": "MoQ Transport events",
   "trace": {
+    "common_fields": {
+      "time_format": "relative",
+      "reference_time": <Unix epoch milliseconds at connection start>
+    },
     "vantage_point": { "type": "server" },
     "event_schemas": [
       "urn:ietf:params:qlog:events:loglevel",
