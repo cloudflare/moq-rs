@@ -2644,6 +2644,228 @@ mod tests {
         }
     }
 
+    // Keep the origin driver idle so tests can answer the relay's SUBSCRIBE
+    // directly, including properties a conforming receiver must refuse.
+    async fn spawn_raw_relay_publisher(
+        locals: Locals,
+        remotes: RemoteManager,
+        coordinator: Arc<dyn Coordinator>,
+    ) -> (
+        web_transport::Session,
+        TransportSession,
+        [tokio::task::AbortHandle; 2],
+    ) {
+        let (server_transport, client_transport) = loopback_webtransport_pair().await;
+        let wire = client_transport.clone();
+        let (server, client) = tokio::join!(
+            TransportSession::accept(server_transport, None, Transport::WebTransport),
+            TransportSession::connect(client_transport, None, Transport::WebTransport),
+        );
+        let (server, _, subscriber) = server.unwrap();
+        let (client, _, _) = client.unwrap();
+        let consumer = crate::Consumer::new(
+            subscriber.unwrap(),
+            locals,
+            coordinator,
+            remotes,
+            None,
+            SessionContext::public(None),
+            None,
+        );
+        let server = tokio::spawn(server.run());
+        let consumer = tokio::spawn(consumer.run());
+        (
+            wire,
+            client,
+            [server.abort_handle(), consumer.abort_handle()],
+        )
+    }
+
+    async fn register_raw_namespace(
+        transport: &web_transport::Session,
+        namespace: TrackNamespace,
+    ) -> (web_transport::SendStream, web_transport::RecvStream) {
+        let (kind, _, send, recv) = open_request(
+            transport,
+            Message::PublishNamespace(moq_transport::message::PublishNamespace {
+                id: 0,
+                track_namespace: namespace,
+                params: KeyValuePairs::default(),
+            }),
+        )
+        .await;
+        assert_eq!(kind, wire_id::RequestOk);
+        (send, recv)
+    }
+
+    async fn accept_raw_subscribe(
+        transport: &web_transport::Session,
+    ) -> (web_transport::SendStream, web_transport::RecvStream) {
+        let (send, mut recv) = tokio::time::timeout(Duration::from_secs(2), transport.accept_bi())
+            .await
+            .unwrap()
+            .unwrap();
+        let (kind, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_bidi_response_frame(&mut recv, &mut Vec::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kind, wire_id::Subscribe);
+        (send, recv)
+    }
+
+    async fn send_raw_subscribe_ok(
+        send: &mut web_transport::SendStream,
+        properties: moq_transport::message::TrackExtensions,
+    ) {
+        let mut payload = vec![42, 0]; // Track Alias, empty parameters.
+        properties.encode(&mut payload).unwrap();
+        let mut frame = Vec::new();
+        wire_id::SubscribeOk.encode(&mut frame).unwrap();
+        (payload.len() as u16).encode(&mut frame).unwrap();
+        frame.extend_from_slice(&payload);
+        send.write(&frame).await.unwrap();
+    }
+
+    async fn assert_upstream_track_properties_fail_pending_subscribers(rendezvous: bool) {
+        for malformed in [false, true] {
+            let locals = Locals::new();
+            let coordinator = Arc::new(CountingCoordinator::default());
+            let remotes = RemoteManager::new(coordinator.clone(), Vec::new());
+            let mut transports = Vec::new();
+            for _ in 0..3 {
+                let (transport, subscriber, _) = spawn_relay_session_with_limits(
+                    locals.clone(),
+                    remotes.clone(),
+                    coordinator.clone(),
+                    MAX_SUBSCRIBE_TRACKS_CHILDREN_PER_SESSION,
+                    MAX_SUBSCRIBE_TRACKS_SLOTS_PER_SESSION,
+                )
+                .await;
+                transports.push((transport, subscriber));
+            }
+            let (origin, _client, tasks) =
+                spawn_raw_relay_publisher(locals.clone(), remotes, coordinator.clone()).await;
+            let namespace = TrackNamespace::from_utf8_path("admission");
+            let mut publication = None;
+            if !rendezvous {
+                publication = Some(register_raw_namespace(&origin, namespace.clone()).await);
+            }
+            let make_request = || {
+                let mut params = KeyValuePairs::default();
+                if rendezvous {
+                    params.set_rendezvous_timeout(10_000);
+                }
+                Message::Subscribe(moq_transport::message::Subscribe {
+                    id: 0,
+                    track_namespace: namespace.clone(),
+                    track_name: "properties".into(),
+                    params,
+                })
+            };
+            let transport = transports[0].0.clone();
+            let request = make_request();
+            let first = tokio::spawn(async move { open_request(&transport, request).await });
+            if rendezvous {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !coordinator.looked_up("properties") {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!first.is_finished(), "held until a publisher appears");
+                publication = Some(register_raw_namespace(&origin, namespace.clone()).await);
+            }
+            let _publication = publication.unwrap();
+            let (mut upstream_send, _upstream_recv) = accept_raw_subscribe(&origin).await;
+            let full_name = FullTrackName {
+                namespace: namespace.clone(),
+                name: "properties".into(),
+            };
+            let cached = locals
+                .retrieve_track_with_interest(None, &full_name)
+                .unwrap();
+            let interest = cached.interest.as_ref().unwrap();
+            let transport = transports[1].0.clone();
+            let request = make_request();
+            let waiting = tokio::spawn(async move { open_request(&transport, request).await });
+            // Count includes this test's guard. Both real downstream requests
+            // must hold the same cache generation before upstream answers.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while interest.count() < 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("second subscriber did not join pending cache entry");
+            assert!(!first.is_finished());
+            assert!(!waiting.is_finished());
+            let mut properties = moq_transport::message::TrackExtensions::new();
+            if malformed {
+                properties.set_bytes_extension(0x0b, vec![2]);
+            } else {
+                properties.set_int_extension(0x4000, 7);
+            }
+            let code = if malformed { 0x12 } else { 0x33 };
+            send_raw_subscribe_ok(&mut upstream_send, properties).await;
+            for task in [first, waiting] {
+                let (kind, payload, _send, _recv) =
+                    tokio::time::timeout(Duration::from_secs(2), task)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(kind, wire_id::RequestError);
+                assert_eq!(response_error_code(payload), code);
+            }
+            assert!(
+                cached.reader.track_extensions().unwrap().is_empty(),
+                "invalid properties were not stored"
+            );
+            assert!(cached.reader.is_closed());
+            drop(cached);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while locals.retrieve_track(None, &full_name).is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("failed cache entry remained available");
+            // A later request must trigger a new upstream SUBSCRIBE rather than
+            // accepting the failed generation. Answer it with the existing byte fixture.
+            let transport = transports[2].0.clone();
+            let request = make_request();
+            let later = tokio::spawn(async move { open_request(&transport, request).await });
+            let (mut later_send, _later_recv) = accept_raw_subscribe(&origin).await;
+            let mut input = TRACK_PROPERTY_BYTES;
+            let properties = moq_transport::message::TrackExtensions::decode(&mut input).unwrap();
+            send_raw_subscribe_ok(&mut later_send, properties).await;
+            let (kind, payload, _send, _recv) = tokio::time::timeout(Duration::from_secs(2), later)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(kind, wire_id::SubscribeOk);
+            let mut input = payload.as_slice();
+            let _alias = u64::decode(&mut input).unwrap();
+            let _params = KeyValuePairs::decode_message_params(&mut input).unwrap();
+            assert_eq!(input, TRACK_PROPERTY_BYTES);
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_track_properties_fail_first_and_waiting_subscribers() {
+        assert_upstream_track_properties_fail_pending_subscribers(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_track_properties_fail_rendezvous_and_waiting_subscribers() {
+        assert_upstream_track_properties_fail_pending_subscribers(true).await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn relay_admission_serves_available_tracks_before_rejecting_new_holds() {
         let locals = Locals::with_rendezvous_capacity(1);

@@ -67,7 +67,11 @@ pub struct SubscriptionFilter {
     pub end_group_id: Option<u64>,
 }
 
-/// Draft-16 Track Extensions are a trailing sequence of KVPs with no count or length prefix.
+/// Track Properties are a trailing sequence of KVPs with no count or length prefix.
+/// Typed getters search mutable properties first, then Immutable Properties.
+/// Mutable values take precedence when both contain a single-valued property.
+/// An Immutable Properties value nested inside another is kept but not searched:
+/// draft 18 forbids that nesting for Objects and defines no meaning for Tracks.
 #[derive(Default, Clone, Debug, Eq, PartialEq)]
 pub struct TrackExtensions(pub Vec<KeyValuePair>);
 
@@ -101,8 +105,9 @@ impl TrackExtensions {
     /// 12.7). Draft 18 registers none, so every such type is unknown here.
     ///
     /// Immutable Properties are parsed into a temporary view, so their stored
-    /// bytes are unchanged. An error means one of them cannot be parsed, which makes the
-    /// track malformed and outranks a mandatory type inside another one.
+    /// bytes are unchanged. An error means one of them cannot be parsed, which
+    /// makes the track malformed; it outranks a mandatory type found inside
+    /// another one.
     pub(crate) fn has_unknown_mandatory_extension(&self) -> Result<bool, DecodeError> {
         let contains_mandatory = |pairs: &[KeyValuePair]| {
             pairs
@@ -113,21 +118,76 @@ impl TrackExtensions {
             return Ok(true);
         }
         let mut inner_mandatory = false;
-        for pair in &self.0 {
-            if pair.key != extension_type::IMMUTABLE_EXTENSIONS {
-                continue;
-            }
-            let Value::BytesValue(bytes) = &pair.value else {
-                return Err(DecodeError::InvalidParameter);
-            };
-            let inner = Self::decode(&mut bytes.as_slice())?;
-            inner_mandatory |= contains_mandatory(&inner.0);
+        for inner in self.immutable_extensions() {
+            inner_mandatory |= contains_mandatory(&inner?.0);
         }
         Ok(inner_mandatory)
     }
 
+    fn immutable_extensions(&self) -> impl Iterator<Item = Result<Self, DecodeError>> + '_ {
+        self.0.iter().filter_map(|pair| {
+            if pair.key != extension_type::IMMUTABLE_EXTENSIONS {
+                return None;
+            }
+            Some(match &pair.value {
+                Value::BytesValue(bytes) => Self::decode(&mut bytes.as_slice()),
+                Value::IntValue(_) => Err(DecodeError::InvalidParameter),
+            })
+        })
+    }
+
+    fn int_extension(&self, key: u64) -> Result<Option<u64>, DecodeError> {
+        if let Some(value) = get_kvp_int(&self.0, key)? {
+            return Ok(Some(value));
+        }
+        for inner in self.immutable_extensions() {
+            if let Some(value) = get_kvp_int(&inner?.0, key)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Validate every readable occurrence, including shadowed values.
+    /// Unparseable immutable values are classified separately by
+    /// `has_unknown_mandatory_extension` at the receive boundary.
+    pub(crate) fn validate_values(&self) -> Result<(), DecodeError> {
+        fn validate(pairs: &[KeyValuePair]) -> Result<(), DecodeError> {
+            for pair in pairs {
+                match pair.key {
+                    extension_type::DEFAULT_PUBLISHER_PRIORITY => {
+                        get_kvp_u8(std::slice::from_ref(pair), pair.key)?;
+                    }
+                    extension_type::DEFAULT_PUBLISHER_GROUP_ORDER
+                        if !matches!(
+                            get_kvp_int(std::slice::from_ref(pair), pair.key)?,
+                            Some(1 | 2)
+                        ) =>
+                    {
+                        return Err(DecodeError::InvalidGroupOrder);
+                    }
+                    extension_type::DYNAMIC_GROUPS
+                        if !matches!(
+                            get_kvp_int(std::slice::from_ref(pair), pair.key)?,
+                            Some(0 | 1)
+                        ) =>
+                    {
+                        return Err(DecodeError::InvalidParameter);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        validate(&self.0)?;
+        for inner in self.immutable_extensions().flatten() {
+            validate(&inner.0)?;
+        }
+        Ok(())
+    }
+
     pub fn delivery_timeout(&self) -> Result<Option<u64>, DecodeError> {
-        get_kvp_int(&self.0, extension_type::DELIVERY_TIMEOUT)
+        self.int_extension(extension_type::DELIVERY_TIMEOUT)
     }
 
     pub fn set_delivery_timeout(&mut self, timeout: u64) {
@@ -135,7 +195,7 @@ impl TrackExtensions {
     }
 
     pub fn max_cache_duration(&self) -> Result<Option<u64>, DecodeError> {
-        get_kvp_int(&self.0, extension_type::MAX_CACHE_DURATION)
+        self.int_extension(extension_type::MAX_CACHE_DURATION)
     }
 
     pub fn set_max_cache_duration(&mut self, duration: u64) {
@@ -143,7 +203,9 @@ impl TrackExtensions {
     }
 
     pub fn default_publisher_priority(&self) -> Result<Option<u8>, DecodeError> {
-        get_kvp_u8(&self.0, extension_type::DEFAULT_PUBLISHER_PRIORITY)
+        self.int_extension(extension_type::DEFAULT_PUBLISHER_PRIORITY)?
+            .map(|value| u8::try_from(value).map_err(|_| DecodeError::InvalidParameter))
+            .transpose()
     }
 
     pub fn set_default_publisher_priority(&mut self, priority: u8) {
@@ -151,7 +213,7 @@ impl TrackExtensions {
     }
 
     pub fn default_publisher_group_order(&self) -> Result<Option<GroupOrder>, DecodeError> {
-        match get_kvp_int(&self.0, extension_type::DEFAULT_PUBLISHER_GROUP_ORDER)? {
+        match self.int_extension(extension_type::DEFAULT_PUBLISHER_GROUP_ORDER)? {
             Some(1) => Ok(Some(GroupOrder::Ascending)),
             Some(2) => Ok(Some(GroupOrder::Descending)),
             Some(_) => Err(DecodeError::InvalidGroupOrder),
@@ -176,7 +238,7 @@ impl TrackExtensions {
     }
 
     pub fn dynamic_groups(&self) -> Result<Option<bool>, DecodeError> {
-        match get_kvp_int(&self.0, extension_type::DYNAMIC_GROUPS)? {
+        match self.int_extension(extension_type::DYNAMIC_GROUPS)? {
             Some(0) => Ok(Some(false)),
             Some(1) => Ok(Some(true)),
             Some(_) => Err(DecodeError::InvalidParameter),
@@ -561,6 +623,33 @@ mod tests {
             Some(GroupOrder::Ascending)
         );
         assert_eq!(extensions.dynamic_groups().unwrap(), Some(true));
+    }
+
+    #[test]
+    fn mandatory_type_precedence_around_malformed_immutable_properties() {
+        let mut inner = TrackExtensions::new();
+        inner.set_int_extension(0x4000, 7);
+        let mut bytes = Vec::new();
+        inner.encode(&mut bytes).unwrap();
+        let mandatory = KeyValuePair::new_bytes(extension_type::IMMUTABLE_EXTENSIONS, bytes);
+        // A type with no value cannot be parsed.
+        let malformed = KeyValuePair::new_bytes(extension_type::IMMUTABLE_EXTENSIONS, vec![0x02]);
+
+        // A top-level mandatory type outranks malformed Immutable Properties.
+        assert!(matches!(
+            TrackExtensions(vec![malformed.clone(), KeyValuePair::new_int(0x4000, 7)])
+                .has_unknown_mandatory_extension(),
+            Ok(true)
+        ));
+        // Malformed Immutable Properties outrank a mandatory type inside another.
+        for order in [
+            vec![mandatory.clone(), malformed.clone()],
+            vec![malformed, mandatory],
+        ] {
+            assert!(TrackExtensions(order)
+                .has_unknown_mandatory_extension()
+                .is_err());
+        }
     }
 
     #[test]

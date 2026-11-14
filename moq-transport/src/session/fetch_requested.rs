@@ -52,7 +52,7 @@ enum ProxyOutcome {
 }
 
 enum ProxyStep {
-    Response(Result<message::FetchOk, Option<message::RequestError>>),
+    Response(Result<message::FetchOk, ServeError>),
     Record(Option<FetchRecord>),
     Payload(Option<bytes::Bytes>),
 }
@@ -425,8 +425,12 @@ impl FetchRequested {
                 Err(ServeError::Timeout.into())
             }
             ProxyOutcome::Done(Err(err)) => {
-                let code = if is_malformed_response(&err) {
+                let code = if upstream.properties_error() == Some(RequestErrorCode::MalformedTrack)
+                    || is_malformed_response(&err)
+                {
                     DataStreamResetCode::MalformedTrack
+                } else if upstream.properties_error().is_some() {
+                    DataStreamResetCode::Cancelled
                 } else {
                     DataStreamResetCode::InternalError
                 };
@@ -436,7 +440,9 @@ impl FetchRequested {
                     if let Some(stream) = relay.stream.as_mut() {
                         stream.reset = code;
                     }
-                    if let Some(error) = upstream.rejection() {
+                    if let Some(code) = upstream.properties_error() {
+                        self.reject(code, "unsupported or malformed upstream track properties")?;
+                    } else if let Some(error) = upstream.rejection() {
                         self.reject_with(error)?;
                     } else {
                         self.reject(RequestErrorCode::InternalError, "fetch proxy failed")?;
@@ -503,10 +509,10 @@ impl FetchRequested {
                         relay.stream = Some(self.open_stream().await?);
                     }
                 }
-                ProxyStep::Response(Err(_)) => {
+                ProxyStep::Response(Err(err)) => {
                     // A REQUEST_ERROR (forwarded by the caller) or a request
                     // stream that ended without a response.
-                    return Err(ServeError::Cancel.into());
+                    return Err(err.into());
                 }
                 ProxyStep::Record(Some(record)) => {
                     relay.validator.validate_record(&record)?;
