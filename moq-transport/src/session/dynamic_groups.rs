@@ -83,7 +83,7 @@ async fn send_publish_ok(writer: &mut Writer, id: u64, new_group: Option<u64>) {
     if let Some(value) = new_group {
         params.set_new_group_request(value);
     }
-    Session::encode_bidi_response(writer, &message::RequestOk { id, params }.into())
+    Session::encode_bidi_response(writer, &message::RequestOk::new(id, params).into())
         .await
         .unwrap();
 }
@@ -761,4 +761,90 @@ async fn repeated_update_request_id_is_session_fatal() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_update_ok_with_track_properties_closes_session() {
+    for inbound_publish in [false, true] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut endpoint, peer) = publisher_with_raw_peer().await;
+            let (source, track) =
+                serve::Track::new(TrackNamespace::from_utf8_path("dynamic"), "video").produce();
+            let mut properties = message::TrackExtensions::new();
+            properties.set_dynamic_groups(true);
+            let mut subscription = None;
+            let mut publication = None;
+            let (mut writer, mut reader) = if inbound_publish {
+                let (send, recv) = peer.webtransport.open_bi().await.unwrap();
+                let mut writer = Writer::new(send);
+                writer
+                    .write(
+                        &encode_request_frame(&Message::Publish(message::Publish {
+                            id: 1,
+                            track_namespace: TrackNamespace::from_utf8_path("dynamic"),
+                            track_name: "video".into(),
+                            track_alias: 42,
+                            params: KeyValuePairs::default(),
+                            track_extensions: properties,
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let mut received = endpoint.subscriber.publish_received().await.unwrap();
+                let track = received.take_reader().unwrap();
+                received.accept(true).unwrap();
+                let mut reader = Reader::new(recv);
+                assert!(matches!(
+                    Session::decode_bidi_response(&mut reader, 1).await.unwrap(),
+                    Message::RequestOk(_)
+                ));
+                track.request_new_group(0).await.unwrap();
+                publication = Some(received);
+                (writer, reader)
+            } else {
+                subscription = Some(endpoint.subscriber.subscribe_start(source).await.unwrap());
+                let (send, recv) = peer.webtransport.accept_bi().await.unwrap();
+                let mut writer = Writer::new(send);
+                let mut reader = Reader::new(recv);
+                let _: Message = reader.decode().await.unwrap();
+                Session::encode_bidi_response(
+                    &mut writer,
+                    &Message::SubscribeOk(message::SubscribeOk {
+                        id: 0,
+                        track_alias: 42,
+                        params: KeyValuePairs::default(),
+                        track_extensions: properties,
+                    }),
+                )
+                .await
+                .unwrap();
+                subscription.as_ref().unwrap().ok().await.unwrap();
+                track.request_new_group(0).await.unwrap();
+                (writer, reader)
+            };
+            assert!(matches!(
+                Session::decode_bidi_response(&mut reader, 0).await.unwrap(),
+                Message::RequestUpdate(_)
+            ));
+            // Raw bytes prevent the response encoder from hiding a receive-side gap.
+            writer
+                .write(&[0x07, 0x00, 0x03, 0x00, 0x30, 0x01])
+                .await
+                .unwrap();
+            let result = (&mut endpoint.driver).await.unwrap();
+            assert!(matches!(result, Err(SessionError::ProtocolViolation(_))));
+            assert!(matches!(
+                peer.webtransport.closed().await,
+                web_transport::Error::Session(
+                    web_transport::quinn::SessionError::WebTransportError(
+                        web_transport::quinn::WebTransportError::Closed(0x3, _)
+                    )
+                )
+            ));
+            drop((subscription, publication));
+        })
+        .await
+        .unwrap();
+    }
 }

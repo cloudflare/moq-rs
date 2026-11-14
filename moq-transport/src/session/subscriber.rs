@@ -990,6 +990,9 @@ impl Subscriber {
                                 Ok(msg) => {
                                     let terminal = matches!(msg, Message::PublishDone(_))
                                         || (!established && matches!(msg, Message::RequestError(_)));
+                                    if let Message::RequestOk(ok) = &msg {
+                                        super::validate_propertyless_request_ok(ok)?;
+                                    }
                                     if matches!(msg, Message::SubscribeOk(_)) { established = true; }
                                     if let Ok(pub_msg) = TryInto::<message::Publisher>::try_into(msg) {
                                         if let Err(err) = subscriber_clone.recv_message(pub_msg) {

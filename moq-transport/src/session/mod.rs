@@ -82,11 +82,19 @@ use crate::{message, setup};
 
 pub(super) const CANCELLED_STREAM_CODE: u32 = crate::data::DataStreamResetCode::Cancelled as u32;
 
+// Call only for the REQUEST_OK kinds whose properties must be empty in Section 10.5.
+fn validate_propertyless_request_ok(msg: &message::RequestOk) -> Result<(), SessionError> {
+    if !msg.track_extensions.is_empty() {
+        return Err(SessionError::ProtocolViolation(
+            "unexpected Track Properties in REQUEST_OK".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) struct BidiResponse {
     message: Message,
     completion: Option<tokio::sync::oneshot::Sender<Result<(), DeliveryError>>>,
-    /// Only TRACK_STATUS_OK can populate properties in a shared REQUEST_OK.
-    track_properties: Option<message::TrackExtensions>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -117,7 +125,6 @@ impl BidiResponse {
         Self {
             message,
             completion: None,
-            track_properties: None,
         }
     }
 
@@ -132,7 +139,6 @@ impl BidiResponse {
             Self {
                 message,
                 completion: Some(completion),
-                track_properties: None,
             },
             receipt,
         )
@@ -1515,10 +1521,9 @@ impl Session {
                                         || (is_fetch_ok && fetch_served.is_none())
                                         || (bounded_response
                                             && matches!(response.message, Message::RequestOk(_)));
-                                    if let Err(err) = Self::encode_bidi_response_with_properties(
+                                    if let Err(err) = Self::encode_bidi_response(
                                         &mut writer,
                                         &response.message,
-                                        response.track_properties.as_ref(),
                                     )
                                     .await
                                     {
@@ -1699,6 +1704,11 @@ impl Session {
                 Err(err) => return Err(err),
             };
 
+            if let Message::RequestOk(ok) = &msg {
+                // A response on a peer-initiated stream acknowledges our REQUEST_UPDATE.
+                validate_propertyless_request_ok(ok)?;
+            }
+
             let terminal = match &msg {
                 Message::PublishDone(_) => Some(FollowupEnd::PublishDone),
                 Message::PublishNamespaceDone(_) | Message::Unsubscribe(_) => {
@@ -1752,13 +1762,6 @@ impl Session {
     /// payload with Request ID omitted). Separated from the async writer
     /// so tests can verify the encoding without a QUIC stream.
     fn encode_bidi_response_frame(msg: &Message) -> Result<bytes::BytesMut, SessionError> {
-        Self::encode_bidi_response_frame_with_properties(msg, None)
-    }
-
-    fn encode_bidi_response_frame_with_properties(
-        msg: &Message,
-        properties: Option<&message::TrackExtensions>,
-    ) -> Result<bytes::BytesMut, SessionError> {
         use bytes::BufMut;
 
         if !msg.parameter_scopes_valid() {
@@ -1771,9 +1774,7 @@ impl Session {
         match msg {
             Message::RequestOk(m) => {
                 m.params.encode_message_params(&mut payload)?;
-                if let Some(properties) = properties {
-                    properties.encode(&mut payload)?;
-                }
+                m.track_extensions.encode(&mut payload)?;
             }
             Message::RequestUpdate(m) => {
                 // Unlike responses, updates consume a new Request ID (§10.1).
@@ -1846,17 +1847,6 @@ impl Session {
         Ok(())
     }
 
-    async fn encode_bidi_response_with_properties(
-        writer: &mut Writer,
-        msg: &Message,
-        properties: Option<&message::TrackExtensions>,
-    ) -> Result<(), SessionError> {
-        let frame = Self::encode_bidi_response_frame_with_properties(msg, properties)?;
-        Self::log_control_message(writer.session_id(), msg, "sent");
-        writer.write(&frame).await?;
-        Ok(())
-    }
-
     /// Decode a response message from a bidi request stream (draft-18).
     ///
     /// Response messages omit the Request ID field — the stream identity
@@ -1907,9 +1897,11 @@ impl Session {
             }
             wire_id::RequestOk => {
                 let params = crate::coding::KeyValuePairs::decode_message_params(&mut buf)?;
+                let track_extensions = message::TrackExtensions::decode(&mut buf)?;
                 Ok(Message::RequestOk(message::RequestOk {
                     id: request_id,
                     params,
+                    track_extensions,
                 }))
             }
             wire_id::SubscribeOk => {
@@ -2932,21 +2924,131 @@ mod tests {
     #[test]
     fn encode_bidi_request_ok_omits_request_id() {
         use message::wire_id;
-        let msg = Message::RequestOk(message::RequestOk {
-            id: 42, // should NOT appear on the wire
-            params: crate::coding::KeyValuePairs::default(),
-        });
+        let msg = Message::RequestOk(message::RequestOk::new(
+            42,
+            crate::coding::KeyValuePairs::default(),
+        ));
         let bytes = encode_bidi_response_bytes(&msg);
-        // type (1 byte) + length 0x0001 (2 bytes) + params_count=0 (1 byte) = 4 bytes
-        assert_eq!(bytes[0], wire_id::RequestOk as u8);
-        assert_eq!(bytes.len(), 4);
+        assert_eq!(bytes, [wire_id::RequestOk as u8, 0, 1, 0]);
+    }
+
+    #[tokio::test]
+    async fn request_ok_track_extensions_survive_request_stream_codec() {
+        let (requester, responder) = test_support::loopback_session_pair().await;
+        let (_request_send, response_recv) = requester.open_bi().await.unwrap();
+        let (mut response_send, _request_recv) = responder.accept_bi().await.unwrap();
+        let mut frame = vec![0x07, 0x00, 0x12, 0x00];
+        frame.extend_from_slice(test_support::TRACK_PROPERTY_BYTES);
+        response_send.write(&frame).await.unwrap();
+
+        let msg = Session::decode_bidi_response(&mut Reader::new(response_recv), 42)
+            .await
+            .unwrap();
+        let Message::RequestOk(ok) = &msg else {
+            panic!("expected TRACK_STATUS_OK");
+        };
+        assert_eq!(ok.id, 42);
+        let mut forwarded = Vec::new();
+        ok.track_extensions.encode(&mut forwarded).unwrap();
+        assert_eq!(forwarded, test_support::TRACK_PROPERTY_BYTES);
+        assert_eq!(encode_bidi_response_bytes(&msg), frame);
+    }
+
+    async fn assert_request_ok_properties_close_session(request_type: u64) {
+        use crate::coding::{TrackNamespace, TrackNamespacePrefix};
+        use message::wire_id;
+
+        let (client_transport, peer_transport) = test_support::loopback_session_pair().await;
+        let peer = peer_transport.clone();
+        let (client, server) = tokio::join!(
+            Session::connect(client_transport, None, Transport::WebTransport),
+            Session::accept(peer_transport, None, Transport::WebTransport),
+        );
+        let (session, mut publisher, mut subscriber) = client.unwrap();
+        let _server = server.unwrap();
+        let mut run = tokio::spawn(session.run());
+        let request = tokio::spawn(async move {
+            match request_type {
+                wire_id::Publish => {
+                    let (_writer, track) =
+                        crate::serve::Track::new(TrackNamespace::from_utf8_path("test"), "track")
+                            .produce();
+                    let _published = publisher
+                        .publish(track, KeyValuePairs::default())
+                        .await
+                        .unwrap();
+                    std::future::pending::<()>().await;
+                }
+                wire_id::PublishNamespace => {
+                    let _published = publisher
+                        .publish_namespace_start(TrackNamespace::from_utf8_path("test"))
+                        .await
+                        .unwrap();
+                    std::future::pending::<()>().await;
+                }
+                wire_id::SubscribeNamespace => {
+                    let _subscribed = subscriber
+                        .subscribe_namespace(
+                            TrackNamespacePrefix::from_utf8_path("test"),
+                            KeyValuePairs::default(),
+                        )
+                        .await
+                        .unwrap();
+                    std::future::pending::<()>().await;
+                }
+                _ => panic!("unsupported test request"),
+            }
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (mut response, incoming) = peer.accept_bi().await.unwrap();
+            let mut incoming = Reader::new(incoming);
+            let msg: Message = incoming.decode().await.unwrap();
+            assert_eq!(msg.id(), request_type);
+            // Send independently of the response encoder so dropping properties
+            // on send cannot hide a missing receive-side check.
+            let mut frame = vec![0x07, 0x00, 0x12, 0x00];
+            frame.extend_from_slice(test_support::TRACK_PROPERTY_BYTES);
+            response.write(&frame).await.unwrap();
+            tokio::join!(&mut run, peer.closed())
+        })
+        .await;
+        run.abort();
+        request.abort();
+        let (run_result, close_error) =
+            result.expect("property-bearing REQUEST_OK must close session");
+        assert!(matches!(
+            run_result.unwrap(),
+            Err(SessionError::ProtocolViolation(_))
+        ));
+        assert!(matches!(
+            close_error,
+            web_transport::Error::Session(web_transport::quinn::SessionError::WebTransportError(
+                web_transport::quinn::WebTransportError::Closed(0x3, _)
+            ))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_ok_with_track_extensions_closes_session() {
+        assert_request_ok_properties_close_session(message::wire_id::Publish).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_namespace_ok_with_track_extensions_closes_session() {
+        assert_request_ok_properties_close_session(message::wire_id::PublishNamespace).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_namespace_ok_with_track_extensions_closes_session() {
+        assert_request_ok_properties_close_session(message::wire_id::SubscribeNamespace).await;
     }
 
     #[test]
     fn encode_bidi_response_rejects_parameter_outside_its_scope() {
         let mut params = crate::coding::KeyValuePairs::default();
         params.set_rendezvous_timeout(1_000);
-        let msg = Message::RequestOk(message::RequestOk { id: 1, params });
+        let msg = Message::RequestOk(message::RequestOk::new(1, params));
 
         assert!(matches!(
             Session::encode_bidi_response_frame(&msg),
@@ -3068,12 +3170,11 @@ mod tests {
     #[test]
     fn response_target_id_covers_responses_only() {
         // Response messages should return Some(id)
-        assert!(Message::RequestOk(message::RequestOk {
-            id: 1,
-            params: Default::default(),
-        })
-        .response_target_id()
-        .is_some());
+        assert!(
+            Message::RequestOk(message::RequestOk::new(1, Default::default()))
+                .response_target_id()
+                .is_some()
+        );
         assert!(Message::RequestError(message::RequestError {
             id: 1,
             error_code: 0,

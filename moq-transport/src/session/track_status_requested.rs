@@ -38,11 +38,8 @@ impl TrackStatusRequested {
         Ok(())
     }
 
-    /// Accept the TRACK_STATUS request with REQUEST_OK (draft-16 §9.7).
-    ///
-    /// The response includes LARGEST_OBJECT when objects have been published.
-    /// No Track Alias is included — draft-16 §9.19 does not use one for
-    /// TRACK_STATUS responses.
+    /// Accept TRACK_STATUS with the track's properties and LARGEST_OBJECT when
+    /// objects have been published. No Track Alias is included (draft-18 Section 10.14).
     pub fn respond_ok(mut self, track: &serve::TrackReader) -> Result<(), SessionError> {
         let mut params = KeyValuePairs::default();
 
@@ -52,13 +49,11 @@ impl TrackStatusRequested {
                 .map_err(|_| SessionError::Internal)?;
         }
 
-        self.publisher.send_track_status_ok(
-            RequestOk {
-                id: self.request_msg.id,
-                params,
-            },
-            track.track_extensions()?,
-        )?;
+        self.publisher.send_track_status_ok(RequestOk {
+            id: self.request_msg.id,
+            params,
+            track_extensions: track.track_extensions()?,
+        })?;
 
         Ok(())
     }
