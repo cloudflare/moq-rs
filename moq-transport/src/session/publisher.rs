@@ -503,6 +503,7 @@ impl Publisher {
                             request_stopped = true;
                         }
                         PublishNamespaceEvent::Response(Ok(Message::RequestOk(msg))) => {
+                            super::validate_propertyless_request_ok(&msg)?;
                             if responded {
                                 return Err(SessionError::ProtocolViolation(
                                     "multiple responses to PUBLISH_NAMESPACE".to_string(),
@@ -761,9 +762,7 @@ impl Publisher {
                             let failed = result.is_err();
                             let response = if replying_to_update {
                                 Some(match &result {
-                                    Ok(()) => message::RequestOk {
-                                        id: request_id, params: KeyValuePairs::default(),
-                                    }.into(),
+                                    Ok(()) => message::RequestOk::new(request_id, KeyValuePairs::default()).into(),
                                     Err(_) => message::RequestError {
                                         id: request_id,
                                         error_code: RequestErrorCode::NotSupported as u64,
@@ -1228,7 +1227,6 @@ impl Publisher {
     pub(super) fn send_track_status_ok(
         &mut self,
         msg: message::RequestOk,
-        properties: message::TrackExtensions,
     ) -> Result<(), SessionError> {
         self.add_mlog_event(|time| mlog::events::request_ok_created(time, 0, "track_status", &msg));
         let stream = self
@@ -1238,8 +1236,7 @@ impl Publisher {
             .get(&msg.id)
             .cloned()
             .ok_or(ServeError::Cancel)?;
-        let mut response = BidiResponse::new(msg.into());
-        response.track_properties = Some(properties);
+        let response = BidiResponse::new(msg.into());
         stream.send(response).map_err(|_| ServeError::Cancel.into())
     }
 
@@ -1266,11 +1263,7 @@ impl Publisher {
         match result {
             Ok(()) => {
                 self.send_bidi_response(
-                    message::RequestOk {
-                        id: parent_id,
-                        params: KeyValuePairs::default(),
-                    }
-                    .into(),
+                    message::RequestOk::new(parent_id, KeyValuePairs::default()).into(),
                 )?;
             }
             Err(err) => {
@@ -1347,10 +1340,7 @@ impl Publisher {
                     request_id = msg.id,
                     "PUBLISH accepted with the draft-16 PUBLISH_OK type"
                 );
-                let msg = message::RequestOk {
-                    id: msg.id,
-                    params: msg.params,
-                };
+                let msg = message::RequestOk::new(msg.id, msg.params);
                 self.recv_publish_ok(&msg)?;
             }
         }
@@ -1544,6 +1534,7 @@ impl Publisher {
     /// from the type instead would resolve a PUBLISH as a namespace
     /// registration and leave the publish waiting forever.
     fn recv_request_ok(&mut self, msg: message::RequestOk) -> Result<(), SessionError> {
+        super::validate_propertyless_request_ok(&msg)?;
         if self.recv_publish_namespace_ok(&msg)? {
             return Ok(());
         }
@@ -2124,10 +2115,10 @@ mod tests {
                 let mut writer = Writer::new(send_stream);
                 Session::encode_bidi_response(
                     &mut writer,
-                    &Message::RequestOk(message::RequestOk {
-                        id: publish.id,
-                        params: KeyValuePairs::default(),
-                    }),
+                    &Message::RequestOk(message::RequestOk::new(
+                        publish.id,
+                        KeyValuePairs::default(),
+                    )),
                 )
                 .await
                 .unwrap();
@@ -2236,10 +2227,10 @@ mod tests {
             let mut writer = Writer::new(send_stream);
             Session::encode_bidi_response(
                 &mut writer,
-                &Message::RequestOk(message::RequestOk {
-                    id: publish.id,
-                    params: KeyValuePairs::default(),
-                }),
+                &Message::RequestOk(message::RequestOk::new(
+                    publish.id,
+                    KeyValuePairs::default(),
+                )),
             )
             .await
             .unwrap();
@@ -2298,10 +2289,10 @@ mod tests {
             let mut writer = Writer::new(send_stream);
             Session::encode_bidi_response(
                 &mut writer,
-                &Message::RequestOk(message::RequestOk {
-                    id: publish.id,
-                    params: KeyValuePairs::default(),
-                }),
+                &Message::RequestOk(message::RequestOk::new(
+                    publish.id,
+                    KeyValuePairs::default(),
+                )),
             )
             .await
             .unwrap();
@@ -2424,10 +2415,7 @@ mod tests {
         ));
         Session::encode_bidi_response(
             &mut peer_writer,
-            &Message::RequestOk(message::RequestOk {
-                id: 0,
-                params: Default::default(),
-            }),
+            &Message::RequestOk(message::RequestOk::new(0, Default::default())),
         )
         .await
         .unwrap();
@@ -2564,10 +2552,7 @@ mod tests {
         ));
         Session::encode_bidi_response(
             &mut peer_writer,
-            &Message::RequestOk(message::RequestOk {
-                id: 0,
-                params: Default::default(),
-            }),
+            &Message::RequestOk(message::RequestOk::new(0, Default::default())),
         )
         .await
         .unwrap();
@@ -2618,10 +2603,9 @@ mod tests {
             );
 
             let response = match reply {
-                Reply::Accept => Message::RequestOk(message::RequestOk {
-                    id: published.id,
-                    params: Default::default(),
-                }),
+                Reply::Accept => {
+                    Message::RequestOk(message::RequestOk::new(published.id, Default::default()))
+                }
                 Reply::LegacyAccept => Message::PublishOk(message::PublishOk {
                     id: published.id,
                     params: Default::default(),

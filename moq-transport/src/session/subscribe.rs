@@ -409,6 +409,8 @@ impl Subscribe {
         }
     }
 
+    /// Wait for acceptance. Unsupported mandatory properties return `Closed(0x33)`;
+    /// malformed Immutable Properties return `Closed(0x12)`. Neither establishes the subscription.
     pub async fn ok(&self) -> Result<(), ServeError> {
         loop {
             {
