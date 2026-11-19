@@ -187,9 +187,11 @@ impl SessionError {
                 Self::WebTransport(
                     web_transport::Error::Write(
                         web_transport::quinn::WriteError::Stopped(_)
+                            | web_transport::quinn::WriteError::InvalidStopped(_)
                             | web_transport::quinn::WriteError::ClosedStream
                     ) | web_transport::Error::Read(
                         web_transport::quinn::ReadError::Reset(_)
+                            | web_transport::quinn::ReadError::InvalidReset(_)
                             | web_transport::quinn::ReadError::ClosedStream
                     )
                 )
@@ -311,6 +313,25 @@ mod tests {
 
         assert!(!reset.is_session_fatal());
         assert!(!ended.is_session_fatal());
+    }
+
+    #[test]
+    fn a_reset_code_without_a_webtransport_mapping_is_still_a_stream_error() {
+        // Over raw QUIC (Session::raw), reset and STOP_SENDING codes still go
+        // through the WebTransport HTTP/3 mapping, so an ordinary MoQT code
+        // such as 5 arrives as InvalidReset / InvalidStopped. That is still
+        // the peer ending one stream, not a reason to close the session.
+        let reset = SessionError::WebTransport(web_transport::Error::Read(
+            web_transport::quinn::ReadError::InvalidReset(5u32.into()),
+        ));
+        let stopped = SessionError::WebTransport(web_transport::Error::Write(
+            web_transport::quinn::WriteError::InvalidStopped(5u32.into()),
+        ));
+
+        assert!(reset.is_stream_error());
+        assert!(stopped.is_stream_error());
+        assert!(!reset.is_session_fatal());
+        assert!(!stopped.is_session_fatal());
     }
 
     #[test]
